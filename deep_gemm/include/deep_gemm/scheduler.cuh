@@ -13,7 +13,7 @@ enum class GemmType {
 template <GemmType kGemmType,
           uint32_t SHAPE_N, uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumGroups, uint32_t kNumTMAMulticast,
-          uint32_t kNumNBlocks = cell_div(SHAPE_N, BLOCK_N),
+          uint32_t kNumNBlocks = ceil_div(SHAPE_N, BLOCK_N),
           uint32_t kNumNBlocksPerGroup = 16>
 struct Scheduler {
     int current_iter = -1;
@@ -30,7 +30,7 @@ struct Scheduler {
 
     __device__ __forceinline__ explicit Scheduler(const uint32_t shape_m,
                                                   int* grouped_layout = nullptr) {
-        num_aligned_m_blocks = cell_div(shape_m, BLOCK_M);
+        num_aligned_m_blocks = ceil_div(shape_m, BLOCK_M);
         if constexpr (kGemmType == GemmType::Normal) {
             num_blocks = num_aligned_m_blocks * kNumNBlocks;
         } else if (kGemmType == GemmType::GroupedContiguous) {
@@ -79,7 +79,7 @@ struct Scheduler {
                     return false;
 
                 // Within current group
-                num_m_blocks = cell_div(static_cast<uint32_t>(__ldg(grouped_layout + curr_group_idx)), BLOCK_M);
+                num_m_blocks = ceil_div(static_cast<uint32_t>(__ldg(grouped_layout + curr_group_idx)), BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
                     break;
