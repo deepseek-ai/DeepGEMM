@@ -10,7 +10,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 We test all shapes potentially used in DeepSeek-V3/R1 inference (including both prefilling and decoding, but without tensor parallelism) on H800 with NVCC 12.8. All speedup metrics are calculated in comparison to our internally and carefully optimized implementation based on CUTLASS 3.6.
 
-DeepGEMM does not behavior very well on some shapes, optimization PRs are welcomed if you are interested.
+DeepGEMM does not behave very well on some shapes, optimization PRs are welcomed if you are interested.
 
 ### Normal GEMMs for dense models
 
