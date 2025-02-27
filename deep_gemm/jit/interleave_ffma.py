@@ -38,7 +38,7 @@ def extract_ffma(sass):
             current = []
 
     if os.getenv('DG_PRINT_REG_REUSE', None):
-        print(f"Found {len(collected)} FFMA segments")
+        print(f'Found {len(collected)} FFMA segments')
     return collected
 
 
@@ -58,7 +58,6 @@ def validate(m, offset, le_bytes, num_lines):
 
 
 def parse_registers(line):
-    import re
     line = re.sub(r'/\*.*?\*/', '', line)
     line = line.replace(';', '')
     tokens = line.strip().split(',')
@@ -92,7 +91,7 @@ def modify_segment(m, name, ffma_lines):
             is_first_occurred = dst_reg not in dst_reg_set
             if is_first_occurred or (last_reused and dst_reg == last_dst_reg):
                 # Modify the `reuse` and `yield` bits
-                assert high_hex & 0x0800200000000000, f"{hex(high_hex)}"
+                assert high_hex & 0x0800200000000000, f'{hex(high_hex)}'
                 high_hex ^= 0x0800200000000000
                 reused = False
                 num_changed += 1
@@ -102,7 +101,7 @@ def modify_segment(m, name, ffma_lines):
         new_le_bytes.append(low_hex.to_bytes(8, 'little') + high_hex.to_bytes(8, 'little'))
         last_reused, last_dst_reg = reused, dst_reg
     if os.getenv('DG_PRINT_REG_REUSE', None):
-        print(f" > segment `{name}` new reused list ({num_changed} changed): {reused_list}")
+        print(f' > segment `{name}` new reused list ({num_changed} changed): {reused_list}')
 
     # Find the offset
     offsets = []
@@ -130,7 +129,7 @@ def process(path):
         mm.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Interleave FFMA reg reuse')
     parser.add_argument('--so', help='Path to the SO file')
     args = parser.parse_args()

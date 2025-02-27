@@ -109,7 +109,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     }
 
     // Initialize barriers
-    DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "To many TMA multicast");
+    DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "Too many TMA multicast");
     if (threadIdx.x == kNumMathThreads) {
         #pragma unroll
         for (int i = 0; i < kNumStages; ++ i) {
@@ -406,7 +406,8 @@ public:
     template <typename T>
     static CUtensorMap make_2d_tma_d_desc(T* global_address, uint32_t shape_m) {
         return make_2d_tma_desc(global_address, Layout::RowMajor,
-                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), SHAPE_N, BLOCK_M, BLOCK_N,
+                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), SHAPE_N,
+                                min(BLOCK_M, shape_m), BLOCK_N,
                                 CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
     }
 
