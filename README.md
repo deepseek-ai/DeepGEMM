@@ -76,10 +76,11 @@ git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
 python setup.py develop
 
 # Test JIT compilation
-python tests/test_jit.py
+pip install pytest
+pytest tests/test_jit.py -v -s
 
 # Test all GEMM implements (normal, contiguous-grouped and masked-grouped)
-python tests/test_core.py
+pytest tests/test_core.py -v -s
 ```
 
 ### Installation
