@@ -122,7 +122,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         (kNumTMAMulticast > 1) ? cutlass::arch::fence_barrier_init() : void();
     }
 
-    // Synchronize all threads to make barrier visible in normal memory model
+    // Synchronize threads to ensure barrier initialization is visible to all participating threads.
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
 
     // For pipeline unrolling
