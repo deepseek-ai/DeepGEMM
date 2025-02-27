@@ -29,7 +29,7 @@ def get_num_sms() -> int:
     return _num_sms
 
 
-def cell_div(x: int, y: int) -> int:
+def ceil_div(x: int, y: int) -> int:
     """
     Perform ceiling division of two integers.
 
@@ -71,7 +71,7 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     tma_alignment_bytes = 16
     assert tma_alignment_bytes % element_size == 0
     alignment = tma_alignment_bytes // element_size
-    return cell_div(x, alignment) * alignment
+    return ceil_div(x, alignment) * alignment
 
 
 def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
