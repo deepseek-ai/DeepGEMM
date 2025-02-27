@@ -109,7 +109,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     }
 
     // Initialize barriers
-    DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "To many TMA multicast");
+    DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "Too many TMA multicast");
     if (threadIdx.x == kNumMathThreads) {
         #pragma unroll
         for (int i = 0; i < kNumStages; ++ i) {
