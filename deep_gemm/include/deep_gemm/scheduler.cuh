@@ -2,7 +2,7 @@
 
 namespace deep_gemm {
 
-enum class GemmType {
+enum class GemmType : uint8_t {
     Normal,
     GroupedContiguous,
     GroupedMasked

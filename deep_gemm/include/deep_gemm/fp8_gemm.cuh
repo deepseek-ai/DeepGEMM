@@ -16,7 +16,7 @@
 
 namespace deep_gemm {
 
-enum class Layout {
+enum class Layout : uint8_t {
     RowMajor,
     ColMajor
 };
