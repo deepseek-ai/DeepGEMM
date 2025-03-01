@@ -25,14 +25,17 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), (x_amax / 448.0).view(x_view.size(0), x_view.size(2))
 
 
-def construct(m: int, k: int, n: int) -> \
+def construct(m: int, k: int, n: int, is_groupwise_scaling_b: bool=False) -> \
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
     x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_out = x @ y.t()
-
-    x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
+    if not is_groupwise_scaling_b:
+        x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_block_cast_to_fp8(y)
+    else:
+        x_fp8, y_fp8 = per_token_cast_to_fp8(x), per_token_cast_to_fp8(y)
+        y_fp8 = (y_fp8[0], get_col_major_tma_aligned_tensor(y_fp8[1]))
     # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
     return x_fp8, y_fp8, out, ref_out
@@ -62,22 +65,25 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
     return x_fp8, y_fp8, out, ref_out
 
 
-def test_gemm() -> None:
-    print('Testing GEMM:')
+def test_gemm(is_groupwise_scaling_b: bool=False) -> None:
+    print(f'Testing GEMM with 1x128 LHS Scaling {"128x1" if is_groupwise_scaling_b else "128x128"} RHS Scaling')
+
     for m in (64, 128, 4096):
         for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
-            x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-            deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+            x_fp8, y_fp8, out, ref_out = construct(m, k, n, is_groupwise_scaling_b=is_groupwise_scaling_b)
+
+            deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out, is_groupwise_scaling_b=is_groupwise_scaling_b)
             diff = calc_diff(out, ref_out)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
             # noinspection PyShadowingNames
             def test_func():
                 # Construct new tensors every time to avoid L2 cache acceleration
-                x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+                x_fp8, y_fp8, out, ref_out = construct(m, k, n, is_groupwise_scaling_b=is_groupwise_scaling_b)
+                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out, is_groupwise_scaling_b=is_groupwise_scaling_b)
 
-            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+            kernel_name = 'fp8_groupwise_gemm_kernel' if is_groupwise_scaling_b else 'fp8_gemm'
+            t = bench_kineto(test_func, kernel_name, suppress_kineto_output=True)
             print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
                   f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
                   f'{(m * k + k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
@@ -153,6 +159,7 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
+    test_gemm(is_groupwise_scaling_b=True)
+    test_gemm(is_groupwise_scaling_b=False)
     test_m_grouped_gemm_contiguous()
     test_m_grouped_gemm_masked()

@@ -795,6 +795,18 @@ __device__  __forceinline__ float ld_shared(const float* __restrict__ ptr) {
     return ret;
 }
 
+__device__  __forceinline__ float4 ld_shared(const float4* __restrict__ ptr) {
+    float4 ret;
+    asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w) : "l"(ptr));
+    return ret;
+}
+
+__device__  __forceinline__ float2 ld_shared(const float2* __restrict__ ptr) {
+    float2 ret;
+    asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(ret.x), "=f"(ret.y) : "l"(ptr));
+    return ret;
+}
+
 __device__ __forceinline__ void st_shared(const float* ptr, float val) {
     asm volatile("st.shared.f32 [%0], %1;" :: "l"(ptr), "f"(val));
 }

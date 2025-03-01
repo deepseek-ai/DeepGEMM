@@ -15,6 +15,7 @@ constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
+constexpr auto kGroupWiseScalingB = {IS_GROUP_WISE_SCALING_B};
 
 // Make a templated GEMM
 using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
@@ -22,12 +23,20 @@ using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMultica
 // Launch kernel
 auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
 auto tma_b_desc = GemmType::make_2d_tma_b_desc(rhs);
-auto tma_scales_a_desc = GemmType::make_2d_tma_scales_a_desc(lhs_scales, m);
 auto tma_d_desc = GemmType::make_2d_tma_d_desc(out, m);
-GemmType::run(out, rhs_scales, nullptr,
-              m,
-              tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
-              stream, num_sms, smem_size);
+auto tma_scales_a_desc = GemmType::make_2d_tma_scales_a_desc(lhs_scales, m);
+if constexpr (not kGroupWiseScalingB) {
+    GemmType::run(out, rhs_scales, nullptr,
+                  m,
+                  tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
+                  stream, num_sms, smem_size);
+} else {
+    auto tma_scales_b_desc = GemmType::make_2d_tma_scales_b_desc(rhs_scales);
+    GemmType::run(out, nullptr,
+                  m,
+                  tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_scales_b_desc, tma_d_desc,
+                  stream, num_sms, smem_size);
+}
 """
 
 
@@ -37,12 +46,16 @@ def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms
     return (n % (block_n * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
 
 
-def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> int:
+def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, is_groupwise_scaling_b: bool = False) -> int:
+    # Alignment requirements for multi-dimensional bulk tensor asynchronous copy operations
+    # Shared memory address : Must be 128 byte aligned.
+    TMA_SMEM_ALIGNMENT = 128 # Byte
     smem_d = block_m * block_n * 2
     smem_a_per_stage = block_m * block_k
     smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
     smem_scales_b = ceil_div(k, block_k) * 4
+
     smem_barrier = num_stages * 8 * 2
 
     smem_size = 0
@@ -50,19 +63,26 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
     smem_size += num_stages * smem_a_per_stage
     smem_size += num_stages * smem_scales_a_per_stage
     smem_size += num_stages * smem_b_per_stage
-    smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
+    if is_groupwise_scaling_b:
+        smem_scales_b_per_stage = ceil_div(block_n * 4, TMA_SMEM_ALIGNMENT) * TMA_SMEM_ALIGNMENT
+        smem_size += num_stages * smem_scales_b_per_stage
+    else:
+        smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
     smem_size += smem_barrier
     return smem_size
 
 
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
+                     is_groupwise_scaling_b: bool = False,
                      is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int, int]:
     if not is_grouped_contiguous:
         # TODO: for some cases, smaller M block is better, add them into tuning space
         block_ms = (64 if m <= 64 else 128, )
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
-    block_ns = tuple(range(16, 129, 8))
+    # smaller N performs better for groupwise scaling 
+    max_block_n = 128 if not is_groupwise_scaling_b else 112
+    block_ns = tuple(range(16, max_block_n + 1, 8))
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
@@ -90,7 +110,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
     for num_stages in (6, 5, 4) if 128 % best_block_n != 0 else (8, 7, 6, 5, 4):
-        best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n)
+        best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n, is_groupwise_scaling_b=is_groupwise_scaling_b)
         if best_smem_size <= sm90_capacity:
             best_num_stages = num_stages
             break
@@ -106,9 +126,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                          rhs: Tuple[torch.Tensor, torch.Tensor],
-                         out: torch.Tensor) -> None:
+                         out: torch.Tensor,
+                         is_groupwise_scaling_b: bool=False) -> None:
     """
-    Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
+    Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 or 128x1 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
     RHS and RHS scaling factors are required to be transposed.
     The LHS scaling tensor requires TMA-aligned transposed format, if your input does not match the requirement,
@@ -120,6 +141,8 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[n, k]`.
              the second element is an FP32 128x128 scaling tensor for RHS of shape `[⌈n / 128⌉, ⌈k / 128⌉]`.
         out: the BF16 output tensor of shape `[m, n]`, representing the result.
+        is_groupwise_scaling_b: If True, applies groupwise scaling(128x1) for RHS. 
+                                Default: False (128x128 block scaling).
     """
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
@@ -133,7 +156,11 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     assert m == m_ and n == n_ and k == k_
     assert n > 0 and k > 0
     assert lhs_scales.shape == (m, (k + 127) // 128)
-    assert rhs_scales.shape == ((n + 127) // 128, (k + 127) // 128)
+    if not is_groupwise_scaling_b:
+        assert rhs_scales.is_contiguous()
+        assert rhs_scales.shape == ((n + 127) // 128, (k + 127) // 128)
+    else:
+        assert rhs_scales.shape == (n, (k + 127) // 128)
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
@@ -142,7 +169,8 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # LHS scales must be transposed for TMA load, but not for RHS scales
     # NOTES: `get_tma_aligned_lhs_scales` may launch a kernel if not processed by previous kernels
     lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
-    assert rhs_scales.is_contiguous()
+    if is_groupwise_scaling_b:
+        rhs_scales = get_col_major_tma_aligned_tensor(rhs_scales)
 
     # Do nothing if `m` is zero
     if m == 0:
@@ -151,12 +179,13 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
+    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms, is_groupwise_scaling_b=is_groupwise_scaling_b)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast},
+              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast,
+              'IS_GROUP_WISE_SCALING_B': "true" if is_groupwise_scaling_b else "false"},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
