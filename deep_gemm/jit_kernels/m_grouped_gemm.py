@@ -54,7 +54,6 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
             `m_indices[i]` records the group which the j-th row of the LHS belong to,
             which means that the i-th row of the LHS matrix will be multiplied with `rhs[m_indices[i]]`.
             Values of `m_indices` in every-m-alignment-block must also be the same.
-            `-1` in this tensor indicates no RHS matrix selected, the kernel will skip the computation for that aligned block.
     """
     lhs, lhs_scales = lhs
     rhs, rhs_scales = rhs
