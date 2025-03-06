@@ -49,6 +49,7 @@ class CustomBuildPy(build_py):
         for d in third_party_include_dirs:
             dirname = d.split('/')[-1]
             src_dir = os.path.join(current_dir, d)
+            assert os.path.exists(src_dir), f"Source directory {src_dir} does not exist."
             dst_dir = os.path.join(build_include_dir, dirname)
 
             # Remove existing directory if it exists
