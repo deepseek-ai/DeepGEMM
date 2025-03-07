@@ -86,12 +86,12 @@ class ConfigCache:
         self.cached = {}
     
     def compute_and_cache(self, m: int, n: int, k: int, num_groups: int, num_sms: int,
-                          is_grouped_contigous: bool = False) -> Tuple[int, int, int, int]:
-        signature = str((m, n, k, num_groups, num_sms, is_grouped_contigous))
+                          is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int]:
+        signature = str((m, n, k, num_groups, num_sms, is_grouped_contiguous))
         signature = hash_to_hex(signature)
         if signature in self.cached:
             return self.cached[signature]
-        best_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contigous)
+        best_config = get_best_configs(m, n, k, num_groups, num_sms, is_grouped_contiguous)
         self.cached[signature] = best_config
         return best_config
 
