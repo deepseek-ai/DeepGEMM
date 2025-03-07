@@ -88,19 +88,22 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     """
     # NOTES: for the extreme performance, you may rewrite/fuse this function in CUDA
     assert x.dim() in (2, 3)
-    remove_dim = False
     if x.dim() == 2:
-        x, remove_dim = x.unsqueeze(0), True
+        m, n = x.shape
+        aligned_m = get_tma_aligned_size(m, x.element_size())
+        if x.stride(0) == 1 and x.stride(1) == aligned_m:
+            return x
+        aligned_x = torch.transpose(torch.empty((n, aligned_m), device=x.device), 0, 1)
+        aligned_x[:m, :] = x
+        aligned_x = aligned_x[:m, :]
+        return aligned_x
+    elif x.dim() == 3:
+        b, m, n = x.shape
+        aligned_m = get_tma_aligned_size(m, x.element_size())
+        if x.stride(0) == aligned_m * n and x.stride(1) == 1 and x.stride(2) == aligned_m:
+            return x
+        aligned_x = torch.transpose(torch.empty((b, n, aligned_m), device=x.device), 1,2)
+        aligned_x[:, :m, :] = x
+        aligned_x = aligned_x[:, :m, :]
+        return aligned_x
 
-    b, m, n = x.shape
-    aligned_m = get_tma_aligned_size(m, x.element_size())
-
-    # The last kernel gives a column-major TMA aligned layout
-    if x.stride(0) == aligned_m * n and x.stride(1) == 1 and x.stride(2) == aligned_m:
-        return x.squeeze(0) if remove_dim else x
-
-    # Normal layout requires transposing
-    aligned_x = torch.transpose(torch.empty((b, n, aligned_m), device=x.device, dtype=x.dtype), 1, 2)
-    aligned_x[:, :m, :] = x
-    aligned_x = aligned_x[:, :m, :]
-    return aligned_x.squeeze(0) if remove_dim else aligned_x
