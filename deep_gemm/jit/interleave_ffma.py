@@ -76,6 +76,11 @@ def modify_segment(m, name, ffma_lines):
     num_lines = (len(ffma_lines) * 9 // 16) // 2 * 2
     assert num_lines % 2 == 0
 
+    tma_threshold = 32
+    if num_lines // 2 > tma_threshold:
+        if os.getenv('DG_PRINT_REG_REUSE', None):
+            print(f' > segment `{name}` may benefit from TMA optimization due to large FFMA count ({num_lines // 2})')
+
     le_bytes, new_le_bytes = [], []
     reused_list = []
     dst_reg_set = set()
