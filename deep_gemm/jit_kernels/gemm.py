@@ -56,7 +56,7 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
 
 
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int, int]:
+                     is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int, int, int]:
     if not is_grouped_contiguous:
         # TODO: for some cases, smaller M block is better, add them into tuning space
         block_ms = (64 if m <= 64 else 128, )
