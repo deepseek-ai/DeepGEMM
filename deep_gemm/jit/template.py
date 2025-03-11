@@ -1,9 +1,9 @@
 import copy
 import ctypes
 import os
+import torch
 from typing import Any, Dict, Iterable, Tuple
 
-import torch
 
 # Name map for Python `eval`
 typename_map: Dict[Any, str] = {
