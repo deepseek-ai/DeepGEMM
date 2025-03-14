@@ -1,6 +1,9 @@
-import random
 import torch
 from typing import Tuple
+import csv
+import random
+
+
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
@@ -143,16 +146,42 @@ def test_m_grouped_gemm_masked() -> None:
                   f'{(num_groups * (m * k + k * n + m * n * 2)) / 1e9 / t:4.0f} GB/s')
     print()
 
-
-if __name__ == '__main__':
-    torch.backends.cuda.matmul.allow_tf32 = True
+if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.manual_seed(0)
     random.seed(0)
 
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
-    test_m_grouped_gemm_contiguous()
-    test_m_grouped_gemm_masked()
+    results = []
+
+    # Collect GEMM benchmarks
+    print('Testing GEMM:')
+    for m in (64, 128, 4096):
+        for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
+            x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+            deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+            diff = calc_diff(out, ref_out)
+            assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
+
+            def test_func():
+                x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+
+            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+            tflops = 2 * m * n * k / t / 1e12
+            bandwidth = (m * k + k * n + m * n * 2) / t / 1e9
+            time_us = t * 1e6
+            print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {time_us:.2f} us | throughput: {tflops:.2f} TFLOPS, {bandwidth:.2f} GB/s')
+
+            results.append([m, n, k, round(time_us, 2), round(tflops, 2), round(bandwidth, 2)])
+
+    # Save results once after all benchmarks
+    with open('results.csv', 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['M', 'N', 'K', 'Latency_us', 'TFLOPS', 'Bandwidth_GBps'])  # Header
+        writer.writerows(results)
+
+    print("Benchmarks saved to results.csv")
