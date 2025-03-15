@@ -71,10 +71,11 @@ def test_gemm() -> None:
             diff = calc_diff(out, ref_out)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
+            # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
+            x_fp8, y_fp8, out, ref_out = construct(m, k, n)
+
             # noinspection PyShadowingNames
             def test_func():
-                # Construct new tensors every time to avoid L2 cache acceleration
-                x_fp8, y_fp8, out, ref_out = construct(m, k, n)
                 deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
             t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
@@ -96,12 +97,13 @@ def test_m_grouped_gemm_contiguous() -> None:
         diff = calc_diff(out, ref_out)
         assert diff < 0.001, f'm={m * num_groups}, {k=}, {n=}, {diff:.5f}'
 
+        # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
+        x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)
+        m_indices = torch.arange(0, num_groups, device='cuda', dtype=torch.int)
+        m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)
+
         # noinspection PyShadowingNames
         def test_func():
-            # Construct new tensors every time to avoid L2 cache acceleration
-            x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)
-            m_indices = torch.arange(0, num_groups, device='cuda', dtype=torch.int)
-            m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
 
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
@@ -129,11 +131,12 @@ def test_m_grouped_gemm_masked() -> None:
                     diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
                     assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
+            # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
+            x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=True)
+            masked_m = torch.ones((num_groups, ), device='cuda', dtype=torch.int) * m
+
             # noinspection PyShadowingNames
             def test_func():
-                # Construct new tensors every time to avoid L2 cache acceleration
-                x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=True)
-                masked_m = torch.ones((num_groups, ), device='cuda', dtype=torch.int) * m
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, m)
 
             # Test performance with fixed shapes
