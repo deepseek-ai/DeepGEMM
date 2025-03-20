@@ -9,6 +9,7 @@ from .jit_kernels import (
     set_num_sms, get_num_sms,
     get_col_major_tma_aligned_tensor,
     get_m_alignment_for_contiguous_layout,
-    m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous
+    m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous,
+    k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous
 )
 from .utils import bench, bench_kineto, calc_diff
