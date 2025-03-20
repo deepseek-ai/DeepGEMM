@@ -115,7 +115,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
             m, M_pad, num_groups,
             torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
-        name='m_grouped_gemm_fp8_fp8_bf16_nt',
+        name='varlen_m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={ 'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedContiguous'},
         space=(),
