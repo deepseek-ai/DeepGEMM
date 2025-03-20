@@ -40,7 +40,7 @@ def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms
 def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> int:
     smem_d = block_m * block_n * 2
     smem_a_per_stage = block_m * block_k
-    smem_scales_a_per_stage = block_m * 4
+    smem_scales_a_per_stage = block_m * 4 + 128 # 16 bytes if a buffer for scale
     smem_b_per_stage = block_n * block_k
     smem_scales_b = ceil_div(k, block_k) * 4
     smem_barrier = num_stages * 8 * 2
