@@ -19,7 +19,7 @@ This repository is based on the original DeepGEMM. In addition to that, we have 
 
 ```bash
 # Submodule must be cloned
-git clone --recursive https://github.com/InternLM/AdaptiveGemm.git
+git clone --recursive git@github.com:InternLM/AdaptiveGemm.git
 
 # Make symbolic links for third-party (CUTLASS and CuTe) include directories
 python setup.py develop
