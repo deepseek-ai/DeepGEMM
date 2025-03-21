@@ -59,11 +59,6 @@ struct Scheduler {
     }
 
 
-    struct CMInfo {
-        uint64_t off_cm;
-        uint32_t cm_left;
-    };
-
     __device__ __forceinline__ uint64_t get_off_am(uint32_t shape_m, uint32_t m_block_idx, const uint64_t* group_pad_offs,
                         const uint64_t* token_cumdiff){
         
@@ -83,14 +78,14 @@ struct Scheduler {
         return off_am;
     }
 
-    __device__ __forceinline__ CMInfo get_cm_info(uint64_t& off_cm, uint32_t& cm_left, uint32_t shape_m, uint32_t m_block_idx,
+    __device__ __forceinline__ void get_cm_info(uint64_t& off_cm, uint32_t& cm_left, uint32_t shape_m, uint32_t m_block_idx,
                         const uint64_t* token_cumdiff, const uint64_t* token_pad_end){
 
         uint32_t group = __ldg(m_indices_pad + m_block_idx);
         off_cm = m_block_idx * BLOCK_M - token_cumdiff[group];
         cm_left = __ldg(token_pad_end + group) - off_cm;
         // printf("group %d, cm_left %d \n", group, cm_left);
-        return ;
+        return;
     }
 
 
