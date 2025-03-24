@@ -5,6 +5,31 @@ from .gemm import get_best_configs
 from .tuner import jit_tuner
 from .utils import get_col_major_tma_aligned_tensor, get_num_sms
 
+import triton
+import triton.language as tl
+
+@triton.jit
+def repeat_interleave_kernel(
+    group_ptr,
+    repeats_ptr,
+    repeat_cum_ptr,
+    output_ptr,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    repeat = tl.load(repeats_ptr + pid)
+    start = tl.load(repeat_cum_ptr + pid) - repeat
+    group = tl.load(group_ptr + pid)
+
+    for r in range(repeat):
+        tl.store(output_ptr + start + r, group)
+
+
+def repeat_interleave(group, repeats, repeat_cum, output, blocks_m):
+    grid = lambda args: (len(repeats), )
+    repeat_interleave_kernel[grid](group, repeats, repeat_cum, output, BLOCK_M=blocks_m)
+    return
+
 # C++ code templates
 includes = ('"deep_gemm/fp8_gemm_varlen_groupM.cuh"', )
 template = """
@@ -106,10 +131,13 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     token_cumdiff = token_diff.cumsum(0) - token_diff
 
 
-    group_indices = torch.arange(num_groups, device='cuda')
-    repeats = (size_per_group_padding // block_m)
-    m_indices_pad = torch.repeat_interleave(group_indices, repeats, dim=0).to(torch.int32)
+    group_indices = torch.arange(num_groups, device='cuda').to(torch.int32)
+    repeats = (size_per_group_padding // block_m).to(torch.int32)
+    m_indices_pad = torch.empty(m, device = "cuda", dtype = torch.int32)
+    repeat_cum = repeats.cumsum(0)
 
+    repeat_interleave(group_indices, repeats, repeat_cum, m_indices_pad, m // block_m)
+    
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices_pad, group_pad_off, token_cumdiff, token_pad_end,
             m, M_pad, num_groups,
