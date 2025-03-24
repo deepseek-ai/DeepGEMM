@@ -36,7 +36,7 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
 fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* m_indices_pad,
                 uint32_t shape_m,
-                uint64_t m_pad,
+                uint64_t* m_pad_ptr,
                 const __grid_constant__ CUtensorMap tensor_map_a,
                 const __grid_constant__ CUtensorMap tensor_map_b,
                 const __grid_constant__ CUtensorMap tensor_map_scales_a,
@@ -59,6 +59,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* m_indices_pad,
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+
+    // Register
+    uint64_t m_pad = __ldg(m_pad_ptr);
 
     // Shared memory
     static constexpr int kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0);
@@ -443,7 +446,7 @@ public:
 
     static void run(__nv_bfloat16* gmem_d, float* scales_b, int* m_indices_pad,
                     uint32_t shape_m,
-                    uint64_t m_pad,
+                    uint64_t* m_pad,
                     const CUtensorMap& tma_a_desc,
                     const CUtensorMap& tma_b_desc,
                     const CUtensorMap& tma_scales_a_desc,

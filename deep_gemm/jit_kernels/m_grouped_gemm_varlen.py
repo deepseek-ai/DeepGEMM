@@ -99,7 +99,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     group_pad_off = torch.zeros(size_per_group.shape[0] + 1, device = "cuda", dtype = torch.long)
     # import pdb; pdb.set_trace()
     group_pad_off[1:] = size_per_group_padding.cumsum(0)
-    M_pad = size_per_group_padding.sum().item()
+    M_pad = size_per_group_padding.sum()
     token_diff = size_per_group_padding - size_per_group
     token_cumdiff = token_diff.cumsum(0)
     token_pad_end = size_per_group_padding.cumsum(0) - token_cumdiff
@@ -127,7 +127,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
                   ('group_pad_off', torch.long),
                   ('token_cumdiff', torch.long),
                   ('token_pad_end', torch.long),
-                  ('m', int), ('m_pad', int),
+                  ('m', int), ('m_pad', torch.long),
                   ('num_groups', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
         template=template,
