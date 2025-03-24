@@ -111,9 +111,13 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # print(best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size)
     return best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
 
+
+@torch.library.custom_op("moe::k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous", mutates_args=('out', ))
 def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
-    lhs: Tuple[torch.Tensor, torch.Tensor],
-    rhs: Tuple[torch.Tensor, torch.Tensor],
+    lhs: torch.Tensor,
+    lhs_scales: torch.Tensor,
+    rhs: torch.Tensor,
+    rhs_scales: torch.Tensor,
     out: torch.Tensor, k_indices: torch.Tensor
 ) -> None:
     """
@@ -137,8 +141,8 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
             `k_indices[i]` records the k-dim size of each group,
             which means that the k-dimension of i-th group of the problems is `k_indices[i]`.
     """
-    lhs, lhs_scales = lhs
-    rhs, rhs_scales = rhs
+    # lhs, lhs_scales = lhs
+    # rhs, rhs_scales = rhs
     m, k   = lhs.shape
     n, k_  = rhs.shape
     num_groups, m_, n_ = out.shape
@@ -194,6 +198,16 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
     # Run the kernel
     runtime(*args)
 
+
+@k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous.register_fake
+def _(
+    lhs: torch.Tensor,
+    lhs_scales: torch.Tensor,
+    rhs: torch.Tensor,
+    rhs_scales: torch.Tensor,
+    out: torch.Tensor, k_indices: torch.Tensor
+) -> None:
+    return
 
 def per_tile_quant(A: torch.Tensor, gsize:int=128):
     import torch.nn.functional as F
