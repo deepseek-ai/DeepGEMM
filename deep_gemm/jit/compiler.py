@@ -96,7 +96,7 @@ def put(path, data, is_binary=False):
 
 def build(name: str, arg_defs: tuple, code: str) -> Runtime:
     # Compiler flags
-    nvcc_flags = ['-std=c++20', '-shared', '-O3', '--expt-relaxed-constexpr', '--expt-extended-lambda',
+    nvcc_flags = ['-std=c++17', '-shared', '-O3', '--expt-relaxed-constexpr', '--expt-extended-lambda',
                   '-gencode=arch=compute_90a,code=sm_90a',
                   '--ptxas-options=--register-usage-level=10' + (',--verbose' if 'DG_PTXAS_VERBOSE' in os.environ else ''),
                   # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
