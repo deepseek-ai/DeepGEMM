@@ -163,10 +163,10 @@ def varlen_gmm_fp8(
         token_pad_end: Tensor,
         m: int, 
         M_pad: Tensor, 
-        num_groups: int) -> None:
+        num_groups: int,
+        num_sms: int) -> None:
     global includes, template
     lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
-    num_sms = get_num_sms()
     m, k = lhs.shape
     num_groups, n, k_ = rhs.shape
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
@@ -212,7 +212,8 @@ def _(
         token_pad_end: Tensor,
         m: int, 
         M_pad: Tensor, 
-        num_groups: int) -> None:
+        num_groups: int,
+        num_sms: int) -> None:
     return
 
 
@@ -252,16 +253,10 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
     assert out.dtype == torch.bfloat16
     assert size_per_group.dtype == torch.long
-    # assert lhs.is_contiguous() and rhs.is_contiguous()
-    # assert out.is_contiguous() and size_per_group.is_contiguous()
     lhs = lhs.contiguous()
     rhs = rhs.contiguous()
     size_per_group = size_per_group.contiguous()
     rhs_scales = rhs_scales.contiguous()
-
-    # LHS scales must be transposed for TMA load, but not for RHS scales
-    # lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
-    # assert rhs_scales.is_contiguous()
 
     # Do nothing if `m` is zero
     if m == 0:
@@ -270,8 +265,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     # Auto-tuning with compilation
     # global includes, template
 
-    # num_sms = get_num_sms()
-    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count
+    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 20
 
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     
@@ -296,33 +290,8 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     varlen_gmm_fp8(
         lhs, lhs_scales, rhs, rhs_scales, out,
         m_indices_pad, group_pad_off, token_cumdiff, token_pad_end,
-        m, M_pad, num_groups,)
+        m, M_pad, num_groups, 
+        num_sms)
     
-    # args = (lhs, lhs_scales, rhs, rhs_scales, out,
-    #         m_indices_pad, group_pad_off, token_cumdiff, token_pad_end,
-    #         m, M_pad, num_groups,
-    #         torch.cuda.current_stream(), num_sms, smem_size)
-    # runtime = jit_tuner.compile_and_tune(
-    #     name='varlen_m_grouped_gemm_fp8_fp8_bf16_nt',
-    #     keys={ 'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
-    #           'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast, 'GEMM_TYPE': 'GroupedContiguous'},
-    #     space=(),
-    #     includes=includes,
-    #     arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
-    #               ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
-    #               ('out', torch.bfloat16),
-    #               ('m_indices_pad', torch.int32),
-    #               ('group_pad_off', torch.long),
-    #               ('token_cumdiff', torch.long),
-    #               ('token_pad_end', torch.long),
-    #               ('m', int), ('m_pad', torch.long),
-    #               ('num_groups', int),
-    #               ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-    #     template=template,
-    #     args=args
-    # )
-
-    # # Run the kernel
-    # runtime(*args)
     return out
 
