@@ -40,7 +40,7 @@ constexpr CUtensorMapDataType get_CUtensorMapDataType() {
     }
 }
 
-PFN_cuTensorMapEncodeTiled get_cuTensorMapEncodeTiled() {
+inline PFN_cuTensorMapEncodeTiled get_cuTensorMapEncodeTiled() {
     // Get pointer to `cuTensorMapEncodeTiled`
     cudaDriverEntryPointQueryResult driver_status;
     void* cuTensorMapEncodeTiled_ptr = nullptr;

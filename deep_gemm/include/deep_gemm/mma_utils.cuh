@@ -888,15 +888,15 @@ struct SM90_U32x4_STSM_N {
     }
 };
 
-__device__ void warpgroup_arrive() {
+__forceinline__ __device__ void warpgroup_arrive() {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 
-__device__ void warpgroup_commit_batch() {
+__forceinline__ __device__ void warpgroup_commit_batch() {
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
 
-__device__ void warpgroup_fence_operand(float& reg) {
+__forceinline__ __device__ void warpgroup_fence_operand(float& reg) {
     asm volatile("" : "+f"(reg) :: "memory");
 }
 
