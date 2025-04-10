@@ -15,7 +15,7 @@ def repeat_interleave_kernel(
     repeats_ptr,
     repeat_cum_ptr,
     output_ptr,
-    BLOCK_M: tl.constexpr,
+    # BLOCK_M: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     repeat = tl.load(repeats_ptr + pid)
@@ -26,11 +26,11 @@ def repeat_interleave_kernel(
         tl.store(output_ptr + start + r, group)
 
 
-@triton_op('myfp8::repeat_interleave', mutates_args=('output', ))
-def repeat_interleave(group: Tensor, repeats: Tensor, repeat_cum: Tensor, output: Tensor, blocks_m: int) -> None:
-    grid = lambda args: (len(repeats), )
-    wrap_triton(repeat_interleave_kernel)[grid](group, repeats, repeat_cum, output, BLOCK_M=blocks_m)
-    return
+# @triton_op('myfp8::repeat_interleave', mutates_args=('output', ))
+# def repeat_interleave(group: Tensor, repeats: Tensor, repeat_cum: Tensor, output: Tensor) -> None:
+#     grid = lambda args: (len(repeats), )
+#     wrap_triton(repeat_interleave_kernel)[grid](group, repeats, repeat_cum, output)
+#     return
 
 # C++ code templates
 includes = ('"deep_gemm/fp8_gemm_varlen_groupM.cuh"', )
@@ -217,6 +217,27 @@ def _(
     return
 
 
+@torch.library.custom_op("moe::repeat_interleave", mutates_args=('m_indices_pad', ))
+def repeat_interleave(
+    group_indices: Tensor, 
+    repeats: Tensor, 
+    repeat_cum: Tensor, 
+    m_indices_pad: Tensor, 
+) -> None:
+    grid = lambda args: (len(repeats), )
+    wrap_triton(repeat_interleave_kernel)[grid](group_indices, repeats, repeat_cum, m_indices_pad)
+    return
+
+
+@repeat_interleave.register_fake
+def _(
+    group_indices: Tensor, 
+    repeats: Tensor, 
+    repeat_cum: Tensor, 
+    m_indices_pad: Tensor, 
+) -> None:
+    return
+
 
 def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
                                               rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -285,7 +306,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     m_indices_pad = torch.empty(m, device = "cuda", dtype = torch.int32)
     repeat_cum = repeats.cumsum(0)
 
-    repeat_interleave(group_indices, repeats, repeat_cum, m_indices_pad, m // block_m)
+    repeat_interleave(group_indices, repeats, repeat_cum, m_indices_pad)
 
     varlen_gmm_fp8(
         lhs, lhs_scales, rhs, rhs_scales, out,
