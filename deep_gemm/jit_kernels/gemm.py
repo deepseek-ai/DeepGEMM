@@ -30,9 +30,10 @@ using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, kSwizzleDM
 auto tma_a_desc = gemm_t::make_2d_tma_a_desc(lhs, m);
 auto tma_b_desc = gemm_t::make_2d_tma_b_desc(rhs);
 auto tma_scales_a_desc = gemm_t::make_2d_tma_scales_a_desc(lhs_scales, m);
+auto tma_d_desc = gemm_t::make_2d_tma_d_desc(out, m);
 gemm_t::run(out, rhs_scales, nullptr,
             m,
-            tma_a_desc, tma_b_desc, tma_scales_a_desc,
+            tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
             stream, num_sms, smem_size);
 """
 
