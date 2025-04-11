@@ -101,7 +101,7 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
                   '-gencode=arch=compute_90a,code=sm_90a',
                   '--ptxas-options=--register-usage-level=10' + (',--verbose' if 'DG_PTXAS_VERBOSE' in os.environ else ''),
                   # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
-                  '--diag-suppress=177,174,940']
+                  '--diag-suppress=39,174,177,940']
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi', '-fconcepts']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
     include_dirs = [get_jit_include_dir()]
