@@ -286,7 +286,7 @@ def m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, to
     # Auto-tuning with compilation
     # global includes, template
 
-    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 20
+    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 24
 
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     
