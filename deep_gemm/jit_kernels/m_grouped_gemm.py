@@ -16,13 +16,14 @@ constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto BLOCK_K = 128;
 constexpr auto BLOCK_N_PADDING = {BLOCK_N_PADDING};
+constexpr auto kSwizzleDMode = {SWIZZLE_D_MODE};
 constexpr auto kNumGroups = {NUM_GROUPS};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
 constexpr auto kIsTMAMulticastOnA = {IS_TMA_MULTICAST_ON_A};
 
 // Make a templated grouped GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, kNumGroups, kNumStages, kNumTMAMulticast, kIsTMAMulticastOnA, GemmType::{GEMM_TYPE}>;
+using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, kNumTMAMulticast, kIsTMAMulticastOnA, GemmType::{GEMM_TYPE}>;
 
 // Launch kernel
 auto tma_a_desc = gemm_t::make_2d_tma_a_desc(lhs, m);
@@ -87,14 +88,15 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_size = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
+    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(m, n, k, 1, num_sms, is_grouped_contiguous=True)
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             m_indices, m, num_groups,
-            torch.cuda.current_stream(), num_sms, smem_size)
+            torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'BLOCK_N_PADDING': get_block_n_padding_for_smem_d(block_n),
+              'SWIZZLE_D_MODE': smem_config[1],
+              'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages,
               'NUM_TMA_MULTICAST': tma_multicast_config[0],
@@ -165,7 +167,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_size = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
+    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
 
     # Extra checks for TMA store
     if num_groups > 1 and m > block_m:
@@ -173,11 +175,12 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out,
             masked_m, m,
-            torch.cuda.current_stream(), num_sms, smem_size)
+            torch.cuda.current_stream(), num_sms, smem_config[0])
     runtime = jit_tuner.compile_and_tune(
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'BLOCK_N_PADDING': get_block_n_padding_for_smem_d(block_n),
+              'SWIZZLE_D_MODE': smem_config[1],
+              'BLOCK_N_PADDING': smem_config[2],
               'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages,
               'NUM_TMA_MULTICAST': tma_multicast_config[0],

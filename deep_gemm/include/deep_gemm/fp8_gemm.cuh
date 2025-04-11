@@ -395,6 +395,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t BLOCK_N_PADDING,
+          uint32_t kSwizzleDMode,
           uint32_t kNumGroups, uint32_t kNumStages,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           GemmType kGemmType>
