@@ -386,7 +386,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         // Reshape the atom in another view and swizzle
                         //  - original: `(WGMMA_M_PER_WARP, kSwizzleDMode / kNumBankGroupBytes)`
                         //  - new: `(WGMMA_M_PER_WARP * kSwizzleDMode / kNumBankGroupBytes / 8, 8)`
-                        auto row = bank_group_index / 8, col = bank_group_index % 8;
+                        constexpr bool kHasShortcut = (kSwizzleDMode / kNumBankGroupBytes) == 8;
+                        auto row = kHasShortcut ? (in_atom_offset / 8 + lane_idx) : (bank_group_index / 8);
+                        auto col = kHasShortcut ? (in_atom_offset) : (bank_group_index % 8);
                         col ^= row % (kSwizzleDMode / 16);
 
                         // Add back into the base pointer
