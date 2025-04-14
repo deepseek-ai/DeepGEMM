@@ -2,7 +2,7 @@
 
 DeepGEMM is a library designed for clean and efficient FP8 General Matrix Multiplications (GEMMs) with fine-grained scaling, as proposed in [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3). It supports both normal and Mix-of-Experts (MoE) grouped GEMMs. Written in CUDA, the library has no compilation need during installation, by compiling all kernels at runtime using a lightweight Just-In-Time (JIT) module.
 
-Currently, DeepGEMM exclusively supports NVIDIA Hopper tensor cores. To address the imprecise FP8 tensor core accumulation, it employs CUDA-core two-level accumulation (promotion). While it leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), it avoids heavy reliance on their templates or algebras. Instead, the library is designed for simplicity, with only one core kernel function comprising around **~300 lines of code**. This makes it a clean and accessible resource for learning Hopper FP8 matrix multiplication and optimization techniques.
+Currently, DeepGEMM exclusively supports NVIDIA Hopper tensor cores. To address the imprecise FP8 tensor core accumulation, it employs CUDA-core two-level accumulation (promotion). While it leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), it avoids heavy reliance on their templates or algebras. Instead, the library is designed for simplicity, with only one core kernel function. This makes it a clean and accessible resource for learning Hopper FP8 matrix multiplication and optimization techniques.
 
 Despite its lightweight design, DeepGEMM's performance matches or exceeds expert-tuned libraries across various matrix shapes.
 
@@ -13,7 +13,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 ## Roadmap
 
 - [ ] More correctness tests for grouped-contiguous layout
-- [ ] Shared memory swizzling for output instead of padding
+- [x] Shared memory swizzling for output
 - [ ] Larger block size on N (up to 256)
 - [ ] MoE scheduler with TMA multicast compatibility
 - [ ] Weight gradient kernels for dense models
@@ -28,55 +28,6 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [ ] Remove shape limitations on N and K
 - [ ] BF16 kernels
 - [ ] Split/stream-k optimizations
-
-## Performance
-
-We test all shapes potentially used in DeepSeek-V3/R1 inference (including both prefilling and decoding, but without tensor parallelism) on H800 SXM5 with NVCC 12.8. All speedup metrics are calculated in comparison to our internally and carefully optimized implementation based on CUTLASS 3.6.
-
-DeepGEMM does not behave very well on some shapes, optimization PRs are welcomed if you are interested.
-
-### Normal GEMMs for dense models
-
-|  M   |   N   |   K   | Computation | Memory bandwidth | Speedup |
-|:----:|:-----:|:-----:|:-----------:|:----------------:|:-------:|
-|  64  | 2112  | 7168  | 206 TFLOPS  |    1688 GB/s     |  2.7x   |
-|  64  | 24576 | 1536  | 289 TFLOPS  |    2455 GB/s     |  1.7x   |
-|  64  | 32768 |  512  | 219 TFLOPS  |    2143 GB/s     |  1.8x   |
-|  64  | 7168  | 16384 | 336 TFLOPS  |    2668 GB/s     |  1.4x   |
-|  64  | 4096  | 7168  | 287 TFLOPS  |    2320 GB/s     |  1.4x   |
-|  64  | 7168  | 2048  | 295 TFLOPS  |    2470 GB/s     |  1.7x   |
-| 128  | 2112  | 7168  | 352 TFLOPS  |    1509 GB/s     |  2.4x   |
-| 128  | 24576 | 1536  | 535 TFLOPS  |    2448 GB/s     |  1.6x   |
-| 128  | 32768 |  512  | 358 TFLOPS  |    2103 GB/s     |  1.5x   |
-| 128  | 7168  | 16384 | 645 TFLOPS  |    2604 GB/s     |  1.4x   |
-| 128  | 4096  | 7168  | 533 TFLOPS  |    2221 GB/s     |  2.0x   |
-| 128  | 7168  | 2048  | 510 TFLOPS  |    2277 GB/s     |  1.7x   |
-| 4096 | 2112  | 7168  | 1127 TFLOPS |     562 GB/s     |  1.2x   |
-| 4096 | 24576 | 1536  | 1212 TFLOPS |     962 GB/s     |  1.2x   |
-| 4096 | 32768 |  512  | 775 TFLOPS  |    1620 GB/s     |  1.2x   |
-| 4096 | 7168  | 16384 | 1520 TFLOPS |     384 GB/s     |  1.4x   |
-| 4096 | 4096  | 7168  | 1410 TFLOPS |     541 GB/s     |  1.3x   |
-| 4096 | 7168  | 2048  | 1168 TFLOPS |     794 GB/s     |  1.2x   |
-
-### Grouped GEMMs for MoE models (contiguous layout)
-
-| #Groups | M per group |  N   |  K   | Computation | Memory bandwidth | Speedup |
-|:-------:|:-----------:|:----:|:----:|:-----------:|:----------------:|:-------:|
-|    4    |    8192     | 4096 | 7168 | 1346 TFLOPS |     434 GB/s     |  1.3x   |
-|    4    |    8192     | 7168 | 2048 | 1214 TFLOPS |     752 GB/s     |  1.3x   |
-|    8    |    4096     | 4096 | 7168 | 1346 TFLOPS |     516 GB/s     |  1.3x   |
-|    8    |    4096     | 7168 | 2048 | 1214 TFLOPS |     826 GB/s     |  1.2x   |
-
-### Grouped GEMMs for MoE models (masked layout)
-
-| #Groups | M per group |  N   |  K   | Computation | Memory bandwidth | Speedup |
-|:-------:|:-----------:|:----:|:----:|:-----------:|:----------------:|:-------:|
-|    1    |    1024     | 4096 | 7168 | 1233 TFLOPS |     924 GB/s     |  1.2x   |
-|    1    |    1024     | 7168 | 2048 | 925 TFLOPS  |     968 GB/s     |  1.2x   |
-|    2    |     512     | 4096 | 7168 | 1040 TFLOPS |    1288 GB/s     |  1.2x   |
-|    2    |     512     | 7168 | 2048 | 916 TFLOPS  |    1405 GB/s     |  1.2x   |
-|    4    |     256     | 4096 | 7168 | 932 TFLOPS  |    2064 GB/s     |  1.1x   |
-|    4    |     256     | 7168 | 2048 | 815 TFLOPS  |    2047 GB/s     |  1.2x   |
 
 ## Quick start
 
