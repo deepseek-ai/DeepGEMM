@@ -22,7 +22,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [ ] CUDA PDL support
 - [ ] More scaling granularity support via templates
 - [ ] Larger TMA multicast size for some shapes
-- [ ] MMA template refactor with CUTLASS
+- [x] MMA template refactor with CUTLASS
 - [ ] Optimizations for unaligned shapes
 - [ ] Optimizations for power efficiency
 - [ ] Remove shape limitations on N and K
