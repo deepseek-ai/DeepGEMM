@@ -12,10 +12,10 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## Roadmap
 
-- [ ] More correctness tests for grouped-contiguous layout
+- [x] More correctness tests for grouped-contiguous layout
 - [x] Shared memory swizzling for output
 - [ ] Larger block size on N (up to 256)
-- [ ] MoE scheduler with TMA multicast compatibility
+- [x] MoE scheduler with TMA multicast compatibility
 - [ ] Weight gradient kernels for dense models
 - [ ] Weight gradient kernels for MoE models
 - [ ] Utility kernels for MoE models (as a pre-built CUDA library)

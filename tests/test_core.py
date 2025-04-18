@@ -4,6 +4,7 @@ from typing import Tuple
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
+from deep_gemm.jit_kernels.utils import get_m_alignment_for_contiguous_layout
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -38,7 +39,38 @@ def construct(m: int, k: int, n: int) -> \
     return x_fp8, y_fp8, out, ref_out
 
 
-def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) -> \
+def construct_contiguous_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int) -> \
+        Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    m = 0
+    m_aligned = get_m_alignment_for_contiguous_layout()
+    group_m_list = []
+    for i in range(num_groups):
+        group_m = m_aligned * random.randint(int(expected_m_per_group * 0.7) // m_aligned, int(expected_m_per_group * 1.3) // m_aligned)
+        m += group_m
+        group_m_list.append(group_m)
+    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)    
+    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
+    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    ref_out = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
+
+    start = 0
+    for i, group_m in enumerate(group_m_list):
+        end = start + group_m
+        m_indices[start:end] = i
+        ref_out[start:end] = x[start:end] @ y[i].t()
+        start = end
+
+    assert m % 4 == 0, f'TMA alignment error: {m}'
+    x_fp8 = per_token_cast_to_fp8(x)
+    y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, (n + 127) // 128, k // 128), device='cuda', dtype=torch.float))
+    for i in range(num_groups):
+        y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
+
+    return m, x_fp8, y_fp8, m_indices, out, ref_out
+
+
+def construct_masked_grouped(num_groups: int, m: int, k: int, n: int) -> \
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
     x = torch.randn((num_groups, m, k), device='cuda', dtype=torch.bfloat16)
     y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
@@ -51,11 +83,6 @@ def construct_grouped(num_groups: int, m: int, k: int, n: int, is_masked: bool) 
     for i in range(num_groups):
         x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
         y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
-
-    # For non-masked input, we must merge the group and M dims
-    if not is_masked:
-        x_fp8 = (x_fp8[0].view(-1, k), per_token_cast_to_fp8(x.view(-1, k))[1])
-        out, ref_out = out.view(-1, n), ref_out.view(-1, n)
 
     # Transpose earlier so that the testing will not trigger transposing kernels
     x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
@@ -88,28 +115,24 @@ def test_gemm() -> None:
 def test_m_grouped_gemm_contiguous() -> None:
     print('Testing grouped contiguous GEMM:')
 
-    for num_groups, m, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168), (8, 4096, 7168, 4096), (8, 4096, 2048, 7168)):
+    for num_groups, expected_m_per_group, k, n in ((4, 8192, 7168, 4096), (4, 8192, 2048, 7168), (8, 4096, 7168, 4096), (8, 4096, 2048, 7168)):
         # TODO: make a stronger test
-        x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)
-        m_indices = torch.arange(0, num_groups, device='cuda', dtype=torch.int)
-        m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)
+        m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n)
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
         diff = calc_diff(out, ref_out)
-        assert diff < 0.001, f'm={m * num_groups}, {k=}, {n=}, {diff:.5f}'
+        assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
         # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
-        x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)
-        m_indices = torch.arange(0, num_groups, device='cuda', dtype=torch.int)
-        m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)
+        m, x_fp8, y_fp8, m_indices, out, ref_out = construct_contiguous_grouped(num_groups, expected_m_per_group, k, n)
 
         # noinspection PyShadowingNames
         def test_func():
             deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
 
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-        print(f' > Performance ({num_groups=}, m_per_group={m:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
-              f'throughput: {2 * num_groups * m * n * k / t / 1e12:4.0f} TFLOPS, '
-              f'{(num_groups * (m * k + k * n + m * n * 2)) / 1e9 / t:4.0f} GB/s')
+        print(f' > Performance ({num_groups=}, m={m:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+              f'throughput: {2 * m * n * k / t / 1e12:4.0f} TFLOPS, '
+              f'{(m * k + num_groups * k * n + m * n * 2) / 1e9 / t:4.0f} GB/s')
     print()
 
 
@@ -121,7 +144,7 @@ def test_m_grouped_gemm_masked() -> None:
             # Test correctness
             masked_m_candidates = list(filter(lambda candidate: candidate <= m, (64, 128, 192, 256, 320, 384)))
             for i in range(10):
-                x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=True)
+                x_fp8, y_fp8, out, ref_out = construct_masked_grouped(num_groups, m, k, n)
                 masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
                 for j in range(num_groups):
                     masked_m[j] = random.choice(masked_m_candidates)
@@ -132,7 +155,7 @@ def test_m_grouped_gemm_masked() -> None:
                     assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
             # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
-            x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=True)
+            x_fp8, y_fp8, out, ref_out = construct_masked_grouped(num_groups, m, k, n)
             masked_m = torch.ones((num_groups, ), device='cuda', dtype=torch.int) * m
 
             # noinspection PyShadowingNames
