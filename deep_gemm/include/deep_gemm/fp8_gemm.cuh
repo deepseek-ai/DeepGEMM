@@ -86,14 +86,14 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
     // Prefetch TMA descriptors at very beginning
     if (threadIdx.x == kNumMathThreads) {
-        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_a));
-        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_b));
-        cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_scales_a));
+        cute::prefetch_tma_descriptor(&tensor_map_a);
+        cute::prefetch_tma_descriptor(&tensor_map_b);
+        cute::prefetch_tma_descriptor(&tensor_map_scales_a);
 
         // `tensor_map_d` is only used in swizzling mode
         // For the `kSwizzleDMode == 0 and BLOCK_N_PADDING == 0` case, it will be treated as padding mode
         if constexpr (kSwizzleDMode > 0)
-            cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d));
+            cute::prefetch_tma_descriptor(&tensor_map_d);
     }
     __syncwarp();
 
@@ -212,19 +212,15 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                                                       scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
 
                         // Issue TMA B
-                        if constexpr (kNumTMAMulticastOnB == kNumTMAMulticast) {
-                            // NOTES: In grouped contiguous GEMM, different m_block_idx values may correspond to blocks of different groups (b), 
+                        if (kNumTMAMulticastOnB > 1 and scheduler.is_tma_multicast_valid(m_block_idx)) {
+                            // NOTES: in grouped contiguous GEMM, different `m_block_idx` values may correspond to blocks of different groups (B),
                             // requiring additional checks before multicast operations.
-                            if (scheduler.is_tma_multicast_valid(m_block_idx))
-                                tma_copy<kNumTMAMulticastOnB>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                              smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
-                            else
-                                tma_copy<1>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                            smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
-                        }
-                        else {
+                            DG_STATIC_ASSERT(kNumTMAMulticastOnB <= 2, "Scheduler does not support > 2 TMA multicast");
                             tma_copy<kNumTMAMulticastOnB>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                                           smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                        } else {
+                            tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                     smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
                         }
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
                     }

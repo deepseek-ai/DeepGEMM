@@ -47,9 +47,9 @@ struct Scheduler {
         if constexpr (kGemmType == GemmType::Normal) {
             return true;
         } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
-            auto expert = __ldg(grouped_layout + m_block_idx * BLOCK_M);
-            auto cluster_partner_expert = __ldg(grouped_layout + (m_block_idx ^ 1) * BLOCK_M);
-            return (expert == cluster_partner_expert);
+            auto group_idx = __ldg(grouped_layout + m_block_idx * BLOCK_M);
+            auto peer_group_idx = __ldg(grouped_layout + (m_block_idx ^ 1) * BLOCK_M);
+            return group_idx == peer_group_idx;
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
             return false;
         }
