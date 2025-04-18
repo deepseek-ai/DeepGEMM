@@ -43,6 +43,18 @@ struct Scheduler {
         }
     }
 
+    __device__ __forceinline__ bool is_tma_multicast_valid(uint32_t& m_block_idx) {
+        if constexpr (kGemmType == GemmType::Normal) {
+            return true;
+        } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
+            auto expert = __ldg(grouped_layout + m_block_idx * BLOCK_M);
+            auto cluster_partner_expert = __ldg(grouped_layout + (m_block_idx ^ 1) * BLOCK_M);
+            return (expert == cluster_partner_expert);
+        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+            return false;
+        }
+    }
+
     __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNum1DBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
@@ -72,10 +84,10 @@ struct Scheduler {
                                                        const uint32_t& block_idx, const uint32_t& m_block_idx=0) {
         if constexpr (kGemmType == GemmType::Normal) {
             return block_idx * block_size;
-        } else if (kGemmType == GemmType::GroupedContiguous) {
+        } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
             auto offset = kIgnoreGroupedForGroupedContiguous ? 0 : __ldg(grouped_layout + m_block_idx * BLOCK_M);
             return offset * shape_dim + block_idx * block_size;
-        } else if (kGemmType == GemmType::GroupedMasked) {
+        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
             return curr_group_idx * shape_dim + block_idx * block_size;
         }
     }

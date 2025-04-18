@@ -212,8 +212,20 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                                                       scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
 
                         // Issue TMA B
-                        tma_copy<kNumTMAMulticastOnB>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                      smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                        if constexpr (kNumTMAMulticastOnB == kNumTMAMulticast) {
+                            // NOTES: In grouped contiguous GEMM, different m_block_idx values may correspond to blocks of different groups (b), 
+                            // requiring additional checks before multicast operations.
+                            if (scheduler.is_tma_multicast_valid(m_block_idx))
+                                tma_copy<kNumTMAMulticastOnB>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                              smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                            else
+                                tma_copy<1>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                            smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                        }
+                        else {
+                            tma_copy<kNumTMAMulticastOnB>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                          smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+                        }
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
                     }
 
