@@ -43,7 +43,7 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ bool is_tma_multicast_valid(uint32_t& m_block_idx) {
+    __device__ __forceinline__ bool is_tma_multicast_b_valid(const uint32_t& m_block_idx) {
         if constexpr (kGemmType == GemmType::Normal) {
             return true;
         } else if constexpr (kGemmType == GemmType::GroupedContiguous) {

@@ -212,7 +212,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                                                       scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
 
                         // Issue TMA B
-                        if (kNumTMAMulticastOnB > 1 and scheduler.is_tma_multicast_valid(m_block_idx)) {
+                        if (kNumTMAMulticastOnB > 1 and scheduler.is_tma_multicast_b_valid(m_block_idx)) {
                             // NOTES: in grouped contiguous GEMM, different `m_block_idx` values may correspond to blocks of different groups (B),
                             // requiring additional checks before multicast operations.
                             DG_STATIC_ASSERT(kNumTMAMulticastOnB <= 2, "Scheduler does not support > 2 TMA multicast");
