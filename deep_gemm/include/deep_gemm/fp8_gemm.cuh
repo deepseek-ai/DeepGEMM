@@ -504,62 +504,72 @@ public:
                                          tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
         DG_HOST_ASSERT(status == cudaSuccess);
     }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_a_desc(T* global_address, uint32_t shape_m) {
-        return make_2d_tma_desc(global_address, Layout::RowMajor,
-                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), SHAPE_K, BLOCK_M, BLOCK_K);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_b_desc(T* global_address) {
-        return make_2d_tma_desc(global_address, Layout::ColMajor,
-                                SHAPE_K, SHAPE_N * (kGemmType != GemmType::Normal ? kNumGroups : 1), BLOCK_K, BLOCK_N);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_d_desc(T* global_address, uint32_t shape_m) {
-        auto swizzle_mode = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
-        if constexpr (kSwizzleDMode == 32)  swizzle_mode = CU_TENSOR_MAP_SWIZZLE_32B;
-        if constexpr (kSwizzleDMode == 64)  swizzle_mode = CU_TENSOR_MAP_SWIZZLE_64B;
-        if constexpr (kSwizzleDMode == 128) swizzle_mode = CU_TENSOR_MAP_SWIZZLE_128B;
-
-        // Swizzling requires the inner box dim less or equal than `kSwizzleDMode` bytes
-        // So `BLOCK_N * sizeof(T) / kSwizzleDMode` TMA stores are required
-        return make_2d_tma_desc(global_address, Layout::RowMajor,
-                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), SHAPE_N,
-                                BLOCK_M, kSwizzleDMode == 0 ? BLOCK_N : kSwizzleDMode / sizeof(T),
-                                swizzle_mode);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_scales_a_desc(T* global_address, uint32_t shape_m) {
-        // Make TMA aligned to 16 bytes
-        constexpr uint32_t kAlignment = 16 / sizeof(T);
-        shape_m = ceil_div(shape_m, kAlignment) * kAlignment;
-
-        return make_2d_tma_desc(global_address, Layout::ColMajor,
-                                shape_m, ceil_div(SHAPE_K, BLOCK_K) * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), BLOCK_M, 1,
-                                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_desc(
-            T* global_address, Layout layout,
-            uint32_t gmem_rows, uint32_t gmem_cols,
-            uint32_t smem_rows, uint32_t smem_cols,
-            CUtensorMapSwizzle swizzle_type = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B) {
-        if (layout == Layout::RowMajor) {
-            uint64_t gmem_dim[2] = {gmem_cols, gmem_rows};
-            uint32_t smem_dim[2] = {smem_cols, smem_rows};
-            return make_2d_tma_copy_desc(global_address, gmem_dim, gmem_cols * sizeof(T), smem_dim, swizzle_type);
-        } else {
-            uint64_t gmem_dim[2] = {gmem_rows, gmem_cols};
-            uint32_t smem_dim[2] = {smem_rows, smem_cols};
-            return make_2d_tma_copy_desc(global_address, gmem_dim, gmem_rows * sizeof(T), smem_dim, swizzle_type);
-        }
-    }
 };
+
+template <typename T, GemmType kGemmType>
+static CUtensorMap make_2d_tma_a_desc(T *global_address, uint32_t shape_m, uint32_t shape_k, uint32_t block_m, uint32_t block_k, uint32_t num_groups = 1) {
+  return make_2d_tma_desc(
+      global_address, Layout::RowMajor,
+      shape_m * (kGemmType == GemmType::GroupedMasked ? num_groups : 1),
+      shape_k, block_m, block_k);
+}
+
+template <typename T, GemmType kGemmType>
+static CUtensorMap make_2d_tma_b_desc(T *global_address, uint32_t shape_k, uint32_t shape_n, uint32_t block_k, uint32_t block_n, uint32_t num_groups = 1) {
+  return make_2d_tma_desc(global_address, Layout::ColMajor, shape_k,
+                          shape_n * (kGemmType != GemmType::Normal ? num_groups : 1),
+                          block_k, block_n);
+}
+
+template <typename T, GemmType kGemmType, uint32_t kSwizzleDMode>
+static CUtensorMap make_2d_tma_d_desc(T *global_address, uint32_t shape_m, uint32_t shape_n, uint32_t block_m, uint32_t block_n, uint32_t num_groups = 1) {
+  auto swizzle_mode = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
+  if constexpr (kSwizzleDMode == 32)
+    swizzle_mode = CU_TENSOR_MAP_SWIZZLE_32B;
+  if constexpr (kSwizzleDMode == 64)
+    swizzle_mode = CU_TENSOR_MAP_SWIZZLE_64B;
+  if constexpr (kSwizzleDMode == 128)
+    swizzle_mode = CU_TENSOR_MAP_SWIZZLE_128B;
+
+  // Swizzling requires the inner box dim less or equal than `kSwizzleDMode`
+  // bytes So `BLOCK_N * sizeof(T) / kSwizzleDMode` TMA stores are required
+  return make_2d_tma_desc(
+      global_address, Layout::RowMajor,
+      shape_m * (kGemmType == GemmType::GroupedMasked ? num_groups : 1),
+      shape_n, block_m,
+      kSwizzleDMode == 0 ? block_n : kSwizzleDMode / sizeof(T), swizzle_mode);
+}
+
+template <typename T, GemmType kGemmType>
+static CUtensorMap make_2d_tma_scales_a_desc(T *global_address, uint32_t shape_m, uint32_t shape_k, uint32_t block_m, uint32_t block_k, uint32_t num_groups = 1) {
+  // Make TMA aligned to 16 bytes
+  constexpr uint32_t kAlignment = 16 / sizeof(T);
+  shape_m = ceil_div(shape_m, kAlignment) * kAlignment;
+
+  return make_2d_tma_desc(
+      global_address, Layout::ColMajor, shape_m,
+      ceil_div(shape_k, block_k) * (kGemmType == GemmType::GroupedMasked ? num_groups : 1),
+      block_m, 1, CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
+}
+
+template <typename T>
+static CUtensorMap
+make_2d_tma_desc(T *global_address, Layout layout, uint32_t gmem_rows,
+                 uint32_t gmem_cols, uint32_t smem_rows, uint32_t smem_cols,
+                 CUtensorMapSwizzle swizzle_type =
+                     CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B) {
+  if (layout == Layout::RowMajor) {
+    uint64_t gmem_dim[2] = {gmem_cols, gmem_rows};
+    uint32_t smem_dim[2] = {smem_cols, smem_rows};
+    return make_2d_tma_copy_desc(global_address, gmem_dim,
+                                 gmem_cols * sizeof(T), smem_dim, swizzle_type);
+  } else {
+    uint64_t gmem_dim[2] = {gmem_rows, gmem_cols};
+    uint32_t smem_dim[2] = {smem_rows, smem_cols};
+    return make_2d_tma_copy_desc(global_address, gmem_dim,
+                                 gmem_rows * sizeof(T), smem_dim, swizzle_type);
+  }
+}
 
 };  // namespace deep_gemm
 

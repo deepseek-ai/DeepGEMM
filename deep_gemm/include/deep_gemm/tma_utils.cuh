@@ -1,6 +1,9 @@
 #pragma once
 
+#ifndef NVRTC_JIT_COMPILATION
 #include <cassert>
+#endif
+
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_fp8.h>

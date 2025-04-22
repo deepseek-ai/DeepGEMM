@@ -1,5 +1,6 @@
 #pragma once
 
+#ifndef NVRTC_JIT_COMPILATION
 #include <exception>
 
 #ifdef __CLION_IDE__
@@ -16,8 +17,12 @@ public:
 
     const char *what() const noexcept override { return message.c_str(); }
 };
+#endif
 
 #ifndef DG_HOST_ASSERT
+#ifdef NVRTC_JIT_COMPILATION
+#define DG_HOST_ASSERT(cond) ((void)0)
+#else
 #define DG_HOST_ASSERT(cond)                                        \
 do {                                                                \
     if (not (cond)) {                                               \
@@ -26,6 +31,7 @@ do {                                                                \
         throw AssertionException("Assertion failed: " #cond);       \
     }                                                               \
 } while (0)
+#endif
 #endif
 
 #ifndef DG_DEVICE_ASSERT
