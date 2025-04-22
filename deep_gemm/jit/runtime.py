@@ -3,8 +3,6 @@ import time
 from typing import Any, Dict, Optional
 
 import cuda.bindings.driver as cuda
-import cuda.bindings.nvrtc as nvrtc
-import torch
 
 from .utils import run_gemm
 
@@ -58,8 +56,9 @@ class Runtime:
 
             end_time = time.time_ns()
             elapsed_time = (end_time - start_time) / 1000
-            print(
-                f'Loading JIT runtime {self.path} took {elapsed_time:.2f} us.')
+            if os.getenv('DG_JIT_DEBUG', None):
+                print(
+                    f'Loading JIT runtime {self.path} took {elapsed_time:.2f} us.')
 
         return run_gemm(
             self.kernel,
