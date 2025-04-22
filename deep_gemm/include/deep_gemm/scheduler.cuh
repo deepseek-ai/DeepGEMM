@@ -48,7 +48,7 @@ struct Scheduler {
         // NOTES: For the case where the total number is an odd number of blocks, the last block requires special barrier processing.
         // Here, we need each cluster to have exactly two blocks.
         DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
-        if (num_blocks_in_group == 1 and n_block_idx == kNumNBlocks - 1 and m_block_idx == num_aligned_m_blocks - 1 
+        if (kNumTMAMulticast == 2 and num_blocks_in_group == 1 and n_block_idx == kNumNBlocks - 1 and m_block_idx == num_aligned_m_blocks - 1 
             and num_aligned_m_blocks % 2 == 1 and kNumNBlocks % 2 == 1)
             return false;
         return true;
