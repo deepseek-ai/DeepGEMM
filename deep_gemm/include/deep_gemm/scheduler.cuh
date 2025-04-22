@@ -83,6 +83,8 @@ struct Scheduler {
         auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
         auto in_group_idx = block_idx % num_blocks_per_group;
         num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
+
+        // Fix unaligned TMA multicast
         if (kNumTMAMulticast > 1 and num_blocks_in_group % 2 != 0) {
             if (in_group_idx < (num_blocks_in_group ^ 1) * secondary_num_blocks) {
                 num_blocks_in_group = num_blocks_in_group ^ 1;
@@ -93,6 +95,7 @@ struct Scheduler {
             }
         }
 
+        // Convert to final M/N block indices
         if constexpr (kIsTMAMulticastOnA) {
             m_block_idx = in_group_idx / num_blocks_in_group;
             n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
