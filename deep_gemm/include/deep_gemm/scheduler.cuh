@@ -28,6 +28,7 @@ struct Scheduler {
     int* grouped_layout;
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum;
+    int num_blocks_in_group;
 
     __device__ __forceinline__ explicit Scheduler(const uint32_t shape_m,
                                                   int* grouped_layout = nullptr) {
@@ -43,15 +44,21 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ bool is_tma_multicast_b_valid(const uint32_t& m_block_idx) {
-        if constexpr (kGemmType == GemmType::Normal) {
-            return true;
-        } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
-            auto group_idx = __ldg(grouped_layout + m_block_idx * BLOCK_M);
-            auto peer_group_idx = __ldg(grouped_layout + (m_block_idx ^ 1) * BLOCK_M);
-            return group_idx == peer_group_idx;
-        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+    __device__ __forceinline__ bool is_tma_multicast_valid(const uint32_t& m_block_idx) {
+        return true;
+        if (num_blocks_in_group == 1)
             return false;
+        if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::GroupedMasked) {
+            return true;
+        } else {
+            DG_STATIC_ASSERT(kGemmType == GemmType::GroupedContiguous, "Invalid Gemm type");
+            if constexpr (kIsTMAMulticastOnA) {
+                return true;
+            } else {
+                auto group_idx = __ldg(grouped_layout + m_block_idx * BLOCK_M);
+                auto peer_group_idx = __ldg(grouped_layout + (m_block_idx ^ 1) * BLOCK_M);
+                return group_idx == peer_group_idx;
+            }
         }
     }
 
@@ -59,23 +66,30 @@ struct Scheduler {
         DG_STATIC_ASSERT(kNum1DBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
         // Swizzle for better L2 usages
-        // TODO: unify these 2 branches
+        auto primary_num_blocks = kIsTMAMulticastOnA ? kNumNBlocks : num_m_blocks;
+        auto secondary_num_blocks = kIsTMAMulticastOnA ? num_m_blocks : kNumNBlocks;
+        auto num_blocks_per_group = secondary_num_blocks * kNum1DBlocksPerGroup;
+        auto group_idx = block_idx / num_blocks_per_group;
+        auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
+        auto in_group_idx = block_idx % num_blocks_per_group;
+        num_blocks_in_group = min(kNum1DBlocksPerGroup, primary_num_blocks - first_block_idx);
+        if (kNumTMAMulticast > 1 and num_blocks_in_group % 2 != 0) {
+            if (in_group_idx < (num_blocks_in_group ^ 1) * secondary_num_blocks) {
+                num_blocks_in_group = num_blocks_in_group ^ 1;
+            }
+            else {
+                in_group_idx = in_group_idx - (num_blocks_in_group ^ 1) * secondary_num_blocks;
+                first_block_idx += num_blocks_in_group ^ 1;
+                num_blocks_in_group = 1;
+            }
+        }
         if constexpr (kIsTMAMulticastOnA) {
-            auto num_blocks_per_group = num_m_blocks * kNum1DBlocksPerGroup;
-            auto group_idx = block_idx / num_blocks_per_group;
-            auto first_n_block_idx = group_idx * kNum1DBlocksPerGroup;
-            auto num_n_blocks_in_group = min(kNum1DBlocksPerGroup, kNumNBlocks - first_n_block_idx);
-            auto in_group_idx = block_idx % num_blocks_per_group;
-            m_block_idx = in_group_idx / num_n_blocks_in_group;
-            n_block_idx = first_n_block_idx + in_group_idx % num_n_blocks_in_group;
-        } else {
-            auto num_blocks_per_group = kNumNBlocks * kNum1DBlocksPerGroup;
-            auto group_idx = block_idx / num_blocks_per_group;
-            auto first_m_block_idx = group_idx * kNum1DBlocksPerGroup;
-            auto num_m_blocks_in_group = min(kNum1DBlocksPerGroup, num_m_blocks - first_m_block_idx);
-            auto in_group_idx = block_idx % num_blocks_per_group;
-            m_block_idx = first_m_block_idx + in_group_idx % num_m_blocks_in_group;
-            n_block_idx = in_group_idx / num_m_blocks_in_group;
+            m_block_idx = in_group_idx / num_blocks_in_group;
+            n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+        }
+        else {
+            m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
+            n_block_idx = in_group_idx / num_blocks_in_group;
         }
     }
 

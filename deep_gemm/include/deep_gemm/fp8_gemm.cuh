@@ -194,6 +194,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     // Assign TMA multicast number into A and B
                     constexpr int kNumTMAMulticastOnA = kIsTMAMulticastOnA ? kNumTMAMulticast : 1;
                     constexpr int kNumTMAMulticastOnB = kIsTMAMulticastOnA ? 1 : kNumTMAMulticast;
+                    DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
 
                     // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
                     // shared memory pointers, e.g. `full_barriers` registers, if all the access indices are constant
@@ -202,19 +203,29 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         // Wait consumer release
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
-                        // Issue TMA A
+                        // NOTES: There may be additional odd rows/columns or cases where multicast is not possible. 
+                        // In grouped contiguous GEMM, different m_block_idx values can also lead to the inability to multicast. 
+                        // We use is_tma_multicast_valid to determine whether multicast is possible.
+                        // Issue TMA A                        
                         auto& full_barrier = *full_barriers[s];
                         int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
-                        tma_copy<kNumTMAMulticastOnA>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                      smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
-                        tma_copy<kNumTMAMulticastOnA>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                      smem_scales_a[s], m_block_idx * BLOCK_M,
-                                                      scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
+                        if (kNumTMAMulticastOnA > 1 and scheduler.is_tma_multicast_valid(m_block_idx)) {
+                            tma_copy<kNumTMAMulticastOnA>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                          smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
+                            tma_copy<kNumTMAMulticastOnA>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                                          smem_scales_a[s], m_block_idx * BLOCK_M,
+                                                          scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));                            
+                        }
+                        else {
+                            tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                     smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
+                            tma_copy(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                     smem_scales_a[s], m_block_idx * BLOCK_M,
+                                     scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));                             
+                        }
 
                         // Issue TMA B
-                        if (kNumTMAMulticastOnB > 1 and scheduler.is_tma_multicast_b_valid(m_block_idx)) {
-                            // NOTES: in grouped contiguous GEMM, different `m_block_idx` values may correspond to blocks of different groups (B),
-                            // requiring additional checks before multicast operations.
+                        if (kNumTMAMulticastOnB > 1 and scheduler.is_tma_multicast_valid(m_block_idx)) {
                             DG_STATIC_ASSERT(kNumTMAMulticastOnB <= 2, "Scheduler does not support > 2 TMA multicast");
                             tma_copy<kNumTMAMulticastOnB>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                                           smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
@@ -281,7 +292,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 if constexpr (kNumTMAMulticast == 1) {
                     lane_idx == 0 ? empty_barriers[s]->arrive() : void();
                 } else {
-                    lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(lane_idx) : void();
+                    auto target_cta_idx = scheduler.is_tma_multicast_valid(m_block_idx) ? lane_idx : cute::block_rank_in_cluster();
+                    lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(target_cta_idx) : void();
                 }
             };
 

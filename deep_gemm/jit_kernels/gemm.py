@@ -38,10 +38,10 @@ gemm_t::run(out, rhs_scales, nullptr,
 """
 
 
-def is_tma_multicast_legal(shape_dim: int, block_dim: int, num_tma_multicast: int, num_sms: int) -> bool:
+def is_tma_multicast_legal(shape_dim: int, multicast_block_dim: int, num_tma_multicast: int, num_sms: int) -> bool:
     if num_tma_multicast == 1:
         return True
-    return (shape_dim % (block_dim * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
+    return shape_dim % multicast_block_dim == 0 and num_sms % num_tma_multicast == 0
 
 
 def get_swizzle_mode(block_n: int) -> int:
@@ -146,8 +146,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     best_tma_multicast_config = (1, True)
 
     # Try to multicast on the larger block side first
+    # NOTES: Currently, grouped masked GEMM only supports multicast on A and requires the number of blocks in the n-direction to be even.
     is_multicast_legal = {
-        'A': is_tma_multicast_legal(n, best_block_n, 2, num_sms),
+        'A': is_tma_multicast_legal(n, best_block_n * (2 if is_grouped_masked else 1), 2, num_sms),
         'B': is_tma_multicast_legal(m, best_block_m, 2, num_sms) and (not is_grouped_masked),
     }
     for i in ('A', 'B') if best_block_m > best_block_n else ('B', 'A'):
