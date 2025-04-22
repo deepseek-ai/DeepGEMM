@@ -292,7 +292,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 if constexpr (kNumTMAMulticast == 1) {
                     lane_idx == 0 ? empty_barriers[s]->arrive() : void();
                 } else {
-                    auto target_cta_idx = scheduler.is_tma_multicast_valid(m_block_idx) ? lane_idx : cute::block_rank_in_cluster();
+                    auto target_cta_idx = scheduler.num_blocks_in_group != 1 ? lane_idx : cute::block_rank_in_cluster();
                     lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(target_cta_idx) : void();
                 }
             };

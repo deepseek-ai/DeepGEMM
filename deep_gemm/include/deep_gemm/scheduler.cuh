@@ -45,7 +45,6 @@ struct Scheduler {
     }
 
     __device__ __forceinline__ bool is_tma_multicast_valid(const uint32_t& m_block_idx) {
-        return true;
         if (num_blocks_in_group == 1)
             return false;
         if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::GroupedMasked) {
