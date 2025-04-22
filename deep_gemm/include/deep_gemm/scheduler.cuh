@@ -44,6 +44,13 @@ struct Scheduler {
         }
     }
 
+    __device__ __forceinline__ bool is_block_in_complete_cluster(const uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        if (num_blocks_in_group == 1 and n_block_idx == kNumNBlocks - 1 and m_block_idx == num_aligned_m_blocks - 1 
+            and num_aligned_m_blocks % 2 == 1 and kNumNBlocks % 2 == 1)
+            return false;
+        return true;
+    }
+
     __device__ __forceinline__ bool is_tma_multicast_valid(const uint32_t& m_block_idx) {
         if (num_blocks_in_group == 1)
             return false;
