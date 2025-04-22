@@ -23,12 +23,13 @@ struct Scheduler {
     // For normal GEMM
     // Maybe not used in the masked grouped GEMM
     uint32_t num_blocks;
+    uint32_t num_blocks_in_group;
 
     // For grouped GEMM
     int* grouped_layout;
+
     // Only used for masked layout
     uint32_t curr_group_idx, curr_cumsum;
-    int num_blocks_in_group;
 
     __device__ __forceinline__ explicit Scheduler(const uint32_t shape_m,
                                                   int* grouped_layout = nullptr) {
@@ -85,18 +86,17 @@ struct Scheduler {
         if (kNumTMAMulticast > 1 and num_blocks_in_group % 2 != 0) {
             if (in_group_idx < (num_blocks_in_group ^ 1) * secondary_num_blocks) {
                 num_blocks_in_group = num_blocks_in_group ^ 1;
-            }
-            else {
+            } else {
                 in_group_idx = in_group_idx - (num_blocks_in_group ^ 1) * secondary_num_blocks;
                 first_block_idx += num_blocks_in_group ^ 1;
                 num_blocks_in_group = 1;
             }
         }
+
         if constexpr (kIsTMAMulticastOnA) {
             m_block_idx = in_group_idx / num_blocks_in_group;
             n_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
-        }
-        else {
+        } else {
             m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group;
             n_block_idx = in_group_idx / num_blocks_in_group;
         }
