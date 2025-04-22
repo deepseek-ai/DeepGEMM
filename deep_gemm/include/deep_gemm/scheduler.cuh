@@ -44,7 +44,7 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ bool is_block_in_complete_cluster(const uint32_t& m_block_idx, uint32_t& n_block_idx) {
+    __device__ __forceinline__ bool is_block_in_complete_cluster(const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
         // NOTES: For the case where the total number is an odd number of blocks, the last block requires special barrier processing.
         // Here, we need each cluster to have exactly two blocks.
         DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
