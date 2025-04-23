@@ -276,7 +276,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
             // Empty barrier arrival
             auto empty_barrier_arrive = [&](int s) {
-                if (kNumTMAMulticast == 1) {
+                if constexpr (kNumTMAMulticast == 1) {
                     lane_idx == 0 ? empty_barriers[s]->arrive() : void();
                 } else {
                     auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
