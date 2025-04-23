@@ -1,16 +1,36 @@
 import os
+import platform
 import time
+import subprocess
 from typing import Any, Dict, Optional
 
 import cuda.bindings.driver as cuda
+from torch.utils.cpp_extension import CUDA_HOME
 
 from .utils import run_gemm
 
+
+def get_symbol(file_path: str, pattern: str) -> Optional[str]:
+    if CUDA_HOME is None:
+        raise Exception("CUDA_HOME is not set")
+   
+    cuobjdump_bin = 'cuobjdump.exe' if platform.system() == 'Windows' else 'cuobjdump'
+    command = [os.path.join(CUDA_HOME, 'bin', cuobjdump_bin), '-symbols', file_path]
+    result = subprocess.run(command, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    assert result.returncode == 0
+    for line in result.stdout.splitlines():
+        if pattern in line:
+            return line.split()[-1]
+    return None
+
+
 class Runtime:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, kernel_name: str) -> None:
         self.path = path
         self.lib = None
         self.kernel = None
+        self.kernel_name = kernel_name
 
         assert self.is_path_valid(self.path)
 
@@ -21,34 +41,24 @@ class Runtime:
             return False
 
         # Contains all necessary files
-        files = ['kernel.cu', 'kernel.cubin']
+        files = ['kernel.cubin', 'kernel.cubin.name']
         return all(os.path.exists(os.path.join(path, file)) for file in files)
 
     def __call__(self, **kwargs: Dict[str, Any]) -> cuda.CUresult:
         # Load CUBIN
-        if self.lib is None:
+        if self.kernel is None:
             start_time = time.time_ns()
             res, lib = cuda.cuLibraryLoadFromFile(
                 bytes(os.path.join(self.path, 'kernel.cubin'), 'utf-8'), [], [], 0, [], [], 0)
             if res != cuda.CUresult.CUDA_SUCCESS:
                 raise Exception(f"Failed to load library: {res}")
 
-            res, kernel_count = cuda.cuLibraryGetKernelCount(lib)
+            res, kernel = cuda.cuLibraryGetKernel(
+                lib, bytes(self.kernel_name, encoding='utf-8'))
             if res != cuda.CUresult.CUDA_SUCCESS:
-                raise Exception(f"Failed to get kernel count: {res}")
+                raise Exception(f"Failed to get kernel: {res}")
 
-            res, kernels = cuda.cuLibraryEnumerateKernels(kernel_count, lib)
-            if res != cuda.CUresult.CUDA_SUCCESS:
-                raise Exception(f"Failed to enumerate kernels: {res}")
-
-            for kernel in kernels:
-                res, kernel_name = cuda.cuKernelGetName(kernel)
-                if res != cuda.CUresult.CUDA_SUCCESS:
-                    raise Exception(f"Failed to get kernel name: {res}")
-                if b"fp8" in kernel_name:
-                    self.kernel = kernel
-                    break
-
+            self.kernel = kernel
             if self.kernel is not None:
                 self.lib = lib
             else:
@@ -95,7 +105,8 @@ class RuntimeCache:
 
         # Already compiled
         if os.path.exists(path) and Runtime.is_path_valid(path):
-            runtime = Runtime(path)
+            kernel_name = open(os.path.join(path, 'kernel.cubin.name'), 'r').read()
+            runtime = Runtime(path, kernel_name)
             self.cache[path] = runtime
             return runtime
         return None

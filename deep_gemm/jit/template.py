@@ -22,7 +22,9 @@ def generate(**kwargs: Dict[str, Any]) -> str:
 #include <cuda_fp8.h>
 #include <deep_gemm/fp8_gemm.cuh>
 
-namespace deep_gemm {{
+using namespace deep_gemm;
+
+#ifndef NVRTC_JIT_COMPILATION
 __global__ void dummy_kernel() {{
   void *ptr = (void *)&fp8_gemm_kernel<
     {kwargs['N']},
@@ -41,7 +43,7 @@ __global__ void dummy_kernel() {{
     GemmType::{kwargs['GEMM_TYPE']}
   >;
 }}
-}}
+#endif
 '''
 
     # Debug print
