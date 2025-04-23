@@ -1,4 +1,5 @@
 import os
+import platform
 import time
 import subprocess
 from typing import Any, Dict, Optional
@@ -12,7 +13,9 @@ from .utils import run_gemm
 def get_symbol(file_path: str, pattern: str) -> Optional[str]:
     if CUDA_HOME is None:
         raise Exception("CUDA_HOME is not set")
-    command = [os.path.join(CUDA_HOME, 'bin', 'cuobjdump'), '-symbols', file_path]
+   
+    cuobjdump_bin = 'cuobjdump.exe' if platform.system() == 'Windows' else 'cuobjdump'
+    command = [os.path.join(CUDA_HOME, 'bin', cuobjdump_bin), '-symbols', file_path]
     result = subprocess.run(command, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
     assert result.returncode == 0
