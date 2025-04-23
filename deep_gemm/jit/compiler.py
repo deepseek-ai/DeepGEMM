@@ -176,7 +176,8 @@ class Compiler(abc.ABC):
 class NvccCompiler(Compiler):
     @staticmethod
     def __version__() -> Tuple[int, int]:
-        major, minor, _ = map(int, cuda.bindings.__version__.split('.'))
+        _, version = get_nvcc_compiler()
+        major, minor = map(int, version.split('.'))
         return (major, minor)
 
     @classmethod
@@ -203,8 +204,7 @@ class NvccCompiler(Compiler):
 class NvrtcCompiler(Compiler):
     @staticmethod
     def __version__() -> Tuple[int, int]:
-        _, version = get_nvcc_compiler()
-        major, minor = map(int, version.split('.'))
+        major, minor = map(int, cuda.bindings.__version__.split('.')[:2])
         return (major, minor)
 
     @staticmethod
