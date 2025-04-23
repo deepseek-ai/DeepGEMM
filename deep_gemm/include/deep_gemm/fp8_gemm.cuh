@@ -226,8 +226,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     // Wait unaligned cases
                     #pragma unroll
                     for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                        empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
                         full_barriers[s]->arrive();
+                        empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
                     }
                 }, 0);
             }

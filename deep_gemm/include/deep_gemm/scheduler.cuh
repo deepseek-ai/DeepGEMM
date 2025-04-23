@@ -118,7 +118,7 @@ struct Scheduler {
                 if (curr_group_idx == kNumGroups)
                     return false;
 
-                // Within current group
+                // Within the current group
                 num_m_blocks = ceil_div(static_cast<uint32_t>(__ldg(grouped_layout + curr_group_idx)), BLOCK_M);
                 auto current_m_block_cumsum = curr_cumsum + num_m_blocks;
                 if (next_block_idx < current_m_block_cumsum * kNumNBlocks)
