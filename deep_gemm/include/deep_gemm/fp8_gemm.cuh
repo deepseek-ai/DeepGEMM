@@ -192,8 +192,11 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
                     // Assign TMA multicast number into A and B
-                    constexpr int kNumTMAMulticastOnA = kIsTMAMulticastOnA ? kNumTMAMulticast : 1;
-                    constexpr int kNumTMAMulticastOnB = kIsTMAMulticastOnA ? 1 : kNumTMAMulticast;
+                    // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
+                    const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
+                    const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
+                    const uint32_t num_tma_multicast_b = (not kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
+                    DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
 
                     // NOTES: unrolling and `kNumInnerStages` are vital for performance, NVCC will try to eliminate all
                     // shared memory pointers, e.g. `full_barriers` registers, if all the access indices are constant
@@ -205,23 +208,18 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         // Issue TMA A
                         auto& full_barrier = *full_barriers[s];
                         int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
-                        tma_copy<kNumTMAMulticastOnA>(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                      smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx));
-                        tma_copy<kNumTMAMulticastOnA>(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                      smem_scales_a[s], m_block_idx * BLOCK_M,
-                                                      scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K));
+                        tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                 smem_a[s], k_idx, scheduler.get_global_idx(shape_m, BLOCK_M, m_block_idx),
+                                 num_tma_multicast_a);
+                        tma_copy(&tensor_map_scales_a, reinterpret_cast<uint64_t*>(&full_barrier),
+                                 smem_scales_a[s], m_block_idx * BLOCK_M,
+                                 scheduler.get_global_idx(SHAPE_K_SCALES, 1, k_idx / BLOCK_K),
+                                 num_tma_multicast_a);
 
                         // Issue TMA B
-                        if (kNumTMAMulticastOnB > 1 and scheduler.is_tma_multicast_b_valid(m_block_idx)) {
-                            // NOTES: in grouped contiguous GEMM, different `m_block_idx` values may correspond to blocks of different groups (B),
-                            // requiring additional checks before multicast operations.
-                            DG_STATIC_ASSERT(kNumTMAMulticastOnB <= 2, "Scheduler does not support > 2 TMA multicast");
-                            tma_copy<kNumTMAMulticastOnB>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                                          smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
-                        } else {
-                            tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                                     smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
-                        }
+                        tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
+                                 smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx),
+                                 num_tma_multicast_b);
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
                     }
 
@@ -281,7 +279,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 if constexpr (kNumTMAMulticast == 1) {
                     lane_idx == 0 ? empty_barriers[s]->arrive() : void();
                 } else {
-                    lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(lane_idx) : void();
+                    auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
+                    lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(target_cta) : void();
                 }
             };
 
