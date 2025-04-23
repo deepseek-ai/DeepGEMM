@@ -1,64 +1,118 @@
+import ctypes
 import os
 import torch
-from typing import Any
+from typing import Any, Dict
+
+import cuda.bindings.driver as cuda
 
 from deep_gemm import jit
 
 
-class Capture:
-    def __init__(self) -> None:
-        self.read_fd = None
-        self.write_fd = None
-        self.saved_stdout = None
-        self.captured = None
+def run_vector_add(kernel: cuda.CUkernel, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, stream: cuda.CUstream) -> cuda.CUresult:
+    assert a.shape == b.shape == c.shape
+    assert a.device == b.device == c.device
+    assert a.dim() == 1
 
-    def __enter__(self) -> Any:
-        self.read_fd, self.write_fd = os.pipe()
-        self.saved_stdout = os.dup(1)
-        os.dup2(self.write_fd, 1)
-        return self
+    n = a.numel()
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        os.dup2(self.saved_stdout, 1)
-        os.close(self.write_fd)
-        with os.fdopen(self.read_fd, 'r') as f:
-            self.captured = f.read()
+    config = cuda.CUlaunchConfig()
+    config.gridDimX = (n + 127) // 128
+    config.gridDimY = 1
+    config.gridDimZ = 1
+    config.blockDimX = 128
+    config.blockDimY = 1
+    config.blockDimZ = 1
+    config.hStream = stream
 
-    def capture(self) -> str:
-        return self.captured
+    kernelValues = (
+        a.data_ptr(),
+        b.data_ptr(),
+        c.data_ptr(),
+        n,
+    )
+    kernelTypes = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+
+    return cuda.cuLaunchKernelEx(config, kernel, (kernelValues, kernelTypes), 0)[0]
+
+
+def generate_vector_add(**kwargs: Dict[str, Any]) -> str:
+    return f"""
+#ifdef __CUDACC_RTC__
+#ifndef NVRTC_JIT_COMPILATION
+#define NVRTC_JIT_COMPILATION
+#endif
+#include <deep_gemm/nvrtc_std.cuh>
+#else
+#include <cuda.h>
+#endif
+
+#include <cuda_fp8.h>
+#include <cuda_bf16.h>
+
+template<typename T>
+__global__ void vector_add(T* a, T* b, T* c, uint32_t N) {{
+    uint32_t i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i < N) {{
+        c[i] = a[i] + b[i];
+    }}
+}}
+
+#ifndef NVRTC_JIT_COMPILATION
+__global__ void dummy_kernel() {{
+    void *ptr = (void *)&vector_add<{kwargs['T']}>;
+}}
+#endif
+"""
+
+
+class VectorAddRuntime(jit.Runtime):
+    def __init__(self, path: str, kernel_name: str) -> None:
+        super().__init__(path, kernel_name, run_vector_add, [
+            'A',
+            'B',
+            'C',
+            'STREAM',
+        ])
 
 
 if __name__ == '__main__':
-    # Runtime
-    print(f'NVCC compiler: {jit.get_nvcc_compiler()}\n')
-
-    # Templates
+    # NVCC
+    print(f'NVCC compiler version: {jit.NvccCompiler.__version__()}\n')
     print('Generated code:')
-    args = (('lhs', torch.float8_e4m3fn), ('rhs', torch.float8_e4m3fn), ('scale', torch.float), ('out', torch.bfloat16),
-            ('enable_double_streams', bool), ('stream', torch.cuda.Stream))
-    body = "\n"
-    body += 'std::cout << reinterpret_cast<uint64_t>(lhs) << std::endl;\n'
-    body += 'std::cout << reinterpret_cast<uint64_t>(rhs) << std::endl;\n'
-    body += 'std::cout << reinterpret_cast<uint64_t>(scale) << std::endl;\n'
-    body += 'std::cout << reinterpret_cast<uint64_t>(out) << std::endl;\n'
-    body += 'std::cout << enable_double_streams << std::endl;\n'
-    body += 'std::cout << reinterpret_cast<uint64_t>(stream) << std::endl;\n'
-    code = jit.generate((), args, body)
+    code = generate_vector_add(T='float')
     print(code)
-
-    # Build
     print('Building ...')
-    func = jit.build('test_func', args, code)
+    func = jit.NvccCompiler.build('test_func', code, 'vector_add', VectorAddRuntime)
 
-    # Test correctness
-    print('Running ...')
-    fp8_tensor = torch.empty((1, ), dtype=torch.float8_e4m3fn, device='cuda')
-    fp32_tensor = torch.empty((1, ), dtype=torch.float, device='cuda')
-    bf16_tensor = torch.empty((1, ), dtype=torch.bfloat16, device='cuda')
-    with Capture() as capture:
-        assert func(fp8_tensor, fp8_tensor, fp32_tensor, bf16_tensor, True, torch.cuda.current_stream()) == 0
-    output = capture.capture()
-    ref_output = f'{fp8_tensor.data_ptr()}\n{fp8_tensor.data_ptr()}\n{fp32_tensor.data_ptr()}\n{bf16_tensor.data_ptr()}\n1\n{torch.cuda.current_stream().cuda_stream}\n'
-    assert output == ref_output, f'{output=}, {ref_output=}'
+    a = torch.randn((1024, ), dtype=torch.float32, device='cuda')
+    b = torch.randn((1024, ), dtype=torch.float32, device='cuda')
+    c = torch.empty_like(a)
+    ret = func(A=a, B=b, C=c, STREAM=torch.cuda.current_stream().cuda_stream)
+    assert ret == cuda.CUresult.CUDA_SUCCESS, ret
+    ref_output = a + b
+    torch.testing.assert_close(c, ref_output)
 
-    print('JIT test passed')
+    print('JIT test for NVCC passed\n')
+
+    # NVRTC
+    print(f'NVRTC compiler version: {jit.NvrtcCompiler.__version__()}\n')
+    print('Generated code:')
+    code = generate_vector_add(T='__nv_bfloat16')
+    print(code)
+    print('Building ...')
+    func = jit.NvrtcCompiler.build('test_func', code, r'vector_add<[\S\s]*?>', VectorAddRuntime)
+
+    a = torch.randn((1024, ), dtype=torch.bfloat16, device='cuda')
+    b = torch.randn((1024, ), dtype=torch.bfloat16, device='cuda')
+    c = torch.empty_like(a)
+    ret = func(A=a, B=b, C=c, STREAM=torch.cuda.current_stream().cuda_stream)
+    assert ret == cuda.CUresult.CUDA_SUCCESS, ret
+    ref_output = a + b
+    torch.testing.assert_close(c, ref_output)
+
+    print('JIT test for NVRTC passed')
