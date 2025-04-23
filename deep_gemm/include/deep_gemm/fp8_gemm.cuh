@@ -279,7 +279,8 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 if (kNumTMAMulticast == 1) {
                     lane_idx == 0 ? empty_barriers[s]->arrive() : void();
                 } else {
-                    lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(lane_idx) : void();
+                    auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
+                    lane_idx < kNumTMAMulticast ? empty_barriers[s]->arrive(target_cta) : void();
                 }
             };
 

@@ -24,6 +24,7 @@ struct Scheduler {
     // Maybe not used in the masked grouped GEMM
     uint32_t num_blocks;
     uint32_t num_blocks_in_group;
+    bool is_peer_cta_alive = true;
 
     // For grouped GEMM
     int* grouped_layout;
@@ -133,6 +134,8 @@ struct Scheduler {
             if (next_block_idx >= num_blocks)
                 return false;
 
+            // NOTES: we don't have to set `is_peer_cta_alive` for masked grouped GEMM, as it must be aligned
+            is_peer_cta_alive = (next_block_idx ^ 1) < num_blocks;
             get_swizzled_block_idx(num_aligned_m_blocks, next_block_idx, m_block_idx, n_block_idx);
         }
         return true;
