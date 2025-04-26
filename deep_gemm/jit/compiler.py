@@ -14,7 +14,7 @@ import cuda.bindings.nvrtc as nvrtc
 from torch.utils.cpp_extension import CUDA_HOME
 
 from . import interleave_ffma
-from .runtime import Runtime, Fp8GemmRuntime, RuntimeCache, get_symbol
+from .runtime import Runtime, Fp8GemmRuntime, RuntimeCache
 
 runtime_cache = RuntimeCache()
 
@@ -115,7 +115,7 @@ class Compiler(abc.ABC):
 
     @classmethod
     @abc.abstractmethod
-    def compile(cls, name: str, code: str, target_path: str, kernel_name_pattern: str) -> str:
+    def compile(cls, name: str, code: str, target_path: str) -> str:
         pass
 
     @staticmethod
@@ -132,10 +132,9 @@ class Compiler(abc.ABC):
         return [get_jit_include_dir()]
 
     @classmethod
-    def build(cls, name: str, code: str, kernel_name_pattern: str, runtime_cls: Type[Runtime] = Fp8GemmRuntime) -> Runtime:
+    def build(cls, name: str, code: str, runtime_cls: Type[Runtime] = Fp8GemmRuntime) -> Runtime:
         # Compiler flags
         flags = cls.flags()
-        include_dirs = cls.include_dirs()
 
         # Build signature
         enable_sass_opt = get_nvcc_compiler()[1] <= '12.8' and int(
@@ -158,7 +157,7 @@ class Compiler(abc.ABC):
         tmp_cubin_path = os.path.join(make_tmp_dir(), f'nvcc.tmp.{str(uuid.uuid4())}.{hash_to_hex(cubin_path)}.cubin')
 
         start_time = time.time()
-        kernel_name = cls.compile(name, code, tmp_cubin_path, kernel_name_pattern)
+        cls.compile(name, code, tmp_cubin_path)
         end_time = time.time()
         elapsed_time = end_time - start_time
         if os.getenv('DG_JIT_DEBUG', None):
@@ -169,15 +168,11 @@ class Compiler(abc.ABC):
         if enable_sass_opt:
             interleave_ffma.process(tmp_cubin_path)
             
-        # Store kernel name
-        put(f'{tmp_cubin_path}.name', kernel_name)
-
         # Atomic replace files
         os.replace(tmp_cubin_path, cubin_path)
-        os.replace(f'{tmp_cubin_path}.name', f'{cubin_path}.name')
 
         # Put cache and return
-        runtime = runtime_cls(path, kernel_name)
+        runtime = runtime_cls(path)
         runtime_cache[path] = runtime
         return runtime
 
@@ -202,7 +197,7 @@ class NvccCompiler(Compiler):
                 f'--compiler-options={",".join(cxx_flags)}']
 
     @classmethod
-    def compile(cls, name: str, code: str, target_path: str, kernel_name_pattern: str) -> str:
+    def compile(cls, name: str, code: str, target_path: str):
         # Write the code
         path = os.path.join(get_cache_dir(), name)
         src_path = os.path.join(path, 'kernel.cu')
@@ -221,9 +216,6 @@ class NvccCompiler(Compiler):
         
         assert result.returncode == 0, f'Failed to compile {src_path}'
 
-        # NVCC needs to get the symbol name from the cubin file using `cuobjdump`
-        return get_symbol(target_path, kernel_name_pattern)
-
 
 class NvrtcCompiler(Compiler):
     @staticmethod
@@ -238,7 +230,7 @@ class NvrtcCompiler(Compiler):
     def include_dirs() -> List[str]:
         if CUDA_HOME is None:
             raise RuntimeError('CUDA_HOME is required for NVRTC compilation')
-        return [get_jit_include_dir(), os.path.join(CUDA_HOME, 'include'), os.path.join(CUDA_HOME, 'targets', 'x86_64-linux', 'include')]
+        return [get_jit_include_dir(), os.path.join(CUDA_HOME, 'include')]
 
     @classmethod
     def flags(cls) -> List[str]:
@@ -251,20 +243,12 @@ class NvrtcCompiler(Compiler):
         return base_flags
 
     @classmethod
-    def compile(cls, name: str, code: str, target_path: str, kernel_name_pattern: str) -> str:
+    def compile(cls, name: str, code: str, target_path: str) -> str:
         code_bytes = bytes(code, 'utf-8')
         res, program = nvrtc.nvrtcCreateProgram(
             code_bytes, bytes(name, 'utf-8'), 0, [], [])
         if res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            raise Exception(f"Failed to create program: {res}")
-
-        kernel_regex = re.compile(kernel_name_pattern, re.MULTILINE)
-        kernel_name = kernel_regex.search(code).group(
-            0).replace('\n', '').replace(' ', '')
-        res = nvrtc.nvrtcAddNameExpression(
-            program, bytes(kernel_name, 'utf-8'))[0]
-        if res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            raise Exception(f"Failed to add name expression: {res}")
+            raise Exception(f'Failed to create program: {res}')
 
         options = [bytes(flag, 'utf-8') for flag in cls.flags()]
         compile_res = nvrtc.nvrtcCompileProgram(
@@ -273,43 +257,35 @@ class NvrtcCompiler(Compiler):
         if os.getenv('DG_JIT_DEBUG', None):
             res, log_size = nvrtc.nvrtcGetProgramLogSize(program)
             if res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-                raise Exception(f"Failed to get program log size: {res}")
+                raise Exception(f'Failed to get program log size: {res}')
             log_bytes = bytes(log_size)
             res = nvrtc.nvrtcGetProgramLog(program, log_bytes)[0]
             if res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-                raise Exception(f"Failed to get program log: {res}")
+                raise Exception(f'Failed to get program log: {res}')
             log_str = log_bytes.decode('utf-8')
             print(log_str)
 
         if compile_res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            raise Exception(f"Failed to compile program: {compile_res}")
-
-        # NVRTC can directly get the lowered name
-        res, lowered_name = nvrtc.nvrtcGetLoweredName(
-            program, bytes(kernel_name, 'utf-8'))
-        if res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            raise Exception(f"Failed to get lowered name: {res}")
+            raise Exception(f'Failed to compile program: {compile_res}')
 
         res, cubin_size = nvrtc.nvrtcGetCUBINSize(program)
         if res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            raise Exception(f"Failed to get CUBIN size: {res}")
+            raise Exception(f'Failed to get CUBIN size: {res}')
 
         cubin_bytes = bytes(cubin_size)
         res = nvrtc.nvrtcGetCUBIN(program, cubin_bytes)[0]
         if res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            raise Exception(f"Failed to get CUBIN: {res}")
+            raise Exception(f'Failed to get CUBIN: {res}')
 
         put(target_path, cubin_bytes)
 
         res = nvrtc.nvrtcDestroyProgram(program)[0]
         if res != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-            raise Exception(f"Failed to destroy program: {res}")
-
-        return lowered_name.decode('utf-8')
+            raise Exception(f'Failed to destroy program: {res}')
 
 
-def build(name: str, code: str) -> Runtime:
+def build(name: str, code: str, runtime_cls: Type[Runtime] = Fp8GemmRuntime) -> Runtime:
     if os.getenv('DG_JIT_USE_NVRTC', '0') in ['1', 'true', 'True']:
-        return NvrtcCompiler.build(name, code, kernel_name_pattern=r'fp8_gemm_kernel<[\S\s]*?>')
+        return NvrtcCompiler.build(name, code, runtime_cls=runtime_cls)
     else:
-        return NvccCompiler.build(name, code, kernel_name_pattern='fp8_gemm_kernel')
+        return NvccCompiler.build(name, code, runtime_cls=runtime_cls)

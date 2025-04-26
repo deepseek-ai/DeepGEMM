@@ -24,7 +24,6 @@ def generate(**kwargs: Dict[str, Any]) -> str:
 
 using namespace deep_gemm;
 
-#ifndef NVRTC_JIT_COMPILATION
 __global__ void dummy_kernel() {{
   void *ptr = (void *)&fp8_gemm_kernel<
     {kwargs['N']},
@@ -43,7 +42,6 @@ __global__ void dummy_kernel() {{
     GemmType::{kwargs['GEMM_TYPE']}
   >;
 }}
-#endif
 '''
 
     # Debug print

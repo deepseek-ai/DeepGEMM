@@ -53,7 +53,7 @@ def get_num_math_warpgroups(block_m: int) -> int:
     return 1 if block_m == 64 else 2
 
 def get_num_threads_per_sm(num_tma_threads: int, num_math_threads_per_group: int, block_m: int) -> int:
-    assert num_math_threads_per_group == 128, "Only support 128 threads per math group"
+    assert num_math_threads_per_group == 128, 'Only support 128 threads per math group'
     return get_num_math_warpgroups(block_m) * num_math_threads_per_group + num_tma_threads
 
 
@@ -74,7 +74,7 @@ def make_2d_tma_copy_desc(global_address: torch.Tensor, gmem_dim: Tuple[cuda.cuu
     )
 
     if res != cuda.CUresult.CUDA_SUCCESS:
-        raise Exception(f"Failed to encode tensor map: {res}")
+        raise Exception(f'Failed to encode tensor map: {res}')
 
     return tensor_map
 
@@ -118,7 +118,7 @@ def run_gemm(kernel: cuda.CUkernel, num_tma_multicast: int, shape_m: int, block_
     
     res = cuda.cuKernelSetAttribute(cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size, kernel, cuda.CUdevice(gmem_d.device.index))[0]
     if res != cuda.CUresult.CUDA_SUCCESS:
-        raise Exception(f"Failed to set max dynamic shared memory size: {res}")
+        raise Exception(f'Failed to set max dynamic shared memory size: {res}')
 
     attr_val = cuda.CUlaunchAttributeValue()
     attr_val.clusterDim.x = num_tma_multicast
