@@ -17,6 +17,9 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [ ] Larger block size on N (up to 256)
 - [x] MoE scheduler with TMA multicast compatibility
 - [x] Fix TMA multicast compatibility for indivisible shapes
+- [ ] Skip useless computation on M
+- [ ] NVRTC as a faster compiler
+- [ ] Sanitizer for testing
 - [ ] Weight gradient kernels for dense models
 - [ ] Weight gradient kernels for MoE models
 - [ ] Utility kernels for MoE models (as a pre-built CUDA library)
