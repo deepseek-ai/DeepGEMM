@@ -109,7 +109,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_config, sm90_capacity = None, None, 232448
-    stage_candidates = (8, 7, 6, 5, 4, 3)
+    stage_candidates = tuple(filter(lambda s: s <= k // 128, (8, 7, 6, 5, 4, 3)))
     if 128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4:
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = (4, 3)
