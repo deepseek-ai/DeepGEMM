@@ -2,8 +2,10 @@ import torch
 from typing import Tuple
 
 from .gemm import get_best_configs
-from .runtime import FP8GemmRuntime, generate
-from .runtime import GemmType, make_2d_tma_a_desc, make_2d_tma_b_desc, make_2d_tma_d_desc, make_2d_tma_scales_a_desc
+from .runtime import (
+    FP8GemmRuntime, GemmType,
+    make_2d_tma_a_desc, make_2d_tma_b_desc,
+    make_2d_tma_d_desc, make_2d_tma_scales_a_desc)
 from .tuner import jit_tuner
 from .utils import get_col_major_tma_aligned_tensor, get_num_sms
 
@@ -103,7 +105,6 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
               'GEMM_TYPE': GemmType.GroupedContiguous},
         space=(),
         kwargs=kwargs,
-        generator=generate,
         runtime_cls=FP8GemmRuntime,
     )
 
@@ -209,7 +210,6 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
               'GEMM_TYPE': GemmType.GroupedMasked},
         space=(),
         kwargs=kwargs,
-        generator=generate,
         runtime_cls=FP8GemmRuntime,
     )
 
