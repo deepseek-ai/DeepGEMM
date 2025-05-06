@@ -1,6 +1,6 @@
 #pragma once
 
-#ifndef NVRTC_JIT_COMPILATION
+#ifndef __CUDACC_RTC__
 #include <cuda.h>
 #endif
 

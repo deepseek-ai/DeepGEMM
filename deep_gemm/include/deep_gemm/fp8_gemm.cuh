@@ -84,8 +84,9 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = get_lane_id();
 
-    // Prefetch TMA descriptors at very beginning
+    // Prefetch TMA descriptors at the very beginning
     if (threadIdx.x == kNumMathThreads) {
+        // NOTES: `reinterpret_cast` must be here, or NVRTC will fail
         cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_a));
         cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_b));
         cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_scales_a));

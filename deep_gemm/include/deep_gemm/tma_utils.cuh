@@ -1,18 +1,10 @@
 #pragma once
 
-#ifndef NVRTC_JIT_COMPILATION
-#include <cassert>
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cudaTypedefs.h>
-#endif
-
-#include <cuda/barrier>
-
 #include "utils.cuh"
 
 namespace deep_gemm {
 
+// TODO: move this function to other files
 __device__ __forceinline__ void
 tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
          int32_t const& crd_0, int32_t const& crd_1, uint32_t num_tma_multicast) {

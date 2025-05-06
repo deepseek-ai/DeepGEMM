@@ -46,7 +46,7 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ bool is_tma_multicast_valid(const uint32_t& m_block_idx) {
+    __device__ __forceinline__ bool is_tma_multicast_valid(const uint32_t& m_block_idx) const {
         if (num_blocks_in_group == 1)
             return false;
         if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::GroupedMasked) {
@@ -63,7 +63,8 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
+    __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx,
+                                                           uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNum1DBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
         // Swizzle for better L2 usages

@@ -1,3 +1,2 @@
-from .compiler import get_nvcc_compiler, build, NvccCompiler, NvrtcCompiler
-from .template import generate
+from .compiler import get_nvcc_compiler, build, NVCCCompiler, NVRTCCompiler
 from .runtime import Runtime

@@ -1,9 +1,9 @@
 import torch
 from typing import Tuple
 
-from ..jit.utils import GemmType, make_2d_tma_a_desc, make_2d_tma_b_desc, make_2d_tma_d_desc, make_2d_tma_scales_a_desc
-
-from .gemm import get_best_configs, get_block_n_padding_for_smem_d
+from .gemm import get_best_configs
+from .runtime import FP8GemmRuntime, generate
+from .runtime import GemmType, make_2d_tma_a_desc, make_2d_tma_b_desc, make_2d_tma_d_desc, make_2d_tma_scales_a_desc
 from .tuner import jit_tuner
 from .utils import get_col_major_tma_aligned_tensor, get_num_sms
 
@@ -15,7 +15,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     Do a grouped GEMM (contiguous format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
     RHS and RHS scaling factors are required to be transposed.
-    The LHS scaling tensor requires TMA-aligned transposed format, if your input does not match the requirement,
+    The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
         this function will do a transposing with a set of slow PyTorch operations.
     On the M axis, inputs are grouped into several batches, of which batch sizes aligned to
         `get_m_alignment_for_contiguous_layout()` (128).
@@ -23,11 +23,11 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     Arguments:
         lhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[m_sum, k]`,
              the second element is an FP32 1x128 scaling tensor for LHS of shape `[m_sum, ⌈k / 128⌉]`.
-        rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[num_groups, n, k]`.
+        rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[num_groups, n, k]`,
              the second element is an FP32 128x128 scaling tensor for RHS of shape `[num_groups, ⌈n / 128⌉, ⌈k / 128⌉]`.
         out: the BF16 output tensor of shape `[m_sum, n]`, representing the result.
         m_indices: a tensor of shape `[m_sum]` with type `torch.int`.
-            `m_indices[i]` records the group which the i-th row of the LHS belong to,
+            `m_indices[i]` records the group which the i-th row of the LHS belongs to,
             which means that the i-th row of the LHS matrix will be multiplied with `rhs[m_indices[i]]`.
             Values of `m_indices` in every-m-alignment-block must also be the same.
     """
@@ -70,7 +70,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
     tensor_map_b = make_2d_tma_b_desc(
         GemmType.GroupedContiguous, rhs, k, n, block_k, block_n, num_groups)
     tensor_map_d = make_2d_tma_d_desc(
-        GemmType.GroupedContiguous, smem_config[1], out, m, n, block_m, block_n, num_groups)
+        GemmType.GroupedContiguous, out, m, n, block_m, block_n, num_groups, smem_config[1])
     tensor_map_scales_a = make_2d_tma_scales_a_desc(
         GemmType.GroupedContiguous, lhs_scales, m, k, block_m, block_k, num_groups)
 
@@ -103,6 +103,8 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
               'GEMM_TYPE': GemmType.GroupedContiguous},
         space=(),
         kwargs=kwargs,
+        generator=generate,
+        runtime_cls=FP8GemmRuntime,
     )
 
     # Run the kernel
@@ -116,7 +118,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     Do a grouped GEMM (masked format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
     RHS and RHS scaling factors are required to be transposed.
-    The LHS scaling tensor requires TMA-aligned transposed format, if your input does not match the requirement,
+    The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
         this function will do a transposing with a set of slow PyTorch operations.
     Moreover, this alignment requirement is different with the contiguous-format kernel, as we require that each batch
         should be separately transposed.
@@ -125,7 +127,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
         lhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[num_groups, m_max, k]`,
              the second element is an FP32 1x128 scaling tensor for LHS of shape `[num_groups, m_max, ⌈k / 128⌉]`.
         rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[num_groups, n, k]`.
-             the second element is an FP32 128x128 scaling tensor for RHS of shape `[num_groups, ⌈n / 128⌉, ⌈k / 128⌉]`.
+             The second element is an FP32 128x128 scaling tensor for RHS of shape `[num_groups, ⌈n / 128⌉, ⌈k / 128⌉]`.
         out: the BF16 output tensor of shape `[num_groups, m_max, n]`, representing the result.
         masked_m: a tensor of shape `[num_groups]`, `masked_m[i]` records actual rows of the `lhs[i]` matrix to compute
             in the i-th group.
@@ -157,7 +159,6 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     assert rhs_scales.is_contiguous()
 
     # Auto-tuning with compilation
-    global includes, template
     num_sms = get_num_sms()
     num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(
         expected_m, n, k, num_groups, num_sms, is_grouped_masked=True)
@@ -175,7 +176,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
     tensor_map_b = make_2d_tma_b_desc(
         GemmType.GroupedMasked, rhs, k, n, block_k, block_n, num_groups)
     tensor_map_d = make_2d_tma_d_desc(
-        GemmType.GroupedMasked, smem_config[1], out, m, n, block_m, block_n, num_groups)
+        GemmType.GroupedMasked, out, m, n, block_m, block_n, num_groups, smem_config[1])
     tensor_map_scales_a = make_2d_tma_scales_a_desc(
         GemmType.GroupedMasked, lhs_scales, m, k, block_m, block_k, num_groups)
 
@@ -208,6 +209,8 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
               'GEMM_TYPE': GemmType.GroupedMasked},
         space=(),
         kwargs=kwargs,
+        generator=generate,
+        runtime_cls=FP8GemmRuntime,
     )
 
     # Run the kernel
