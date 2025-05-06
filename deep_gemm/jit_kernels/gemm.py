@@ -61,16 +61,20 @@ def get_block_n_padding_for_smem_d(block_n: int) -> int:
     return (((padding + requirement[1]) if padding < 0 else padding) * 4) // elem_size
 
 
-def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> Tuple[int, int, int]:
+def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128,        
+                    is_fp32_out: bool = False, is_wgrad: bool = False) -> Tuple[int, int, int]:
     # Try swizzle first, as it does not waste shared memory
     swizzle_mode = get_swizzle_mode(block_n)
     block_n_padding = get_block_n_padding_for_smem_d(block_n) if swizzle_mode == 0 else 0
 
-    smem_d = block_m * (block_n + block_n_padding) * 2
+    smem_d = block_m * (block_n + block_n_padding) * (4 if is_fp32_out else 2)
     smem_a_per_stage = block_m * block_k
     smem_scales_a_per_stage = block_m * 4
     smem_b_per_stage = block_n * block_k
-    smem_scales_b = ceil_div(k, block_k) * 4
+    if is_wgrad:
+        smem_scales_b_per_stage = ceil_div(block_n * 4, 128) * 128
+    else:
+        smem_scales_b = ceil_div(k, block_k) * 4
     smem_barrier = num_stages * 8 * 2
 
     smem_size = 0
@@ -78,7 +82,10 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     smem_size += num_stages * smem_a_per_stage
     smem_size += num_stages * smem_scales_a_per_stage
     smem_size += num_stages * smem_b_per_stage
-    smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
+    if is_wgrad:
+        smem_size += num_stages * smem_scales_b_per_stage
+    else:
+        smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
     smem_size += smem_barrier
 
     # Swizzle and padding are not compatible
@@ -89,13 +96,18 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False) -> \
+                     is_grouped_contiguous: bool = False, is_grouped_masked: bool = False,
+                     is_fp32_out: bool = False, is_wgrad: bool = False) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     if not is_grouped_contiguous:
-        block_ms = (64, 128, 256)
+        block_ms = (64, 128, ) + ((256, ) if not is_fp32_out else ())
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
-    block_ns = tuple(range(16, 129, 8)) + (144, 160, )
+    block_ns = tuple(range(16, 129, 8)) + ((136, 152, ) if is_wgrad else (144, 160, ))
+    
+    # Avoid bank conflicts for fp32 output
+    if is_fp32_out:
+        block_ns = [x for x in block_ns if x % 16 == 8]
 
     fix_wave_saturate = lambda x: num_sms if x == 0 else x
     get_num_waves = lambda bm, bn: (ceil_div(ceil_div(m, bm) * ceil_div(n, bn) * num_groups, num_sms) if bm else None)
@@ -135,7 +147,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = (4, 3)
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n)
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, is_fp32_out=is_fp32_out, is_wgrad=is_wgrad)
         if best_smem_config[0] <= sm90_capacity:
             best_num_stages = num_stages
             break

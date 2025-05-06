@@ -66,12 +66,22 @@ __device__  __forceinline__ float ld_shared(const float* __restrict__ ptr) {
     return ret;
 }
 
+__device__  __forceinline__ float2 ld_shared(const float2* __restrict__ ptr) {
+    float2 ret;
+    asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(ret.x), "=f"(ret.y) : "l"(ptr));
+    return ret;
+}
+
 __device__ __forceinline__ void st_shared(const float* ptr, float val) {
     asm volatile("st.shared.f32 [%0], %1;" :: "l"(ptr), "f"(val));
 }
 
 __device__ __forceinline__ void st_shared(const uint32_t* ptr, uint32_t val) {
     asm volatile("st.shared.u32 [%0], %1;" :: "l"(ptr), "r"(val));
+}
+
+__device__ __forceinline__ void st_shared(const float2* ptr, float2 val) {
+    asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "l"(ptr), "f"(val.x), "f"(val.y));
 }
 
 template <int N>
@@ -180,5 +190,20 @@ struct FP8MMASelector {
 
     using type = decltype(select_type());
 };
+
+enum class Layout {
+    RowMajor,
+    ColMajor
+};
+
+__device__ __host__ constexpr int get_num_math_warpgroups(int block_m) {
+    return block_m == 64 ? 1 : 2;
+}
+
+template <uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup>
+__device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
+    DG_STATIC_ASSERT(kNumMathThreadsPerGroup == 128, "Only support 128 threads per math group");
+    return get_num_math_warpgroups(block_m) * kNumMathThreadsPerGroup + kNumTMAThreads;
+}
 
 } // namespace deep_gemm

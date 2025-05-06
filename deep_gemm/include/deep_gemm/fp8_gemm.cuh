@@ -16,21 +16,6 @@
 
 namespace deep_gemm {
 
-enum class Layout {
-    RowMajor,
-    ColMajor
-};
-
-__device__ __host__ constexpr int get_num_math_warpgroups(int block_m) {
-    return block_m == 64 ? 1 : 2;
-}
-
-template <uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup>
-__device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
-    DG_STATIC_ASSERT(kNumMathThreadsPerGroup == 128, "Only support 128 threads per math group");
-    return get_num_math_warpgroups(block_m) * kNumMathThreadsPerGroup + kNumTMAThreads;
-}
-
 template <int kNumFormerIters, int kGap, int kEnd>
 __device__ __host__ void outer_launch_k_iterations(const auto& inner_launch_k_iterations, const auto& func, int num_former_iters) {
     if (num_former_iters == kNumFormerIters) {
