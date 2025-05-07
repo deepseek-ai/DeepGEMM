@@ -19,7 +19,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [x] Fix TMA multicast compatibility for indivisible shapes
 - [ ] Skip useless computation on M
 - [x] NVRTC as a faster compiler
-- [ ] Fully remove NVCC compilation
+- [ ] Stolen JIT cache
 - [ ] Sanitizer for testing
 - [ ] Weight gradient kernels for dense models
 - [ ] Weight gradient kernels for MoE models
