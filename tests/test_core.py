@@ -1,3 +1,8 @@
+# PyTorch has its own NVRTC, which may have a lower version than the system
+# So try to disable PyTorch's NVRTC, or import NVRTC before PyTorch
+import cuda.bindings.nvrtc as nvrtc
+print(f'NVRTC version: {nvrtc.nvrtcVersion()[1:]}')
+
 import random
 import torch
 from typing import Tuple
