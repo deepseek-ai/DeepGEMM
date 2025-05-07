@@ -95,7 +95,7 @@ class RuntimeCache:
             return self.cache[path]
 
         # Already compiled
-        if not int(os.getenv('DG_DISABLE_CACHE', 0)) and os.path.exists(path) and Runtime.is_path_valid(path):
+        if not int(os.getenv('DG_JIT_DISABLE_CACHE', 0)) and os.path.exists(path) and Runtime.is_path_valid(path):
             runtime = runtime_cls(path)
             self.cache[path] = runtime
             return runtime

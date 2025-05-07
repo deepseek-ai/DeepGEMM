@@ -49,8 +49,8 @@ def get_deep_gemm_version() -> str:
 @functools.lru_cache(maxsize=None)
 def get_nvcc_compiler() -> Tuple[str, str]:
     paths = []
-    if os.getenv('DG_NVCC_COMPILER'):
-        paths.append(os.getenv('DG_NVCC_COMPILER'))
+    if os.getenv('DG_JIT_NVCC_COMPILER'):
+        paths.append(os.getenv('DG_JIT_NVCC_COMPILER'))
     
     nvcc_bin = 'nvcc.exe' if platform.system() == 'Windows' else 'nvcc'
     paths.append(os.path.join(CUDA_HOME, 'bin', nvcc_bin))
@@ -73,8 +73,8 @@ def get_nvcc_compiler() -> Tuple[str, str]:
 
 @functools.lru_cache(maxsize=None)
 def get_default_user_dir():
-    if 'DG_CACHE_DIR' in os.environ:
-        path = os.getenv('DG_CACHE_DIR')
+    if 'DG_JIT_CACHE_DIR' in os.environ:
+        path = os.getenv('DG_JIT_CACHE_DIR')
         os.makedirs(path, exist_ok=True)
         return path
     return os.path.join(os.path.expanduser('~'), '.deep_gemm')
@@ -119,10 +119,10 @@ class Compiler:
 
     @staticmethod
     def flags() -> List[str]:
-        cpp_standard = int(os.getenv('DG_OVERRIDE_CPP_STANDARD', 20))
+        cpp_standard = int(os.getenv('DG_JIT_OVERRIDE_CPP_STANDARD', 20))
         return [f'-std=c++{cpp_standard}',
                 '--ptxas-options=--register-usage-level=10' +
-                (',--verbose' if 'DG_PTXAS_VERBOSE' in os.environ else ''),
+                (',--verbose' if 'DG_JIT_PTXAS_VERBOSE' in os.environ else ''),
                 # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
                 '--diag-suppress=39,161,174,177,940']
 
@@ -136,7 +136,7 @@ class Compiler:
         flags = cls.flags()
 
         # Build signature
-        enable_sass_opt = cls.__version__() <= (12, 8) and not int(os.getenv('DG_DISABLE_FFMA_INTERLEAVE', 0))
+        enable_sass_opt = cls.__version__() <= (12, 8) and not int(os.getenv('DG_JIT_DISABLE_FFMA_INTERLEAVE', 0))
         signature = f'{name}$${get_deep_gemm_version()}$${cls.signature()}$${flags}$${enable_sass_opt}$${code}'
         name = f'kernel.{name}.{hash_to_hex(signature)}'
         path = os.path.join(get_cache_dir(), name)

@@ -7,7 +7,7 @@ from deep_gemm import jit
 
 # Essential debugging staffs
 os.environ['DG_JIT_DEBUG'] = os.getenv('DG_JIT_DEBUG', '1')
-os.environ['DG_DISABLE_CACHE'] = os.getenv('DG_DISABLE_CACHE', '1')
+os.environ['DG_JIT_DISABLE_CACHE'] = os.getenv('DG_JIT_DISABLE_CACHE', '1')
 
 
 class VectorAddRuntime(jit.Runtime):

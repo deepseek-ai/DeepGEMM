@@ -105,16 +105,23 @@ The library provides some utility functions besides the above kernels:
 
 The library also provides some environment variables, which may be useful:
 
-- `DG_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
-- `DG_DISABLE_CACHE`: 0 or 1, disable the use of cache directory, 0 by default
-- `DG_NVCC_COMPILER`: string, specified NVCC compiler path; will find in `from torch.utils.cpp_extension.CUDA_HOME` by default
-- `DG_OVERRIDE_CPP_STANDARD`: integer (e.g., `20`), support for some old version GCC compiler
-- `DG_DISABLE_FFMA_INTERLEAVE`: 0 or 1, disable FFMA-interleaving optimization
-- `DG_PTXAS_VERBOSE`: 0 or 1, show detailed PTXAS compiler output
-- `DG_PRINT_REG_REUSE`: 0 or 1, print FFMA-interleaving details
-- `DG_JIT_PRINT_COMPILER_COMMAND`: 0 or 1, print NVCC compilation command
-- `DG_JIT_DEBUG`: 0 or 1, print more debugging information
-- `DG_JIT_USE_NVRTC`: 0 or 1, use NVRTC instead of NVCC, faster compilation but maybe have lower performance for some cases, 0 by default
+- General
+  - `DG_JIT_DEBUG`: `0` or `1`, print more JIT debugging information, `0` by default
+- JIT cache related
+- `DG_JIT_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
+- `DG_JIT_DISABLE_CACHE`: `0` or `1`, disable the use of cache directory, `0` by default
+- NVCC/NVRTC selections
+  - `DG_JIT_USE_NVRTC`: `0` or `1`, use NVRTC instead of NVCC, faster compilation but maybe have lower performance for some cases, `0` by default
+  - `DG_JIT_NVCC_COMPILER`: string, specified NVCC compiler path; will find in `torch.utils.cpp_extension.CUDA_HOME` by default
+- Compiler options
+  - `DG_JIT_OVERRIDE_CPP_STANDARD`: integer (e.g., `20`), support for some old version GCC compiler, `20` by default
+  - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS compiler output, `0` by default
+  - `DG_JIT_PRINT_REG_REUSE`: `0` or `1`, print FFMA-interleaving details, `0` by default
+  - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print NVCC compilation command, `0` by default
+- Post optimization
+  - `DG_JIT_DISABLE_FFMA_INTERLEAVE`: `0` or `1`, disable FFMA-interleaving optimization, `0` by default
+- Testing
+  - `DG_NSYS_PROFILING`: `0` or `1`, Nsight-system compatible testing, `0` by default
 
 For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
 
@@ -141,9 +148,9 @@ The [Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide
 
 - Utilization of the [`stmatrix`](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-store-instruction-stmatrix) PTX instruction
 - [Register count control](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#miscellaneous-instructions-setmaxnreg) tailored for different warpgroups
-- Larger block sizes
-- Less bank conflicts via 3D TMA 🐳
-- Overlapping as much as possible, e.g. overlapping TMA store and non-TMA RHS scaling factor load 🐳
+- Less bank conflicts via 3D TMA or swizzling
+- Larger block sizes (up to 256x128 🐳)
+- Overlapping as much as possible, e.g., overlapping TMA store and non-TMA RHS scaling factor load 🐳
 
 #### A unified and optimized block scheduler
 
