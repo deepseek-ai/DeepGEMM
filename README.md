@@ -108,8 +108,8 @@ The library also provides some environment variables, which may be useful:
 - General
   - `DG_JIT_DEBUG`: `0` or `1`, print more JIT debugging information, `0` by default
 - JIT cache related
-- `DG_JIT_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
-- `DG_JIT_DISABLE_CACHE`: `0` or `1`, disable the use of cache directory, `0` by default
+  - `DG_JIT_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
+  - `DG_JIT_DISABLE_CACHE`: `0` or `1`, disable the use of cache directory, `0` by default
 - NVCC/NVRTC selections
   - `DG_JIT_USE_NVRTC`: `0` or `1`, use NVRTC instead of NVCC, faster compilation but maybe have lower performance for some cases, `0` by default
   - `DG_JIT_NVCC_COMPILER`: string, specified NVCC compiler path; will find in `torch.utils.cpp_extension.CUDA_HOME` by default
