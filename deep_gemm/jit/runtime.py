@@ -44,6 +44,7 @@ class Runtime:
             assert result == cbd.CUresult.CUDA_SUCCESS, f'Failed to load library: {result}'
 
             # Extract the kernel name
+            # TODO: use `cuda-bindings` API to do this (requires at least 12.8)
             command = [f'{CUDA_HOME}/bin/cuobjdump', '-symbols', path]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             assert result.returncode == 0
