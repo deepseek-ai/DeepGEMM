@@ -73,7 +73,7 @@ class RuntimeCache:
     def __init__(self) -> None:
         self.cache = {}
 
-    def __setitem__(self, path, runtime) -> None:
+    def __setitem__(self, path: str, runtime: Runtime) -> None:
         self.cache[path] = runtime
 
     def get(self, path: str, runtime_cls: Type[Runtime]) -> Optional[Runtime]:
