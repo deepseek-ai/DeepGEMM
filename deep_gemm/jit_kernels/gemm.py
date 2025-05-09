@@ -111,9 +111,13 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     return num_min_sms, best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
 
 
-def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
-                         rhs: Tuple[torch.Tensor, torch.Tensor],
-                         out: torch.Tensor) -> None:
+@torch.library.custom_op("moe::gemm_fp8_fp8_bf16_nt", mutates_args=('out', ))
+def gemm_fp8_fp8_bf16_nt(
+        lhs: torch.Tensor,
+        lhs_scales: torch.Tensor,
+        rhs: torch.Tensor,
+        rhs_scales: torch.Tensor,
+        out: torch.Tensor) -> None:
     """
     Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -128,8 +132,6 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
              the second element is an FP32 128x128 scaling tensor for RHS of shape `[⌈n / 128⌉, ⌈k / 128⌉]`.
         out: the BF16 output tensor of shape `[m, n]`, representing the result.
     """
-    lhs, lhs_scales = lhs
-    rhs, rhs_scales = rhs
     m, k = lhs.shape
     n, k_ = rhs.shape
     m_, n_ = out.shape
@@ -157,7 +159,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
 
     # Auto-tuning with compilation
     global includes, template
-    num_sms = get_num_sms()
+    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 24
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
@@ -176,3 +178,13 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
 
     # Run the kernel
     runtime(*args)
+
+
+@gemm_fp8_fp8_bf16_nt.register_fake
+def _(
+    lhs: torch.Tensor,
+    lhs_scales: torch.Tensor,
+    rhs: torch.Tensor,
+    rhs_scales: torch.Tensor,
+    out: torch.Tensor) -> None:
+    return
