@@ -55,13 +55,14 @@ fp8_wgrad_gemm_kernel(uint32_t shape_k,
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = get_lane_id();
 
-    // Prefetch TMA descriptors at very beginning
+    // Prefetch TMA descriptors at the very beginning
     if (threadIdx.x == kNumMathThreads) {
-        cute::prefetch_tma_descriptor(&tensor_map_a);
-        cute::prefetch_tma_descriptor(&tensor_map_b);
-        cute::prefetch_tma_descriptor(&tensor_map_scales_a);
-        cute::prefetch_tma_descriptor(&tensor_map_scales_b);
-        cute::prefetch_tma_descriptor(&tensor_map_d);
+        // NOTES: `reinterpret_cast` must be here, or NVRTC will fail
+        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_a));
+        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_b));
+        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_scales_a));
+        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_scales_b));
+        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_d));
     }
     __syncwarp();
 
@@ -143,8 +144,6 @@ fp8_wgrad_gemm_kernel(uint32_t shape_k,
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = Scheduler<GemmType::Normal, SHAPE_N, BLOCK_M, BLOCK_N, 1, kNumTMAMulticast, kIsTMAMulticastOnA>(SHAPE_M);
-
-    cudaGridDependencySynchronize();
 
     if (threadIdx.x >= kNumMathThreads) {
         // TMA warp-group for loading data
@@ -351,117 +350,12 @@ fp8_wgrad_gemm_kernel(uint32_t shape_k,
             }
             __syncwarp();
         }
- 
-        cudaTriggerProgrammaticLaunchCompletion();
     }
 #else
     if (blockIdx.x == 0 && threadIdx.x == 0)
         DG_DEVICE_ASSERT(false && "This kernel only support sm_90a");
 #endif
 }
-
-template <uint32_t SHAPE_M, uint32_t SHAPE_N,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t kNumStages, uint32_t kLastStages,
-          uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA>
-class WgradGemm {
-public:
-    WgradGemm() = default;
-
-    static void run(uint32_t shape_k, 
-                    const CUtensorMap& tma_a_desc,
-                    const CUtensorMap& tma_b_desc,
-                    const CUtensorMap& tma_scales_a_desc,
-                    const CUtensorMap& tma_scales_b_desc,
-                    const CUtensorMap& tma_d_desc,
-                    cudaStream_t stream,
-                    int num_sms, uint32_t smem_size) {
-        // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
-        constexpr uint32_t kNumTMAThreads = 128;
-        constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        auto kernel = fp8_wgrad_gemm_kernel<SHAPE_M, SHAPE_N, BLOCK_M, BLOCK_N, BLOCK_K,
-                                            kNumStages, kLastStages, kNumTMAThreads, kNumMathThreadsPerGroup,
-                                            kNumTMAMulticast, kIsTMAMulticastOnA>;
-        DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
-
-        // Cluster launch
-        cudaLaunchConfig_t config;
-        config.gridDim = num_sms;
-        config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-
-        // Clusters for TMA multicast
-        // NOTES: `>= 4` cluster size will cause performance degradation
-        cudaLaunchAttribute attr[2];
-        attr[0].id = cudaLaunchAttributeClusterDimension;
-        attr[0].val.clusterDim = {kNumTMAMulticast, 1, 1};
-        attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attr[1].val.programmaticStreamSerializationAllowed = 1;
-        config.attrs = attr;
-        config.numAttrs = 2;
-
-        // Launch
-        auto status = cudaLaunchKernelEx(&config, kernel,
-                                         shape_k,
-                                         tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_scales_b_desc, tma_d_desc);
-        DG_HOST_ASSERT(status == cudaSuccess);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_a_desc(T* global_address, uint32_t shape_m, uint32_t shape_k, uint32_t a_stride) {
-        return make_2d_tma_desc(global_address, Layout::RowMajor, shape_m, shape_k, BLOCK_M, BLOCK_K, a_stride);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_b_desc(T* global_address, uint32_t shape_n, uint32_t shape_k, uint32_t b_stride) {
-        return make_2d_tma_desc(global_address, Layout::ColMajor, shape_k, shape_n, BLOCK_K, BLOCK_N, b_stride);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_d_desc(T* global_address, uint32_t shape_m, uint32_t shape_n, uint32_t d_stride) {
-        return make_2d_tma_desc(global_address, Layout::RowMajor, shape_m, shape_n, BLOCK_M, BLOCK_N, d_stride,
-                                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_scales_a_desc(T* global_address, uint32_t shape_m, uint32_t shape_k) {
-        // Make TMA aligned to 16 bytes
-        constexpr uint32_t kAlignment = 16 / sizeof(T);
-        shape_m = ceil_div(shape_m, kAlignment) * kAlignment;
-
-        return make_2d_tma_desc(global_address, Layout::ColMajor, shape_m, ceil_div(shape_k, BLOCK_K), BLOCK_M, 1, shape_m,
-                                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_scales_b_desc(T* global_address, uint32_t shape_n, uint32_t shape_k) {
-        // Make TMA aligned to 16 bytes
-        constexpr uint32_t kAlignment = 16 / sizeof(T);
-        shape_n = ceil_div(shape_n, kAlignment) * kAlignment;
-
-        return make_2d_tma_desc(global_address, Layout::ColMajor, shape_n, ceil_div(shape_k, BLOCK_K), BLOCK_N, 1, shape_n,
-                                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_desc(
-            T* global_address, Layout layout,
-            uint32_t gmem_rows, uint32_t gmem_cols,
-            uint32_t smem_rows, uint32_t smem_cols,
-            uint32_t gmem_stride,
-            CUtensorMapSwizzle swizzle_type = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B) {
-        if (layout == Layout::RowMajor) {
-            uint64_t gmem_dim[2] = {gmem_cols, gmem_rows};
-            uint32_t smem_dim[2] = {smem_cols, smem_rows};
-            return make_2d_tma_copy_desc(global_address, gmem_dim, gmem_stride * sizeof(T), smem_dim, swizzle_type);
-        } else {
-            uint64_t gmem_dim[2] = {gmem_rows, gmem_cols};
-            uint32_t smem_dim[2] = {smem_rows, smem_cols};
-            return make_2d_tma_copy_desc(global_address, gmem_dim, gmem_stride * sizeof(T), smem_dim, swizzle_type);
-        }
-    }
-};
 
 }; // namespace deep_gemm
 

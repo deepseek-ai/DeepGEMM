@@ -37,7 +37,7 @@ def extract_ffma(sass):
                 collected.append((f'{arch_name}::{func_name}', current))
             current = []
 
-    if os.getenv('DG_PRINT_REG_REUSE', None):
+    if int(os.getenv('DG_JIT_PRINT_REG_REUSE', 0)):
         print(f'Found {len(collected)} FFMA segments')
     return collected
 
@@ -100,7 +100,7 @@ def modify_segment(m, name, ffma_lines):
         dst_reg_set.add(dst_reg)
         new_le_bytes.append(low_hex.to_bytes(8, 'little') + high_hex.to_bytes(8, 'little'))
         last_reused, last_dst_reg = reused, dst_reg
-    if os.getenv('DG_PRINT_REG_REUSE', None):
+    if int(os.getenv('DG_JIT_PRINT_REG_REUSE', 0)):
         print(f' > segment `{name}` new reused list ({num_changed} changed): {reused_list}')
 
     # Find the offset
@@ -118,7 +118,7 @@ def modify_segment(m, name, ffma_lines):
 
 
 def process(path):
-    if os.getenv('DG_PRINT_REG_REUSE', None):
+    if int(os.getenv('DG_JIT_PRINT_REG_REUSE', 0)):
         print(f'Processing {path}')
     output = run_cuobjdump(path)
     segments = extract_ffma(output)

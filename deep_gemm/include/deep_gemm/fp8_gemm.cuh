@@ -69,16 +69,17 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = get_lane_id();
 
-    // Prefetch TMA descriptors at very beginning
+    // Prefetch TMA descriptors at the very beginning
     if (threadIdx.x == kNumMathThreads) {
-        cute::prefetch_tma_descriptor(&tensor_map_a);
-        cute::prefetch_tma_descriptor(&tensor_map_b);
-        cute::prefetch_tma_descriptor(&tensor_map_scales_a);
+        // NOTES: `reinterpret_cast` must be here, or NVRTC will fail
+        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_a));
+        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_b));
+        cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_scales_a));
 
         // `tensor_map_d` is only used in swizzling mode
         // For the `kSwizzleDMode == 0 and BLOCK_N_PADDING == 0` case, it will be treated as padding mode
         if constexpr (kSwizzleDMode > 0)
-            cute::prefetch_tma_descriptor(&tensor_map_d);
+            cute::prefetch_tma_descriptor(reinterpret_cast<const cute::TmaDescriptor*>(&tensor_map_d));
     }
     __syncwarp();
 
@@ -431,119 +432,6 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         DG_DEVICE_ASSERT(false and "This kernel only support sm_90a");
 #endif
 }
-
-template <uint32_t SHAPE_N, uint32_t SHAPE_K,
-          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t BLOCK_N_PADDING,
-          uint32_t kSwizzleDMode,
-          uint32_t kNumGroups, uint32_t kNumStages,
-          uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
-          GemmType kGemmType>
-class Gemm {
-private:
-    using Barrier = cuda::barrier<cuda::thread_scope_block>;
-
-public:
-    Gemm() = default;
-
-    static void run(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
-                    uint32_t shape_m,
-                    const CUtensorMap& tma_a_desc,
-                    const CUtensorMap& tma_b_desc,
-                    const CUtensorMap& tma_scales_a_desc,
-                    const CUtensorMap& tma_d_desc,
-                    cudaStream_t stream,
-                    int num_sms, uint32_t smem_size) {
-        // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
-        constexpr uint32_t kNumTMAThreads = 128;
-        constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        auto kernel = fp8_gemm_kernel<SHAPE_N, SHAPE_K,
-                                      BLOCK_M, BLOCK_N, BLOCK_K,
-                                      BLOCK_N_PADDING,
-                                      kSwizzleDMode,
-                                      kNumGroups, kNumStages,
-                                      kNumTMAThreads, kNumMathThreadsPerGroup,
-                                      kNumTMAMulticast, kIsTMAMulticastOnA, kGemmType>;
-        DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
-
-        // Cluster launch
-        cudaLaunchConfig_t config;
-        config.gridDim = num_sms;
-        config.blockDim = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
-        config.dynamicSmemBytes = smem_size;
-        config.stream = stream;
-
-        // Clusters for TMA multicast
-        // NOTES: `>= 4` cluster size will cause performance degradation
-        cudaLaunchAttribute attr;
-        attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim = {kNumTMAMulticast, 1, 1};
-        config.attrs = &attr;
-        config.numAttrs = 1;
-
-        // Launch
-        auto status = cudaLaunchKernelEx(&config, kernel,
-                                         gmem_d, scales_b, grouped_layout,
-                                         shape_m,
-                                         tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc);
-        DG_HOST_ASSERT(status == cudaSuccess);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_a_desc(T* global_address, uint32_t shape_m) {
-        return make_2d_tma_desc(global_address, Layout::RowMajor,
-                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), SHAPE_K, BLOCK_M, BLOCK_K);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_b_desc(T* global_address) {
-        return make_2d_tma_desc(global_address, Layout::ColMajor,
-                                SHAPE_K, SHAPE_N * (kGemmType != GemmType::Normal ? kNumGroups : 1), BLOCK_K, BLOCK_N);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_d_desc(T* global_address, uint32_t shape_m) {
-        auto swizzle_mode = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE;
-        if constexpr (kSwizzleDMode == 32)  swizzle_mode = CU_TENSOR_MAP_SWIZZLE_32B;
-        if constexpr (kSwizzleDMode == 64)  swizzle_mode = CU_TENSOR_MAP_SWIZZLE_64B;
-        if constexpr (kSwizzleDMode == 128) swizzle_mode = CU_TENSOR_MAP_SWIZZLE_128B;
-
-        // Swizzling requires the inner box dim less or equal than `kSwizzleDMode` bytes
-        // So `BLOCK_N * sizeof(T) / kSwizzleDMode` TMA stores are required
-        return make_2d_tma_desc(global_address, Layout::RowMajor,
-                                shape_m * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), SHAPE_N,
-                                BLOCK_M, kSwizzleDMode == 0 ? BLOCK_N : kSwizzleDMode / sizeof(T),
-                                swizzle_mode);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_scales_a_desc(T* global_address, uint32_t shape_m) {
-        // Make TMA aligned to 16 bytes
-        constexpr uint32_t kAlignment = 16 / sizeof(T);
-        shape_m = ceil_div(shape_m, kAlignment) * kAlignment;
-
-        return make_2d_tma_desc(global_address, Layout::ColMajor,
-                                shape_m, ceil_div(SHAPE_K, BLOCK_K) * (kGemmType == GemmType::GroupedMasked ? kNumGroups : 1), BLOCK_M, 1,
-                                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE);
-    }
-
-    template <typename T>
-    static CUtensorMap make_2d_tma_desc(
-            T* global_address, Layout layout,
-            uint32_t gmem_rows, uint32_t gmem_cols,
-            uint32_t smem_rows, uint32_t smem_cols,
-            CUtensorMapSwizzle swizzle_type = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B) {
-        if (layout == Layout::RowMajor) {
-            uint64_t gmem_dim[2] = {gmem_cols, gmem_rows};
-            uint32_t smem_dim[2] = {smem_cols, smem_rows};
-            return make_2d_tma_copy_desc(global_address, gmem_dim, gmem_cols * sizeof(T), smem_dim, swizzle_type);
-        } else {
-            uint64_t gmem_dim[2] = {gmem_rows, gmem_cols};
-            uint32_t smem_dim[2] = {smem_rows, smem_cols};
-            return make_2d_tma_copy_desc(global_address, gmem_dim, gmem_rows * sizeof(T), smem_dim, swizzle_type);
-        }
-    }
-};
 
 };  // namespace deep_gemm
 

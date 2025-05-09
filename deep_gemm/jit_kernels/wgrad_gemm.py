@@ -2,38 +2,13 @@ import math
 import torch
 from typing import List, Tuple
 
+from .runtime import (
+    FP8WgradGemmRuntime, GemmType,
+    make_2d_tma_a_desc, make_2d_tma_b_desc,
+    make_2d_tma_d_desc, make_2d_tma_scales_a_desc, make_2d_tma_scales_b_desc)
 from .gemm import get_best_configs
 from .tuner import jit_tuner
 from .utils import get_num_sms, get_col_major_tma_aligned_tensor, get_tma_aligned_size
-
-# C++ code templates
-includes = ('"deep_gemm/fp8_wgrad_gemm.cuh"', )
-template = """
-using namespace deep_gemm;
-
-// Templated args from Python JIT call
-constexpr auto M = {M}, N = {N};
-constexpr auto BLOCK_M = {BLOCK_M};
-constexpr auto BLOCK_N = {BLOCK_N};
-constexpr auto BLOCK_K = 128;
-constexpr auto kNumStages = {NUM_STAGES};
-constexpr auto kLastStages = {LAST_STAGES};
-constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
-constexpr auto kIsTMAMulticastOnA = {IS_TMA_MULTICAST_ON_A};
-
-// Make a templated GEMM
-using gemm_t = WgradGemm<M, N, BLOCK_M, BLOCK_N, BLOCK_K, kNumStages, kLastStages, kNumTMAMulticast, kIsTMAMulticastOnA>;
-
-// Launch kernel
-auto tma_a_desc = gemm_t::make_2d_tma_a_desc(lhs, m, k, a_stride);
-auto tma_b_desc = gemm_t::make_2d_tma_b_desc(rhs, n, k, b_stride);
-auto tma_scales_a_desc = gemm_t::make_2d_tma_scales_a_desc(lhs_scales, m, k);
-auto tma_scales_b_desc = gemm_t::make_2d_tma_scales_b_desc(rhs_scales, n, k);
-auto tma_d_desc = gemm_t::make_2d_tma_d_desc(out, m, n, d_stride);
-gemm_t::run(k,
-            tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_scales_b_desc, tma_d_desc,
-            stream, num_sms, smem_size);
-"""
 
 
 def wgrad_gemm_fp8_fp8_fp32_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -49,7 +24,7 @@ def wgrad_gemm_fp8_fp8_fp32_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     Arguments:
         lhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[m, k]`,
              the second element is an FP32 1x128 scaling tensor for LHS of shape `[m, ⌈k / 128⌉]`.
-        rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[n, k]`.
+        rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[n, k]`,
              the second element is an FP32 1x128 scaling tensor for RHS of shape `[n, ⌈k / 128⌉]`.
         out: the FP32 output tensor of shape `[m, n]`, representing the result.
     """
@@ -77,14 +52,14 @@ def wgrad_gemm_fp8_fp8_fp32_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # NOTES: `get_tma_aligned_lhs_scales` may launch a kernel if not processed by previous kernels
     if lhs_scales.shape == ((k + 127) // 128, m):
         lhs_scales = lhs_scales.permute(1, 0)
-        assert get_tma_aligned_size(m, 4) == m
+        assert get_tma_aligned_size(m, 4) == m and lhs_scales.stride(1) == m
     else:
         lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     assert lhs_scales.stride(0) == 1
     
     if rhs_scales.shape == ((k + 127) // 128, n):
         rhs_scales = rhs_scales.permute(1, 0)
-        assert get_tma_aligned_size(n, 4) == n
+        assert get_tma_aligned_size(n, 4) == n and rhs_scales.stride(1) == n
     else:
         rhs_scales = get_col_major_tma_aligned_tensor(rhs_scales)
     assert rhs_scales.stride(0) == 1
@@ -97,34 +72,57 @@ def wgrad_gemm_fp8_fp8_fp32_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     aligned_k = (k + 127) // 128 * 128
 
     # Auto-tuning with compilation
-    global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(m, aligned_n, aligned_k, 1, num_sms, is_fp32_out=True, is_wgrad=True)
+    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(
+        m, aligned_n, aligned_k, 1, num_sms, is_fp32_out=True, is_wgrad=True)
     last_stages = (k + 127) // 128 % num_stages
+    block_k = 128
+    num_tma_threads = 128
+    num_math_threads_per_group = 128
 
-    args = (lhs, lhs_scales, rhs, rhs_scales, out, m, n, k,
-            lhs_stride, rhs_stride, out_stride,
-            torch.cuda.current_stream(), num_sms, smem_config[0])
-    runtime = jit_tuner.compile_and_tune(
-        name='gemm_fp8_fp8_fp32_nt_dptp128c_dyn',
+    tensor_map_a = make_2d_tma_a_desc(
+        GemmType.Normal, lhs, m, k, block_m, block_k, 1, a_stride=lhs_stride)
+    tensor_map_b = make_2d_tma_b_desc(
+        GemmType.Normal, rhs, k, n, block_k, block_n, 1, b_stride=rhs_stride)
+    tensor_map_d = make_2d_tma_d_desc(
+        GemmType.Normal, out, m, n, block_m, block_n, 1, smem_config[1], d_stride=out_stride)
+    tensor_map_scales_a = make_2d_tma_scales_a_desc(
+        GemmType.Normal, lhs_scales, m, k, block_m, block_k)
+    tensor_map_scales_b = make_2d_tma_scales_b_desc(
+        GemmType.Normal, rhs_scales, n, k, block_n, block_k)
+
+    kwargs = {
+        'GEMM_TYPE': GemmType.Normal,
+        'NUM_TMA_THREADS': num_tma_threads,
+        'NUM_MATH_THREADS_PER_GROUP': num_math_threads_per_group,
+        'K': aligned_k,
+        'NUM_GROUPS': 1,
+        'BLOCK_K': block_k,
+        'GMEM_D': out,
+        'NUM_SMS': num_sms,
+        'SMEM_SIZE': smem_config[0],
+        'TENSOR_MAP_A': tensor_map_a,
+        'TENSOR_MAP_B': tensor_map_b,
+        'TENSOR_MAP_SCALES_A': tensor_map_scales_a,
+        'TENSOR_MAP_SCALES_B': tensor_map_scales_b,
+        'TENSOR_MAP_D': tensor_map_d,
+        'STREAM': torch.cuda.current_stream().cuda_stream,
+    }
+
+    runtime, best_keys = jit_tuner.compile_and_tune(
+        name='wgrad_gemm_fp8_fp8_fp32_nt',
         keys={'M': m, 'N': aligned_n, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
               'NUM_STAGES': num_stages,
               'LAST_STAGES': last_stages,
               'NUM_TMA_MULTICAST': tma_multicast_config[0],
               'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1]},
         space=(),
-        includes=includes,
-        arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
-                  ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
-                  ('out', torch.float), ('m', int), ('n', int), ('k', int),
-                  ('a_stride', int), ('b_stride', int), ('d_stride', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template,
-        args=args
+        kwargs=kwargs,
+        runtime_cls=FP8WgradGemmRuntime,
     )
 
     # Run the kernel
-    runtime(*args)
+    runtime(**best_keys, **kwargs)
 
 
 def k_grouped_wgrad_gemm_fp8_fp8_fp32_nt(lhs: Tuple[torch.Tensor, torch.Tensor],

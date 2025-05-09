@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef __CUDACC_RTC__
 #include <cuda.h>
+#endif
 
 #include <cute/arch/mma_sm90_gmma.hpp>
 #include <cute/arch/mma_sm90_gmma_ext.hpp>
@@ -178,6 +180,7 @@ struct FP8MMASelector {
         if constexpr (N == 112) return MMA_64x112x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 120) return MMA_64x120x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 128) return MMA_64x128x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 136) return MMA_64x136x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 144) return MMA_64x144x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 152) return MMA_64x152x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 160) return MMA_64x160x32_F32E4M3E4M3_SS_TN();

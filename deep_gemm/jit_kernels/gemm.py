@@ -3,39 +3,12 @@ import torch
 from functools import lru_cache
 from typing import Tuple
 
+from .runtime import (
+    FP8GemmRuntime, GemmType,
+    make_2d_tma_a_desc, make_2d_tma_b_desc,
+    make_2d_tma_d_desc, make_2d_tma_scales_a_desc)
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
-
-# C++ code templates
-includes = ('"deep_gemm/fp8_gemm.cuh"', )
-template = """
-using namespace deep_gemm;
-
-// Templated args from Python JIT call
-constexpr auto N = {N}, K = {K};
-constexpr auto BLOCK_M = {BLOCK_M};
-constexpr auto BLOCK_N = {BLOCK_N};
-constexpr auto BLOCK_K = 128;
-constexpr auto BLOCK_N_PADDING = {BLOCK_N_PADDING};
-constexpr auto kSwizzleDMode = {SWIZZLE_D_MODE};
-constexpr auto kNumGroups = 1;
-constexpr auto kNumStages = {NUM_STAGES};
-constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
-constexpr auto kIsTMAMulticastOnA = {IS_TMA_MULTICAST_ON_A};
-
-// Make a templated GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_N_PADDING, kSwizzleDMode, kNumGroups, kNumStages, kNumTMAMulticast, kIsTMAMulticastOnA, GemmType::Normal>;
-
-// Launch kernel
-auto tma_a_desc = gemm_t::make_2d_tma_a_desc(lhs, m);
-auto tma_b_desc = gemm_t::make_2d_tma_b_desc(rhs);
-auto tma_scales_a_desc = gemm_t::make_2d_tma_scales_a_desc(lhs_scales, m);
-auto tma_d_desc = gemm_t::make_2d_tma_d_desc(out, m);
-gemm_t::run(out, rhs_scales, nullptr,
-            m,
-            tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
-            stream, num_sms, smem_size);
-"""
 
 
 def is_tma_multicast_legal(shape_dim: int, block_dim: int, num_tma_multicast: int, num_sms: int,
@@ -65,7 +38,8 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
                     is_fp32_out: bool = False, is_wgrad: bool = False) -> Tuple[int, int, int]:
     # Try swizzle first, as it does not waste shared memory
     swizzle_mode = get_swizzle_mode(block_n)
-    block_n_padding = get_block_n_padding_for_smem_d(block_n) if swizzle_mode == 0 else 0
+    block_n_padding = get_block_n_padding_for_smem_d(
+        block_n) if swizzle_mode == 0 else 0
 
     smem_d = block_m * (block_n + block_n_padding) * (4 if is_fp32_out else 2)
     smem_a_per_stage = block_m * block_k
@@ -85,7 +59,8 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     if is_wgrad:
         smem_size += num_stages * smem_scales_b_per_stage
     else:
-        smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
+        smem_size += ceil_div(smem_scales_b * (1 if block_k %
+                              block_n == 0 else 2), 8) * 8
     smem_size += smem_barrier
 
     # Swizzle and padding are not compatible
@@ -116,7 +91,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # Decide block sizes by waves
     best_block_m, best_block_n = None, None
     for block_m in block_ms:
-        # NOTES: the block sizes can not be too large, so at least one dim less than 128
+        # NOTES: the block sizes cannot be too large, so at least one dim less than 128
         for block_n in filter(lambda bn: block_m <= 128 or bn <= 128, block_ns):
             success = False
             num_waves, best_num_waves = get_num_waves(block_m, block_n), get_num_waves(best_block_m, best_block_n)
@@ -142,10 +117,10 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # Always pick the longest one
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_config, sm90_capacity = None, None, 232448
-    stage_candidates = tuple(filter(lambda s: s <= k // 128, (8, 7, 6, 5, 4, 3)))
+    stage_candidates = tuple(filter(lambda s: s <= max(k // 128, 1), (8, 7, 6, 5, 4, 3, 2, 1)))
     if 128 % best_block_n != 0 and 128 // math.gcd(128, best_block_n) <= 4:
         # Unrolling both stages and `num_former_iters` will cause large code size
-        stage_candidates = (4, 3)
+        stage_candidates = tuple(filter(lambda s: s <= max(k // 128, 1), (4, 3, 2, 1)))
     for num_stages in stage_candidates:
         best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, is_fp32_out=is_fp32_out, is_wgrad=is_wgrad)
         if best_smem_config[0] <= sm90_capacity:
@@ -154,7 +129,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     assert best_smem_config is not None
     assert best_num_stages is not None
 
-    # Decide the number of TMA multicast and whether broadcast on A
+    # Decide the number of TMA multicasts and whether broadcast on A
     best_tma_multicast_config = (1, True)
 
     # Try to multicast on the larger block side first
@@ -185,13 +160,13 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
     RHS and RHS scaling factors are required to be transposed.
-    The LHS scaling tensor requires TMA-aligned transposed format, if your input does not match the requirement,
+    The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
         this function will do a transposing with a set of slow PyTorch operations.
 
     Arguments:
         lhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[m, k]`,
              the second element is an FP32 1x128 scaling tensor for LHS of shape `[m, ⌈k / 128⌉]`.
-        rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[n, k]`.
+        rhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[n, k]`,
              the second element is an FP32 128x128 scaling tensor for RHS of shape `[⌈n / 128⌉, ⌈k / 128⌉]`.
         out: the BF16 output tensor of shape `[m, n]`, representing the result.
     """
@@ -213,7 +188,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous() and out.is_contiguous()
 
-    # LHS scales must be transposed for TMA load, but not for RHS scales
+    # LHS scales must be transposed for TMA loads, but not for RHS scales
     # NOTES: `get_tma_aligned_lhs_scales` may launch a kernel if not processed by previous kernels
     lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     assert rhs_scales.is_contiguous()
@@ -223,11 +198,42 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
         return
 
     # Auto-tuning with compilation
-    global includes, template
     num_sms = get_num_sms()
-    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(m, n, k, 1, num_sms)
-    args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
-    runtime = jit_tuner.compile_and_tune(
+    num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(
+        m, n, k, 1, num_sms)
+    block_k = 128
+    num_tma_threads = 128
+    num_math_threads_per_group = 128
+
+    tensor_map_a = make_2d_tma_a_desc(
+        GemmType.Normal, lhs, m, k, block_m, block_k, 1)
+    tensor_map_b = make_2d_tma_b_desc(
+        GemmType.Normal, rhs, k, n, block_k, block_n, 1)
+    tensor_map_d = make_2d_tma_d_desc(
+        GemmType.Normal, out, m, n, block_m, block_n, 1, smem_config[1])
+    tensor_map_scales_a = make_2d_tma_scales_a_desc(
+        GemmType.Normal, lhs_scales, m, k, block_m, block_k)
+
+    kwargs = {
+        'GEMM_TYPE': GemmType.Normal,
+        'NUM_TMA_THREADS': num_tma_threads,
+        'NUM_MATH_THREADS_PER_GROUP': num_math_threads_per_group,
+        'M': m,
+        'NUM_GROUPS': 1,
+        'BLOCK_K': block_k,
+        'GMEM_D': out,
+        'SCALES_B': rhs_scales,
+        'GROUPED_LAYOUT': torch.empty(0, dtype=torch.int32, device=out.device),
+        'NUM_SMS': num_sms,
+        'SMEM_SIZE': smem_config[0],
+        'TENSOR_MAP_A': tensor_map_a,
+        'TENSOR_MAP_B': tensor_map_b,
+        'TENSOR_MAP_SCALES_A': tensor_map_scales_a,
+        'TENSOR_MAP_D': tensor_map_d,
+        'STREAM': torch.cuda.current_stream().cuda_stream,
+    }
+    
+    runtime, best_keys = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
               'SWIZZLE_D_MODE': smem_config[1],
@@ -236,14 +242,9 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
               'NUM_TMA_MULTICAST': tma_multicast_config[0],
               'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1]},
         space=(),
-        includes=includes,
-        arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
-                  ('rhs', torch.float8_e4m3fn), ('rhs_scales', torch.float),
-                  ('out', torch.bfloat16), ('m', int),
-                  ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template,
-        args=args
+        kwargs=kwargs,
+        runtime_cls=FP8GemmRuntime,
     )
 
     # Run the kernel
-    runtime(*args)
+    runtime(**best_keys, **kwargs)
