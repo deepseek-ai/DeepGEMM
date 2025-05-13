@@ -14,13 +14,15 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
                                               rhs: Tuple[torch.Tensor, torch.Tensor],
                                               out: torch.Tensor, m_indices: torch.Tensor) -> None:
     """
-    Do a grouped GEMM (contiguous format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
-    LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
-    RHS and RHS scaling factors are required to be transposed.
-    The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
-        this function will do a transposing with a set of slow PyTorch operations.
-    On the M axis, inputs are grouped into several batches, of which batch sizes aligned to
-        `get_m_alignment_for_contiguous_layout()` (128).
+    Perform a grouped GEMM (contiguous format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
+
+    Requirements:
+        LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
+        RHS and RHS scaling factors are required to be transposed.
+        The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
+            this function will do a transposing with a set of slow PyTorch operations.
+        On the M axis, inputs are grouped into several batches, of which batch sizes aligned to
+            `get_m_alignment_for_contiguous_layout()` (128).
 
     Arguments:
         lhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[m_sum, k]`,
@@ -116,13 +118,15 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
                                           rhs: Tuple[torch.Tensor, torch.Tensor],
                                           out: torch.Tensor, masked_m: torch.Tensor, expected_m: int) -> None:
     """
-    Do a grouped GEMM (masked format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
-    LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
-    RHS and RHS scaling factors are required to be transposed.
-    The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
-        this function will do a transposing with a set of slow PyTorch operations.
-    Moreover, this alignment requirement is different with the contiguous-format kernel, as we require that each batch
-        should be separately transposed.
+    Perform a grouped GEMM (masked format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
+
+    Requirements:
+        LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
+        RHS and RHS scaling factors are required to be transposed.
+        The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
+            this function will do a transposing with a set of slow PyTorch operations.
+        Moreover, this alignment requirement is different with the contiguous-format kernel, as we require that each batch
+            should be separately transposed.
 
     Arguments:
         lhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[num_groups, m_max, k]`,

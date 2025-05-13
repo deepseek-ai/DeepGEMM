@@ -157,11 +157,14 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                          rhs: Tuple[torch.Tensor, torch.Tensor],
                          out: torch.Tensor) -> None:
     """
-    Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
-    LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
-    RHS and RHS scaling factors are required to be transposed.
-    The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
-        this function will do a transposing with a set of slow PyTorch operations.
+    Perform a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
+
+    Requirements:
+        LHS, RHS, and output tensors must be contiguous in dimension 1, i.e., stride(1) = 1.
+        The stride(0) of LHS and RHS must be a multiple of 16, and the stride(0) of output must be a multiple of 8.
+        RHS and RHS scaling factors are required to be transposed.
+        The LHS scaling tensor requires a TMA-aligned transposed format, if your input does not match the requirement,
+            this function will do a transposing with a set of slow PyTorch operations.
 
     Arguments:
         lhs: the first element is an FP8 tensor (typed `torch.float8_e4m3fn`) of shape `[m, k]`,
