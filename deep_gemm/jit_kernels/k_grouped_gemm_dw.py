@@ -170,7 +170,6 @@ def k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
 
     # Auto-tuning with compilation
     global includes, template
-    # num_sms = get_num_sms()
     num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 24
     block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, num_groups, num_sms,
                                                                                   is_grouped_contiguous=True)

@@ -26,11 +26,27 @@ def repeat_interleave_kernel(
         tl.store(output_ptr + start + r, group)
 
 
-# @triton_op('myfp8::repeat_interleave', mutates_args=('output', ))
-# def repeat_interleave(group: Tensor, repeats: Tensor, repeat_cum: Tensor, output: Tensor) -> None:
-#     grid = lambda args: (len(repeats), )
-#     wrap_triton(repeat_interleave_kernel)[grid](group, repeats, repeat_cum, output)
-#     return
+@torch.library.custom_op("moe::repeat_interleave", mutates_args=('m_indices_pad', ))
+def repeat_interleave(
+    group_indices: Tensor, 
+    repeats: Tensor, 
+    repeat_cum: Tensor, 
+    m_indices_pad: Tensor, 
+) -> None:
+    grid = lambda args: (len(repeats), )
+    repeat_interleave_kernel[grid](group_indices, repeats, repeat_cum, m_indices_pad)
+    return
+
+
+@repeat_interleave.register_fake
+def _(
+    group_indices: Tensor, 
+    repeats: Tensor, 
+    repeat_cum: Tensor, 
+    m_indices_pad: Tensor, 
+) -> None:
+    return
+
 
 # C++ code templates
 includes = ('"deep_gemm/fp8_gemm_varlen_groupM.cuh"', )
@@ -214,28 +230,6 @@ def _(
         M_pad: Tensor, 
         num_groups: int,
         num_sms: int) -> None:
-    return
-
-
-@torch.library.custom_op("moe::repeat_interleave", mutates_args=('m_indices_pad', ))
-def repeat_interleave(
-    group_indices: Tensor, 
-    repeats: Tensor, 
-    repeat_cum: Tensor, 
-    m_indices_pad: Tensor, 
-) -> None:
-    grid = lambda args: (len(repeats), )
-    wrap_triton(repeat_interleave_kernel)[grid](group_indices, repeats, repeat_cum, m_indices_pad)
-    return
-
-
-@repeat_interleave.register_fake
-def _(
-    group_indices: Tensor, 
-    repeats: Tensor, 
-    repeat_cum: Tensor, 
-    m_indices_pad: Tensor, 
-) -> None:
     return
 
 
