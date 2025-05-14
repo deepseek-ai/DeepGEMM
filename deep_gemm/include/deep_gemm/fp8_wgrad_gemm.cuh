@@ -23,11 +23,11 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
 fp8_wgrad_gemm_kernel(uint32_t shape_k, 
-                const __grid_constant__ CUtensorMap tensor_map_a,
-                const __grid_constant__ CUtensorMap tensor_map_b,
-                const __grid_constant__ CUtensorMap tensor_map_scales_a,
-                const __grid_constant__ CUtensorMap tensor_map_scales_b,
-                const __grid_constant__ CUtensorMap tensor_map_d) {
+                      const __grid_constant__ CUtensorMap tensor_map_a,
+                      const __grid_constant__ CUtensorMap tensor_map_b,
+                      const __grid_constant__ CUtensorMap tensor_map_scales_a,
+                      const __grid_constant__ CUtensorMap tensor_map_scales_b,
+                      const __grid_constant__ CUtensorMap tensor_map_d) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)) || defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
@@ -352,7 +352,7 @@ fp8_wgrad_gemm_kernel(uint32_t shape_k,
         }
     }
 #else
-    if (blockIdx.x == 0 && threadIdx.x == 0)
+    if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false && "This kernel only support sm_90a");
 #endif
 }

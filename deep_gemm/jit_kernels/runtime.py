@@ -269,7 +269,7 @@ static void __instantiate_kernel() {{
         return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
-class FP8WgradGemmRuntime(Runtime):
+class FP8WGradGemmRuntime(Runtime):
     def __init__(self, path: str) -> None:
         super().__init__(path, [
             'NUM_TMA_MULTICAST',
@@ -320,7 +320,7 @@ static void __instantiate_kernel() {{
 }};
 '''
         if int(os.getenv('DG_JIT_DEBUG', 0)):
-            print(f'Generated FP8 Wgrad GEMM code:\n{code}')
+            print(f'Generated FP8 WGrad GEMM code:\n{code}')
         return code
 
     # noinspection PyMethodOverriding

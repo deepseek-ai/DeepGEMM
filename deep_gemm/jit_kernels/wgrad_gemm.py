@@ -1,9 +1,8 @@
-import math
 import torch
 from typing import List, Tuple
 
 from .runtime import (
-    FP8WgradGemmRuntime, GemmType,
+    FP8WGradGemmRuntime, GemmType,
     make_2d_tma_a_desc, make_2d_tma_b_desc,
     make_2d_tma_d_desc, make_2d_tma_scales_a_desc, make_2d_tma_scales_b_desc)
 from .gemm import get_best_configs
@@ -122,7 +121,7 @@ def wgrad_gemm_fp8_fp8_fp32_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
               'IS_TMA_MULTICAST_ON_A': tma_multicast_config[1]},
         space=(),
         kwargs=kwargs,
-        runtime_cls=FP8WgradGemmRuntime,
+        runtime_cls=FP8WGradGemmRuntime,
     )
 
     # Run the kernel
