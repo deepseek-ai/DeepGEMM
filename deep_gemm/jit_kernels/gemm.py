@@ -200,7 +200,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     if m == 0:
         return
 
-    aligned_n = (n + 63) // 64 * 64
+    # K must be aligned to 128
     aligned_k = (k + 127) // 128 * 128
 
     # Auto-tuning with compilation
@@ -241,7 +241,8 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     
     runtime, best_keys = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
-        keys={'N': aligned_n, 'K': aligned_k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
+        keys={'N': n, 'K': aligned_k,
+              'BLOCK_M': block_m, 'BLOCK_N': block_n,
               'SWIZZLE_D_MODE': smem_config[1],
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_STAGES': num_stages,
