@@ -49,7 +49,7 @@ class Runtime:
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             assert result.returncode == 0
             kernel_names = [line.split()[-1] for line in result.stdout.splitlines()
-                            if line.startswith('STT_FUNC') and '__instantiate_kernel' not in line]
+                            if line.startswith('STT_FUNC') and '__instantiate_kernel' not in line and '__assertfail' not in line]
             assert len(kernel_names) == 1, f'Too many kernels in the library: {kernel_names}'
 
             # Load kernel from the library
