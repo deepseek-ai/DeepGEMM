@@ -207,7 +207,7 @@ def test_m_grouped_gemm_contiguous() -> None:
 
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
         sum_m = (m_indices != -1).sum().item()
-        print(f' > Performance ({num_groups=}, m={m:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+        print(f' > Performance ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
               f'throughput: {2 * sum_m * n * k / t / 1e12:4.0f} TFLOPS, '
               f'{(sum_m * k + num_groups * k * n + sum_m * n * 2) / 1e9 / t:4.0f} GB/s')
     print()
@@ -217,14 +217,14 @@ def test_m_grouped_gemm_masked() -> None:
     print('Testing grouped masked GEMM:')
 
     m = 4096
-    for num_groups, excepted_m in ((1, 1024), (2, 512), (4, 256)):
+    for num_groups, expected_m_per_group in ((1, 1024), (2, 512), (4, 256)):
         for k, n in ((7168, 4096), (2048, 7168), ):
             # Test correctness
             for i in range(10):
                 x_fp8, y_fp8, out, ref_out = construct_masked_grouped(num_groups, m, k, n)
                 masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
                 for j in range(num_groups):
-                    masked_m[j] = random.randint(int(excepted_m * 0.7), int(excepted_m * 1.3))
+                    masked_m[j] = random.randint(int(expected_m_per_group * 0.7), int(expected_m_per_group * 1.3))
                 expected_m = min(int(masked_m.float().mean()) + 1, m)
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m)
                 for j in range(num_groups):
@@ -234,7 +234,7 @@ def test_m_grouped_gemm_masked() -> None:
             # Construct new tensors only once to avoid L2 cache acceleration (creating them puts them in L2)
             x_fp8, y_fp8, out, ref_out = construct_masked_grouped(num_groups, m, k, n)
             for j in range(num_groups):
-                masked_m[j] = random.randint(int(excepted_m * 0.7), int(excepted_m * 1.3))
+                masked_m[j] = random.randint(int(expected_m_per_group * 0.7), int(expected_m_per_group * 1.3))
             expected_m = min(int(masked_m.float().mean()) + 1, m)
             sum_m = masked_m.sum().item()
 
@@ -244,7 +244,7 @@ def test_m_grouped_gemm_masked() -> None:
 
             # Test performance with fixed shapes
             t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-            print(f' > Performance ({num_groups=}, m_per_group={m:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+            print(f' > Performance ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
                   f'throughput: {2 * sum_m * n * k / t / 1e12:4.0f} TFLOPS, '
                   f'{(sum_m * k + num_groups * k * n + sum_m * n * 2) / 1e9 / t:4.0f} GB/s')
     print()
