@@ -271,7 +271,7 @@ fp8_gemm_kernel(float* scales_b, int* grouped_layout,
                 }
             };
 
-            if (!scheduler.is_valid_m(math_wg_idx * WGMMA::M, m_block_idx)) {
+            if (!scheduler.is_m_valid(math_wg_idx * WGMMA::M, m_block_idx)) {
                 // Skip useless computation for unaligned Ms
                 launch_k_iterations([&](int k_iter, auto type, auto _) {
                     #pragma unroll
