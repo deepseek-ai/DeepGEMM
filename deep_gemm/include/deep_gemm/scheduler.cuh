@@ -48,6 +48,16 @@ struct Scheduler {
         }
     }
 
+    __device__ __forceinline__ bool is_valid_m(const uint32_t m_offset, const uint32_t& m_block_idx) const {
+        if constexpr (kGemmType == GemmType::Normal) {
+            return true;
+        } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
+            return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) != -1;
+        } else if constexpr (kGemmType == GemmType::GroupedMasked) {
+            return m_offset + m_block_idx * BLOCK_M < __ldg(grouped_layout + curr_group_idx);
+        }
+    }
+
     __device__ __forceinline__ bool is_tma_multicast_valid(const uint32_t& m_block_idx) const {
         if (num_blocks_in_group == 1)
             return false;
