@@ -121,7 +121,7 @@ class Compiler:
                 '--ptxas-options=--register-usage-level=10' +
                 (',--verbose' if 'DG_JIT_PTXAS_VERBOSE' in os.environ else ''),
                 # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
-                '--diag-suppress=39,161,174,177,940']
+                '--diag-suppress=39,161,174,177,186,940']
 
     @staticmethod
     def include_dirs() -> List[str]:

@@ -49,11 +49,11 @@ struct Scheduler {
     }
 
     // ReSharper disable once CppNotAllPathsReturnValue
-    __device__ __forceinline__ bool is_m_valid(const uint32_t& m_offset, const uint32_t& m_block_idx) const {
+    __device__ __forceinline__ bool is_computation_valid(const uint32_t& m_block_idx, const uint32_t& m_offset) const {
         if constexpr (kGemmType == GemmType::Normal) {
             return true;
         } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
-            return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) != -1;
+            return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) > 0;
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
             return m_offset + m_block_idx * BLOCK_M < __ldg(grouped_layout + curr_group_idx);
         }
@@ -76,7 +76,7 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx,
+    __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, uint32_t block_idx,
                                                            uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNum1DBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
