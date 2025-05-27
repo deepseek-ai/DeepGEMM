@@ -215,16 +215,15 @@ def test_m_grouped_gemm_contiguous() -> None:
 def test_m_grouped_gemm_masked() -> None:
     print('Testing grouped masked GEMM:')
 
-    max_m = 4096
     for num_groups, expected_m_per_group in ((1, 1024), (2, 512), (4, 256)):
         for k, n in ((7168, 4096), (2048, 7168), ):
             # Test correctness
             for i in range(10):
-                x_fp8, y_fp8, masked_m, out, ref_out = construct_masked_grouped(num_groups, max_m, expected_m_per_group, k, n)
+                x_fp8, y_fp8, masked_m, out, ref_out = construct_masked_grouped(num_groups, 4096, expected_m_per_group, k, n)
                 deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m_per_group)
                 for j in range(num_groups):
                     diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
-                    assert diff < 0.001, f'{max_m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                    assert diff < 0.001, f'{expected_m_per_group=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
             # noinspection PyShadowingNames
             def test_func():
