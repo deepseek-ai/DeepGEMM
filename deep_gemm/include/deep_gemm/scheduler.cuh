@@ -48,7 +48,8 @@ struct Scheduler {
         }
     }
 
-    __device__ __forceinline__ bool is_m_valid(const uint32_t m_offset, const uint32_t& m_block_idx) const {
+    // ReSharper disable once CppNotAllPathsReturnValue
+    __device__ __forceinline__ bool is_m_valid(const uint32_t& m_offset, const uint32_t& m_block_idx) const {
         if constexpr (kGemmType == GemmType::Normal) {
             return true;
         } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
