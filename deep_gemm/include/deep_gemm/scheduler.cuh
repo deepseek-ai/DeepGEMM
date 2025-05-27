@@ -53,7 +53,7 @@ struct Scheduler {
         if constexpr (kGemmType == GemmType::Normal) {
             return true;
         } else if constexpr (kGemmType == GemmType::GroupedContiguous) {
-            return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) > 0;
+            return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) >= 0;
         } else if constexpr (kGemmType == GemmType::GroupedMasked) {
             return m_offset + m_block_idx * BLOCK_M < __ldg(grouped_layout + curr_group_idx);
         }
