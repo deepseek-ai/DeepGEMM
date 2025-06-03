@@ -1,5 +1,5 @@
 import torch
-from typing import Tuple
+from typing import Tuple, List
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
@@ -112,12 +112,9 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
 
 @torch.library.custom_op("moe::gemm_fp8_fp8_bf16_nt", mutates_args=('out', ))
-def gemm_fp8_fp8_bf16_nt(
-        lhs: torch.Tensor,
-        lhs_scales: torch.Tensor,
-        rhs: torch.Tensor,
-        rhs_scales: torch.Tensor,
-        out: torch.Tensor) -> None:
+def gemm_fp8_fp8_bf16_nt(lhs: List[torch.Tensor],
+                         rhs: List[torch.Tensor],
+                         out: torch.Tensor) -> None:
     """
     Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -132,6 +129,8 @@ def gemm_fp8_fp8_bf16_nt(
              the second element is an FP32 128x128 scaling tensor for RHS of shape `[⌈n / 128⌉, ⌈k / 128⌉]`.
         out: the BF16 output tensor of shape `[m, n]`, representing the result.
     """
+    lhs, lhs_scales = lhs
+    rhs, rhs_scales = rhs
     m, k = lhs.shape
     n, k_ = rhs.shape
     m_, n_ = out.shape
@@ -181,10 +180,7 @@ def gemm_fp8_fp8_bf16_nt(
 
 
 @gemm_fp8_fp8_bf16_nt.register_fake
-def _(
-    lhs: torch.Tensor,
-    lhs_scales: torch.Tensor,
-    rhs: torch.Tensor,
-    rhs_scales: torch.Tensor,
-    out: torch.Tensor) -> None:
+def _(lhs: List[torch.Tensor],
+      rhs: List[torch.Tensor],
+      out: torch.Tensor) -> None:
     return
