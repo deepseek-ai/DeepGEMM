@@ -103,3 +103,12 @@ class RuntimeCache:
             self.cache[path] = runtime
             return runtime
         return None
+
+
+# Map some common Python types into C types
+pytypes_to_ctypes = {
+    True: 'true',
+    False: 'false',
+    torch.bfloat16: 'cutlass::bfloat16_t',
+    torch.float: 'float'
+}

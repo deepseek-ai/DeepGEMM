@@ -2,6 +2,7 @@ import os
 import setuptools
 import shutil
 import subprocess
+from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 
@@ -15,7 +16,6 @@ third_party_include_dirs = (
 
 class PostDevelopCommand(develop):
     def run(self):
-        develop.run(self)
         self.make_jit_include_symlinks()
 
     @staticmethod
@@ -37,8 +37,20 @@ class CustomBuildPy(build_py):
         # First, prepare the include directories
         self.prepare_includes()
 
-        # Then run the regular build
+        # Second, make clusters' cache setting default into `envs.py`
+        self.generate_default_envs()
+
+        # Finally, run the regular build
         build_py.run(self)
+
+    def generate_default_envs(self):
+        code = '# Pre-installed environment variables\n'
+        code += 'persistent_envs = dict()\n'
+        for name in ('DG_JIT_CACHE_HOME_DIR', 'DG_JIT_CACHE_SHARED_USERS'):
+            code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
+
+        with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
+            f.write(code)
 
     def prepare_includes(self):
         # Create temporary build directory instead of modifying package directory
@@ -69,15 +81,16 @@ if __name__ == '__main__':
 
     setuptools.setup(
         name='deep_gemm',
-        version='1.0.0' + revision,
-        packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels'],
+        version='1.1.0' + revision,
+        packages=find_packages('.'),
         package_data={
             'deep_gemm': [
-                'include/deep_gemm/*',
+                'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',
             ]
         },
+        zip_safe=False,
         cmdclass={
             'develop': PostDevelopCommand,
             'build_py': CustomBuildPy,

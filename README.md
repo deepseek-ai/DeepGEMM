@@ -2,7 +2,7 @@
 
 DeepGEMM is a library designed for clean and efficient FP8 General Matrix Multiplications (GEMMs) with fine-grained scaling, as proposed in [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3). It supports both normal and Mix-of-Experts (MoE) grouped GEMMs. Written in CUDA, the library has no compilation need during installation, by compiling all kernels at runtime using a lightweight Just-In-Time (JIT) module.
 
-Currently, DeepGEMM exclusively supports NVIDIA Hopper tensor cores. To address the imprecise FP8 tensor core accumulation, it employs CUDA-core two-level accumulation (promotion). While it leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), it avoids heavy reliance on their templates or algebras. Instead, the library is designed for simplicity, with only one core kernel function. This makes it a clean and accessible resource for learning Hopper FP8 matrix multiplication and optimization techniques.
+DeepGEMM leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), it avoids heavy reliance on their templates or algebras. Instead, the library is designed for simplicity, with only one core kernel function. This makes it a clean and accessible resource for learning SM90 and SM100 FP8 matrix multiplication and optimization techniques.
 
 Despite its lightweight design, DeepGEMM's performance matches or exceeds expert-tuned libraries across various matrix shapes.
 
@@ -40,12 +40,14 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ### Requirements
 
-- Hopper architecture GPUs, `sm_90a` must be supported
-- Python 3.8 or above
-- CUDA 12.3 or above
-  - **But we highly recommend 12.8 or above for the best performance**
-- PyTorch 2.1 or above
-- CUTLASS 3.6 or above (could be cloned by Git submodule)
+- NVIDIA SM90 or SM100 architecture GPU
+- Python 3.8 or higher
+- CUDA Toolkit:
+  - CUDA 12.3 or higher for SM90
+    - **We highly recommend 12.8 or higher for the best performance**
+  - CUDA 12.8 or higher for SM100
+- PyTorch 2.1 or higher
+- CUTLASS 3.6 or higher (could be cloned by Git submodule)
 
 ### Development
 
@@ -53,8 +55,8 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 # Submodule must be cloned
 git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
 
-# Make symbolic links for third-party (CUTLASS and CuTe) include directories
-python setup.py develop
+# Install DeepGEMM
+python setup.py install
 
 # Test JIT compilation
 python tests/test_jit.py
@@ -75,11 +77,19 @@ Then, import `deep_gemm` in your Python project, and enjoy!
 
 #### Notices
 
-This library exclusively contains GEMM kernels. It requires the LHS scaling factor to be TMA-aligned and transposed, and it only supports the NT format (non-transposed LHS and transposed RHS). For transposition or other FP8 casting operations, please implement or fuse them into prior kernels independently. While the library provides some simple PyTorch utility functions, these may result in slower performance, but our primary focus is on optimizing the GEMM kernels themselves.
+This library provides optimized GEMM kernels for NVIDIA GPUs. The input shape layout is NT (non-transposed LHS, transposed RHS). While the SM90 implementation supports only the NT memory layout (row-major, col-major), the SM100 implementation supports all memory layouts (NT, TN, NN, TT).
+
+For both architectures, the LHS scaling factor is required to have a TMA-aligned and transposed layout. And the data format for the scaling factor of SM90 and SM100 is different:
+
+- SM90 requires scaling factors in FP32 format.
+
+- SM100 requires scaling factors in [UE8M0](https://docs.nvidia.com/cuda/parallel-thread-execution/#alternate-floating-point-data-formats) format.
+
+Please note that operations like input transposition or FP8 casting must be handled separately by the user, please implement or fuse them into prior kernels independently. While the library provides some simple PyTorch utility functions, these may result in slower performance, but our primary focus is on optimizing the GEMM kernels themselves.
 
 #### Normal dense GEMMs (non-grouped)
 
-To perform a basic non-grouped FP8 GEMM, call the `deep_gemm.gemm_fp8_fp8_bf16_nt` function. For more details, please refer to the function documentation.
+To perform a basic non-grouped FP8 GEMM, call the `fp8_gemm_nt` function. For more details, please refer to the function documentation.
 
 #### Grouped GEMMs (contiguous layout)
 
@@ -87,13 +97,13 @@ Unlike traditional grouped GEMMs in CUTLASS, DeepGEMM groups only the M-axis, wh
 
 For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_m_alignment_for_contiguous_layout()`).
 
-For more information, please refer to the `m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` function documentation.
+For more information, please refer to the `m_grouped_fp8_gemm_nt_contiguous` function documentation.
 
 #### Grouped GEMMs (masked layout)
 
 During the inference decoding phase, when CUDA graph is enabled and the CPU is unaware of the number of tokens each expert receives, we support masked grouped GEMMs. By providing a mask tensor, the kernel computes only the valid portions.
 
-Use `m_grouped_gemm_fp8_fp8_bf16_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
+Use `fp8_m_grouped_gemm_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
 
 #### Utilities
 
@@ -121,7 +131,7 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_PRINT_REG_REUSE`: `0` or `1`, print FFMA-interleaving details, `0` by default
   - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print NVCC compilation command, `0` by default
 - Post optimization
-  - `DG_JIT_DISABLE_FFMA_INTERLEAVE`: `0` or `1`, disable FFMA-interleaving optimization, `0` by default
+  - `DG_JIT_DISABLE_FFMA_INTERLEAVE`: `0` or `1`, disable FFMA-interleaving optimization, `0` by default (only valid for SM90)
 - Heuristic selection
   - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
 - Testing
@@ -139,7 +149,7 @@ Following the CUTLASS design, the kernels in DeepGEMM are warp-specialized, enab
 
 ![design](figures/design.png)
 
-#### Hopper TMA features
+#### TMA features
 
 The [Tensor Memory Accelerator](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#tensor-memory-accelerator) (TMA) is a new hardware feature introduced by the Hopper architecture, designed for faster and asynchronous data movement. Specifically, we utilize TMA for:
 

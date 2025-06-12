@@ -1,15 +1,29 @@
-import torch
+import os
 
-from . import jit
-from .jit_kernels import (
-    gemm_fp8_fp8_bf16_nt,
-    m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-    wgrad_gemm_fp8_fp8_fp32_nt,
-    k_grouped_wgrad_gemm_fp8_fp8_fp32_nt,
-    ceil_div,
-    set_num_sms, get_num_sms,
-    get_col_major_tma_aligned_tensor,
-    get_m_alignment_for_contiguous_layout
+# Set some default environment provided at setup
+try:
+    # noinspection PyUnresolvedReferences
+    from .envs import persistent_envs
+    for key, value in persistent_envs.items():
+        if key not in os.environ:
+            os.environ[key] = value
+except ImportError:
+    pass
+
+# All modules
+from . import (
+    dispatch,
+    jit,
+    jit_kernels,
+    testing,
+    utils
 )
-from .utils import bench, bench_kineto, calc_diff
+
+# All kernels
+from .dispatch import *
+
+# Some useful utils
+from .utils.layout import (
+    get_device_arch,
+    get_m_alignment_for_contiguous_layout,
+)

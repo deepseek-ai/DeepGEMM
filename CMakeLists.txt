@@ -3,8 +3,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(deep_gemm LANGUAGES CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
 find_package(CUDAToolkit REQUIRED)

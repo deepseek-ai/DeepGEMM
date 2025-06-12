@@ -1,0 +1,109 @@
+#pragma once
+
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+#ifdef __CLION_IDE__
+
+__host__ __device__ __forceinline__ void host_device_printf(const char* format, ...) {
+    asm volatile("trap;");
+}
+
+#define printf host_device_printf
+#endif
+
+#ifndef DG_DEVICE_ASSERT
+#define DG_DEVICE_ASSERT(cond) \
+do { \
+    if (not (cond)) { \
+        printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
+        asm("trap;"); \
+    } \
+} while (0)
+#endif
+
+#ifndef DG_TRAP_ONLY_DEVICE_ASSERT
+#define DG_TRAP_ONLY_DEVICE_ASSERT(cond) \
+do { \
+    if (not (cond)) \
+        asm("trap;"); \
+} while (0)
+#endif
+
+#ifndef DG_STATIC_ASSERT
+#define DG_STATIC_ASSERT(cond, ...) static_assert(cond, __VA_ARGS__)
+#endif
+
+namespace deep_gemm {
+
+template <typename T>
+__device__ __host__ constexpr T ceil_div(T a, T b) {
+    return (a + b - 1) / b;
+}
+
+template <typename T>
+__device__ __host__ constexpr T align(T a, T b) {
+    return ceil_div(a, b) * b;
+}
+
+template <typename T>
+__device__ __host__ constexpr T constexpr_gcd(T a, T b) {
+    return b == 0 ? a : constexpr_gcd(b, a % b);
+}
+
+template<typename T>
+__forceinline__ __device__ void swap(T& a, T& b) {
+    T temp = a;
+    a = b;
+    b = temp;
+}
+
+__forceinline__ __device__ uint32_t get_sm_idx() {
+    uint32_t sm_idx;
+    asm ("mov.u32 %0, %%smid;" : "=r"(sm_idx));
+    return sm_idx;
+}
+
+__forceinline__ __device__ uint32_t get_lane_idx() {
+    uint32_t lane_id;
+    asm ("mov.u32 %0, %laneid;" : "=r"(lane_id));
+    return lane_id;
+}
+
+__device__  __forceinline__ uint32_t ld_shared(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__  __forceinline__ float4 ld_shared(const float4* ptr) {
+    float4 ret;
+    asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w) : "l"(ptr));
+    return ret;
+}
+
+__device__  __forceinline__ float ld_shared(const float* ptr) {
+    float ret;
+    asm volatile("ld.shared.f32 %0, [%1];" : "=f"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ void st_shared(const float* ptr, float val) {
+    asm volatile("st.shared.f32 [%0], %1;" :: "l"(ptr), "f"(val));
+}
+
+__device__ __forceinline__ void st_shared(const uint32_t* ptr, uint32_t val) {
+    asm volatile("st.shared.u32 [%0], %1;" :: "l"(ptr), "r"(val));
+}
+
+__device__  __forceinline__ void st_shared(const void* ptr, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+    asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(ptr), "r"(x), "r"(y), "r"(z), "r"(w));
+}
+
+template <typename old_t>
+__device__ __forceinline__ int cast_into_bf16_and_pack(old_t& x, old_t& y) {
+    auto bf16x2 = __float22bfloat162_rn({*reinterpret_cast<float*>(&x), *reinterpret_cast<float*>(&y)});
+    return *reinterpret_cast<int*>(&bf16x2);
+}
+
+} // namespace `deep_gemm`

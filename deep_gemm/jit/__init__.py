@@ -1,2 +1,2 @@
 from .compiler import get_nvcc_compiler, build, NVCCCompiler, NVRTCCompiler
-from .runtime import Runtime
+from .runtime import Runtime, pytypes_to_ctypes

@@ -1,9 +1,11 @@
 import functools
+import getpass
 import hashlib
 import os
 import re
 import subprocess
 import time
+import torch
 import uuid
 from typing import Any, Dict, List, Tuple, Type
 
@@ -11,10 +13,17 @@ import cuda.bindings
 import cuda.bindings.nvrtc as nvrtc
 from torch.utils.cpp_extension import CUDA_HOME
 
-from . import interleave_ffma
+from .scripts import sm90_interleave_ffma
 from .runtime import Runtime, RuntimeCache
 
 runtime_cache = RuntimeCache()
+
+
+@functools.lru_cache(maxsize=None)
+def get_device_arch():
+    major, minor = torch.cuda.get_device_capability()
+    suffix = 'a' if major >= 9 else ''
+    return f'{major * 10 + minor}{suffix}'
 
 
 def hash_to_hex(s: str) -> str:
@@ -35,13 +44,18 @@ def get_deep_gemm_version() -> str:
     # Update include directories
     include_dir = os.path.join(get_jit_include_dir(), 'deep_gemm')
     assert os.path.exists(include_dir), f'Cannot find GEMM include directory {include_dir}'
-    for filename in filter(lambda x: x.endswith('.cuh'), sorted(os.listdir(include_dir))):
-        with open(os.path.join(include_dir, filename), 'rb') as f:
-            md5.update(f.read())
+    # Recursively walk through all subdirectories
+    for root, dirs, files in os.walk(include_dir):
+        for filename in filter(lambda x: x.endswith('.cuh'), sorted(files)):
+            filepath = os.path.join(root, filename)
+            with open(filepath, 'rb') as f:
+                md5.update(f.read())
 
-    # Update `interleave_ffma.py`
-    with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'interleave_ffma.py'), 'rb') as f:
-        md5.update(f.read())
+    # Update post-compilation scripts
+    script_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'scripts')
+    for filename in filter(lambda x: x.endswith('.py'), sorted(os.listdir(script_dir))):
+        with open(os.path.join(script_dir, filename), 'rb') as f:
+            md5.update(f.read())
     return md5.hexdigest()[0:12]
 
 
@@ -74,28 +88,38 @@ def get_default_user_dir():
         path = os.getenv('DG_JIT_CACHE_DIR')
         os.makedirs(path, exist_ok=True)
         return path
-    return os.path.join(os.path.expanduser('~'), '.deep_gemm')
+
+    # By default, the user home directory is `~`
+    path = os.path.expanduser('~')
+
+    # For a cluster environment, we may use a shared directory
+    # e.g., `/cluster/shared/user_0`, `/cluster/shared/user_1`
+    if 'DG_JIT_CACHE_HOME_DIR' in os.environ:
+        path = os.path.join(os.environ['DG_JIT_CACHE_HOME_DIR'], getpass.getuser())
+    return os.path.join(path, '.deep_gemm')
 
 
 @functools.lru_cache(maxsize=None)
-def get_tmp_dir():
-    return os.path.join(get_default_user_dir(), 'tmp')
-
-
-@functools.lru_cache(maxsize=None)
-def get_cache_dir():
+def get_default_cache_dir():
     return os.path.join(get_default_user_dir(), 'cache')
 
 
-def make_tmp_dir():
-    tmp_dir = get_tmp_dir()
+def make_default_tmp_dir():
+    tmp_dir = os.path.join(get_default_user_dir(), 'tmp')
     os.makedirs(tmp_dir, exist_ok=True)
     return tmp_dir
 
 
+def get_shared_cache_dirs(name: str):
+    if 'DG_JIT_CACHE_HOME_DIR' in os.environ and 'DG_JIT_CACHE_SHARED_USERS' in os.environ:
+        return [os.path.join(os.environ['DG_JIT_CACHE_HOME_DIR'], user, 'cache', name)
+                for user in os.environ['DG_JIT_CACHE_SHARED_USERS'].split(':')]
+    return []
+
+
 def put(path, data):
     # Write and do POSIX atomic replace
-    tmp_file_path = os.path.join(make_tmp_dir(), f'file.tmp.{str(uuid.uuid4())}.{hash_to_hex(path)}')
+    tmp_file_path = os.path.join(make_default_tmp_dir(), f'file.tmp.{str(uuid.uuid4())}.{hash_to_hex(path)}')
     with open(tmp_file_path, 'wb' if isinstance(data, bytes) else 'w') as f:
         f.write(data)
     os.replace(tmp_file_path, path)
@@ -121,7 +145,7 @@ class Compiler:
                 '--ptxas-options=--register-usage-level=10' +
                 (',--verbose' if 'DG_JIT_PTXAS_VERBOSE' in os.environ else ''),
                 # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
-                '--diag-suppress=39,161,174,177,186,940']
+                '--diag-suppress=39,161,174,177,940']
 
     @staticmethod
     def include_dirs() -> List[str]:
@@ -133,23 +157,26 @@ class Compiler:
         flags = cls.flags()
 
         # Build signature
-        enable_sass_opt = cls.__version__() <= (12, 8) and not int(os.getenv('DG_JIT_DISABLE_FFMA_INTERLEAVE', 0))
+        # TODO: refactor post-process scripts if we have more in the future (or remove `< 12.9` support)
+        enable_sass_opt = cls.__version__() <= (12, 8) and get_device_arch() == '90a' and not int(os.getenv('DG_JIT_DISABLE_FFMA_INTERLEAVE', 0))
         signature = f'{name}$${get_deep_gemm_version()}$${cls.signature()}$${flags}$${enable_sass_opt}$${code}'
         name = f'kernel.{name}.{hash_to_hex(signature)}'
-        path = os.path.join(get_cache_dir(), name)
+        path = os.path.join(get_default_cache_dir(), name)
 
         # Check runtime cache or file system hit
+        # NOTES: also try to use other users' cache
         global runtime_cache
-        cached_runtime = runtime_cache.get(path, runtime_cls, name, kwargs)
-        if cached_runtime is not None:
-            if int(os.getenv('DG_JIT_DEBUG', 0)):
-                print(f'Using cached JIT runtime {name} during build')
-            return cached_runtime
+        for possible_path in [path, *get_shared_cache_dirs(name)]:
+            cached_runtime = runtime_cache.get(possible_path, runtime_cls, name, kwargs)
+            if cached_runtime is not None:
+                if int(os.getenv('DG_JIT_DEBUG', 0)):
+                    print(f'Using cached JIT runtime {name} during build')
+                return cached_runtime
 
         # Compile into a temporary CU file
         os.makedirs(path, exist_ok=True)
         cubin_path = os.path.join(path, 'kernel.cubin')
-        tmp_cubin_path = os.path.join(make_tmp_dir(), f'nvcc.tmp.{str(uuid.uuid4())}.{hash_to_hex(cubin_path)}.cubin')
+        tmp_cubin_path = os.path.join(make_default_tmp_dir(), f'nvcc.tmp.{str(uuid.uuid4())}.{hash_to_hex(cubin_path)}.cubin')
 
         start_time = time.time()
         cls.compile(name, code, tmp_cubin_path)
@@ -158,10 +185,10 @@ class Compiler:
         if int(os.getenv('DG_JIT_DEBUG', 0)):
             print(f'Compilation of JIT runtime {name} took {elapsed_time:.2f} seconds.')
 
-        # Interleave FFMA reuse
+        # Interleave FFMA reuse (SM90 only)
         if enable_sass_opt:
-            interleave_ffma.process(tmp_cubin_path)
-            
+            sm90_interleave_ffma.process(tmp_cubin_path)
+
         # Atomic replace files
         os.replace(tmp_cubin_path, cubin_path)
 
@@ -186,14 +213,14 @@ class NVCCCompiler(Compiler):
     def flags(cls) -> List[str]:
         cxx_flags = ['-fPIC', '-O3', '-fconcepts', '-Wno-deprecated-declarations', '-Wno-abi']
         return [*super().flags(), *[f'-I{d}' for d in cls.include_dirs()],
-                '-gencode=arch=compute_90a,code=sm_90a',
+                f'--gpu-architecture=sm_{get_device_arch()}',
                 '-cubin', '-O3', '--expt-relaxed-constexpr', '--expt-extended-lambda',
                 f'--compiler-options={",".join(cxx_flags)}']
 
     @classmethod
     def compile(cls, name: str, code: str, target_path: str) -> None:
         # Write the code
-        path = os.path.join(get_cache_dir(), name)
+        path = os.path.join(get_default_cache_dir(), name)
         src_path = os.path.join(path, 'kernel.cu')
         put(src_path, code)
         command = [get_nvcc_compiler()[0],
@@ -206,6 +233,10 @@ class NVCCCompiler(Compiler):
         if result.returncode != 0:
             print(f'NVCC compilation failed: stdout: {result.stdout}, stderr: {result.stderr}')
             assert False, f'Failed to compile {src_path}'
+
+        # Print PTXAS log
+        if int(os.getenv('DG_JIT_DEBUG', 0)) or int(os.getenv('DG_JIT_PTXAS_VERBOSE', 0)):
+            print(result.stderr)
 
 
 class NVRTCCompiler(Compiler):
@@ -230,7 +261,7 @@ class NVRTCCompiler(Compiler):
     @classmethod
     def flags(cls) -> List[str]:
         flags = [*super().flags(), *[f'-I{d}' for d in cls.include_dirs()],
-                 '--gpu-architecture=sm_90a', '-default-device']
+                 f'--gpu-architecture=sm_{get_device_arch()}', '-default-device']
         # NOTES: PCH is vital for compilation speed
         if cls.__version__() >= (12, 8):
             flags += ['--pch']
@@ -240,6 +271,8 @@ class NVRTCCompiler(Compiler):
 
     @classmethod
     def compile(cls, name: str, code: str, target_path: str) -> None:
+        assert int(os.getenv('DG_JIT_PTXAS_VERBOSE', 0)) == 0, '`ptxas --verbose` is not compatible with NVRTC'
+
         # Create program
         code_bytes = bytes(code, 'utf-8')
         result, program = nvrtc.nvrtcCreateProgram(
