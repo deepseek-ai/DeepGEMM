@@ -17,8 +17,8 @@ def is_tma_multicast_legal(shape_dim: int, block_dim: int, num_tma_multicast: in
     return divisible and num_sms % num_tma_multicast == 0
 
 
-def get_swizzle_mode(block_n: int) -> int:
-    elem_size = 2
+def get_swizzle_mode(block_n: int, is_fp32_out: bool) -> int:
+    elem_size = 4 if is_fp32_out else 2
     for mode_bytes in (128, 64, 32):
         if (block_n * elem_size) % mode_bytes == 0:
             return mode_bytes
@@ -38,7 +38,7 @@ def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k
     assert block_k == 128
 
     # Try swizzle first, as it does not waste shared memory
-    swizzle_mode = get_swizzle_mode(block_n)
+    swizzle_mode = get_swizzle_mode(block_n, is_fp32_out)
     block_n_padding = get_block_n_padding_for_smem_d(
         block_n) if swizzle_mode == 0 else 0
 
