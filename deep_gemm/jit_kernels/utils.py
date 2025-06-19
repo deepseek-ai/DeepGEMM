@@ -107,3 +107,6 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     aligned_x[:, :m, :] = x
     aligned_x = aligned_x[:, :m, :]
     return aligned_x.squeeze(0) if remove_dim else aligned_x
+
+def compute_padded_offset(offset, idx_problem, alignment=32):
+    return (offset + idx_problem * (alignment - 1)) // alignment * alignment

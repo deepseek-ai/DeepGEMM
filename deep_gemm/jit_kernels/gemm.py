@@ -34,42 +34,71 @@ def get_block_n_padding_for_smem_d(block_n: int) -> int:
 
 
 def get_smem_config(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128,        
-                    is_fp32_out: bool = False, is_wgrad: bool = False) -> Tuple[int, int, int]:
+                    is_fp32_out: bool = False, is_wgrad: bool = False, is_swap_ab: bool = False) -> Tuple[int, int, int]:
     assert block_k == 128
 
-    # Try swizzle first, as it does not waste shared memory
-    swizzle_mode = get_swizzle_mode(block_n)
-    block_n_padding = get_block_n_padding_for_smem_d(
-        block_n) if swizzle_mode == 0 else 0
 
-    # NOTES: `scales_b` in a total manner or per-stage manner
-    smem_d = block_m * (block_n + block_n_padding) * (4 if is_fp32_out else 2)
-    smem_a_per_stage = block_m * block_k
-    smem_scales_a_per_stage = block_m * 4
-    smem_b_per_stage = block_n * block_k
-    smem_scales_b_per_stage = ceil_div(block_n * 4, block_k) * block_k if is_wgrad else 0
-    smem_scales_b = ceil_div(k, block_k) * 4 if not is_wgrad else 0
-    smem_barrier = num_stages * 8 * 2
+    if not is_swap_ab:
+        # Try swizzle first, as it does not waste shared memory
+        swizzle_mode = get_swizzle_mode(block_n)
+        block_n_padding = get_block_n_padding_for_smem_d(
+            block_n) if swizzle_mode == 0 else 0
 
-    smem_size = 0
-    smem_size += smem_d
-    smem_size += num_stages * smem_a_per_stage
-    smem_size += num_stages * smem_scales_a_per_stage
-    smem_size += num_stages * smem_b_per_stage
-    smem_size += num_stages * smem_scales_b_per_stage
-    smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
-    smem_size += smem_barrier
+        # NOTES: `scales_b` in a total manner or per-stage manner
+        smem_d = block_m * (block_n + block_n_padding) * (4 if is_fp32_out else 2)
+        smem_a_per_stage = block_m * block_k
+        smem_scales_a_per_stage = block_m * 4
+        smem_b_per_stage = block_n * block_k
+        smem_scales_b_per_stage = ceil_div(block_n * 4, block_k) * block_k if is_wgrad else 0
+        smem_scales_b = ceil_div(k, block_k) * 4 if not is_wgrad else 0
+        smem_barrier = num_stages * 8 * 2
 
-    # Swizzle and padding are not compatible
-    assert int(swizzle_mode > 0) + int(block_n_padding > 0) <= 1
+        smem_size = 0
+        smem_size += smem_d
+        smem_size += num_stages * smem_a_per_stage
+        smem_size += num_stages * smem_scales_a_per_stage
+        smem_size += num_stages * smem_b_per_stage
+        smem_size += num_stages * smem_scales_b_per_stage
+        smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
+        smem_size += smem_barrier
 
-    return smem_size, swizzle_mode, block_n_padding
+        # Swizzle and padding are not compatible
+        assert int(swizzle_mode > 0) + int(block_n_padding > 0) <= 1
 
+        return smem_size, swizzle_mode, block_n_padding
+    else:
+        # Try swizzle first, as it does not waste shared memory
+        swizzle_mode = get_swizzle_mode(block_n)
+        block_n_padding = get_block_n_padding_for_smem_d(
+            block_n) if swizzle_mode == 0 else 0
+
+        # NOTES: `scales_b` in a total manner or per-stage manner
+        smem_d = block_m * (block_n + block_n_padding) * (4 if is_fp32_out else 2)
+        smem_a_per_stage = block_m * block_k
+        smem_scales_a_per_stage = ceil_div(k, block_k) * 4; # weight scales
+        smem_b_per_stage = block_n * block_k
+        smem_scales_b_per_stage = 0 # swap_ab not support wgrad
+        smem_scales_b = ceil_div(block_n * 4, 128) * 128 # swap_ab not support wgrad
+        smem_barrier = num_stages * 8 * 2
+
+        smem_size = 0
+        smem_size += smem_d
+        smem_size += num_stages * smem_a_per_stage
+        smem_size += num_stages * smem_scales_b
+        smem_size += num_stages * smem_b_per_stage
+        smem_size += num_stages * smem_scales_b_per_stage
+        smem_size += ceil_div(smem_scales_a_per_stage * (1 if block_k % block_n == 0 else 2), 8) * 8
+        smem_size += smem_barrier
+
+        # Swizzle and padding are not compatible
+        assert int(swizzle_mode > 0) + int(block_n_padding > 0) <= 1
+
+        return smem_size, swizzle_mode, block_n_padding
 
 @lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_contiguous: bool = False, is_grouped_masked: bool = False,
-                     is_fp32_out: bool = False, is_wgrad: bool = False) -> \
+                     is_fp32_out: bool = False, is_wgrad: bool = False, is_swap_ab: bool = False) -> \
         Tuple[int, int, int, int, Tuple[int, bool], Tuple[int, int, int]]:
     if not is_grouped_contiguous:
         block_ms = (64, 128, ) + ((256, ) if not is_fp32_out else ())
@@ -119,7 +148,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         # Unrolling both stages and `num_former_iters` will cause large code size
         stage_candidates = tuple(filter(lambda s: s <= max(k // 128, 1), (4, 3, 2, 1)))
     for num_stages in stage_candidates:
-        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, is_fp32_out=is_fp32_out, is_wgrad=is_wgrad)
+        best_smem_config = get_smem_config(num_stages, k, best_block_m, best_block_n, is_fp32_out=is_fp32_out, is_wgrad=is_wgrad, is_swap_ab = is_swap_ab)
         if best_smem_config[0] <= sm90_capacity:
             best_num_stages = num_stages
             break
@@ -131,21 +160,39 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Try to multicast on the larger block side first
     # NOTES: currently, grouped masked GEMM only supports multicast on A and requires the number of blocks in the N-direction to be even
-    is_multicast_legal = {
-        'A': is_tma_multicast_legal(n, best_block_n, 2, num_sms, is_grouped_masked),
-        'B': is_tma_multicast_legal(m, best_block_m, 2, num_sms) and not is_grouped_masked,
-    }
-    for i in ('A', 'B') if best_block_m > best_block_n else ('B', 'A'):
-        if m >= 512 and is_multicast_legal[i]:
-            best_tma_multicast_config = (2, i == 'A')
-            break
 
-    # Recompute the minimal number of SMs required
-    # NOTES: less L2 cache usage and less GPU frequency drop
-    num_waves = get_num_waves(best_block_m, best_block_n)
-    num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
-    num_min_sms = ceil_div(num_min_sms, best_tma_multicast_config[0]) * best_tma_multicast_config[0]
-    assert num_min_sms <= num_sms
+    if not is_swap_ab:
+        is_multicast_legal = {
+            'A': is_tma_multicast_legal(n, best_block_n, 2, num_sms, is_grouped_masked),
+            'B': is_tma_multicast_legal(m, best_block_m, 2, num_sms) and not is_grouped_masked,
+        }
+        for i in ('A', 'B') if best_block_m > best_block_n else ('B', 'A'):
+            if m >= 512 and is_multicast_legal[i]:
+                best_tma_multicast_config = (2, i == 'A')
+                break
+
+        # Recompute the minimal number of SMs required
+        # NOTES: less L2 cache usage and less GPU frequency drop
+        num_waves = get_num_waves(best_block_m, best_block_n)
+        num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, num_waves)
+        num_min_sms = ceil_div(num_min_sms, best_tma_multicast_config[0]) * best_tma_multicast_config[0]
+        assert num_min_sms <= num_sms
+    else: 
+        is_multicast_legal = {
+            'A': is_tma_multicast_legal(n, best_block_m, 2, num_sms),
+            'B': is_tma_multicast_legal(m, best_block_n, 2, num_sms),
+        }
+        for i in ('A', 'B') if best_block_m > best_block_n else ('B', 'A'):
+            if n >= 512 and is_multicast_legal[i]:
+                best_tma_multicast_config = (2, i == 'B')
+                break
+
+        # Recompute the minimal number of SMs required
+        # NOTES: less L2 cache usage and less GPU frequency drop
+        num_waves = get_num_waves(best_block_n, best_block_m)
+        num_min_sms = ceil_div(ceil_div(n, best_block_m) * ceil_div(m, best_block_n) * num_groups, num_waves)
+        num_min_sms = ceil_div(num_min_sms, best_tma_multicast_config[0]) * best_tma_multicast_config[0]
+        assert num_min_sms <= num_sms
 
     return num_min_sms, best_block_m, best_block_n, best_num_stages, best_tma_multicast_config, best_smem_config
 
