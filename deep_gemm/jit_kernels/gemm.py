@@ -104,8 +104,8 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
         block_ms = (64, 128, ) + ((256, ) if not is_fp32_out else ())
     else:
         block_ms = (get_m_alignment_for_contiguous_layout(), )
-    block_ns = tuple(range(16, 129, 8)) + ((136, 152, ) if is_wgrad else (144, 160, ))
-    
+    #block_ns = tuple(range(16, 129, 8)) + ((136, 152, ) if is_wgrad else (144, 160, ))
+    block_ns = tuple(range(16, 129, 8)) 
     # Avoid bank conflicts for FP32 output
     if is_fp32_out:
         block_ns = [x for x in block_ns if x % 16 == 8]

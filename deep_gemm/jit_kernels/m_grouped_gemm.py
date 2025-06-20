@@ -260,7 +260,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor]
     else:
         m_per_expert_threshold = 32 # H100
 
-    if expected_m>= m_per_expert_threshold:
+    if expected_m> m_per_expert_threshold:
 
         num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(
             expected_m, n, k, num_groups, num_sms, is_grouped_contiguous = True, is_swap_ab=False)

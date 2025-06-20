@@ -391,21 +391,9 @@ struct SchedulerSelector
 {
     static constexpr auto select_type()
     {
-        if constexpr (GT == GemmType::Normal)
-            return NormalScheduler<SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kNumNBlocks,
-                kNumNBlocksPerGroup>();
-        if constexpr (GT == GemmType::GroupedContiguous)
-            return GroupedContiguousScheduler<SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kNumNBlocks,
-                kNumNBlocksPerGroup>();
-        if constexpr (GT == GemmType::GroupedMasked)
-            return GroupedMaskedScheduler<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kNumGroups, kNumTMAMulticast,
-                kNumNBlocks, kNumNBlocksPerGroup>();
         if constexpr (GT == GemmType::GroupedWithOffset)
             return GroupedWithOffsetScheduler<SHAPE_N, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kNumNBlocks,
                 kNumNBlocksPerGroup>();
-        if constexpr (GT == GemmType::StridedBatched)
-            return StridedBatchedScheduler<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kNumGroups, kNumTMAMulticast,
-                kNumNBlocks, kNumNBlocksPerGroup>();
     }
 
     using type = decltype(select_type());

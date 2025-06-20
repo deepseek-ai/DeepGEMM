@@ -851,18 +851,6 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                         scheduler.m_boundary, n_block_idx * BLOCK_N, SHAPE_N, SHAPE_N);
                 }
             }
-            else if constexpr (SchedulerType::gemm_type == GemmType::StridedBatched)
-            {
-                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-                __nv_bfloat16* gmem_d_this_block;
-                auto m_global_idx = scheduler.get_global_m_idx(m_block_idx);
-                gmem_d_this_block = gmem_d + scheduler.curr_group_idx * problem_input.stride_d
-                    + (m_block_idx * BLOCK_M) * problem_input.ld_d;
-                constexpr int NUM_WARPS
-                    = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
-                write_result_to_gmem<BLOCK_M, BLOCK_N, NUM_WARPS>(gmem_d_this_block, smem_d, m_global_idx,
-                    scheduler.m_boundary, n_block_idx * BLOCK_N, SHAPE_N, problem_input.ld_d);
-            }
             else
             {
                 cute::tma_store_fence();

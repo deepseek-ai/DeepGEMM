@@ -119,10 +119,9 @@ def construct_offset_grouped(num_groups: int, expected_m_per_group: int, k: int,
 def test_m_grouped_gemm_offset() -> None:
     print('Testing grouped contiguous GEMM:')
 
-    for num_groups, expected_m_per_group, k, n in ((8, 32, 7168, 4096),):
+    for num_groups, expected_m_per_group, k, n in ((9, 32, 7168, 4096),):
         # NOTES: we should mask the unfilled part before calculating difference
         
-        '''
         x_fp8_mask, y_fp8_mask, masked_m_mask, out_mask, ref_out_mask = construct_masked_grouped(num_groups, expected_m_per_group, expected_m_per_group, k, n)
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8_mask, y_fp8_mask, out_mask, masked_m_mask, expected_m_per_group)
         
@@ -160,6 +159,8 @@ def test_m_grouped_gemm_offset() -> None:
         print(f' > m_grouped_gemm_fp8_fp8_bf16_nt_offset: Perf ({num_groups=:2}, {expected_m_per_group=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
               f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
               f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
+    
+        '''
     print()
 
 
