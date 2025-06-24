@@ -221,20 +221,12 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor]
     num_groups, n, k_ = rhs.shape
     m_, n_ = out.shape
 
-    
-    print("expected_m: ",expected_m)
-    print("A shape: ",lhs.shape)
-    print("A scale shape: ",lhs_scales.shape)
-    print("B shape: ",rhs.shape)
-    print("B scale shape: ",rhs_scales.shape)
-    print("out shape: ",out.shape)
-
 
     # Type and shape checks
     assert m == m_ and n == n_ and k == k_
 
     max_shape_m_4_align = ceil_div(m, 4) * 4 # align 4
-    max_shape_m_32_align_padded = compute_padded_offset(m, num_groups)
+    max_shape_m_32_align_padded = compute_padded_offset(max_shape_m_4_align, num_groups)
 
     assert expected_m > 0 and max_shape_m_4_align > 0 and n > 0 and k > 0 and num_groups > 0
     
@@ -244,12 +236,14 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor]
     assert rhs_scales.shape == (num_groups, ceil_div(n, 128), ceil_div(k, 128))
     assert lhs.dtype == torch.float8_e4m3fn and lhs_scales.dtype == torch.float32
     assert rhs.dtype == torch.float8_e4m3fn and rhs_scales.dtype == torch.float32
+    assert offsets.dtype == torch.int64
     assert out.dtype == torch.bfloat16
     assert lhs.is_contiguous() and rhs.is_contiguous()
     assert out.is_contiguous()
 
     # LHS scales must be transposed for TMA load, but not for RHS scales
-    lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
+    
+    #lhs_scales = get_col_major_tma_aligned_tensor(lhs_scales)
     assert rhs_scales.is_contiguous()
 
     # Auto-tuning with compilation
@@ -273,9 +267,9 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor]
         num_tma_threads = 128
         num_math_threads_per_group = 128
 
-        tensor_map_a = make_2d_tma_a_desc(GemmType.GroupedWithOffset, lhs, m, k, k, block_m, block_k, num_groups)
+        tensor_map_a = make_2d_tma_a_desc(GemmType.GroupedWithOffset, lhs, max_shape_m_4_align, k, k, block_m, block_k, num_groups)
         tensor_map_b = make_2d_tma_b_desc(GemmType.GroupedWithOffset, rhs, n, k, k, block_n, block_k, num_groups)
-        tensor_map_d = make_2d_tma_d_desc(GemmType.GroupedWithOffset, out, m, n, n, block_m, block_n, num_groups, 0) # none swizzle
+        tensor_map_d = make_2d_tma_d_desc(GemmType.GroupedWithOffset, out, max_shape_m_4_align, n, n, block_m, block_n, num_groups, 0) # none swizzle
         tensor_map_scales_a = make_2d_tma_scales_a_offset_desc(GemmType.GroupedWithOffset, lhs_scales, max_shape_m_32_align_padded, k, block_m, block_k) # none swizzle
 
 
@@ -287,7 +281,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor]
             'PROBLEM_OFFSETS': offsets,
             'NUM_TMA_THREADS': num_tma_threads,
             'NUM_MATH_THREADS_PER_GROUP': num_math_threads_per_group,
-            'M': m, 'N': n, 'K': k,
+            'M': max_shape_m_4_align, 'N': n, 'K': k,
             'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
             'NUM_GROUPS': num_groups,
             'NUM_STAGES': num_stages,
@@ -310,26 +304,17 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor]
     else:
         num_sms, block_m, block_n, num_stages, tma_multicast_config, smem_config = get_best_configs(
             n, expected_m, k, num_groups, num_sms, is_grouped_contiguous = True, is_swap_ab=True)
-        
         # Extra checks for TMA store
         if num_groups > 1 and n > block_m:
             assert n % block_m == 0, f'For GroupedWithOffset grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})'
-
-        print("is_swap_ab=True =========")
-        print("num_sms: ",num_sms)
-        print("block_m: ",block_m)
-        print("block_n: ",block_n)
-        print("num_stages: ",num_stages)
-        print("tma_multicast_config: ",tma_multicast_config)
-        print("smem_config: ",smem_config)
 
         block_k = 128
         num_tma_threads = 128
         num_math_threads_per_group = 128
 
         tensor_map_a = make_2d_tma_a_offset_desc_swapAB(GemmType.GroupedWithOffset, rhs, n, k, k, block_m, block_k, num_groups)
-        tensor_map_b = make_2d_tma_b_offset_desc_swapAB(GemmType.GroupedWithOffset, lhs, m, k, k, block_n, block_k, num_groups)
-        tensor_map_d = make_2d_tma_d_offset_desc_swapAB(GemmType.GroupedWithOffset, out, n, m, m, block_m, block_n, num_groups, 0) # no swizzle
+        tensor_map_b = make_2d_tma_b_offset_desc_swapAB(GemmType.GroupedWithOffset, lhs, max_shape_m_4_align, k, k, block_n, block_k, num_groups)
+        tensor_map_d = make_2d_tma_d_offset_desc_swapAB(GemmType.GroupedWithOffset, out, max_shape_m_4_align, n, n, block_m, block_n, num_groups, 0) # no swizzle
         tensor_map_scales_b = make_2d_tma_scales_b_offset_desc_swapAB(GemmType.GroupedWithOffset, lhs_scales, max_shape_m_32_align_padded, k, block_n, block_k) # no swizzle
 
         kwargs = {
@@ -340,7 +325,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor]
             'PROBLEM_OFFSETS': offsets,
             'NUM_TMA_THREADS': num_tma_threads,
             'NUM_MATH_THREADS_PER_GROUP': num_math_threads_per_group,
-            'M': m, 'N': n, 'K': k,
+            'M': max_shape_m_4_align, 'N': n, 'K': k,
             'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
             'NUM_GROUPS': num_groups,
             'NUM_STAGES': num_stages,

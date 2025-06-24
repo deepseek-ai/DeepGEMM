@@ -173,8 +173,8 @@ def make_2d_tma_d_offset_desc_swapAB(gemm_type: GemmType, t: torch.Tensor,
     # Swizzling requires the inner box dim to be less or equal than `kSwizzleDMode`
     # bytes, so `BLOCK_N * sizeof(T) / kSwizzleDMode` TMA stores are required
     return make_2d_tma_desc(t,
-                            shape_n, shape_m * (num_groups if gemm_type != GemmType.Normal else 1), m_stride,
-                            min(block_n, shape_n), min(block_m, shape_m),
+                            shape_n, shape_m * (num_groups if gemm_type == GemmType.GroupedMasked else 1), m_stride,
+                            min(block_m, shape_n), min(block_n, shape_m),
                             cbd.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE)
 
 

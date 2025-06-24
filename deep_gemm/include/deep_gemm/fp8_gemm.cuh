@@ -438,6 +438,7 @@ fp8_gemm_kernel(float* scales_b, int* grouped_layout,
         DG_DEVICE_ASSERT(false and "This kernel only support sm_90a");
 #endif
 }
+
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t NUM_WARPS_PER_BLOCK>
 static __device__ __forceinline__ void write_result_to_gmem(__nv_bfloat16* gmem_d_this_block,
     __nv_bfloat16 const* smem_d, uint32_t const m_offset, uint32_t const m_boundary, uint32_t const n_offset,
@@ -638,18 +639,9 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                             tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
                                 smem_a[s], k_idx, scheduler.get_global_m_idx(m_block_idx), kNumTMAMulticast);
 
-                            if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset)
-                            {
-                                tma_copy(&tensor_map_scales_a,
-                                    reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_a[s],
-                                    scheduler.get_global_scales_a_idx(m_block_idx), k_idx / BLOCK_K, kNumTMAMulticast);
-                            }
-                            else
-                            {
-                                tma_copy(&tensor_map_scales_a,
-                                    reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_a[s], m_block_idx * BLOCK_M,
-                                    scheduler.get_global_scales_a_idx(k_idx / BLOCK_K), kNumTMAMulticast);
-                            }
+                            tma_copy(&tensor_map_scales_a,
+                                reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_a[s],
+                                scheduler.get_global_scales_a_idx(m_block_idx), k_idx / BLOCK_K, kNumTMAMulticast);
 
                             // Issue TMA B without broadcasting
                             tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier), smem_b[s], k_idx,
@@ -826,45 +818,28 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                     smem_d + (warp_idx * 16 + lane_idx % 16) * BLOCK_N + WGMMA::kNumAccum / 8 * 16);
             }
 
-            if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset)
+            auto m_global_idx = scheduler.get_global_m_idx(m_block_idx);
+            bool cross_boundary = (m_global_idx + BLOCK_M) > scheduler.m_boundary;
+            cute::tma_store_fence();
+            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+            if (!cross_boundary)
             {
-                auto m_global_idx = scheduler.get_global_m_idx(m_block_idx);
-                bool cross_boundary = (m_global_idx + BLOCK_M) > scheduler.m_boundary;
-                cute::tma_store_fence();
-                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-                if (!cross_boundary)
-                {
-                    // Use TMA store to write back to global memory
-                    if (threadIdx.x == 0)
-                    {
-                        cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N, m_global_idx);
-                        cute::tma_store_arrive();
-                        cute::tma_store_wait<0>();
-                    }
-                }
-                else
-                {
-                    __nv_bfloat16* gmem_d_this_block = gmem_d + m_global_idx * SHAPE_N;
-                    constexpr int NUM_WARPS
-                        = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
-                    write_result_to_gmem<BLOCK_M, BLOCK_N, NUM_WARPS>(gmem_d_this_block, smem_d, m_global_idx,
-                        scheduler.m_boundary, n_block_idx * BLOCK_N, SHAPE_N, SHAPE_N);
-                }
-            }
-            else
-            {
-                cute::tma_store_fence();
-                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
                 // Use TMA store to write back to global memory
                 if (threadIdx.x == 0)
                 {
-                    cute::SM90_TMA_STORE_2D::copy(
-                        &tensor_map_d, smem_d, n_block_idx * BLOCK_N, scheduler.get_global_m_idx(m_block_idx));
+                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, n_block_idx * BLOCK_N, m_global_idx);
                     cute::tma_store_arrive();
                     cute::tma_store_wait<0>();
                 }
             }
-
+            else
+            {
+                __nv_bfloat16* gmem_d_this_block = gmem_d + m_global_idx * SHAPE_N;
+                constexpr int NUM_WARPS
+                    = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
+                write_result_to_gmem<BLOCK_M, BLOCK_N, NUM_WARPS>(gmem_d_this_block, smem_d, m_global_idx,
+                    scheduler.m_boundary, n_block_idx * BLOCK_N, SHAPE_N, SHAPE_N);
+            }
             __syncwarp();
         }
     }
@@ -1050,18 +1025,9 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                                 smem_b[s], k_idx, scheduler.get_global_n_idx(n_block_idx), kNumTMAMulticast);
 
                             // Issue TMA scales_b (act scales) for B matrix
-                            if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset)
-                            {
-                                tma_copy(&tensor_map_scales_b,
-                                    reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s],
-                                    scheduler.get_global_scales_b_idx(n_block_idx), k_idx / BLOCK_K, kNumTMAMulticast);
-                            }
-                            else
-                            {
-                                tma_copy(&tensor_map_scales_b,
-                                    reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s], n_block_idx * BLOCK_N,
-                                    scheduler.get_global_scales_b_idx(k_idx / BLOCK_K), kNumTMAMulticast);
-                            }
+                            tma_copy(&tensor_map_scales_b,
+                                reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s],
+                                scheduler.get_global_scales_b_idx(n_block_idx), k_idx / BLOCK_K, kNumTMAMulticast);
 
                             full_barrier.arrive_and_expect_tx(
                                 SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_B_SIZE_PER_STAGE);
@@ -1246,45 +1212,28 @@ __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMat
                     smem_d + warp_idx * 16 + WGMMA::kNumAccum / 8 * 16 * BLOCK_M + tid);
             }
 
-            if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset)
+            auto n_global_idx = scheduler.get_global_n_idx(n_block_idx);
+            bool cross_boundary = (n_global_idx + BLOCK_N) > scheduler.n_boundary;
+            cute::tma_store_fence();
+            cutlass::arch::NamedBarrier(kNumMathThreads).sync();
+            if (!cross_boundary)
             {
-                auto n_global_idx = scheduler.get_global_n_idx(n_block_idx);
-                bool cross_boundary = (n_global_idx + BLOCK_N) > scheduler.n_boundary;
-                cute::tma_store_fence();
-                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-                if (!cross_boundary)
-                {
-                    // Use TMA store to write back to global memory
-                    if (threadIdx.x == 0)
-                    {
-                        cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, m_block_idx * BLOCK_M, n_global_idx);
-                        cute::tma_store_arrive();
-                        cute::tma_store_wait<0>();
-                    }
-                }
-                else
-                {
-                    __nv_bfloat16* gmem_d_this_block = gmem_d + n_global_idx * SHAPE_M;
-                    constexpr int NUM_WARPS
-                        = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
-                    write_result_to_gmem<BLOCK_N, BLOCK_M, NUM_WARPS>(gmem_d_this_block, smem_d, n_global_idx,
-                        scheduler.n_boundary, m_block_idx * BLOCK_M, SHAPE_M, SHAPE_M);
-                }
-            }
-            else
-            {
-                cute::tma_store_fence();
-                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
                 // Use TMA store to write back to global memory
                 if (threadIdx.x == 0)
                 {
-                    cute::SM90_TMA_STORE_2D::copy(
-                        &tensor_map_d, smem_d, m_block_idx * BLOCK_M, scheduler.get_global_n_idx(n_block_idx));
+                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, m_block_idx * BLOCK_M, n_global_idx);
                     cute::tma_store_arrive();
                     cute::tma_store_wait<0>();
                 }
             }
-
+            else
+            {
+                __nv_bfloat16* gmem_d_this_block = gmem_d + n_global_idx * SHAPE_M;
+                constexpr int NUM_WARPS
+                    = (get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M) - 128) / 32;
+                write_result_to_gmem<BLOCK_N, BLOCK_M, NUM_WARPS>(gmem_d_this_block, smem_d, n_global_idx,
+                    scheduler.n_boundary, m_block_idx * BLOCK_M, SHAPE_M, SHAPE_M);
+            }
             __syncwarp();
         }
     }
