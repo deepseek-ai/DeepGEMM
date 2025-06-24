@@ -6,6 +6,7 @@ print(f'NVRTC version: {nvrtc.nvrtcVersion()[1:]}')
 import random
 import torch
 from typing import List, Tuple
+import itertools
 
 import deep_gemm
 from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
@@ -167,6 +168,81 @@ def construct_k_grouped_wgrad(m: int, n: int, k_sizes: List[int]) -> \
     return (x_fp8_flat, x_scales), (y_fp8_flat, y_scales), out, ref_out, k_sizes
 
 
+def change_to_offset_layout(
+    ms: List[int],
+    x_fp8: torch.Tensor,
+    x_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x_list = []
+    x_scale_list = []
+    shape_m_total = 0
+    num_problems = len(ms)
+    m_acc = [0] + list(itertools.accumulate(ms))
+
+    # Need to keep the same as the one in cpp/include/tensorrt_llm/deep_gemm/scheduler.cuh
+    def compute_padded_offset(offset, idx_problem, alignment=32):
+        return (offset + idx_problem * (alignment - 1)) // alignment * alignment
+
+    offset = 0
+    for i in range(num_problems):
+        ms[i]
+        x_list.append(x_fp8[m_acc[i]:m_acc[i + 1]])
+        offset_next = compute_padded_offset(m_acc[i + 1], i + 1)
+        size_padded = (offset_next - offset) - (m_acc[i + 1] - m_acc[i])
+        x_scale_padded = torch.cat([
+            x_scale[m_acc[i]:m_acc[i + 1]],
+            torch.zeros(
+                [size_padded, *x_scale.shape[1:]],
+                dtype=x_scale.dtype,
+                device=x_scale.device,
+            ),
+        ])
+        x_scale_list.append(x_scale_padded)
+        offset = offset_next
+
+    shape_m_total = m_acc[-1]
+    ret_x = torch.cat(x_list)
+    ret_x_scale = torch.cat(x_scale_list)
+    ret_x_scale = ret_x_scale.t().contiguous()
+    pad_target = compute_padded_offset(shape_m_total, num_problems)
+    pad_target -= ret_x_scale.shape[1]
+    ret_x_scale = torch.nn.functional.pad(ret_x_scale, (0, pad_target),
+                                          mode='constant',
+                                          value=0)
+    return ret_x, ret_x_scale
+
+
+def construct_offset_grouped(num_groups: int, expected_m_per_group: int, k: int, n: int) -> \
+        Tuple[int, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    alignment = 4
+    group_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
+
+    m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
+
+    x = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    offsets = torch.empty(num_groups+1, device='cuda', dtype=torch.int64)
+    out = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    ref_out = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
+
+    start = 0
+    offsets[0] = 0
+    for i, group_m in enumerate(group_ms):
+        aligned_end = start + ceil_div(group_m, alignment) * alignment
+        offsets[i+1] = aligned_end
+        ref_out[start:aligned_end] = x[start:aligned_end] @ y[i].t()
+        start = aligned_end
+        group_ms[i] = ceil_div(group_m, alignment) * alignment
+
+    assert m % 4 == 0, f'TMA alignment error: {m}'
+    x_fp8 = per_token_cast_to_fp8(x)
+    y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), k // 128), device='cuda', dtype=torch.float))
+    for i in range(num_groups):
+        y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i])
+
+    return group_ms, m, x_fp8, y_fp8, offsets.type(torch.int64), out, ref_out
+
+
 def test_gemm() -> None:
     print('Testing GEMM:')
     for m in (64, 128, 4096):
@@ -295,6 +371,32 @@ def test_k_grouped_wgrad_gemm():
     print()
 
 
+def test_m_grouped_gemm_offset() -> None:
+    print('Testing grouped offset GEMM:')
+
+    for num_groups, expected_m_per_group in ((2, 16), (4, 16), (2, 32), (9, 32), (2, 32), (4, 32), (32, 64)):
+        for k, n in ((7168, 4096),):
+            # NOTES: we should mask the unfilled part before calculating difference
+            ms, m_offset, x_fp8_offset, y_fp8_offset, offset, out_offset, ref_out_offset = construct_offset_grouped(num_groups, expected_m_per_group, k, n)
+            pad_x_fp8 = change_to_offset_layout(ms, x_fp8_offset[0], x_fp8_offset[1])
+
+            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_offset(pad_x_fp8, y_fp8_offset, offset, out_offset, expected_m_per_group)
+            diff = calc_diff(out_offset, ref_out_offset)
+            assert diff < 0.001, f'{m_offset=}, {k=}, {n=}, {diff:.5f}'
+
+            # noinspection PyShadowingNames
+            def test_func():
+                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_offset(pad_x_fp8, y_fp8_offset, offset, out_offset, expected_m_per_group)
+
+            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+            valid_m = m_offset
+
+            print(f' > Perf ({num_groups=:2}, {expected_m_per_group=:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
+                f'throughput: {2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS, '
+                f'{(valid_m * k + num_groups * k * n + valid_m * n * 2) / 1e9 / t:4.0f} GB/s')
+    print()
+
+
 if __name__ == '__main__':
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -307,6 +409,7 @@ if __name__ == '__main__':
     test_gemm()
     test_m_grouped_gemm_contiguous()
     test_m_grouped_gemm_masked()
+    test_m_grouped_gemm_offset()
 
     test_wgrad_gemm()
     test_k_grouped_wgrad_gemm()

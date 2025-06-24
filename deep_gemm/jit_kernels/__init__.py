@@ -1,7 +1,8 @@
 from .gemm import gemm_fp8_fp8_bf16_nt
 from .m_grouped_gemm import (
     m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-    m_grouped_gemm_fp8_fp8_bf16_nt_masked
+    m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+    m_grouped_gemm_fp8_fp8_bf16_nt_offset
 )
 from .wgrad_gemm import (
     wgrad_gemm_fp8_fp8_fp32_nt,
