@@ -187,6 +187,7 @@ class NVCCCompiler(Compiler):
         cxx_flags = ['-fPIC', '-O3', '-fconcepts', '-Wno-deprecated-declarations', '-Wno-abi']
         return [*super().flags(), *[f'-I{d}' for d in cls.include_dirs()],
                 '-gencode=arch=compute_90a,code=sm_90a',
+                '-gencode=arch=compute_120,code=sm_120',
                 '-cubin', '-O3', '--expt-relaxed-constexpr', '--expt-extended-lambda',
                 f'--compiler-options={",".join(cxx_flags)}']
 
@@ -230,7 +231,7 @@ class NVRTCCompiler(Compiler):
     @classmethod
     def flags(cls) -> List[str]:
         flags = [*super().flags(), *[f'-I{d}' for d in cls.include_dirs()],
-                 '--gpu-architecture=sm_90a', '-default-device']
+                 '--gpu-architecture=compute_90a', '--gpu-architecture=compute_120', '-default-device']
         # NOTES: PCH is vital for compilation speed
         if cls.__version__() >= (12, 8):
             flags += ['--pch']
