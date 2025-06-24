@@ -12,7 +12,7 @@ find_package(pybind11 REQUIRED)
 
 file(WRITE ${CMAKE_BINARY_DIR}/test_cuda.cu "extern \"C\" __global__ void testKernel() { }")
 execute_process(
-        COMMAND ${CUDA_NVCC_EXECUTABLE} ${CMAKE_CUDA_FLAGS} -gencode arch=compute_90a,code=sm_90a -o ${CMAKE_BINARY_DIR}/test_cuda.o -c ${CMAKE_BINARY_DIR}/test_cuda.cu
+        COMMAND ${CUDA_NVCC_EXECUTABLE} ${CMAKE_CUDA_FLAGS} -gencode arch=compute_90a,code=sm_90a -gencode arch=compute_120,code=sm_120 -o ${CMAKE_BINARY_DIR}/test_cuda.o -c ${CMAKE_BINARY_DIR}/test_cuda.cu
         RESULT_VARIABLE NVCC_RESULT
         OUTPUT_VARIABLE NVCC_OUTPUT
         ERROR_VARIABLE NVCC_ERROR_OUTPUT
@@ -27,8 +27,11 @@ else()
 endif()
 
 if (NVCC_SUPPORTS_SM90)
-    set(TORCH_CUDA_ARCH_LIST "8.6" CACHE STRING "Add arch tag 90a to NVCC" FORCE)
+    set(TORCH_CUDA_ARCH_LIST "8.6;9.0a" CACHE STRING "Add arch tag 90a to NVCC" FORCE) # TODO: Check if 9.0a is correct for sm_90a, it might be just 9.0
     list(APPEND CUDA_NVCC_FLAGS "-gencode;arch=compute_90a,code=sm_90a")
+    # Add Blackwell support if NVCC supports it (determined by the test_cuda.cu compilation)
+    list(APPEND CUDA_NVCC_FLAGS "-gencode;arch=compute_120,code=sm_120")
+    set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST};12.0" CACHE STRING "Add arch tag 120 to NVCC" FORCE) # TODO: Check if 12.0 is correct for sm_120
 endif()
 find_package(Torch REQUIRED)
 
