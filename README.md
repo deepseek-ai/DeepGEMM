@@ -46,7 +46,8 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - Python 3.8 or higher
 - Compilers with C++20 support
 - CUDA Toolkit:
-    - CUDA 12.3 or higher for SM90
+    - Currently, CUDA 12.8 or higher is required, but support for older versions may be added in the future
+    - CUDA 12.8 or higher for SM90
         - **We highly recommend 12.9 or higher for the best performance**
     - CUDA 12.9 or higher for SM100
 - PyTorch 2.1 or higher
