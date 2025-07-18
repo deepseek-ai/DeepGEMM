@@ -74,8 +74,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
-    constexpr uint32_t SF_BLOCK_M = align(BLOCK_M, kNumUTCCPAlignedElems);
-    constexpr uint32_t SF_BLOCK_N = align(BLOCK_N, kNumUTCCPAlignedElems);
+    constexpr uint32_t SF_BLOCK_M = constexpr_align(BLOCK_M, kNumUTCCPAlignedElems);
+    constexpr uint32_t SF_BLOCK_N = constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
     DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
@@ -111,14 +111,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     uint32_t* smem_sfa[kNumStages];
     uint32_t* smem_sfb[kNumStages];
 
-    // TMA Barrier for both divisible and non-divisible cases
-    Barrier* full_barriers[kNumStages];
-    Barrier* empty_barriers[kNumStages];
-    Barrier* with_sf_full_barriers[kNumStages];
-    Barrier* tmem_full_barriers[kNumEpilogueStages];
-    Barrier* tmem_empty_barriers[kNumEpilogueStages];
-    Barrier* accumulation_full_barrier;
-
     // Fill D/A/B pointers
     #pragma unroll
     for (uint32_t i = 0; i < kNumTMAStoreStages; ++ i)
@@ -142,21 +134,14 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         SMEM_CD_SIZE +
         kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
         kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE));
-    #pragma unroll
-    for (uint32_t i = 0; i < kNumStages; ++ i) {
-        full_barriers[i] = barrier_start_ptr + i;
-        empty_barriers[i] = barrier_start_ptr + kNumStages + i;
-        with_sf_full_barriers[i] = barrier_start_ptr + kNumStages * 2 + i;
-    }
-    #pragma unroll
-    for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
-        tmem_full_barriers[i] = barrier_start_ptr + kNumStages * 3 + i;
-        tmem_empty_barriers[i] = barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages + i;
-    }
-    accumulation_full_barrier = barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2;
+    auto full_barriers              = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
+    auto empty_barriers             = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
+    auto with_sf_full_barriers      = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
+    auto tmem_full_barriers         = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
+    auto tmem_empty_barriers        = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages + i); });
 
     // Fill the tensor memory pointer
-    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2 + 1);
+    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2);
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // Initialize barriers
@@ -176,8 +161,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             // Arrive only at the leader CTA
             tmem_empty_barriers[i]->init(kNumMulticast * kNumEpilogueThreads);
         }
-        if constexpr (kWithAccumulation)
-            accumulation_full_barrier->init(1);
 
         // Make initialized barrier visible in async proxy
         cutlass::arch::fence_view_async_shared();
@@ -188,18 +171,27 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     }
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
+    // Block scheduler
+    uint32_t m_block_idx, n_block_idx;
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA>(shape_m, shape_n, grouped_layout);
+
     // For pipeline unrolling
     struct DivisibleK {};
     struct NotDivisibleK {};
-    const uint32_t num_iterations = ceil_div(shape_k, kNumStages * BLOCK_K);
-    auto launch_k_iterations = [=](const auto& func) {
-        if constexpr (kNumLastStages == 0) {
-            for (uint32_t k_iter = 0; k_iter < num_iterations; ++ k_iter)
-                func(k_iter, DivisibleK{}, k_iter == num_iterations - 1);
+    uint32_t phase = 0;
+    auto launch_k_iterations = [&](const auto& func) {
+        const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
+        const uint32_t num_iterations = ceil_div(current_shape_k, kNumStages * BLOCK_K);
+        const uint32_t num_last_stages = ceil_div(current_shape_k, BLOCK_K) % kNumStages;
+
+        // TODO: refactor here
+        if (num_last_stages == 0) {
+            for (uint32_t k_iter = 0; k_iter < num_iterations; ++ k_iter, phase ^= 1)
+                func(k_iter, DivisibleK{}, k_iter == num_iterations - 1, num_last_stages);
         } else {
-            for (uint32_t k_iter = 0; k_iter < num_iterations - 1; ++ k_iter)
-                func(k_iter, DivisibleK{}, false);
-            func(num_iterations - 1, NotDivisibleK{}, true);
+            for (uint32_t k_iter = 0; k_iter < num_iterations - 1; ++ k_iter, phase ^= 1)
+                func(k_iter, DivisibleK{}, false, num_last_stages);
+            func(num_iterations - 1, NotDivisibleK{}, true, num_last_stages), phase ^= 1;
         }
     };
 
@@ -209,38 +201,35 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         accum_stage_idx == 0 ? func(0) : func(1);
     };
 
-    // Block scheduler
-    uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA>(shape_m, shape_n, grouped_layout);
-
     // Dispatch warps into different roles
     if (warp_idx == 0) {
         // TMA load warp
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter) {
+            launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
                 constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
-                constexpr uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : kNumLastStages;
-                DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+                const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
 
                 #pragma unroll
                 for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                     // Wait consumer release
-                    empty_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter + 1) & 1);
+                    empty_barriers[s]->wait(phase ^ 1);
 
                     // Compute offsets
                     // NOTES: the group is always concatenated with the outer dimension
-                    uint32_t m_idx = scheduler.get_global_idx<(kGemmType != GemmType::GroupedContiguous)>(
+                    uint32_t m_idx = scheduler.template get_global_idx<(kGemmType == GemmType::MGroupedMasked), KGroupedIndexType::MN> (
                         shape_m, BLOCK_M, m_block_idx);
-                    uint32_t n_idx = scheduler.get_global_idx<(kMajorB == cute::UMMA::Major::K)>(
+                    uint32_t n_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::K), KGroupedIndexType::MN> (
                         shape_n, BLOCK_N, n_block_idx, m_block_idx);
 
                     // NOTES: `k_idx` is actually the k index default for K-major, while `k_b_idx` may be MN-major
-                    // And for all grouped GEMMs, A must be K-majored
-                    DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kMajorA == cute::UMMA::Major::K, "Invalid major");
+                    // And for all m-grouped GEMMs, A must be K-majored
+                    DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous or kMajorA == cute::UMMA::Major::K, "Invalid major");
                     uint32_t k_block_idx = k_iter * kNumStages + s;
                     uint32_t k_idx = k_block_idx * BLOCK_K;
-                    uint32_t k_b_idx = scheduler.get_global_idx<(kMajorB == cute::UMMA::Major::MN)>(
+                    uint32_t k_a_idx = scheduler.template get_global_idx<(kMajorA == cute::UMMA::Major::MN), KGroupedIndexType::K> (
+                        shape_k, BLOCK_K, k_block_idx, m_block_idx);
+                    uint32_t k_b_idx = scheduler.template get_global_idx<(kMajorB == cute::UMMA::Major::MN), KGroupedIndexType::K> (
                         shape_k, BLOCK_K, k_block_idx, m_block_idx);
 
                     // Add 2 CTA offsets
@@ -252,9 +241,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     // Issue TMAs
                     if (cute::elect_one_sync()) {
                         if constexpr (kMajorA == cute::UMMA::Major::K)
-                            tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a[s], k_idx, m_idx);
+                            tma_copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a[s], k_a_idx, m_idx);
                         if constexpr (kMajorA == cute::UMMA::Major::MN)
-                            tma_copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a[s], m_idx, k_idx);
+                            tma_copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, 1>(&tensor_map_a, full_barriers[s], smem_a[s], m_idx, k_a_idx);
                         if constexpr (kMajorB == cute::UMMA::Major::K)
                             tma_copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, 1>(&tensor_map_b, full_barriers[s], smem_b[s], k_b_idx, n_idx);
                         if constexpr (kMajorB == cute::UMMA::Major::MN)
@@ -267,9 +256,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
                     if (sf_stage_in_group_idx == 0 and cute::elect_one_sync()) {
                         tma_copy<BLOCK_M, 1, 0, 1>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M,
-                                                   scheduler.get_global_idx<(kGemmType != GemmType::GroupedContiguous)>(shape_sf_k, 1, ceil_div(k_idx, BLOCK_K * kNumSFStagesPerLoad)));
+                                                   scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), KGroupedIndexType::SF_K>(shape_sf_k, 1, ceil_div(k_idx, BLOCK_K * kNumSFStagesPerLoad)));
                         tma_copy<BLOCK_N, 1, 0, 1>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N,
-                                                   scheduler.get_global_idx<true>(shape_sf_k, 1, ceil_div(k_idx, BLOCK_K * kNumSFStagesPerLoad), m_block_idx));
+                                                   scheduler.template get_global_idx<true, KGroupedIndexType::SF_K>(shape_sf_k, 1, ceil_div(k_idx, BLOCK_K * kNumSFStagesPerLoad), m_block_idx));
                         num_arrival_bytes += (BLOCK_M + BLOCK_N) * sizeof(uint32_t);
                     }
 
@@ -281,7 +270,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                 // Wait unaligned cases
                 #pragma unroll
                 for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                    empty_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter + 1) & 1);
+                    empty_barriers[s]->wait(phase ^ 1);
                     if (cute::elect_one_sync())
                         full_barriers[s]->arrive();
                 }
@@ -299,6 +288,12 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                                                    float, cutlass::float_ue8m0_t,
                                                                    UMMA_M, UMMA_N, kMajorA, kMajorB>();
         auto sf_desc = make_sf_desc(nullptr);
+
+        DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
+        auto a_desc = make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[0], 0, 0);
+        auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[0], 0, 0);
+        uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
+        uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
         // Checks for MMA instructions
         // NOTES: CUTLASS does not have such checks except the MMA traits, but we are not using these traits
@@ -333,15 +328,14 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                 };
 
                 // Launch MMAs
-                launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter) {
+                launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
                     constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
-                    constexpr uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : kNumLastStages;
-                    DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+                    const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
 
                     #pragma unroll
                     for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                         // Wait TMA and SF-transpose arrival
-                        with_sf_full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
+                        with_sf_full_barriers[s]->wait(phase);
                         tcgen05_after_thread_sync();
 
                         // Do SF copy at certain stages
@@ -352,7 +346,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                 cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
 
                             // SFA and SFB copy
-                            // TODO: preprocess shared memory descriptor
+                            // TODO: process shared memory descriptor by addition
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = smem_sfa[s] + i * kNumUTCCPAlignedElems;
@@ -374,14 +368,15 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                                               cutlass::float_ue8m0_t, UMMA_M, UMMA_N, kMajorA, kMajorB>,
                             cute::SM100_MMA_MXF8F6F4_2x1SM_SS<cutlass::float_e4m3_t, cutlass::float_e4m3_t, float,
                                                               cutlass::float_ue8m0_t, UMMA_M, UMMA_N, kMajorA, kMajorB>>;
+                        const auto& runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sf_stage_in_group_idx);
+                        const auto& a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, s);
+                        const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, s);
                         #pragma unroll
                         for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                            auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_K, kSwizzleBMode>(smem_b[s], 0, k * UMMA_K);
-                            // TODO: optimize runtime instruction creation
+                            b_desc.lo = advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, cutlass::float_e4m3_t>(b_desc_base_lo, 0, k * UMMA_K);
                             #pragma unroll
                             for (uint32_t w = 0; w < kNumMWaves; ++ w) {
-                                auto a_desc = make_umma_desc<kMajorA, BLOCK_M, BLOCK_K, kSwizzleAMode>(smem_a[s], w * LAYOUT_AD_M, k * UMMA_K);
-                                auto runtime_instr_desc = make_runtime_instr_desc_with_sf_id(instr_desc, sf_stage_in_group_idx);
+                                a_desc.lo = advance_umma_desc_lo<kMajorA, BLOCK_M, kSwizzleAMode, cutlass::float_e4m3_t>(a_desc_base_lo, w * LAYOUT_AD_M * BLOCK_K, k * UMMA_K);
                                 cute_mma_t::fma(a_desc, b_desc,
                                                 accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N,
                                                 k_iter > 0 or s > 0 or k > 0,
@@ -392,14 +387,14 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         }
 
                         // Commit to the mbarrier object
-                        tcgen05_before_thread_sync();
+                        // No explicit `tcgen05.fence::before_thread_sync` is needed, as this is implicitly performed by `tcgen05.commit`
                         empty_barrier_arrive(s, is_last_iter and s == kNumInnerStages - 1);
                     }
 
                     // Wait unaligned cases
                     #pragma unroll
                     for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                        with_sf_full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
+                        with_sf_full_barriers[s]->wait(phase);
                         empty_barrier_arrive(s, false);
                     }
                 });
@@ -420,15 +415,14 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         };
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter) {
+            launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
                 constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
-                constexpr uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : kNumLastStages;
-                DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+                const uint32_t kNumInnerStages = kHasDivisibleStages ? kNumStages : num_last_stages;
 
                 #pragma unroll
                 for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                     // Wait TMA arrival
-                    full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
+                    full_barriers[s]->wait(phase);
 
                     // Transpose for UTCCP at certain stages
                     const uint32_t sf_stage_in_group_idx = (k_iter * kNumStages + s) % kNumSFStagesPerLoad;
@@ -450,7 +444,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                 // Wait unaligned cases
                 #pragma unroll
                 for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
-                    full_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter) & 1);
+                    full_barriers[s]->wait(phase);
                     with_sf_full_barriers[s]->arrive(0u);
                 }
             });
@@ -508,15 +502,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
                         // The pipeline stage
                         const auto tma_stage_idx = iter_idx % kNumTMAStoreStages;
-                        const auto m_idx = scheduler.get_global_idx<(kGemmType != GemmType::GroupedContiguous)>(shape_m, BLOCK_M, m_block_idx) + w * LAYOUT_AD_M;
+                        const auto m_idx = scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), KGroupedIndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * LAYOUT_AD_M;
                         const auto n_idx = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
-
-                        // Issue accumulation TMA
-                        if (kWithAccumulation and epilogue_thread_idx == 0) {
-                            tma_copy<STORE_BLOCK_N, STORE_BLOCK_M, kSwizzleCDMode, 1, cd_dtype_t>(
-                                &tensor_map_c, accumulation_full_barrier, smem_cd[tma_stage_idx], n_idx, m_idx);
-                            accumulation_full_barrier->arrive_and_expect_tx(STORE_BLOCK_M * kSwizzleCDMode);
-                        }
 
                         // Store into shared memory
                         #pragma unroll
@@ -549,18 +536,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                 cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
                                     values[0], values[1], values[2], values[3]);
                                 cutlass::arch::fence_view_async_tmem_load();
-                                if constexpr (kWithAccumulation) {
-                                    // Wait TMA arrival before the first accumulation
-                                    if (i == 0)
-                                        accumulation_full_barrier->wait((scheduler.current_iter * (kNumMWaves * kNumStores) + iter_idx) & 1);
-
-                                    // Load the same position and add
-                                    auto c_values = ld_shared(reinterpret_cast<float4*>(smem_ptr));
-                                    *reinterpret_cast<float*>(&values[0]) += c_values.x;
-                                    *reinterpret_cast<float*>(&values[1]) += c_values.y;
-                                    *reinterpret_cast<float*>(&values[2]) += c_values.z;
-                                    *reinterpret_cast<float*>(&values[3]) += c_values.w;
-                                }
                                 st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
                             } else {
                                 // For BF16 output, read, cast and store
@@ -589,7 +564,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                         cute::tma_store_fence();
                         cutlass::arch::NamedBarrier(kNumEpilogueThreads).sync();
                         if (epilogue_thread_idx == 0) {
-                            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_cd[tma_stage_idx], n_idx, m_idx);
+                            using cute_tma_t = std::conditional_t<kWithAccumulation,
+                                cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
+                            cute_tma_t::copy(&tensor_map_d, smem_cd[tma_stage_idx], n_idx, m_idx);
                             cute::tma_store_arrive();
                         }
                     }

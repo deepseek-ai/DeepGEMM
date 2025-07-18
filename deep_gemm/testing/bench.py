@@ -29,7 +29,7 @@ def bench(fn, num_warmups: int = 5, num_tests: int = 10,
     end_event.record()
     torch.cuda.synchronize()
 
-    return start_event.elapsed_time(end_event) / num_tests
+    return start_event.elapsed_time(end_event) / num_tests / 1e3
 
 
 class empty_suppress:

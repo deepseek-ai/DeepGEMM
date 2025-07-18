@@ -92,9 +92,22 @@ constexpr static cute::UMMA::LayoutType to_umma_layout_type() {
     if constexpr (kSwizzleMode == 128) return cute::UMMA::LayoutType::SWIZZLE_128B;
 }
 
+template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t kSwizzleMode, typename dtype_t>
+__device__ __forceinline__
+constexpr uint32_t get_umma_desc_stride_k() {
+    return kMajorMode == cute::UMMA::Major::K ? 1 : get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, dtype_t>();
+}
+
+template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t kSwizzleMode, typename dtype_t>
+__device__ __forceinline__
+uint32_t advance_umma_desc_lo(const uint32_t& base, const uint32_t& offset, const uint32_t& k_idx) {
+    return base + ((offset + k_idx * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>()) >> 4u);
+}
+
 template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode, typename dtype_t>
 __device__ __forceinline__
 cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_idx, uint32_t k_idx) {
+    const uint32_t stride_k = get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>();
     if constexpr (kMajorMode == cute::UMMA::Major::K) {
         // NOTES: for K-major layout, the swizzle must be 128B (also, atom index must be 0), as `BLOCK_K` is always 128
         DG_STATIC_ASSERT(kSwizzleMode == BLOCK_K * sizeof(dtype_t), "Unexpected value");
@@ -105,7 +118,7 @@ cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_id
         const uint32_t stride_byte_offset = 8 * BLOCK_K * sizeof(dtype_t);
         const uint32_t leading_byte_offset = 0;
         return make_smem_desc(to_umma_layout_type<kSwizzleMode>(),
-                              base_smem_ptr + mn_idx * BLOCK_K + k_idx,
+                              base_smem_ptr + mn_idx * BLOCK_K + k_idx * stride_k,
                               stride_byte_offset, leading_byte_offset);
     } else {
         constexpr uint32_t BLOCK_MN_ATOM = get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, dtype_t>();
@@ -124,7 +137,7 @@ cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_id
         if constexpr (kSwizzleMode == 16)
             swap(stride_byte_offset, leading_byte_offset);
         return make_smem_desc(to_umma_layout_type<kSwizzleMode>(),
-                              base_smem_ptr + mn_idx * BLOCK_K + BLOCK_MN_ATOM * k_idx,
+                              base_smem_ptr + mn_idx * BLOCK_K + k_idx * stride_k,
                               stride_byte_offset, leading_byte_offset);
     }
 }

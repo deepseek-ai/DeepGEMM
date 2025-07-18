@@ -4,32 +4,26 @@ import shutil
 import subprocess
 from setuptools import find_packages
 from setuptools.command.build_py import build_py
-from setuptools.command.develop import develop
+from torch.utils.cpp_extension import CppExtension, CUDA_HOME
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-jit_include_dirs = ('deep_gemm/include/deep_gemm', )
-third_party_include_dirs = (
+cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi']
+sources = ['csrc/python_api.cpp']
+build_include_dirs = [
+    f'{CUDA_HOME}/include',
+    'deep_gemm/include',
+    'third-party/cutlass/include',
+    'third-party/fmt/include',
+]
+build_libraries = ['cuda', 'cudart']
+build_library_dirs = [
+    f'{CUDA_HOME}/lib64',
+    f'{CUDA_HOME}/lib64/stub'
+]
+third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
-)
-
-
-class PostDevelopCommand(develop):
-    def run(self):
-        self.make_jit_include_symlinks()
-
-    @staticmethod
-    def make_jit_include_symlinks():
-        # Make symbolic links of third-party include directories
-        for d in third_party_include_dirs:
-            dirname = d.split('/')[-1]
-            src_dir = f'{current_dir}/{d}'
-            dst_dir = f'{current_dir}/deep_gemm/include/{dirname}'
-            assert os.path.exists(src_dir)
-            if os.path.exists(dst_dir):
-                assert os.path.islink(dst_dir)
-                os.unlink(dst_dir)
-            os.symlink(src_dir, dst_dir, target_is_directory=True)
+]
 
 
 class CustomBuildPy(build_py):
@@ -46,7 +40,7 @@ class CustomBuildPy(build_py):
     def generate_default_envs(self):
         code = '# Pre-installed environment variables\n'
         code += 'persistent_envs = dict()\n'
-        for name in ('DG_JIT_CACHE_HOME_DIR', 'DG_JIT_CACHE_SHARED_USERS'):
+        for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_DISABLE_SHORTCUT_CACHE'):
             code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
 
         with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
@@ -79,9 +73,10 @@ if __name__ == '__main__':
     except:
         revision = ''
 
+    # noinspection PyTypeChecker
     setuptools.setup(
         name='deep_gemm',
-        version='1.1.0' + revision,
+        version='2.0.0' + revision,
         packages=find_packages('.'),
         package_data={
             'deep_gemm': [
@@ -90,9 +85,16 @@ if __name__ == '__main__':
                 'include/cutlass/**/*',
             ]
         },
+        ext_modules=[
+            CppExtension(name='deep_gemm_cpp',
+                         sources=sources,
+                         include_dirs=build_include_dirs,
+                         libraries=build_libraries,
+                         library_dirs=build_library_dirs,
+                         extra_compile_args=cxx_flags)
+        ],
         zip_safe=False,
         cmdclass={
-            'develop': PostDevelopCommand,
             'build_py': CustomBuildPy,
         },
     )

@@ -9,11 +9,11 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
     return 1 - sim
 
 
-def count_bytes(tensors: Iterable[torch.Tensor]):
+def count_bytes(*tensors):
     total = 0
     for t in tensors:
-        if isinstance(t, tuple) or isinstance(t, list):
-            total += count_bytes(t)
+        if isinstance(t, (tuple, list)):
+            total += count_bytes(*t)
         elif t is not None:
             total += t.numel() * t.element_size()
     return total

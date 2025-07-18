@@ -36,14 +36,37 @@ do { \
 
 namespace deep_gemm {
 
+template <typename FuncT>
+struct PatternVisitor {
+    FuncT func;
+
+    __device__ __host__
+    explicit PatternVisitor(FuncT&& func): func(std::forward<FuncT>(func)) {}
+
+    __device__ __host__
+    auto operator [](const uint32_t& i) {
+        return func(i);
+    }
+};
+
 template <typename T>
-__device__ __host__ constexpr T ceil_div(T a, T b) {
+__device__ __host__ T ceil_div(T a, T b) {
     return (a + b - 1) / b;
 }
 
 template <typename T>
-__device__ __host__ constexpr T align(T a, T b) {
+__device__ __host__ constexpr T constexpr_ceil_div(T a, T b) {
+    return (a + b - 1) / b;
+}
+
+template <typename T>
+__device__ __host__ T align(T a, T b) {
     return ceil_div(a, b) * b;
+}
+
+template <typename T>
+__device__ __host__ constexpr T constexpr_align(T a, T b) {
+    return constexpr_ceil_div(a, b) * b;
 }
 
 template <typename T>
@@ -79,6 +102,12 @@ __device__  __forceinline__ uint32_t ld_shared(const uint32_t* ptr) {
 __device__  __forceinline__ float4 ld_shared(const float4* ptr) {
     float4 ret;
     asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w) : "l"(ptr));
+    return ret;
+}
+
+__device__  __forceinline__ uint4 ld_shared(const uint4* ptr) {
+    uint4 ret;
+    asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(ptr));
     return ret;
 }
 
