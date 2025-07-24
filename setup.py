@@ -78,6 +78,9 @@ if __name__ == '__main__':
         name='deep_gemm',
         version='2.0.0' + revision,
         packages=find_packages('.'),
+        install_requires=[
+            'torch>=2.1.0',
+        ],
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/**/*',
