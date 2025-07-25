@@ -133,6 +133,43 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
         const auto& runtime = compiler->build("transpose_and_pack_fp32_into_ue8m0", code);
         TransposeAndPackFP32IntoUE8M0Runtime::launch(runtime, args);
     } else {
+        if (mn % 4 != 0) {
+            const auto& padded_mn = ceil_div(mn, 4) * 4;
+            const auto& padded_sf = torch::empty_strided({num_groups, padded_mn, sf_k},
+                                                        {padded_mn * sf_k, 1, padded_mn},
+                                                        batched_sf.options());
+            const auto& padded_out = torch::empty_strided({num_groups, padded_mn, packed_sf_k},
+                                                          {packed_sf_k * tma_aligned_mn, 1, tma_aligned_mn},
+                                                          at::TensorOptions().device(padded_sf.device()).dtype(torch::kInt));
+            DG_HOST_ASSERT(padded_mn % 4 == 0 and num_groups == 1);
+            DG_HOST_ASSERT(padded_sf.stride(1) == 1 and padded_sf.stride(2) == padded_mn);
+
+            padded_sf.slice(1, 0, mn).copy_(batched_sf);
+            padded_sf.slice(1, mn, padded_mn).fill_(0);
+            
+            constexpr int block_mn = 128;
+            constexpr int block_packed_sf_k = 16;
+            constexpr int num_threads = 512;
+            const PackFP32IntoUE8M0Runtime::Args& args = {
+                .num_groups = 1,
+                .mn = padded_mn,
+                .sf_k = sf_k,
+                .packed_sf_k = packed_sf_k,
+                .block_mn = block_mn,
+                .block_packed_sf_k = block_packed_sf_k,
+                .sf = padded_sf.data_ptr(),
+                .out = padded_out.data_ptr(),
+                .ks = nullptr,
+                .launch_args = LaunchArgs({ceil_div(padded_mn, block_mn), ceil_div(packed_sf_k, block_packed_sf_k)}, num_threads)
+            };
+
+            const auto& code = PackFP32IntoUE8M0Runtime::generate(args);
+            const auto& runtime = compiler->build("pack_fp32_into_ue8m0", code);
+            PackFP32IntoUE8M0Runtime::launch(runtime, args);
+            
+            out.copy_(padded_out.slice(1, 0, mn));
+            return (dim == 2) ? out.squeeze(0) : out;
+        }
         DG_HOST_ASSERT(mn % 4 == 0 and num_groups == 1);
         DG_HOST_ASSERT(batched_sf.stride(1) == 1 and batched_sf.stride(2) == mn);
 
