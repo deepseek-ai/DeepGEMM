@@ -118,7 +118,7 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(const to
     const auto& [num_groups, mn, k] = get_shape<3>(sf_reshaped);
     const auto& aligned_mn = get_tma_aligned_size(mn, 4);
     const auto& aligned_k  = align(k, 4);
-    
+
     const auto& options = torch::TensorOptions().device(sf.device()).dtype(torch::kUInt8);
     auto padded = torch::zeros({num_groups, aligned_mn, aligned_k}, options);
     padded.slice(1, 0, mn).slice(2, 0, k).copy_(ue8m0_tensor);
