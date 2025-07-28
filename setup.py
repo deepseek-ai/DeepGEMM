@@ -4,22 +4,44 @@ import shutil
 import subprocess
 from setuptools import find_packages
 from setuptools.command.build_py import build_py
-from torch.utils.cpp_extension import CppExtension, CUDA_HOME
+
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi']
 sources = ['csrc/python_api.cpp']
-build_include_dirs = [
-    f'{CUDA_HOME}/include',
-    'deep_gemm/include',
-    'third-party/cutlass/include',
-    'third-party/fmt/include',
-]
+
+
+def get_cuda_home():
+    """Get CUDA_HOME path, with fallback to environment variable"""
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME
+        return CUDA_HOME
+    except ImportError:
+        import os
+        return os.environ.get('CUDA_HOME', '/usr/local/cuda')
+
+
+def get_build_include_dirs():
+    """Get build include directories"""
+    cuda_home = get_cuda_home()
+    return [
+        f'{cuda_home}/include',
+        'deep_gemm/include',
+        'third-party/cutlass/include',
+        'third-party/fmt/include',
+    ]
+
+
+def get_build_library_dirs():
+    """Get build library directories"""
+    cuda_home = get_cuda_home()
+    return [
+        f'{cuda_home}/lib64',
+        f'{cuda_home}/lib64/stub'
+    ]
+
+
 build_libraries = ['cuda', 'cudart']
-build_library_dirs = [
-    f'{CUDA_HOME}/lib64',
-    f'{CUDA_HOME}/lib64/stub'
-]
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
@@ -66,6 +88,7 @@ class CustomBuildPy(build_py):
 
 
 if __name__ == '__main__':
+    from torch.utils.cpp_extension import CppExtension
     # noinspection PyBroadException
     try:
         cmd = ['git', 'rev-parse', '--short', 'HEAD']
@@ -91,9 +114,9 @@ if __name__ == '__main__':
         ext_modules=[
             CppExtension(name='deep_gemm_cpp',
                          sources=sources,
-                         include_dirs=build_include_dirs,
+                         include_dirs=get_build_include_dirs(),
                          libraries=build_libraries,
-                         library_dirs=build_library_dirs,
+                         library_dirs=get_build_library_dirs(),
                          extra_compile_args=cxx_flags)
         ],
         zip_safe=False,
