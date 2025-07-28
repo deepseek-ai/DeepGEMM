@@ -9,6 +9,9 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
+#include <cute/tensor.hpp>
+#include <cute/layout.hpp>
+#include <cute/swizzle.hpp>
 
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/scheduler.cuh>
@@ -58,7 +61,14 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
-
+    // TMA checks
+    constexpr uint32_t kNumElemBytes = sizeof(nv_bfloat16);
+    constexpr uint32_t TMA_D_BLOCK_N = kSwizzleDMode == 0 ? BLOCK_N : (kSwizzleDMode / kNumElemBytes);
+    constexpr uint32_t WGMMA_M_PER_WARP = WGMMA::M / 4;
+    DG_STATIC_ASSERT(BLOCK_M % 8 == 0, "Invalid swizzling atom");
+    DG_STATIC_ASSERT(BLOCK_N % TMA_D_BLOCK_N == 0 and BLOCK_N / TMA_D_BLOCK_N <= 32,
+                    "Unaligned TMA store or too many TMA store instructions");
+    DG_STATIC_ASSERT(TMA_D_BLOCK_N % 8 == 0, "Invalid TMA block N");
     // Shared memory
     static constexpr bool kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0);
     static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(__nv_bfloat16);
@@ -89,7 +99,19 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     DG_STATIC_ASSERT(SMEM_D_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
 
     // Data on shared memory
-    auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer);
+    // auto smem_d = reinterpret_cast<__nv_bfloat16*>(smem_buffer);
+    constexpr auto BBits = kSwizzleDMode == 128 ? 3 : (kSwizzleDMode == 64 ? 2 : 1);
+    auto smem_d = cute::make_tensor(
+        cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem_buffer)),
+        cute::composition(
+            cute::Swizzle<BBits, 3, 3>{}, 
+            cute::make_layout(
+            cute::make_shape(BLOCK_N / TMA_D_BLOCK_N, BLOCK_M, TMA_D_BLOCK_N),
+                cute::LayoutRight{}
+            )
+        )
+    );
+
     __nv_fp8_e4m3* smem_a[kNumStages];
     __nv_fp8_e4m3* smem_b[kNumStages];
     float* smem_sfa[kNumStages];
@@ -352,15 +374,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 }
             }, not scheduler.is_computation_valid(m_block_idx, math_wg_idx * WGMMA::M), num_former_iters);
 
-            // TMA checks
-            constexpr uint32_t kNumElemBytes = sizeof(nv_bfloat16);
-            constexpr uint32_t TMA_D_BLOCK_N = kSwizzleDMode == 0 ? BLOCK_N : (kSwizzleDMode / kNumElemBytes);
-            constexpr uint32_t WGMMA_M_PER_WARP = WGMMA::M / 4;
-            DG_STATIC_ASSERT(BLOCK_M % 8 == 0, "Invalid swizzling atom");
-            DG_STATIC_ASSERT(BLOCK_N % TMA_D_BLOCK_N == 0 and BLOCK_N / TMA_D_BLOCK_N <= 32,
-                            "Unaligned TMA store or too many TMA store instructions");
-            DG_STATIC_ASSERT(TMA_D_BLOCK_N % 8 == 0, "Invalid TMA block N");
-
             // Wait last TMA store to be finished
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)
                 cute::tma_store_wait<0>();
@@ -375,36 +388,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 #pragma unroll
                 for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                     // Swizzle or padding into the correct address
-                    uint8_t* smem_ptr = nullptr;
-                    if constexpr (kSwizzleDMode > 0) {
-                        // Calculate the swizzling atom offset and in-atom offset
-                        constexpr uint32_t kNumBankGroupBytes = 16;
-                        auto atom_offset = i / (TMA_D_BLOCK_N / 8), in_atom_offset = i % (TMA_D_BLOCK_N / 8);
-
-                        // Calculate the index of the bank group to be written in the atom
-                        auto bank_group_index = in_atom_offset + lane_idx * (kSwizzleDMode / kNumBankGroupBytes);
-
-                        // Reshape the atom in another view and swizzle
-                        //  - original: `(BLOCK_M, kSwizzleDMode / kNumBankGroupBytes)`
-                        //  - new: `(BLOCK_M * kSwizzleDMode / kNumBankGroupBytes / 8, 8)`
-                        constexpr bool kHasShortcut = (kSwizzleDMode / kNumBankGroupBytes) == 8;
-                        auto row = kHasShortcut ? (in_atom_offset / 8 + lane_idx) : (bank_group_index / 8);
-                        auto col = kHasShortcut ? (in_atom_offset) : (bank_group_index % 8);
-                        col ^= row % (kSwizzleDMode / 16);
-
-                        // Add back into the base pointer
-                        // NOTES: think twice before modifying this, as changes may affect the number of instructions
-                        smem_ptr = reinterpret_cast<uint8_t*>(smem_d) +                // Base pointer
-                            warp_idx * (WGMMA_M_PER_WARP * kSwizzleDMode) +            // Warp offset
-                            m_offset * kSwizzleDMode +                                 // Wave offset
-                            atom_offset * BLOCK_M * kSwizzleDMode +                    // Swizzle atom offset (constants)
-                            row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes; // In-atom offset
-                    } else {
-                        // No swizzling, just padding
-                        smem_ptr = reinterpret_cast<uint8_t*>(smem_d + (m_offset + warp_idx * WGMMA_M_PER_WARP + lane_idx) * BLOCK_N + i * 8);
-                    }
-
                     // NOTES: only 16 lanes' addresses are used
+                    auto smem_ptr = &smem_d(i * 8 / TMA_D_BLOCK_N, m_offset + warp_idx * WGMMA_M_PER_WARP + lane_idx, i * 8 % TMA_D_BLOCK_N);
                     SM90_U32x2_STSM_N<nv_bfloat162>::copy(
                         __float22bfloat162_rn({shifted_accum[i * 4 + 0], shifted_accum[i * 4 + 1]}),
                         __float22bfloat162_rn({shifted_accum[i * 4 + 2], shifted_accum[i * 4 + 3]}),
@@ -421,7 +406,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             DG_STATIC_ASSERT(kNumMathThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
-                auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
+                auto smem_ptr = &smem_d(threadIdx.x, 0, 0);
                 cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr,
                                               n_block_idx * BLOCK_N + in_block_n_offset,
                                               scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx));
