@@ -140,7 +140,7 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
                                            at::TensorOptions().device(batched_sf.device()).dtype(torch::kInt));
     // Launch the kernel
     if (batched_sf.is_contiguous()) {
-        if ((mn * sf_k) % 4 != 0)
+        if ((mn * sf_k) % 4 != 0 and num_groups > 1)
             return get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(sf);
         constexpr int block_mn = 48;
         constexpr int num_threads = 512;
