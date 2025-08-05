@@ -65,7 +65,7 @@ cat develop.sh
 ./develop.sh
 
 # Test all GEMM implements
-python tests/test_layout.py
+python tests/test_jit.py
 python tests/test_core.py
 ```
 
