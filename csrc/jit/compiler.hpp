@@ -153,7 +153,7 @@ public:
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
         // The override the compiler flags
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{}a "
+        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-cubin -O3 --expt-relaxed-constexpr --expt-extended-lambda",
                             flags, library_include_path.c_str(), device_runtime->get_arch());
@@ -203,7 +203,7 @@ public:
         }
 
         // Override the compiler flags
-        flags = fmt::format("{} {}--gpu-architecture=sm_{}a -default-device {}",
+        flags = fmt::format("{} {}--gpu-architecture=sm_{} -default-device {}",
                             flags, include_dirs, device_runtime->get_arch(), pch_flags);
     }
 
