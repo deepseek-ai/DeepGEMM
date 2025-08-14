@@ -36,9 +36,9 @@ struct SM90ArchSpec {
             return false;
 
         // Must be some fixed block N selections
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D1D and (block_n != 136 or block_n != 152))
+        if (block_n > 128 and kernel_type == KernelType::Kernel1D1D and (block_n != 136) and (block_n != 152))
             return false;
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 or block_n != 160))
+        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144) and (block_n != 160))
             return false;
 
         // Avoid bank conflicts for FP32 output
