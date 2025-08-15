@@ -10,6 +10,35 @@
 
 namespace deep_gemm {
 
+class TransposeFP32Runtime final: public LaunchRuntime<TransposeFP32Runtime> {
+public:
+    struct Args {
+        int mn, sf_k;
+        int block_mn;
+        void *sf, *out;
+
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/smxx_layout.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&transpose_fp32<
+        {}, {}, {}
+    >);
+}};
+)", args.launch_args.num_threads, args.block_mn, args.sf_k);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config, args.sf, args.out, static_cast<uint32_t>(args.mn)));
+    }
+};
+
 class TransposeAndPackFP32IntoUE8M0Runtime final: public LaunchRuntime<TransposeAndPackFP32IntoUE8M0Runtime> {
 public:
     struct Args {
@@ -88,10 +117,32 @@ static torch::Tensor get_mn_major_tma_aligned_tensor(const torch::Tensor& sf) {
     if ((batched_sf.stride(0) == tma_aligned_mn * sf_k or dim == 2) and batched_sf.stride(1) == 1 and batched_sf.stride(2) == tma_aligned_mn)
         return (dim == 2) ? batched_sf.squeeze(0) : batched_sf;
 
-    // Normal layout requires transposing
-    auto aligned_sf = torch::empty_strided({num_groups, tma_aligned_mn, sf_k}, {tma_aligned_mn * sf_k, 1, tma_aligned_mn}, batched_sf.options());
-    aligned_sf = aligned_sf.slice(1, 0, mn).copy_(batched_sf);
-    return (dim == 2) ? aligned_sf.squeeze(0) : aligned_sf;
+    const auto& out = torch::empty_strided({num_groups, mn, sf_k},
+                                           {tma_aligned_mn * sf_k, 1, tma_aligned_mn},
+                                           batched_sf.options());
+
+    if (not batched_sf.is_contiguous()) {
+        // Fallback to PyTorch's slow copy if not contiguous
+        // ReSharper disable once CppExpressionWithoutSideEffects
+        out.copy_(batched_sf);
+    } else {
+        constexpr int block_mn = 64;
+        constexpr int num_threads = 512;
+        const auto& smem_size = block_mn * (sf_k + (1 - (sf_k % 2))) * static_cast<int>(sizeof(float));
+        const TransposeFP32Runtime::Args& args = {
+            .mn = mn,
+            .sf_k = sf_k,
+            .block_mn = block_mn,
+            .sf = batched_sf.data_ptr(),
+            .out = out.data_ptr(),
+            .launch_args = LaunchArgs({ceil_div(mn, block_mn), num_groups}, num_threads, smem_size)
+        };
+
+        const auto& code = TransposeFP32Runtime::generate(args);
+        const auto& runtime = compiler->build("transpose_fp32", code);
+        TransposeFP32Runtime::launch(runtime, args);
+    }
+    return (dim == 2) ? out.squeeze(0) : out;
 }
 
 static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(const torch::Tensor& sf) {
@@ -127,7 +178,6 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
                                            at::TensorOptions().device(batched_sf.device()).dtype(torch::kInt));
     // Launch the kernel
     if (batched_sf.is_contiguous()) {
-        // Fallback to slow PyTorch impl for non-supported cases
         if ((mn * sf_k) % 4 != 0 and num_groups > 1)
             return get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(sf);
 
@@ -146,11 +196,8 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
         const auto& runtime = compiler->build("transpose_and_pack_fp32_into_ue8m0", code);
         TransposeAndPackFP32IntoUE8M0Runtime::launch(runtime, args);
     } else {
-        // Fallback to slow PyTorch impl for non-supported cases
         if (mn % 4 != 0 or num_groups > 1)
             return get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(sf);
-
-        DG_HOST_ASSERT(mn % 4 == 0 and num_groups == 1);
         DG_HOST_ASSERT(batched_sf.stride(1) == 1 and batched_sf.stride(2) == mn);
 
         constexpr int block_mn = 128;

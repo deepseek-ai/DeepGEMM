@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../utils/math.hpp"
+#include "../../utils/layout.hpp"
 
 namespace deep_gemm {
 
@@ -146,7 +147,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
                                   const bool& with_accumulation, const int& num_sms) {
-    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
     // Select M/N block sizes
@@ -179,7 +180,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         for (const auto& block_n: block_ns) {
             const int& num_waves = get_num_waves(block_m, block_n);
             const auto& last_util = get_last_wave_util(block_m, block_n);
-            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, block_m, block_n))
+            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, block_m, block_n, block_k))
                 continue;
 
             bool success = false;

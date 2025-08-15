@@ -175,7 +175,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
 
         // NOTES: only one thread (or warp) will be used
-        if (threadIdx.x == kNumMathThreads) {
+        if (threadIdx.x < kNumMathThreads + 32 and cute::elect_one_sync()) {
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                 launch_k_iterations([&](uint32_t k_iter, auto divisible_type, auto _, auto __) {

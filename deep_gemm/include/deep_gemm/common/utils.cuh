@@ -144,4 +144,22 @@ __device__ __forceinline__ void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
+template <uint32_t kNumBytes>
+struct Vectorized {
+    static auto zeros() {
+        // TODO: add `ulonglong4` for SM100 once `__ldg` support this
+        if constexpr (kNumBytes > 0 and kNumBytes % 16 == 0) {
+            return make_uint4(0, 0, 0, 0);
+        } else if constexpr (kNumBytes > 0 and kNumBytes % 8 == 0) {
+            return make_uint2(0, 0);
+        } else if constexpr (kNumBytes > 0 and kNumBytes % 4 == 0) {
+            return 0;
+        } else {
+            DG_STATIC_ASSERT(kNumBytes > 0 and kNumBytes % 4 == 0, "Invalid vectorization");
+        }
+    }
+
+    using vec_t = decltype(zeros());
+};
+
 } // namespace `deep_gemm`

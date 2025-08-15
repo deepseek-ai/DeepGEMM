@@ -136,7 +136,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             // Arrive at all CTAs
-            full_barriers[i]->init(1);
+            full_barriers[i]->init(kNumMulticast);
             empty_barriers[i]->init(kNumMulticast * kNumEpilogueThreads / 32);
         }
         #pragma unroll
@@ -241,6 +241,8 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE;
                     if (is_leader_cta and cute::elect_one_sync())
                         full_barriers[s]->arrive_and_expect_tx(kNumArrivalBytes * kNumMulticast);
+                    if (not is_leader_cta and cute::elect_one_sync())
+                        full_barriers[s]->arrive(0u);
                 }
 
                 // Wait unaligned cases
@@ -249,6 +251,8 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     empty_barriers[s]->wait((scheduler.current_iter * num_iterations + k_iter + 1) & 1);
                     if (is_leader_cta and cute::elect_one_sync())
                         full_barriers[s]->arrive();
+                    if (not is_leader_cta and cute::elect_one_sync())
+                        full_barriers[s]->arrive(0u);
                 }
             });
         }

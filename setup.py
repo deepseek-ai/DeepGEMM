@@ -27,6 +27,10 @@ third_party_include_dirs = [
     'third-party/cutlass/include/cutlass',
 ]
 
+# Use driver API for older CUDA compatibility
+if int(os.environ.get('DG_JIT_USE_DRIVER_API', '0')):
+    cxx_flags.append('-DDG_JIT_USE_DRIVER_API')
+
 
 class CustomBuildPy(build_py):
     def run(self):

@@ -35,10 +35,10 @@ public:
     }
 
     static void prepare_init(const std::string& library_root_path,
-                             const std::string& cuda_home_path_by_torch) {
+                             const std::string& cuda_home_path_by_python) {
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
-        Compiler::cuda_home = cuda_home_path_by_torch;
+        Compiler::cuda_home = cuda_home_path_by_python;
         Compiler::library_version = get_library_version();
     }
 
@@ -64,6 +64,8 @@ public:
                             get_env<int>("DG_JIT_CPP_STANDARD", 20));
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
             flags += " --ptxas-options=--verbose";
+        if (get_env("DG_JIT_WITH_LINEINFO", 0))
+            flags += " -Xcompiler -rdynamic -lineinfo";
     }
 
     virtual ~Compiler() = default;
