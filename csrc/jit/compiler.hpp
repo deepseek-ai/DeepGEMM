@@ -35,10 +35,10 @@ public:
     }
 
     static void prepare_init(const std::string& library_root_path,
-                             const std::string& cuda_home_path_by_torch) {
+                             const std::string& cuda_home_path_by_python) {
         Compiler::library_root_path = library_root_path;
         Compiler::library_include_path = Compiler::library_root_path / "include";
-        Compiler::cuda_home = cuda_home_path_by_torch;
+        Compiler::cuda_home = cuda_home_path_by_python;
         Compiler::library_version = get_library_version();
     }
 

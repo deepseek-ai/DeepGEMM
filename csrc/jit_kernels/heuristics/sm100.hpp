@@ -43,7 +43,7 @@ struct SM100ArchSpec {
     static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                     const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
-                                    const int& block_m, const int& block_n) {
+                                    const int& block_m, const int& block_n, const int& block_k) {
         // TODO: consider more carefully for BF16 GEMMs
         // 2SM BF16 UMMA does not support `N % 32 != 0`
         if (ab_dtype == torch::kBFloat16 and block_n % 32 != 0)
@@ -106,7 +106,7 @@ struct SM100ArchSpec {
                                 const int& swizzle_cd_mode,
                                 const at::ScalarType& cd_dtype) {
         constexpr static int layout_ad_m = 128;
-        return (kernel_type == KernelType::Kernel1D1D ? std::min(block_m, layout_ad_m) : block_m) * swizzle_cd_mode * 2;
+        return (kernel_type != KernelType::Kernel1D2D ? std::min(block_m, layout_ad_m) : block_m) * swizzle_cd_mode * 2;
     }
 
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,

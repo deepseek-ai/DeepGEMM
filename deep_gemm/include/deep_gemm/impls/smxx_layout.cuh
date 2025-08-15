@@ -4,6 +4,45 @@
 
 namespace deep_gemm {
 
+template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K,
+          uint32_t PADDED_SF_K = SF_K + (1 - (SF_K % 2))>
+__global__ void transpose_fp32(const float* sf, float* out, const uint32_t mn) {
+    typedef typename Vectorized<sizeof(float) * SF_K>::vec_t in_vec_t;
+    constexpr static uint32_t kNumElemsPerVec = sizeof(in_vec_t) / sizeof(float);
+    constexpr static uint32_t SF_VEC_K = SF_K / kNumElemsPerVec;
+
+    // Shapes and strides
+    extern __shared__ float smem_buffer[];
+    constexpr auto kNumTMAAlignedElems = static_cast<uint32_t>(16 / sizeof(float));
+    const auto in_block_mn = min(BLOCK_MN, mn - blockIdx.x * BLOCK_MN);
+    const auto tma_aligned_mn = align<uint32_t>(mn, kNumTMAAlignedElems);
+
+    // Shift into the block
+    sf = sf + static_cast<uint64_t>(blockIdx.y) * mn * SF_K;
+    out = out + static_cast<uint64_t>(blockIdx.y) * tma_aligned_mn * SF_K;
+    const auto& local_sf = reinterpret_cast<const in_vec_t*>(sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
+
+    // Load
+    for (uint32_t i = threadIdx.x; i < in_block_mn * SF_VEC_K; i += kNumThreads) {
+        auto in_vec = __ldg(local_sf + i);
+        const auto& in_values = reinterpret_cast<float*>(&in_vec);
+
+        const auto& row = i / SF_VEC_K, col = (i % SF_VEC_K) * kNumElemsPerVec;
+        #pragma unroll
+        for (uint32_t j = 0; j < kNumElemsPerVec; ++ j)
+            smem_buffer[row * PADDED_SF_K + col + j] = in_values[j];
+    }
+    __syncthreads();
+
+    // Store
+    #pragma unroll
+    for (uint32_t i = threadIdx.x; i < in_block_mn * SF_K; i += kNumThreads) {
+        const auto& sf_k_idx = i / in_block_mn, mn_idx = i % in_block_mn;
+        const auto& global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx;
+        out[sf_k_idx * tma_aligned_mn + global_mn_idx] = ld_shared(smem_buffer + mn_idx * PADDED_SF_K + sf_k_idx);
+    }
+}
+
 // NOTES: the two kernels below always pack the K dimension
 
 template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K>

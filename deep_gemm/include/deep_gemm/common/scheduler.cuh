@@ -11,16 +11,22 @@ enum class KGroupedIndexType {
     SF_K,
 };
 
-template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumSMs, bool isMulticastOnA>
+template <GemmType kGemmType, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumSMs, bool kIsMulticastOnA>
 static constexpr uint32_t get_num_1d_blocks_per_group() {
     // Select the best from candidates
     uint32_t num_best_blocks = 0, min_usage = cute::numeric_limits<uint32_t>::max();
-    for (const auto& candidate: {8u, 16u}) {
-        const auto& usage = isMulticastOnA ?
-            candidate * BLOCK_N + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_M: // Grouping on N
-            candidate * BLOCK_M + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_N; // Grouping on M
-        if (usage < min_usage)
-            min_usage = usage, num_best_blocks = candidate;
+    if constexpr (kGemmType == GemmType::MGroupedContiguous or
+                  kGemmType == GemmType::MGroupedMasked) {
+        // For grouped GEMMs, let weights always stay in the L2 cache and read activations by once
+        num_best_blocks = kNumSMs;
+    } else {
+        for (const auto& candidate: {8u, 16u}) {
+            const auto& usage = kIsMulticastOnA ?
+                        candidate * BLOCK_N + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_M: // Grouping on N
+                        candidate * BLOCK_M + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_N; // Grouping on M
+            if (usage < min_usage)
+                min_usage = usage, num_best_blocks = candidate;
+        }
     }
     return num_best_blocks;
 }
@@ -32,7 +38,7 @@ template <GemmType kGemmType,
           uint32_t kNumGroups,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>()>
+          uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>()>
 struct Scheduler {
     int current_iter = -1;
 

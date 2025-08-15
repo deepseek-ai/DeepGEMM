@@ -48,7 +48,18 @@ struct FP8MMASelector {
         if constexpr (N == 144) return MMA_64x144x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 152) return MMA_64x152x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 160) return MMA_64x160x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 168) return MMA_64x168x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 176) return MMA_64x176x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 184) return MMA_64x184x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 192) return MMA_64x192x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 200) return MMA_64x200x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 208) return MMA_64x208x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 216) return MMA_64x216x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 224) return MMA_64x224x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 232) return MMA_64x232x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 240) return MMA_64x240x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 248) return MMA_64x248x32_F32E4M3E4M3_SS_TN();
+        if constexpr (N == 256) return MMA_64x256x32_F32E4M3E4M3_SS_TN();
     }
 
     static constexpr auto select_type() {
@@ -57,6 +68,71 @@ struct FP8MMASelector {
 
     using type = decltype(select_type());
 };
+
+template <int N_, typename MMA>
+struct BF16MMA {
+
+    template <size_t ...Idx>
+    __forceinline__ __device__ static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
+        using namespace cute::SM90::GMMA;
+        MMA::fma(desc_a, desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
+    }
+
+    __forceinline__ __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, float* d, bool scale_d) {
+        call_fma_impl(desc_a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
+    }
+
+    static constexpr int M = 64;
+    static constexpr int N = N_;
+    static constexpr int K = 16;
+    static constexpr int kNumAccum = M * N / 128;
+};
+
+template <int N>
+struct BF16MMASelector {
+
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        if constexpr (N == 16) return MMA_64x16x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 24) return MMA_64x24x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 32) return MMA_64x32x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 40) return MMA_64x40x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 48) return MMA_64x48x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 56) return MMA_64x56x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 64) return MMA_64x64x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 72) return MMA_64x72x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 80) return MMA_64x80x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 88) return MMA_64x88x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 96) return MMA_64x96x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 104) return MMA_64x104x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 112) return MMA_64x112x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 120) return MMA_64x120x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 128) return MMA_64x128x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 136) return MMA_64x136x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 144) return MMA_64x144x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 152) return MMA_64x152x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 160) return MMA_64x160x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 168) return MMA_64x168x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 176) return MMA_64x176x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 184) return MMA_64x184x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 192) return MMA_64x192x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 200) return MMA_64x200x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 208) return MMA_64x208x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 216) return MMA_64x216x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 224) return MMA_64x224x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 232) return MMA_64x232x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 240) return MMA_64x240x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 248) return MMA_64x248x16_F32BF16BF16_SS<Major::K, Major::K>();
+        if constexpr (N == 256) return MMA_64x256x16_F32BF16BF16_SS<Major::K, Major::K>();
+    }
+
+    static constexpr auto select_type() {
+        return BF16MMA<N, decltype(select_mma())>();
+    }
+
+    using type = decltype(select_type());
+};
+
 
 template <typename dtype_t>
 struct SM90_U32x2_STSM_N {

@@ -64,8 +64,8 @@ public:
         kernel = load_kernel(cubin_path, symbol_names[0], &library);
     }
 
-    static void prepare_init(const std::string& cuda_home_path_by_torch) {
-        cuda_home = cuda_home_path_by_torch;
+    static void prepare_init(const std::string& cuda_home_path_by_python) {
+        cuda_home = cuda_home_path_by_python;
     }
 
     static bool check_validity(const std::filesystem::path& dir_path) {

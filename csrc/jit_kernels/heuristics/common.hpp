@@ -179,7 +179,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         for (const auto& block_n: block_ns) {
             const int& num_waves = get_num_waves(block_m, block_n);
             const auto& last_util = get_last_wave_util(block_m, block_n);
-            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, block_m, block_n))
+            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, block_m, block_n, block_k))
                 continue;
 
             bool success = false;

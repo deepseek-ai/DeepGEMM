@@ -30,15 +30,19 @@ struct SM90ArchSpec {
     static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                     const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
-                                    const int& block_m, const int& block_n) {
+                                    const int& block_m, const int& block_n, const int& block_k) {
         // FP32 output does not support `block_m == 256`
         if (cd_dtype == at::kFloat and block_m == 256)
             return false;
 
+        // TODO: more general block N selection
         // Must be some fixed block N selections
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D1D and (block_n != 136 or block_n != 152))
+        if (block_n > 128 and kernel_type == KernelType::Kernel1D1D and (block_n != 136 and block_n != 152))
             return false;
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 or block_n != 160))
+
+        // Too many scaling factors in a single block: `block_n > block_k and std::gcd(block_n, block_k) != block_n - block_k`
+        // Or too many register spills
+        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 192))
             return false;
 
         // Avoid bank conflicts for FP32 output

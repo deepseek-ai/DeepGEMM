@@ -8,7 +8,7 @@
 
 namespace deep_gemm {
 
-#if CUDART_VERSION >= 12080 or defined(DG_JIT_USE_DRIVER_API)
+#if CUDART_VERSION >= 12080 and not defined(DG_JIT_USE_DRIVER_API)
 
 // Use CUDA runtime API
 using LibraryHandle = cudaLibrary_t;

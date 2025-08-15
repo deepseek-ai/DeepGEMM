@@ -202,7 +202,7 @@ static void sm100_m_grouped_fp8_gemm_contiguous_1d1d(const torch::Tensor& a, con
     SM100FP8Gemm1D1DRuntime::launch(runtime, args);
 }
 
-static void sm100_fp8_m_grouped_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+static void sm100_m_grouped_fp8_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                  const torch::Tensor& b, const torch::Tensor& sfb,
                                                  const torch::Tensor& d,
                                                  const torch::Tensor& masked_m,
