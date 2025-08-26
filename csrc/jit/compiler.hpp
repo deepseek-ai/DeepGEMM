@@ -155,10 +155,14 @@ public:
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
         // The override the compiler flags
+        std::string selected_arch = device_runtime->get_arch();
+        // Compatibility: NVCC < 12.9 may not recognize sm_100f; fallback to sm_100a
+        if (selected_arch == "100f" && (nvcc_major < 12 || (nvcc_major == 12 && nvcc_minor < 9)))
+            selected_arch = "100a";
         flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-cubin -O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), device_runtime->get_arch());
+                            flags, library_include_path.c_str(), selected_arch);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const override {
@@ -205,8 +209,12 @@ public:
         }
 
         // Override the compiler flags
+        std::string selected_arch = device_runtime->get_arch();
+        // Compatibility: NVRTC < 12.9 may not recognize sm_100f; fallback to sm_100a
+        if (selected_arch == "100f" && (major < 12 || (major == 12 && minor < 9)))
+            selected_arch = "100a";
         flags = fmt::format("{} {}--gpu-architecture=sm_{} -default-device {}",
-                            flags, include_dirs, device_runtime->get_arch(), pch_flags);
+                            flags, include_dirs, selected_arch, pch_flags);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const override {
