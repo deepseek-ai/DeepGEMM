@@ -13,6 +13,7 @@ cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declar
 sources = ['csrc/python_api.cpp']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
+    f'{CUDA_HOME}/include/cccl',
     'deep_gemm/include',
     'third-party/cutlass/include',
     'third-party/fmt/include',
