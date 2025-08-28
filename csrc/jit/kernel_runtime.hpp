@@ -13,12 +13,17 @@ struct LaunchArgs {
     int num_threads;
     int smem_size;
     int cluster_dim;
+    bool cooperative;
 
-    LaunchArgs(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1):
-        grid_dim({grid_dim_x, 1}), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim) {}
+    LaunchArgs(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, 
+               const int& cluster_dim = 1, const bool& cooperative = false):
+        grid_dim({grid_dim_x, 1}), num_threads(num_threads), smem_size(smem_size), 
+        cluster_dim(cluster_dim), cooperative(cooperative) {}
 
-    LaunchArgs(const std::pair<int, int>& grid_dim, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1):
-        grid_dim(grid_dim), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim) {}
+    LaunchArgs(const std::pair<int, int>& grid_dim, const int& num_threads, const int& smem_size = 0, 
+               const int& cluster_dim = 1, const bool& cooperative = false):
+        grid_dim(grid_dim), num_threads(num_threads), smem_size(smem_size), 
+        cluster_dim(cluster_dim), cooperative(cooperative) {}
 };
 
 class KernelRuntime final {

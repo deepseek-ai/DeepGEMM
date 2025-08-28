@@ -37,7 +37,8 @@ static void unload_library(const LibraryHandle& library) {
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                   const cudaStream_t& stream, const int& smem_size,
-                                                  const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim) {
+                                                  const dim3& grid_dim, const dim3& block_dim, 
+                                                  const int& cluster_dim, const bool& cooperative = false) {
     if (smem_size > 0)
         DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -49,14 +50,27 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.numAttrs = 0;
     config.attrs = nullptr;
 
-    // NOTES: must use `static` or the `attr` will be deconstructed
-    static LaunchAttrHandle attr;
+    // 支持多个属性
+    static LaunchAttrHandle attrs[2];
+    int attr_count = 0;
+    
     if (cluster_dim > 1) {
-        attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim = {static_cast<unsigned>(cluster_dim), 1, 1};
-        config.attrs = &attr;
-        config.numAttrs = 1;
+        attrs[attr_count].id = cudaLaunchAttributeClusterDimension;
+        attrs[attr_count].val.clusterDim = {static_cast<unsigned>(cluster_dim), 1, 1};
+        attr_count++;
     }
+    
+    if (cooperative) {
+        attrs[attr_count].id = cudaLaunchAttributeCooperative;
+        attrs[attr_count].val.cooperative = 1;
+        attr_count++;
+    }
+    
+    if (attr_count > 0) {
+        config.attrs = attrs;
+        config.numAttrs = attr_count;
+    }
+    
     return config;
 }
 
@@ -95,7 +109,7 @@ static void unload_library(const LibraryHandle& library) {
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                  const cudaStream_t& stream, const int& smem_size,
-                                                 const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim) {
+                                                 const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& cooperative = false) {
     if (smem_size > 0)
         DG_CUDA_DRIVER_CHECK(cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
 
@@ -111,16 +125,30 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.numAttrs = 0;
     config.attrs = nullptr;
 
+    // 支持多个属性
     // NOTES: must use `static` or the `attr` will be deconstructed
-    static LaunchAttrHandle attr;
+    static LaunchAttrHandle attrs[2];
+    int attr_count = 0;
+
     if (cluster_dim > 1) {
-        attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-        attr.value.clusterDim.x = cluster_dim;
-        attr.value.clusterDim.y = 1;
-        attr.value.clusterDim.z = 1;
-        config.attrs = &attr;
-        config.numAttrs = 1;
+        attrs[attr_count].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+        attrs[attr_count].value.clusterDim.x = cluster_dim;
+        attrs[attr_count].value.clusterDim.y = 1;
+        attrs[attr_count].value.clusterDim.z = 1;
+        attr_count++;
     }
+
+    if (cooperative) {
+        attrs[attr_count].id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+        attrs[attr_count].value.cooperative = 1;
+        attr_count++;
+    }
+
+    if (attr_count > 0) {
+        config.attrs = attrs;
+        config.numAttrs = attr_count;
+    }
+
     return config;
 }
 
