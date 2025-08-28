@@ -61,6 +61,7 @@ struct GemmConfig {
     cute::UMMA::Major major_b;
     bool with_accumulation;
     int block_m, block_n, block_k;
+    int signal_threshold;
     int num_stages, num_last_stages;
 
     // Templated device configs
@@ -266,6 +267,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         .block_m = best_block_m,
         .block_n = best_block_n,
         .block_k = block_k,
+        .signal_threshold = ceil_div(n, best_block_n),
         .num_stages = best_num_stages,
         .num_last_stages = ceil_div(k, block_k) % best_num_stages,
         .num_sms = num_min_sms,
