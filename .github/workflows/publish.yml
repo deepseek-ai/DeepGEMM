@@ -82,7 +82,8 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Build core package
         env:
-          GROUPED_GEMM_SKIP_CUDA_BUILD: "TRUE"
+          DEEP_GEMM_NO_LOCAL_VERSION: "TRUE"
+          DEEP_GEMM_SKIP_CUDA_BUILD: "TRUE"
         run: |
           python setup.py sdist --dist-dir=dist
       - name: Deploy
