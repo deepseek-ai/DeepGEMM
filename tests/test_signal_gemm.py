@@ -62,21 +62,21 @@ def test_m_grouped_gemm_signal() -> None:
         print(f' > Correctness ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}) checked ')
 
         # Construct full cases
-        a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
-        max_signal_size = num_groups * ceil_div(max_m, 64)
-        combine_signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
+        # a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+        # max_signal_size = num_groups * ceil_div(max_m, 64)
+        # combine_signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
 
-        # noinspection PyShadowingNames
-        def test_func():
-            deep_gemm.m_grouped_fp8_gemm_nt_signal(a, b, d, masked_m, combine_signal, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+        # # noinspection PyShadowingNames
+        # def test_func():
+        #     deep_gemm.m_grouped_fp8_gemm_nt_signal(a, b, d, masked_m, combine_signal, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
-        # Test performance with fixed shapes
-        valid_m = masked_m.sum().item()
-        t = bench_kineto(test_func, 'fp8_signal_gemm', suppress_kineto_output=True)
-        print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): '
-              f'{t * 1e6:4.0f} us | '
-              f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
-              f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+        # # Test performance with fixed shapes
+        # valid_m = masked_m.sum().item()
+        # t = bench_kineto(test_func, 'fp8_signal_gemm', suppress_kineto_output=True)
+        # print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): '
+        #       f'{t * 1e6:4.0f} us | '
+        #       f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
+        #       f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
     print()
 
 
@@ -98,19 +98,19 @@ def test_m_grouped_gemm_masked() -> None:
                 assert diff < 0.001, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
 
         # Construct full cases
-        a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
+        # a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
 
-        # noinspection PyShadowingNames
-        def test_func():
-            deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+        # # noinspection PyShadowingNames
+        # def test_func():
+        #     deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
 
-        # Test performance with fixed shapes
-        valid_m = masked_m.sum().item()
-        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-        print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): '
-              f'{t * 1e6:4.0f} us | '
-              f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
-              f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
+        # # Test performance with fixed shapes
+        # valid_m = masked_m.sum().item()
+        # t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        # print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): '
+        #       f'{t * 1e6:4.0f} us | '
+        #       f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
+        #       f'{(count_bytes(a, d) * valid_m / (max_m * num_groups) + count_bytes(b)) / 1e9 / t:4.0f} GB/s')
     print()
 
 if __name__ == '__main__':
