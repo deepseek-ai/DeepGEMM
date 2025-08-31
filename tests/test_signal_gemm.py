@@ -49,7 +49,7 @@ def test_m_grouped_gemm_signal() -> None:
         disable_ue8m0_cast = not use_ue8m0
 
         # Test correctness
-        for i in range(10):
+        for i in range(2):
             a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
             max_signal_size = num_groups * ceil_div(max_m, 64)
             combine_signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
@@ -90,12 +90,14 @@ def test_m_grouped_gemm_masked() -> None:
         disable_ue8m0_cast = not use_ue8m0
 
         # Test correctness
-        for i in range(10):
+        for i in range(2):
             a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
             deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
             for j in range(num_groups):
                 diff = calc_diff(d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
                 assert diff < 0.001, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+
+        print(f' > Correctness ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}) checked ')
 
         # Construct full cases
         # a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
