@@ -86,10 +86,15 @@ def enumerate_m_grouped_contiguous(use_bf16: bool = False) -> Generator:
 
 
 def enumerate_m_grouped_masked() -> Generator:
-    max_m = 4096
+    max_m = 2048
+    # max_m = 4096
+    # for kernel_type in get_kernel_types():
+    #     for num_groups, m in ((1, 1024), (2, 512), (4, 256)):
+    #         for n, k in ((4096, 7168), (7168, 2048), ):
+    #             yield kernel_type, num_groups, max_m, m, n, k
     for kernel_type in get_kernel_types():
-        for num_groups, m in ((1, 1024), (2, 512), (4, 256)):
-            for n, k in ((4096, 7168), (7168, 2048), ):
+        for num_groups, m in ((16, 32), (16, 64)):
+            for n, k in ((7168, 2048), ):
                 yield kernel_type, num_groups, max_m, m, n, k
 
 
