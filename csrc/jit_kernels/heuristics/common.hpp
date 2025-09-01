@@ -210,7 +210,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         }
     }
     DG_HOST_ASSERT(best_block_m > 0 and best_block_n > 0);
-    printf("Best block size: (%d, %d)\n", best_block_m, best_block_n);
+    printf("Best num waves: %d, Best block size: (%d, %d)\n", best_num_waves, best_block_m, best_block_n);
 
     // Decide the number of TMA multicasts and whether broadcast on A
     MulticastConfig best_multicast_config = {1, true};
