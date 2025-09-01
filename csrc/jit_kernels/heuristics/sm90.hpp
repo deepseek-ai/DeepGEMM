@@ -42,7 +42,7 @@ struct SM90ArchSpec {
 
         // Too many scaling factors in a single block: `block_n > block_k and std::gcd(block_n, block_k) != block_n - block_k`
         // Or too many register spills
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 192))
+        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 176 and block_n != 192))
             return false;
 
         // Avoid bank conflicts for FP32 output

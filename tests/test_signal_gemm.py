@@ -127,6 +127,5 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    for max_block_n in (144, 160, 192):
-        test_m_grouped_gemm_signal(max_block_n)
+    test_m_grouped_gemm_signal()
         # test_m_grouped_gemm_masked()
