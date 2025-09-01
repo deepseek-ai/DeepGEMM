@@ -12,7 +12,7 @@ from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
 from pathlib import Path
-from packaging import version as parse
+from packaging.version import parse
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 SKIP_CUDA_BUILD = os.getenv("DEEP_GEMM_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
