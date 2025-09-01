@@ -54,10 +54,8 @@ def test_m_grouped_gemm_signal() -> None:
             max_signal_size = num_groups * ceil_div(max_m, 64)
             combine_signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
             origin_sms = deep_gemm.get_num_sms()
-            print(f'Origin SMS: {origin_sms}')
             deep_gemm.set_num_sms(origin_sms - 3)
             block_m, threshold = deep_gemm.m_grouped_fp8_gemm_nt_signal(a, b, d, masked_m, combine_signal, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
-            print(f'Current SMS: {deep_gemm.get_num_sms()}')
             deep_gemm.set_num_sms(origin_sms)
             check_signal(num_groups, max_m, block_m, threshold, combine_signal, masked_m)
             for j in range(num_groups):

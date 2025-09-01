@@ -150,9 +150,6 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const bool& with_accumulation, const int& num_sms) {
     DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
-    printf("m: %d, n: %d, k: %d, num_groups: %d, major_a: %d, major_b: %d, ab_dtype: %d, cd_dtype: %d, with_accumulation: %d, num_sms: %d\n",
-           m, n, k, num_groups, static_cast<int>(major_a), static_cast<int>(major_b),
-           static_cast<int>(ab_dtype), static_cast<int>(cd_dtype), with_accumulation, num_sms);
 
     // Select M/N block sizes
     // TODO: support `% 16 == 8` block size on SM90
@@ -205,6 +202,10 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                 }
             }
 
+            if (block_m == 64 and block_n == 176) {
+                printf("success: %d, num_waves: %d, last_util: %d, best_block: (%d, %d), best_num_waves: %d, best_last_util: %d\n", success, num_waves, last_util, best_block_m, best_block_n, best_num_waves, best_last_util);
+            }
+
             // Replace with the new config if successful
             if (success) {
                 best_block_m = block_m, best_block_n = block_n;
@@ -213,7 +214,6 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         }
     }
     DG_HOST_ASSERT(best_block_m > 0 and best_block_n > 0);
-    printf("Best num waves: %d, Best block size: (%d, %d)\n", best_num_waves, best_block_m, best_block_n);
 
     // Decide the number of TMA multicasts and whether broadcast on A
     MulticastConfig best_multicast_config = {1, true};
