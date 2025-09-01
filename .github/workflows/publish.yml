@@ -63,6 +63,7 @@ jobs:
       cxx11_abi: ${{ matrix.cxx11_abi }}
       release-version: ${{ needs.setup_release.outputs.release-version }}
       upload-to-release: true
+      use-local-version: false
 
   publish_package:
     name: Publish package
