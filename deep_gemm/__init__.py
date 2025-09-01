@@ -14,6 +14,8 @@ except ImportError:
 # Configs
 import deep_gemm_cpp
 from deep_gemm_cpp import (
+    set_compile_mode,
+    get_compile_mode,
     set_num_sms,
     get_num_sms,
     set_tc_util,

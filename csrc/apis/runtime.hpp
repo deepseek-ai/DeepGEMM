@@ -6,11 +6,17 @@
 namespace deep_gemm::runtime {
 
 static void register_apis(pybind11::module_& m) {
+    m.def("set_compile_mode", [&](const int& new_compile_mode) {
+        device_runtime->set_compile_mode(new_compile_mode);
+    });
+    m.def("get_compile_mode", [&]() {
+        return device_runtime->get_compile_mode();
+    });
     m.def("set_num_sms", [&](const int& new_num_sms) {
         device_runtime->set_num_sms(new_num_sms);
     });
     m.def("get_num_sms", [&]() {
-       return device_runtime->get_num_sms();
+        return device_runtime->get_num_sms();
     });
     m.def("set_tc_util", [&](const int& new_tc_util) {
         device_runtime->set_tc_util(new_tc_util);
