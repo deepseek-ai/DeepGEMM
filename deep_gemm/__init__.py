@@ -5,7 +5,6 @@ import subprocess
 try:
     # noinspection PyUnresolvedReferences
     from .envs import persistent_envs
-
     for key, value in persistent_envs.items():
         if key not in os.environ:
             os.environ[key] = value
@@ -14,31 +13,29 @@ except ImportError:
 
 # Configs
 import deep_gemm_cpp
-from deep_gemm_cpp import (
-    set_num_sms,
-    get_num_sms,
-    set_tc_util,
-    get_tc_util,
-)
 
 # Kernels
 from deep_gemm_cpp import (
-    # FP8 GEMMs
-    fp8_gemm_nt,
-    fp8_gemm_nn,
-    fp8_gemm_tn,
-    fp8_gemm_tt,
-    m_grouped_fp8_gemm_nt_contiguous,
-    m_grouped_fp8_gemm_nn_contiguous,
-    m_grouped_fp8_gemm_nt_masked,
-    k_grouped_fp8_gemm_tn_contiguous,
+    bf16_gemm_nn,
     # BF16 GEMMs
     bf16_gemm_nt,
-    bf16_gemm_nn,
     bf16_gemm_tn,
     bf16_gemm_tt,
+    fp8_gemm_nn,
+    # FP8 GEMMs
+    fp8_gemm_nt,
+    fp8_gemm_tn,
+    fp8_gemm_tt,
+    get_num_sms,
+    get_tc_util,
+    k_grouped_fp8_gemm_tn_contiguous,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
+    m_grouped_fp8_gemm_nn_contiguous,
+    m_grouped_fp8_gemm_nt_contiguous,
+    m_grouped_fp8_gemm_nt_masked,
+    set_num_sms,
+    set_tc_util,
     # Layout kernels
     transform_sf_into_required_layout,
 )
@@ -49,8 +46,7 @@ fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
 bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 
 # Some utils
-from . import testing
-from . import utils
+from . import testing, utils
 from .utils import *
 
 
@@ -58,19 +54,15 @@ from .utils import *
 def _find_cuda_home() -> str:
     # TODO: reuse PyTorch API later
     # For some PyTorch versions, the original `_find_cuda_home` will initialize CUDA, which is incompatible with process forks
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
     if cuda_home is None:
         # noinspection PyBroadException
         try:
-            with open(os.devnull, "w") as devnull:
-                nvcc = (
-                    subprocess.check_output(["which", "nvcc"], stderr=devnull)
-                    .decode()
-                    .rstrip("\r\n")
-                )
+            with open(os.devnull, 'w') as devnull:
+                nvcc = subprocess.check_output(['which', 'nvcc'], stderr=devnull).decode().rstrip('\r\n')
                 cuda_home = os.path.dirname(os.path.dirname(nvcc))
         except Exception:
-            cuda_home = "/usr/local/cuda"
+            cuda_home = '/usr/local/cuda'
             if not os.path.exists(cuda_home):
                 cuda_home = None
     assert cuda_home is not None
@@ -78,9 +70,8 @@ def _find_cuda_home() -> str:
 
 
 deep_gemm_cpp.init(
-    os.path.dirname(os.path.abspath(__file__)),  # Library root directory path
-    _find_cuda_home(),  # CUDA home
+    os.path.dirname(os.path.abspath(__file__)), # Library root directory path
+    _find_cuda_home()                           # CUDA home
 )
-
 
 __version__ = "2.0.0"
