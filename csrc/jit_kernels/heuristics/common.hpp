@@ -147,7 +147,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const int& m, const int& n, const int& k, const int& num_groups,
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
-                                  const bool& with_accumulation, const int& num_sms) {
+                                  const bool& with_accumulation, const int& num_sms, const int& max_block_n = 256) {
     DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
@@ -156,7 +156,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     const auto& block_ms = gemm_type == GemmType::MGroupedContiguous ?
         std::vector{get_mk_alignment_for_contiguous_layout()} : std::vector{64, 128, 256};
     std::vector<int> block_ns;
-    for (int i = 16; i <= 256; i += 16)
+    for (int i = 16; i <= max_block_n; i += 16)
         block_ns.push_back(i);
 
     // K block size is selected in a fixed manner
@@ -200,10 +200,6 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                     success |= block_m != best_block_m and block_n > best_block_n 
                                and block_n <= n and block_m <= m;
                 }
-            }
-
-            if (block_m == 64 and block_n == 176) {
-                printf("success: %d, num_waves: %d, last_util: %d, best_block: (%d, %d), best_num_waves: %d, best_last_util: %d\n", success, num_waves, last_util, best_block_m, best_block_n, best_num_waves, best_last_util);
             }
 
             // Replace with the new config if successful

@@ -229,7 +229,8 @@ static std::pair<int, int> m_grouped_fp8_gemm_nt_signal(const std::pair<torch::T
                                          const int& expected_m,
                                          std::optional<std::tuple<int, int, int>> recipe,
                                          const std::string& compiled_dims,
-                                         const bool& disable_ue8m0_cast) {
+                                         const bool& disable_ue8m0_cast,
+                                         const int& max_block_n = 256) {
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a.first);
     const auto& major_b = get_major_type_ab(b.first);
@@ -489,7 +490,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_fp8_gemm_nt_signal", &m_grouped_fp8_gemm_nt_signal,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"), py::arg("signal"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
-          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false);
+          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false, py::arg("max_block_n") = 256);
     m.def("k_grouped_fp8_gemm_tn_contiguous", &k_grouped_fp8_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks"),
           py::arg("ks_tensor"), py::arg("c") = std::nullopt,

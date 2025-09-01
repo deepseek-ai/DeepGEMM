@@ -309,7 +309,7 @@ static std::pair<int, int> sm90_m_grouped_fp8_gemm_signal_1d2d(const torch::Tens
                                                 const int& num_groups, const int& m, const int& n, const int& k,
                                                 const int& expected_m,
                                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                                const std::string& compiled_dims) {
+                                                const std::string& compiled_dims, const int& max_block_n = 256) {
     const auto& aligned_k = align(k, 128);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
@@ -319,7 +319,7 @@ static std::pair<int, int> sm90_m_grouped_fp8_gemm_signal_1d2d(const torch::Tens
         GemmType::MGroupedMasked, KernelType::Kernel1D2D,
         expected_m, n, k, num_groups, major_a, major_b,
         torch::kFloat8_e4m3fn, d.scalar_type(), false,
-        device_runtime->get_num_sms());
+        device_runtime->get_num_sms(), max_block_n);
 
     // Requires no TMA splits
     DG_HOST_ASSERT(config.smem_config.swizzle_a_mode == config.block_k);
