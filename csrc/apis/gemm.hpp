@@ -265,7 +265,7 @@ static std::pair<int, int> m_grouped_fp8_gemm_nt_signal(const std::pair<torch::T
     const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         return sm90_m_grouped_fp8_gemm_signal_1d2d(a.first, sfa, b.first, sfb, d, masked_m, signal,
-                                            num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
+                                            num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims, max_block_n);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
