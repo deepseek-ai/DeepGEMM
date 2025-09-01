@@ -13,31 +13,29 @@ except ImportError:
 
 # Configs
 import deep_gemm_cpp
+from deep_gemm_cpp import (
+    set_num_sms,
+    get_num_sms,
+    set_tc_util,
+    get_tc_util,
+)
 
 # Kernels
 from deep_gemm_cpp import (
-    bf16_gemm_nn,
-    # BF16 GEMMs
-    bf16_gemm_nt,
-    bf16_gemm_tn,
-    bf16_gemm_tt,
-    fp8_gemm_nn,
     # FP8 GEMMs
-    fp8_gemm_nt,
-    fp8_gemm_tn,
-    fp8_gemm_tt,
-    get_num_sms,
-    get_tc_util,
+    fp8_gemm_nt, fp8_gemm_nn,
+    fp8_gemm_tn, fp8_gemm_tt,
+    m_grouped_fp8_gemm_nt_contiguous,
+    m_grouped_fp8_gemm_nn_contiguous,
+    m_grouped_fp8_gemm_nt_masked,
     k_grouped_fp8_gemm_tn_contiguous,
+    # BF16 GEMMs
+    bf16_gemm_nt, bf16_gemm_nn,
+    bf16_gemm_tn, bf16_gemm_tt,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
-    m_grouped_fp8_gemm_nn_contiguous,
-    m_grouped_fp8_gemm_nt_contiguous,
-    m_grouped_fp8_gemm_nt_masked,
-    set_num_sms,
-    set_tc_util,
     # Layout kernels
-    transform_sf_into_required_layout,
+    transform_sf_into_required_layout
 )
 
 # Some alias for legacy supports
@@ -74,5 +72,3 @@ deep_gemm_cpp.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     _find_cuda_home()                           # CUDA home
 )
-
-__version__ = "2.0.0"
