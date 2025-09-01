@@ -39,7 +39,7 @@ def check_signal(num_local_expert, max_m, block_m, threshold, combine_signal, ma
                 else:
                     assert signal[i] == 0, f'{i=}, {signal[i]=}'
 
-def test_m_grouped_gemm_signal() -> None:
+def test_m_grouped_gemm_signal(max_block_n) -> None:
     print('Testing m-grouped masked GEMM:')
 
     # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
@@ -55,7 +55,7 @@ def test_m_grouped_gemm_signal() -> None:
             combine_signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
             origin_sms = deep_gemm.get_num_sms()
             deep_gemm.set_num_sms(origin_sms - 3)
-            block_m, threshold = deep_gemm.m_grouped_fp8_gemm_nt_signal(a, b, d, masked_m, combine_signal, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
+            block_m, threshold = deep_gemm.m_grouped_fp8_gemm_nt_signal(a, b, d, masked_m, combine_signal, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast, max_block_n=max_block_n)
             deep_gemm.set_num_sms(origin_sms)
             check_signal(num_groups, max_m, block_m, threshold, combine_signal, masked_m)
             for j in range(num_groups):
@@ -127,5 +127,6 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_m_grouped_gemm_signal()
-    test_m_grouped_gemm_masked()
+    for max_block_n in (144, 160, 192):
+        test_m_grouped_gemm_signal(max_block_n)
+        # test_m_grouped_gemm_masked()
