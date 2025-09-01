@@ -64,4 +64,4 @@ jobs:
       torch-version: ${{ inputs.torch-version || matrix.torch-version }}
       cxx11_abi: ${{ inputs.cxx11_abi || matrix.cxx11_abi }}
       upload-to-release: ${{ inputs.upload-to-release || false }}
-      release-version: ${{ inputs.release-version || 'v2.0.0' }}
+      release-version: ${{ inputs.release-version || github.sha }}
