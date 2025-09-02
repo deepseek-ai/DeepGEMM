@@ -437,7 +437,6 @@ sm90_fp8_signal_gemm_1d2d_impl(float* sfb, int* grouped_layout, int32_t* signal,
             }
 
             group.sync();
-            // __threadfence();  
             
             if (threadIdx.x == 0) {
                 atomicAdd(signal + scheduler.current_group_idx * ceil_div(shape_m, BLOCK_M) + m_block_idx, 1);
