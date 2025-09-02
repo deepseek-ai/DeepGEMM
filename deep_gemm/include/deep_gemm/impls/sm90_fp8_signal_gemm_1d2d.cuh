@@ -432,9 +432,9 @@ sm90_fp8_signal_gemm_1d2d_impl(float* sfb, int* grouped_layout, int32_t* signal,
             }
             __syncwarp();
 
-            if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
-                cute::tma_store_wait<0>();
-            }
+            // if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
+            //     cute::tma_store_wait<0>();
+            // }
 
             group.sync();
             __threadfence();  
