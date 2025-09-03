@@ -50,7 +50,7 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.numAttrs = 0;
     config.attrs = nullptr;
 
-    // 支持多个属性
+    // Support for multiple attributes
     static LaunchAttrHandle attrs[2];
     int attr_count = 0;
     
@@ -125,7 +125,7 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.numAttrs = 0;
     config.attrs = nullptr;
 
-    // 支持多个属性
+    // Support for multiple attributes
     // NOTES: must use `static` or the `attr` will be deconstructed
     static LaunchAttrHandle attrs[2];
     int attr_count = 0;
