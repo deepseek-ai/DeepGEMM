@@ -75,7 +75,7 @@ def test_m_grouped_gemm_signal(max_block_n=256) -> None:
 
         # Test performance with fixed shapes
         valid_m = masked_m.sum().item()
-        t = bench_kineto(test_func, 'fp8_signal_gemm', suppress_kineto_output=True)
+        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
         print(f' > Perf ({num_groups=}, expected_m_per_group={expected_m_per_group:4}, n={n:4}, k={k:4}, {kernel_opt}): '
               f'{t * 1e6:4.0f} us | '
               f'{2 * valid_m * n * k / t / 1e12:4.0f} TFLOPS | '
