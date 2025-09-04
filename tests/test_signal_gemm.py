@@ -55,7 +55,7 @@ def test_m_grouped_gemm_signal(max_block_n=256) -> None:
             combine_signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda')
             origin_sms = deep_gemm.get_num_sms()
             deep_gemm.set_num_sms(origin_sms - 3)
-            block_m, threshold = deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, combine_signal, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast, signal=combine_signal, max_block_n=max_block_n, enable_overlap=True)
+            block_m, threshold = deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast, signal=combine_signal, max_block_n=max_block_n, enable_overlap=True)
             deep_gemm.set_num_sms(origin_sms)
             check_signal(num_groups, max_m, block_m, threshold, combine_signal, masked_m)
             for j in range(num_groups):
