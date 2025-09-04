@@ -30,16 +30,12 @@ def check_signal(num_local_expert, max_m, block_m, threshold, combine_signal, ma
         mask = maskm[expert]
         start = expert * expert_len
         end = expert * expert_len + expert_len
-        if mask == 0:
-            for i in range(start, end):
+        valid_len = ceil_div(mask, block_m)
+        for i in range(start, end):
+            if i < start + valid_len:
+                assert signal[i] == threshold, f'{i=}, {signal[i]=}, {threshold=}'
+            else:
                 assert signal[i] == 0, f'{i=}, {signal[i]=}'
-        else:
-            valid_len = ceil_div(mask, block_m)
-            for i in range(start, end):
-                if i < start + valid_len:
-                    assert signal[i] == threshold, f'{i=}, {signal[i]=}, {threshold=}'
-                else:
-                    assert signal[i] == 0, f'{i=}, {signal[i]=}'
 
 def test_m_grouped_gemm_signal(max_block_n=256) -> None:
     print('Testing m-grouped signal GEMM:')
