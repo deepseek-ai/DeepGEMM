@@ -15,6 +15,7 @@
 #include <deep_gemm/common/scheduler.cuh>
 #include <deep_gemm/common/sm90_utils.cuh>
 
+namespace cg = cooperative_groups;
 namespace deep_gemm {
 
 using namespace deep_gemm::sm90;
