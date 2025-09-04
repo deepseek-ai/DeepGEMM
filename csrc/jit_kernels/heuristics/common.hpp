@@ -72,6 +72,8 @@ struct GemmConfig {
     MulticastConfig multicast_config;
     SharedMemoryConfig smem_config;
     ThreadConfig thread_config;
+
+    bool enable_overlap;
 };
 
 static bool is_multicast_legal(const int& shape_dim, const int& block_dim,
@@ -147,7 +149,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const int& m, const int& n, const int& k, const int& num_groups,
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
-                                  const bool& with_accumulation, const int& num_sms, const int& max_block_n = 256) {
+                                  const bool& with_accumulation, const int& num_sms,
+                                  const int& max_block_n = 256, const bool& enable_overlap = false) {
     DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
