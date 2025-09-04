@@ -20,34 +20,25 @@ def ceil_div(a, b):
 
 def check_signal(num_local_expert, max_m, block_m, threshold, combine_signal, masked_m):
     signal = combine_signal.cpu().tolist()
-    # print(signal)
+    print(f'signal = {signal}')
+    print(f'masked_m = {masked_m.cpu().tolist()}')
     
     expert_len = max_m // block_m
     # print(len(signal))
-    flag = True
     for expert in range(num_local_expert):
         mask = masked_m[expert]
         start = expert * expert_len
         end = expert * (expert_len + 1)
         if mask == 0:
             for i in range(start, end):
-                if signal[i] != 0:
-                    flag = False
-                # assert signal[i] == 0, f'{i=}, {signal[i]=}'
+                assert signal[i] == 0, f'{i=}, {signal[i]=}'
         else:
             valid_len = ceil_div(mask, block_m)
-            print(f'{start=}, {end=}, {valid_len=}')
             for i in range(start, end):
                 if i < start + valid_len:
-                    # assert signal[i] == threshold, f'{i=}, {signal[i]=}, {threshold=}'
-                    if signal[i] != threshold:
-                        print(f'{i=}, {signal[i]=}, {threshold=}')
-                        flag = False
+                    assert signal[i] == threshold, f'{i=}, {signal[i]=}, {threshold=}'
                 else:
-                    # assert signal[i] == 0, f'{i=}, {signal[i]=}'
-                    if signal[i] != 0:
-                        print(f'{i=}, {signal[i]=}')
-                        flag = False
+                    assert signal[i] == 0, f'{i=}, {signal[i]=}'
 
 def test_m_grouped_gemm_signal(max_block_n=256) -> None:
     print('Testing m-grouped signal GEMM:')
