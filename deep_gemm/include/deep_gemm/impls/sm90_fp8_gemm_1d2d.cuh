@@ -437,7 +437,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, int* signal,
                 }
 
                 cg::coalesced_group group = cg::coalesced_threads();
-                group.value().sync();
+                group.sync();
 
                 __threadfence();
 
