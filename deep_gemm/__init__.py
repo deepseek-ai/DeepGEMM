@@ -28,7 +28,6 @@ from deep_gemm_cpp import (
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nn_contiguous,
     m_grouped_fp8_gemm_nt_masked,
-    m_grouped_fp8_gemm_nt_signal,
     k_grouped_fp8_gemm_tn_contiguous,
     # BF16 GEMMs
     bf16_gemm_nt, bf16_gemm_nn,
