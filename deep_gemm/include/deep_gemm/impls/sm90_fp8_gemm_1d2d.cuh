@@ -234,9 +234,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, int* signal,
             }
         }
     } else {
-        cg::coalesced_group group;
+        std::optional<cg::coalesced_group> group;
         if constexpr (kEnableOverlap) {
-            group = cg::coalesced_threads();
+            group.emplace(cg::coalesced_threads());
         }
         // Math warp-groups for WGMMA
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
@@ -440,7 +440,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, int* signal,
                     cute::tma_store_wait<0>();
                 }
 
-                group.sync();
+                group.value().sync();
                 __threadfence();
 
                 if (threadIdx.x == 0) {
