@@ -219,7 +219,8 @@ static std::optional<std::pair<int, int>> m_grouped_fp8_gemm_nt_masked(const std
     std::optional<std::pair<int, int>> result = std::nullopt;
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         result = sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
-                                            num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
+                                            num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims,
+                                            max_block_n, enable_overlap, signal);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                              num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
@@ -498,7 +499,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
-          py::arg("max_block_n") = 256, py::arg("enable_overlap") = false
+          py::arg("max_block_n") = 256, py::arg("enable_overlap") = false,
           py::arg("signal") = std::nullopt);
     m.def("m_grouped_fp8_gemm_nt_signal", &m_grouped_fp8_gemm_nt_signal,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"), py::arg("signal"),

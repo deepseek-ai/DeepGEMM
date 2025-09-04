@@ -60,7 +60,7 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.sfb, args.grouped_layout, args.signal
+            args.sfb, args.grouped_layout, args.signal,
             args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_d, args.tensor_map_sfa));
@@ -249,7 +249,9 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_m_grouped_gemm_masked_1d2d", code);
     SM90FP8Gemm1D2DRuntime::launch(runtime, args);
-    return enable_overlap ? std::make_pair(config.block_m, config.signal_threshold) : std::nullopt;
+    return enable_overlap ? 
+        std::optional(std::make_pair(config.block_m, config.signal_threshold)) : 
+        std::nullopt;
 }
 
 class SM90FP8SignalGemm1D2DRuntime final: public LaunchRuntime<SM90FP8SignalGemm1D2DRuntime> {
