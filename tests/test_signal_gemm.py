@@ -21,11 +21,8 @@ def ceil_div(a, b):
 def check_signal(num_local_expert, max_m, block_m, threshold, combine_signal, masked_m):
     signal = combine_signal.cpu().tolist()
     maskm = masked_m.cpu().tolist()
-    print(f'signal = {signal}')
-    print(f'masked_m = {masked_m.cpu().tolist()}')
     
     expert_len = max_m // block_m
-    # print(len(signal))
     for expert in range(num_local_expert):
         mask = maskm[expert]
         start = expert * expert_len
