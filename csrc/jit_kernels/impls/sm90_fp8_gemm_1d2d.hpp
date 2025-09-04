@@ -253,3 +253,4 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
         std::optional(std::make_pair(config.block_m, config.signal_threshold)) : 
         std::nullopt;
 }
+}
