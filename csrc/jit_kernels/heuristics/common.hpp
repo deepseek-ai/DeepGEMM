@@ -278,7 +278,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         .multicast_config = best_multicast_config,
         // ReSharper disable once CppLocalVariableMightNotBeInitialized
         .smem_config = best_smem_config,
-        .thread_config = ArchSpec::get_thread_config(kernel_type, best_block_m, best_block_n)
+        .thread_config = ArchSpec::get_thread_config(kernel_type, best_block_m, best_block_n),
+        .enable_overlap = enable_overlap
     };
 
     // Only SM100 BF16 kernels support tensor core control
