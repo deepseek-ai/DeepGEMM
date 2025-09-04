@@ -234,8 +234,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, int* signal,
             }
         }
     } else {
-        if constexpr (kEnableOverlap)
-            cg::coalesced_group group = cg::coalesced_threads();
+        cg::coalesced_group group;
+        if constexpr (kEnableOverlap) {
+            group = cg::coalesced_threads();
+        }
         // Math warp-groups for WGMMA
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
