@@ -40,7 +40,7 @@ def check_signal(num_local_expert, max_m, block_m, threshold, combine_signal, ma
                     assert signal[i] == 0, f'{i=}, {signal[i]=}'
 
 def test_m_grouped_gemm_signal(max_block_n=256) -> None:
-    print('Testing m-grouped masked GEMM:')
+    print('Testing m-grouped signal GEMM:')
 
     # TODO: when the actual `m` is greater than `expected_m_per_group`, efficiency may significantly decrease.
     for kernel_type, num_groups, max_m, expected_m_per_group, n, k in enumerate_m_grouped_masked():
