@@ -169,14 +169,17 @@ static void m_grouped_fp8_gemm_nn_contiguous(const std::pair<torch::Tensor, torc
                                      d, m_indices, recipe, compiled_dims, disable_ue8m0_cast);
 }
 
-static void m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+static std::optional<std::pair<int, int>> m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
                                          const std::pair<torch::Tensor, torch::Tensor>& b,
                                          const torch::Tensor& d,
                                          const torch::Tensor& masked_m,
                                          const int& expected_m,
                                          std::optional<std::tuple<int, int, int>> recipe,
                                          const std::string& compiled_dims,
-                                         const bool& disable_ue8m0_cast) {
+                                         const bool& disable_ue8m0_cast,
+                                         const int& max_block_n,
+                                         const bool& enable_overlap,
+                                         const std::optional<torch::Tensor>& signal) {
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto& major_a = get_major_type_ab(a.first);
     const auto& major_b = get_major_type_ab(b.first);
@@ -196,6 +199,12 @@ static void m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::T
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
 
+    if (enable_overlap) {
+        DG_HOST_ASSERT(signal.has_value());
+        DG_HOST_ASSERT(signal.value().is_contiguous());
+        DG_HOST_ASSERT(signal.value().scalar_type() == torch::kInt32);
+    }
+
     // D must be N-major
     check_major_type_cd(d);
 
@@ -207,8 +216,9 @@ static void m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::T
 
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
+    std::optional<std::pair<int, int>> result = std::nullopt;
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
-        sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
+        result = sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_m_grouped_fp8_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
@@ -219,6 +229,7 @@ static void m_grouped_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::T
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
+    return result;
 }
 
 static std::pair<int, int> m_grouped_fp8_gemm_nt_signal(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -486,7 +497,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_fp8_gemm_nt_masked", &m_grouped_fp8_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
-          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false);
+          py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false,
+          py::arg("max_block_n") = 256, py::arg("enable_overlap") = false
+          py::arg("signal") = std::nullopt);
     m.def("m_grouped_fp8_gemm_nt_signal", &m_grouped_fp8_gemm_nt_signal,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"), py::arg("signal"),
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
