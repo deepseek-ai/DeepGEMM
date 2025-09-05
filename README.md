@@ -1,4 +1,9 @@
-# DeepGEMM
+# AdaptiveGEMM
+<p align="center">
+  <a href="https://arxiv.org/abs/2508.16584" target="_blank">
+    <img src="https://img.shields.io/badge/Paper-ArXiv%3A2508.16584-blue?logo=arxiv" alt="Paper Link" />
+  </a>
+</p>
 This repository is based on the original DeepGEMM. In addition to that, we have added two key features:
 
 * **Adaptation to Various Lengths of Group M**: We have enhanced the repository to support different lengths of group M, providing more flexibility for diverse use cases.
@@ -37,5 +42,20 @@ python tests/test_varlen_groupm.py
 python setup.py install
 ```
 
+## Citation
+
+If you find our work useful, please cite:
+
+```bibtex
+@misc{su2025tmaadaptivefp8groupedgemm,
+  title={TMA-Adaptive FP8 Grouped GEMM: Eliminating Padding Requirements in Low-Precision Training and Inference on Hopper}, 
+  author={Zhongling Su and Rong Fu and Weihan Cao and Jianfei Gao and Minxi Jin and Zhilin Pei and Hui Wang},
+  year={2025},
+  eprint={2508.16584},
+  archivePrefix={arXiv},
+  primaryClass={cs.AR},
+  url={https://arxiv.org/abs/2508.16584}, 
+}
+```
 ## Original deepgemm
 To get detailed information of original deepgeem, please refer to https://github.com/deepseek-ai/DeepGEMM
