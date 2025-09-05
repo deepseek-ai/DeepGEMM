@@ -3,7 +3,6 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#include <cooperative_groups.h>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
@@ -15,7 +14,6 @@
 #include <deep_gemm/common/scheduler.cuh>
 #include <deep_gemm/common/sm90_utils.cuh>
 
-namespace cg = cooperative_groups;
 namespace deep_gemm {
 
 using namespace deep_gemm::sm90;
@@ -436,9 +434,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, int* signal,
                     cute::tma_store_wait<0>();
                 }
 
-                cg::coalesced_group group = cg::coalesced_threads();
-                group.sync();
-
+                cutlass::arch::NamedBarrier(kNumMathThreads).sync();
                 __threadfence();
 
                 if (threadIdx.x == 0) {

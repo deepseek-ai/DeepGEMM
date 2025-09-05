@@ -237,7 +237,7 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
         .gemm_config = config,
         .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
-                                  config.multicast_config.num_multicast, enable_overlap),
+                                  config.multicast_config.num_multicast),
         .sfb = sfb.data_ptr(),
         .grouped_layout = masked_m.data_ptr(),
         .signal = enable_overlap ? signal.value().data_ptr() : nullptr,
