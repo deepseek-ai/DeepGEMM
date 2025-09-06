@@ -6,7 +6,8 @@ import torch
 import deep_gemm
 from deep_gemm.testing import (
     bench, bench_kineto,
-    calc_diff, count_bytes
+    calc_diff, count_bytes,
+    check_signal,
 )
 
 from generators import (
@@ -14,28 +15,6 @@ from generators import (
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
 )
-
-def ceil_div(a, b):
-    return (a + b - 1) // b
-
-def check_signal(num_local_expert, max_m, block_m, threshold, combine_signal, masked_m):
-    ceil_div = lambda a, b: (a + b - 1) // b
-
-    signal = combine_signal.cpu().tolist()
-    maskm = masked_m.cpu().tolist()
-    
-    expert_len = max_m // block_m
-    for expert in range(num_local_expert):
-        mask = maskm[expert]
-        start = expert * expert_len
-        end = expert * expert_len + expert_len
-        valid_len = ceil_div(mask, block_m)
-        for i in range(start, end):
-            if i < start + valid_len:
-                assert signal[i] == threshold, f'{i=}, {signal[i]=}, {threshold=}'
-            else:
-                assert signal[i] == 0, f'{i=}, {signal[i]=}'
-
 
 def test_m_grouped_gemm_masked() -> None:
     print('Testing m-grouped masked GEMM:')
