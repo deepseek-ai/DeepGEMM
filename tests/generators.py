@@ -88,9 +88,10 @@ def enumerate_m_grouped_contiguous(use_bf16: bool = False) -> Generator:
 def enumerate_m_grouped_masked() -> Generator:
     max_m = 4096
     for kernel_type in get_kernel_types():
-        for num_groups, m in ((1, 1024), (2, 512), (4, 256)):
-            for n, k in ((4096, 7168), (7168, 2048), ):
-                yield kernel_type, num_groups, max_m, m, n, k
+        for enable_overlap in (False, True):
+            for num_groups, m in ((1, 1024), (2, 512), (4, 256)):
+                for n, k in ((4096, 7168), (7168, 2048), ):
+                    yield kernel_type, enable_overlap, num_groups, max_m, m, n, k
 
 
 def enumerate_k_grouped_contiguous():
@@ -191,7 +192,7 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
 
 
 def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int,
-                              use_ue8m0: bool = False, use_bf16: bool = False):
+                              use_ue8m0: bool = False, use_bf16: bool = False, enable_overlap: bool = False):
     a = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
     b = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
@@ -211,7 +212,11 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
         a_fp8[0][i], a_fp8[1][i] = per_token_cast_to_fp8(a[i], use_ue8m0=use_ue8m0)
         b_fp8[0][i], b_fp8[1][i] = per_block_cast_to_fp8(b[i], use_ue8m0=use_ue8m0)
 
-    return a_fp8, b_fp8, masked_m, d, ref_d
+    ceil_div = lambda a, b: (a + b - 1) // b
+    max_signal_size = num_groups * ceil_div(max_m, 64)
+    signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda') if enable_overlap else None
+
+    return a_fp8, b_fp8, masked_m, d, ref_d, signal
 
 
 def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, ks: List[int], use_ue8m0: bool):
@@ -234,26 +239,3 @@ def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, ks: List[int]
     b_fp8 = per_channel_cast_to_fp8(b, use_ue8m0=use_ue8m0)
     return k, a_fp8, b_fp8, c, d, ref_d
 
-
-def generate_m_grouped_signal(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int,
-                              use_ue8m0: bool = False, use_bf16: bool = False):
-    a = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
-    b = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
-    d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
-    ref_d = torch.einsum('gmk,gnk->gmn', a, b)
-
-    masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
-    for j in range(num_groups):
-        masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
-    assert masked_m.amax().item() <= max_m
-
-    if use_bf16:
-        return a, b, masked_m, d, ref_d
-
-    a_fp8 = (torch.empty_like(a, dtype=torch.float8_e4m3fn), torch.empty((num_groups, max_m, ceil_div(k, 128)), device='cuda', dtype=torch.float))
-    b_fp8 = (torch.empty_like(b, dtype=torch.float8_e4m3fn), torch.empty((num_groups, ceil_div(n, 128), ceil_div(k, 128)), device='cuda', dtype=torch.float))
-    for i in range(num_groups):
-        a_fp8[0][i], a_fp8[1][i] = per_token_cast_to_fp8(a[i], use_ue8m0=use_ue8m0)
-        b_fp8[0][i], b_fp8[1][i] = per_block_cast_to_fp8(b[i], use_ue8m0=use_ue8m0)
-
-    return a_fp8, b_fp8, masked_m, d, ref_d

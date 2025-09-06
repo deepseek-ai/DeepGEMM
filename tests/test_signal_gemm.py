@@ -19,6 +19,8 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 def check_signal(num_local_expert, max_m, block_m, threshold, combine_signal, masked_m):
+    ceil_div = lambda a, b: (a + b - 1) // b
+
     signal = combine_signal.cpu().tolist()
     maskm = masked_m.cpu().tolist()
     
