@@ -212,7 +212,6 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
         a_fp8[0][i], a_fp8[1][i] = per_token_cast_to_fp8(a[i], use_ue8m0=use_ue8m0)
         b_fp8[0][i], b_fp8[1][i] = per_block_cast_to_fp8(b[i], use_ue8m0=use_ue8m0)
 
-    ceil_div = lambda a, b: (a + b - 1) // b
     max_signal_size = num_groups * ceil_div(max_m, 64)
     signal = torch.zeros(max_signal_size, dtype=torch.int32, device='cuda') if enable_overlap else None
 
