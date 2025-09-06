@@ -89,7 +89,7 @@ def enumerate_m_grouped_masked() -> Generator:
     max_m = 4096
     for kernel_type in get_kernel_types():
         for enable_overlap in (False, True):
-            for num_groups, m in ((1, 1024), (2, 512), (4, 256)):
+            for num_groups, m in ((1, 1024), (2, 512), (4, 256), (16, 64), (16, 32)):
                 for n, k in ((4096, 7168), (7168, 2048), ):
                     yield kernel_type, enable_overlap, num_groups, max_m, m, n, k
 
