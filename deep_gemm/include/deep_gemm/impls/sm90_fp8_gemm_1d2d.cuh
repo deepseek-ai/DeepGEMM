@@ -438,7 +438,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, int* signal,
                 __threadfence();
 
                 if (threadIdx.x == 0) {
-                    atomicAdd(signal + scheduler.current_group_idx * ceil_div(shape_m, BLOCK_M) + m_block_idx, 1);
+                    atomic_add_release_global(signal + scheduler.current_group_idx * ceil_div(shape_m, BLOCK_M) + m_block_idx, 1);
                 }
             }
         }
