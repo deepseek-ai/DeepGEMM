@@ -144,6 +144,10 @@ __device__ __forceinline__ void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
+__device__ __forceinline__ void store_wait() {
+    asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+}
+
 template <uint32_t kNumBytes>
 struct Vectorized {
     static auto zeros() {

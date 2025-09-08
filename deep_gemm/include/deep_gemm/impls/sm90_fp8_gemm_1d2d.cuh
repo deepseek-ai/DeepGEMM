@@ -431,7 +431,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout, int* signal,
 
             if constexpr (kEnableOverlap) {
                 if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
-                    cute::tma_store_wait<0>();
+                    store_wait();
                 }
 
                 cutlass::arch::NamedBarrier(kNumMathThreads).sync();
