@@ -2,8 +2,8 @@ import random
 import torch
 from typing import Tuple
 
-import deep_gemm
-from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
+import adaptive_gemm
+from adaptive_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
 
 
 def generate_random_list(length, total_sum):
@@ -143,10 +143,10 @@ if __name__=='__main__':
         # import pdb; pdb.set_trace()
         
         for i in range(3):
-            deep_gemm.k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(x_fp8, x_scale, weights_fp8, weights_scale, output_tensor, size_per_group)
+            adaptive_gemm.k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(x_fp8, x_scale, weights_fp8, weights_scale, output_tensor, size_per_group)
         
         def test_func():
-            deep_gemm.k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(x_fp8, x_scale, weights_fp8, weights_scale, output_tensor, size_per_group)
+            adaptive_gemm.k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(x_fp8, x_scale, weights_fp8, weights_scale, output_tensor, size_per_group)
         
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
         K = sum(tokens_per_expert)
@@ -167,7 +167,7 @@ if __name__=='__main__':
     #         with_stack = True,
     #         with_modules = True,
     #         record_shapes=True,) as prof:
-    #     output_tensor = deep_gemm.m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous((x_fp8, x_scale), (weights_fp8, weights_scale), size_per_group)
+    #     output_tensor = adaptive_gemm.m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous((x_fp8, x_scale), (weights_fp8, weights_scale), size_per_group)
     
     # trace = f'./grouped_m_gemm.json'
     # prof.export_chrome_trace(trace)

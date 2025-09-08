@@ -2,7 +2,7 @@ import os
 import torch
 from typing import Any
 
-from deep_gemm import jit
+from adaptive_gemm import jit
 
 
 class Capture:

@@ -1,6 +1,6 @@
 #include "utils.cuh"
 
-namespace deep_gemm {
+namespace adaptive_gemm {
 
 enum class GemmType {
     Normal,
@@ -100,4 +100,4 @@ struct Scheduler {
 };
 #pragma clang diagnostic pop
 
-} // namespace deep_gemm
+} // namespace adaptive_gemm

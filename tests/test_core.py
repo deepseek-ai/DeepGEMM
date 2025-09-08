@@ -2,8 +2,8 @@ import random
 import torch
 from typing import Tuple
 
-import deep_gemm
-from deep_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
+import adaptive_gemm
+from adaptive_gemm import bench_kineto, calc_diff, ceil_div, get_col_major_tma_aligned_tensor
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -67,7 +67,7 @@ def test_gemm() -> None:
     for m in (64, 128, 4096):
         for k, n in [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096), (2048, 7168)]:
             x_fp8, y_fp8, out, ref_out = construct(m, k, n)
-            deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+            adaptive_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
             diff = calc_diff(out, ref_out)
             assert diff < 0.001, f'{m=}, {k=}, {n=}, {diff:.5f}'
 
@@ -76,7 +76,7 @@ def test_gemm() -> None:
 
             # noinspection PyShadowingNames
             def test_func():
-                deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+                adaptive_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
 
             t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
             print(f' > Performance (m={m:5}, n={n:5}, k={k:5}): {t * 1e6:4.0f} us | '
@@ -93,7 +93,7 @@ def test_m_grouped_gemm_contiguous() -> None:
         x_fp8, y_fp8, out, ref_out = construct_grouped(num_groups, m, k, n, is_masked=False)
         m_indices = torch.arange(0, num_groups, device='cuda', dtype=torch.int)
         m_indices = m_indices.unsqueeze(-1).expand(num_groups, m).contiguous().view(-1)
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
+        adaptive_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
         diff = calc_diff(out, ref_out)
         assert diff < 0.001, f'm={m * num_groups}, {k=}, {n=}, {diff:.5f}'
 
@@ -104,7 +104,7 @@ def test_m_grouped_gemm_contiguous() -> None:
 
         # noinspection PyShadowingNames
         def test_func():
-            deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
+            adaptive_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(x_fp8, y_fp8, out, m_indices)
 
         t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
         print(f' > Performance ({num_groups=}, m_per_group={m:4}, n={n:4}, k={k:4}): {t * 1e6:4.0f} us | '
@@ -126,7 +126,7 @@ def test_m_grouped_gemm_masked() -> None:
                 for j in range(num_groups):
                     masked_m[j] = random.choice(masked_m_candidates)
                 expected_m = min(int(masked_m.float().mean()) + 1, m)
-                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m)
+                adaptive_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, expected_m)
                 for j in range(num_groups):
                     diff = calc_diff(out[j, :masked_m[j].item()], ref_out[j, :masked_m[j].item()])
                     assert diff < 0.001, f'{m=}, {k=}, {n=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
@@ -137,7 +137,7 @@ def test_m_grouped_gemm_masked() -> None:
 
             # noinspection PyShadowingNames
             def test_func():
-                deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, m)
+                adaptive_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(x_fp8, y_fp8, out, masked_m, m)
 
             # Test performance with fixed shapes
             t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
@@ -154,7 +154,7 @@ if __name__ == '__main__':
     random.seed(0)
 
     print('Library path:')
-    print(f' > {deep_gemm.__path__}\n')
+    print(f' > {adaptive_gemm.__path__}\n')
 
     test_gemm()
     test_m_grouped_gemm_contiguous()

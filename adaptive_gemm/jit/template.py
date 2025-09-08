@@ -75,7 +75,7 @@ def cpp_format(template: str, keys: Dict[str, Any]) -> str:
 
 def generate(includes: Iterable[str], arg_defs: Iterable[Tuple], body: str) -> str:
     # Common prefix
-    code = '// DeepGEMM auto-generated JIT CUDA source file\n\n'
+    code = '// AdaptiveGEMM auto-generated JIT CUDA source file\n\n'
 
     # Includes
     preload_sys_includes = ['<cuda.h>', '<cuda_fp8.h>', '<cuda_runtime.h>', '<iostream>']

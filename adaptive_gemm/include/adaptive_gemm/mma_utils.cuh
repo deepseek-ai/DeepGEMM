@@ -4,7 +4,7 @@
 
 #include "utils.cuh"
 
-namespace deep_gemm {
+namespace adaptive_gemm {
 
 struct SM90_64x16x32_F32E4M3E4M3_SS {
     __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b,
@@ -882,4 +882,4 @@ struct FP8MMASelector {
     using type = decltype(select_type());
 };
 
-} // namespace deep_gemm
+} // namespace adaptive_gemm

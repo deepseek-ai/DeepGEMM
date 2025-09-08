@@ -8,9 +8,9 @@ from .utils import get_col_major_tma_aligned_tensor, get_num_sms
 os.environ["DG_DW_DEBUG"] = "1"
 
 # C++ code templates
-includes = ('"deep_gemm/fp8_gemm_dw.cuh"', )
+includes = ('"adaptive_gemm/fp8_gemm_dw.cuh"', )
 template = """
-using namespace deep_gemm;
+using namespace adaptive_gemm;
 
 // Templated args from Python JIT call
 constexpr auto M = {M}, N = {N};

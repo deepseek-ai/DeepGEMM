@@ -6,7 +6,7 @@ from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
-jit_include_dirs = ('deep_gemm/include/deep_gemm', )
+jit_include_dirs = ('adaptive_gemm/include/adaptive_gemm', )
 third_party_include_dirs = (
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
@@ -24,7 +24,7 @@ class PostDevelopCommand(develop):
         for d in third_party_include_dirs:
             dirname = d.split('/')[-1]
             src_dir = f'{current_dir}/{d}'
-            dst_dir = f'{current_dir}/deep_gemm/include/{dirname}'
+            dst_dir = f'{current_dir}/adaptive_gemm/include/{dirname}'
             assert os.path.exists(src_dir)
             if os.path.exists(dst_dir):
                 assert os.path.islink(dst_dir)
@@ -42,7 +42,7 @@ class CustomBuildPy(build_py):
 
     def prepare_includes(self):
         # Create temporary build directory instead of modifying package directory
-        build_include_dir = os.path.join(self.build_lib, 'deep_gemm/include')
+        build_include_dir = os.path.join(self.build_lib, 'adaptive_gemm/include')
         os.makedirs(build_include_dir, exist_ok=True)
 
         # Copy third-party includes to the build directory
@@ -68,12 +68,12 @@ if __name__ == '__main__':
         revision = ''
 
     setuptools.setup(
-        name='deep_gemm',
+        name='adaptive_gemm',
         version='1.0.0' + revision,
-        packages=['deep_gemm', 'deep_gemm/jit', 'deep_gemm/jit_kernels'],
+        packages=['adaptive_gemm', 'adaptive_gemm/jit', 'adaptive_gemm/jit_kernels'],
         package_data={
-            'deep_gemm': [
-                'include/deep_gemm/*',
+            'adaptive_gemm': [
+                'include/adaptive_gemm/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',
             ]

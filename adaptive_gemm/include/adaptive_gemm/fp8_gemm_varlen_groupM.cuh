@@ -14,7 +14,7 @@
 #include "tma_utils.cuh"
 #include "utils.cuh"
 
-namespace deep_gemm {
+namespace adaptive_gemm {
 
 enum class Layout {
     RowMajor,
@@ -548,6 +548,6 @@ public:
     }
 };
 
-};  // namespace deep_gemm
+};  // namespace adaptive_gemm
 
 #pragma clang diagnostic pop

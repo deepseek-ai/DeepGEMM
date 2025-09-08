@@ -7,5 +7,5 @@ dist
 *.pyc
 
 # Third-party links created by `setup.py develop`
-deep_gemm/include/cute
-deep_gemm/include/cutlass
+adaptive_gemm/include/cute
+adaptive_gemm/include/cutlass

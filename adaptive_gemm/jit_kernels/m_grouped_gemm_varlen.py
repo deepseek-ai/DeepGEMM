@@ -49,9 +49,9 @@ def _(
 
 
 # C++ code templates
-includes = ('"deep_gemm/fp8_gemm_varlen_groupM.cuh"', )
+includes = ('"adaptive_gemm/fp8_gemm_varlen_groupM.cuh"', )
 template = """
-using namespace deep_gemm;
+using namespace adaptive_gemm;
 
 // Templated args from Python JIT call
 constexpr auto N = {N}, K = {K};

@@ -26,9 +26,9 @@ def get_jit_include_dir() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def get_deep_gemm_version() -> str:
+def get_adaptive_gemm_version() -> str:
     # Update include directories
-    include_dir = f'{get_jit_include_dir()}/deep_gemm'
+    include_dir = f'{get_jit_include_dir()}/adaptive_gemm'
     assert os.path.exists(include_dir), f'Cannot find GEMM include directory {include_dir}'
     md5 = hashlib.md5()
     for filename in filter(lambda x: x.endswith('.cuh'), sorted(os.listdir(include_dir))):
@@ -67,7 +67,7 @@ def get_default_user_dir():
         path = os.getenv('DG_CACHE_DIR')
         os.makedirs(path, exist_ok=True)
         return path
-    return os.path.expanduser('~') + '/.deep_gemm'
+    return os.path.expanduser('~') + '/.adaptive_gemm'
 
 
 @functools.lru_cache(maxsize=None)
@@ -107,7 +107,7 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
 
     # Build signature
     enable_sass_opt = get_nvcc_compiler()[1] <= '12.8' and int(os.getenv('DG_DISABLE_FFMA_INTERLEAVE', 0)) == 0
-    signature = f'{name}$${get_deep_gemm_version()}$${code}$${get_nvcc_compiler()}$${flags}$${enable_sass_opt}'
+    signature = f'{name}$${get_adaptive_gemm_version()}$${code}$${get_nvcc_compiler()}$${flags}$${enable_sass_opt}'
     name = f'kernel.{name}.{hash_to_hex(signature)}'
     path = f'{get_cache_dir()}/{name}'
 

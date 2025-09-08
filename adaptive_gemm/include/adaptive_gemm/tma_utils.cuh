@@ -9,7 +9,7 @@
 
 #include "utils.cuh"
 
-namespace deep_gemm {
+namespace adaptive_gemm {
 
 template <class T>
 constexpr CUtensorMapDataType get_CUtensorMapDataType() {
@@ -93,4 +93,4 @@ tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
     }
 }
 
-}  // namespace deep_gemm
+}  // namespace adaptive_gemm

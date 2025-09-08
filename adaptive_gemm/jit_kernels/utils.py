@@ -78,7 +78,7 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     """
     Returns TMA-aligned transposed format of the input tensor. `torch.transpose` will be called if necessary.
     If the input tensor is already column-major layout and 16-byte aligned along the M axis
-        (thus meets the requirement of LHS scaling tensor in DeepGEMM), this function will do nothing.
+        (thus meets the requirement of LHS scaling tensor in AdaptiveGEMM), this function will do nothing.
 
     Arguments:
         x: usually the LHS scaling tensor in GEMM.
