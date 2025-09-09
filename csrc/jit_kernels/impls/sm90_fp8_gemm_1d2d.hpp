@@ -254,4 +254,4 @@ static std::optional<std::pair<int, int>> sm90_m_grouped_fp8_gemm_masked_1d2d(co
         std::nullopt;
 }
 
-} } // namespace deep_gemm
+} // namespace deep_gemm
