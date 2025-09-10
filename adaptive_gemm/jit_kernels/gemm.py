@@ -158,7 +158,9 @@ def gemm_fp8_fp8_bf16_nt(lhs: List[torch.Tensor],
 
     # Auto-tuning with compilation
     global includes, template
-    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count - 24
+    # When communication overlaps with computing, both operations compete for SM resources.
+    # Disable persistent kernel can lead to better performance.
+    num_sms = torch.cuda.get_device_properties(device='cuda').multi_processor_count * 10
     num_sms, block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
