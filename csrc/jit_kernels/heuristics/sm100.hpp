@@ -86,6 +86,15 @@ struct SM100ArchSpec {
         return false;
     }
 
+    // Since split-k optimization is not yet supported on sm100, we directly return device_num_sms here to make it compatible.
+    static int get_num_sms_available_by_cluster_size(int cluster_size, int device_num_sms) {
+        return device_num_sms;
+    }
+
+    static bool support_split_k() {
+        return false;
+    }
+
     static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type,
                                                       const int& m, const int& n, const int& block_m, const int& block_n,
                                                       const int& num_sms) {
