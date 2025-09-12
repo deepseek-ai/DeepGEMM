@@ -71,7 +71,7 @@ struct SM90ArchSpec {
                                                         const int& num_sms) {
         return {
             is_multicast_legal(n, block_n, 2, num_sms, gemm_type == GemmType::MGroupedMasked),
-            is_multicast_legal(m, block_m, 2, num_sms, false) and gemm_type != GemmType::MGroupedMasked,
+            is_multicast_legal(m, block_m, 2, num_sms, false) and (gemm_type != GemmType::MGroupedMasked or ceil_div(n, block_n) % 2 == 0),
         };
     }
 
