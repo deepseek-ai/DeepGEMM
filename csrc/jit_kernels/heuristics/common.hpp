@@ -152,9 +152,11 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // Select M/N block sizes
     // TODO: support `% 16 == 8` block size on SM90
-    const auto& block_ms = gemm_type == GemmType::MGroupedContiguous ?
-        std::vector{get_mk_alignment_for_contiguous_layout()} :
-        gemm_type == GemmType::MGroupedMasked ? std::vector{64, 128} : std::vector{64, 128, 256};
+    auto block_ms = std::vector{64, 128, 256};
+    if (gemm_type == GemmType::MGroupedContiguous)
+        block_ms = std::vector{get_mk_alignment_for_contiguous_layout()};
+    if (gemm_type == GemmType::MGroupedMasked)  // Exclude 256 for performance
+        block_ms = std::vector{64, 128};
     std::vector<int> block_ns;
     for (int i = 16; i <= 256; i += 16)
         block_ns.push_back(i);

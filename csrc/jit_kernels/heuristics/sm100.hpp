@@ -90,7 +90,6 @@ struct SM100ArchSpec {
                                                       const int& m, const int& n, const int& block_m, const int& block_n,
                                                       const int& num_sms) {
         // TODO: support other layouts
-        // NOTES: the first returned value indicates whether it can multicast on A, and the second value indicates whether it can multicast on B
         return {
             false,
             is_multicast_legal(m, block_m, 2, num_sms, true) and (gemm_type == GemmType::Normal or gemm_type == GemmType::KGroupedContiguous),
