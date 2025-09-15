@@ -29,13 +29,19 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+
+    const char* kernel_name =
+        get_env<int>("ENABLE_SWAPAB") ?
+            "swapAB_sm90_fp8_gemm_1d2d_impl" :
+            "sm90_fp8_gemm_1d2d_impl";
+
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm90_fp8_gemm_1d2d_impl<
+    auto ptr = reinterpret_cast<void*>(&{}<
         {}, {}, {},
         {},
         {}, {}, {},
@@ -47,6 +53,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+        kernel_name,
         // TODO: add CD dtype
         get_compiled_dim(args.m, 'm', args.compiled_dims), get_compiled_dim(args.n, 'n', args.compiled_dims), get_compiled_dim(args.k, 'k', args.compiled_dims),
         args.num_groups,

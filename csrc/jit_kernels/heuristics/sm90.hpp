@@ -42,9 +42,15 @@ struct SM90ArchSpec {
 
         // Too many scaling factors in a single block: `block_n > block_k and std::gcd(block_n, block_k) != block_n - block_k`
         // Or too many register spills
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 192))
-            return false;
 
+        if(get_env<int>("ENABLE_SWAPAB")){
+            if (block_n != 64 and block_n != 128 and block_n != 256)
+                return false;
+        }else{
+           if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 192))
+                return false;
+        }
+        
         // Avoid bank conflicts for FP32 output
         if (cd_dtype == torch::kFloat and block_n % 16 == 0)
             return false;
@@ -79,7 +85,13 @@ struct SM90ArchSpec {
 
     static ThreadConfig get_thread_config(const KernelType& kernel_type,
                                           const int& block_m, const int& block_n) {
-        return ThreadConfig::sm90(128, (block_m == 64 ? 1 : 2) * 128);
+        int tile = 64;
+        if(get_env<int>("ENABLE_SWAPAB")){
+            tile = block_n;
+        }else{
+            tile = block_m;
+        }
+        return ThreadConfig::sm90(128, (tile > 64 ? 2 : 1) * 128);
     }
 
     static int get_smem_cd_size(const KernelType& kernel_type,
@@ -104,7 +116,8 @@ struct SM90ArchSpec {
 
     static int get_extra_sfb_smem_size(const int& m, const int& n, const int& k,
                                        const int& block_m, const int& block_n, const int& block_k) {
-        const auto& use_uniform_sfb = block_k % block_n == 0 ? 1 : 2;
+        const auto& use_uniform_sfb = get_env<int>("ENABLE_SWAPAB") ? (block_n / 64):(block_k % block_n == 0 ? 1 : 2);
+
         return align<int>(ceil_div(k, block_k) * static_cast<int>(sizeof(float)) * use_uniform_sfb, 8);
     }
 
