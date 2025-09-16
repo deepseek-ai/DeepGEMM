@@ -91,8 +91,8 @@ struct SM100ArchSpec {
                                                       const int& num_sms) {
         // TODO: support other layouts
         return {
-            is_multicast_legal(m, block_m, 2, num_sms, true) and (gemm_type == GemmType::Normal or gemm_type == GemmType::KGroupedContiguous),
             false,
+            is_multicast_legal(m, block_m, 2, num_sms, true) and (gemm_type == GemmType::Normal or gemm_type == GemmType::KGroupedContiguous),
         };
     }
 
