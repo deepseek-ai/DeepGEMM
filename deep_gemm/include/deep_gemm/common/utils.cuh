@@ -144,6 +144,16 @@ __device__ __forceinline__ void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
+__device__ __forceinline__ void store_wait() {
+    asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+}
+
+__device__ __forceinline__ int atomic_add_release_global(int* addr, int value) {
+    int ret;
+    asm volatile ("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(addr), "r"(value));
+    return ret;
+}
+
 template <uint32_t kNumBytes>
 struct Vectorized {
     static auto zeros() {
