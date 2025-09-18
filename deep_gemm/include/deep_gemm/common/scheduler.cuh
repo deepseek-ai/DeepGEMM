@@ -20,9 +20,10 @@ static constexpr uint32_t get_num_1d_blocks_per_group() {
         // For grouped GEMMs, let weights always stay in the L2 cache and read activations by once
         num_best_blocks = kNumSMs;
     } else {
+        // 也可以这样理解。8个Block为一组。当kIsMulticastOnA为true，Block_N需要8个(假设是1，2，3，4，5，6，7，8)，BlockM需要SM/8个。每8个SM的BlockM相同。假如这几个SM的BLOCKM都是0，则分别可以计算((0,1),(0,2),(0,3),(0,4),(0,5),(0,6),(0,7),(0,8))
         for (const auto& candidate: {8u, 16u}) {
             const auto& usage = kIsMulticastOnA ?
-                        candidate * BLOCK_N + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_M: // Grouping on N
+                        candidate * BLOCK_N + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_M: // Grouping on N 这个主要的意思就是我们在排列的时候以N维度来寻找下一个该计算的block。
                         candidate * BLOCK_M + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_N; // Grouping on M
             if (usage < min_usage)
                 min_usage = usage, num_best_blocks = candidate;
@@ -65,7 +66,7 @@ struct Scheduler {
         num_m_blocks = ceil_div(shape_m, BLOCK_M);
         num_n_blocks = ceil_div(shape_n, BLOCK_N);
         if constexpr (kGemmType == GemmType::Normal) {
-            num_blocks = num_m_blocks * num_n_blocks;
+            num_blocks = num_m_blocks * num_n_blocks; // 对于正常单个矩阵乘法，需要计算的block的总数为num_m_blocks * num_n_blocks
         } else if (kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_m_blocks * num_n_blocks;
             this->grouped_layout = grouped_layout;
