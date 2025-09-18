@@ -140,8 +140,8 @@ class NVCCCompiler final: public Compiler {
         DG_HOST_ASSERT(std::regex_search(output, match, std::regex(R"(release (\d+\.\d+))")));
         std::sscanf(match[1].str().c_str(), "%d.%d", &major, &minor);
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVCC version should be >= 12.3");
-        if (major < 12 or (major == 12 and minor < 9))
-            printf("Warning: please use at least NVCC 12.9 for the best DeepGEMM performance");
+        if (major == 12 and minor < 9)
+            printf("Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\n");
         return {major, minor};
     }
 
@@ -155,10 +155,12 @@ public:
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
         // The override the compiler flags
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{}a "
+        // Only NVCC >= 12.9 supports arch-specific family suffix
+        const auto& arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
+        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-cubin -O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), device_runtime->get_arch());
+                            flags, library_include_path.c_str(), arch);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const override {
@@ -189,6 +191,7 @@ public:
         int major, minor;
         DG_NVRTC_CHECK(nvrtcVersion(&major, &minor));
         signature = fmt::format("NVRTC{}.{}", major, minor);
+        DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVRTC version should be >= 12.3");
 
         // Build include directories list
         std::string include_dirs;
@@ -198,15 +201,17 @@ public:
         // Add PCH support for version 12.8 and above
         // NOTES: PCH is vital for compilation speed
         std::string pch_flags;
-        if (major > 12 or (major == 12 and minor >= 8)) {
+        if (major > 12 or minor >= 8) {
             pch_flags = "--pch ";
             if (get_env<int>("DG_JIT_DEBUG", 0))
                 pch_flags += "--pch-verbose=true ";
         }
 
         // Override the compiler flags
-        flags = fmt::format("{} {}--gpu-architecture=sm_{}a -default-device {}",
-                            flags, include_dirs, device_runtime->get_arch(), pch_flags);
+        // Only NVRTC >= 12.9 supports arch-specific family suffix
+        const auto& arch = device_runtime->get_arch(false, major > 12 or minor >= 9);
+        flags = fmt::format("{} {}--gpu-architecture=sm_{} -default-device {}",
+                            flags, include_dirs, arch, pch_flags);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const override {

@@ -15,20 +15,15 @@ template <GemmType kGemmType, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t kNumS
 static constexpr uint32_t get_num_1d_blocks_per_group() {
     // Select the best from candidates
     uint32_t num_best_blocks = 0, min_usage = cute::numeric_limits<uint32_t>::max();
-    if constexpr (kGemmType == GemmType::MGroupedContiguous or
-                  kGemmType == GemmType::MGroupedMasked) {
-        // For grouped GEMMs, let weights always stay in the L2 cache and read activations by once
-        num_best_blocks = kNumSMs;
-    } else {
-        // 也可以这样理解。8个Block为一组。当kIsMulticastOnA为true，Block_N需要8个(假设是1，2，3，4，5，6，7，8)，BlockM需要SM/8个。每8个SM的BlockM相同。假如这几个SM的BLOCKM都是0，则分别可以计算((0,1),(0,2),(0,3),(0,4),(0,5),(0,6),(0,7),(0,8))
-        for (const auto& candidate: {8u, 16u}) {
-            const auto& usage = kIsMulticastOnA ?
-                        candidate * BLOCK_N + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_M: // Grouping on N 这个主要的意思就是我们在排列的时候以N维度来寻找下一个该计算的block。
-                        candidate * BLOCK_M + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_N; // Grouping on M
-            if (usage < min_usage)
-                min_usage = usage, num_best_blocks = candidate;
-        }
+     // 也可以这样理解。8个Block为一组。当kIsMulticastOnA为true，Block_N需要8个(假设是1，2，3，4，5，6，7，8)，BlockM需要SM/8个。每8个SM的BlockM相同。假如这几个SM的BLOCKM都是0，则分别可以计算((0,1),(0,2),(0,3),(0,4),(0,5),(0,6),(0,7),(0,8))
+    for (const auto& candidate: {8u, 16u}) {
+        const auto& usage = kIsMulticastOnA ?
+                    candidate * BLOCK_N + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_M: // Grouping on N 这个主要的意思就是我们在排列的时候以N维度来寻找下一个该计算的block
+                    candidate * BLOCK_M + constexpr_ceil_div(kNumSMs, candidate) * BLOCK_N; // Grouping on M
+        if (usage < min_usage)
+            min_usage = usage, num_best_blocks = candidate;
     }
+
     return num_best_blocks;
 }
 

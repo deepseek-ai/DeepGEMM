@@ -13,6 +13,7 @@ cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declar
 sources = ['csrc/python_api.cpp']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
+    f'{CUDA_HOME}/include/cccl',
     'deep_gemm/include',
     'third-party/cutlass/include',
     'third-party/fmt/include',
@@ -27,9 +28,9 @@ third_party_include_dirs = [
     'third-party/cutlass/include/cutlass',
 ]
 
-# Use driver API for older CUDA compatibility
-if int(os.environ.get('DG_JIT_USE_DRIVER_API', '0')):
-    cxx_flags.append('-DDG_JIT_USE_DRIVER_API')
+# Use runtime API
+if int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')):
+    cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
 
 
 class CustomBuildPy(build_py):

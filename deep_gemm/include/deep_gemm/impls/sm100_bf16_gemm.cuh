@@ -32,6 +32,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+    using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
     // GEMM with accumulation must have FP32 output
     if constexpr (kWithAccumulation)
@@ -141,7 +142,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         cutlass::arch::fence_barrier_init();
     } else if (threadIdx.x >= 32 and threadIdx.x < 64) {
         // Allocate tensor memory
-        cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, tmem_ptr_in_smem);
+        Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
@@ -472,15 +473,13 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         }
 
         // Flush all stages in the pipeline to make TMA stores visible to the next kernel
-        // TODO: do we actually need this?
         if (epilogue_thread_idx == 0)
             cute::tma_store_wait<0>();
 
         // Deallocate tensor memory by warp 1
         // NOTES: warp 0 is waiting TMA store
-        // TODO: do we need 2 SM allocation?
         if (epilogue_warp_idx == 1)
-            cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
+            Allocator().free(0, kNumTmemCols);
     }
 
     // To safely deconstruct all barriers, we need a cluster sync

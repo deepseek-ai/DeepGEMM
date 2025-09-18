@@ -71,7 +71,9 @@ struct SM90ArchSpec {
                                                         const int& num_sms) {
         return {
             is_multicast_legal(n, block_n, 2, num_sms, gemm_type == GemmType::MGroupedMasked),
-            is_multicast_legal(m, block_m, 2, num_sms, false) and gemm_type != GemmType::MGroupedMasked,
+            // For masked GEMM layout, divisibility on N is also required as we must ensure the total number of blocks is even
+            is_multicast_legal(m, block_m, 2, num_sms, false)
+                and (gemm_type != GemmType::MGroupedMasked or is_multicast_legal(n, block_n, 2, num_sms, true))
         };
     }
 
