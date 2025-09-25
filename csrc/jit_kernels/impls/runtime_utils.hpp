@@ -217,4 +217,10 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                             allow_tf32);
 }
 
+#define MAYBE_LAUNCH(EXPR) do {                     \
+    if (device_runtime->get_compile_mode() == 0) {  \
+        (EXPR);                                     \
+    }                                               \
+} while (0)
+
 } // namespace deep_gemm
