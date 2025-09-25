@@ -56,14 +56,14 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
 
     // FP32 on SM90
     if (sf.scalar_type() == torch::kFloat and arch_major == 9)
-        DG_HOST_UNREACHABLE("Unimplemented");
+        return get_mn_major_tma_aligned_tensor(sf);
 
     // FP32 on SM100
     if (sf.scalar_type() == torch::kFloat and arch_major == 10)
         return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks);
 
     // INT on SM100
-    if (sf.scalar_type() == torch::kFloat and arch_major == 10)
+    if (sf.scalar_type() == torch::kInt and arch_major == 10)
         DG_HOST_UNREACHABLE("Unimplemented");
 
     DG_HOST_UNREACHABLE("Unknown cases");

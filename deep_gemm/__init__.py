@@ -25,15 +25,22 @@ from deep_gemm_cpp import (
     # FP8 GEMMs
     fp8_gemm_nt, fp8_gemm_nn,
     fp8_gemm_tn, fp8_gemm_tt,
+    fp8_gemm_nt_skip_head_mid,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nn_contiguous,
     m_grouped_fp8_gemm_nt_masked,
+    k_grouped_fp8_gemm_nt_contiguous,
     k_grouped_fp8_gemm_tn_contiguous,
     # BF16 GEMMs
     bf16_gemm_nt, bf16_gemm_nn,
     bf16_gemm_tn, bf16_gemm_tt,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
+    # cuBLASLt GEMMs
+    cublaslt_gemm_nt, cublaslt_gemm_nn,
+    cublaslt_gemm_tn, cublaslt_gemm_tt,
+    # Einsum kernels
+    einsum,
     # Layout kernels
     transform_sf_into_required_layout
 )

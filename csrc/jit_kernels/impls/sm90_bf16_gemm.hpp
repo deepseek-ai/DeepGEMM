@@ -41,7 +41,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {}, {}
+        {}, {}, {}
     >);
 }};
 )",
@@ -53,7 +53,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.num_stages, args.gemm_config.num_last_stages,
         args.gemm_config.thread_config.num_tma_threads, args.gemm_config.thread_config.num_math_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
-        args.gemm_config.num_sms, to_string(args.gemm_config.gemm_type));
+        args.gemm_config.num_sms, to_string(args.gemm_config.gemm_type),
+        to_string(args.gemm_config.cd_dtype));
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -73,10 +74,10 @@ static void sm90_bf16_gemm(const torch::Tensor& a,
                            const int& m, const int& n, const int& k,
                            const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                            const std::string& compiled_dims) {
-    DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(not c.has_value());
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
-    DG_HOST_ASSERT(k % 64 == 0);
 
+    const auto& aligned_k = align(k, 64);
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::Normal, KernelType::KernelNoSF,
         m, n, k, 1, major_a, major_b,
@@ -102,7 +103,7 @@ static void sm90_bf16_gemm(const torch::Tensor& a,
 
     // Launch
     const SM90BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
+        .m = m, .n = n, .k = aligned_k,
         .num_groups = 1,
         .compiled_dims = compiled_dims,
         .gemm_config = config,

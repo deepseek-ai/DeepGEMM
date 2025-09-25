@@ -12,6 +12,15 @@ namespace deep_gemm {
 struct SM100ArchSpec {
     static constexpr int smem_capacity = 232448;
 
+    static std::vector<int> get_block_n_candidates(const at::ScalarType& cd_dtype) {
+        // 16 is for better SM usage
+        // Stride 32 is due to low-performance swizzle-16/32B
+        std::vector<int> candidates = {16};
+        for (int i = 32; i <= 256; i += 32)
+            candidates.push_back(i);
+        return candidates;
+    }
+
     static int get_ab_load_block_m(const MulticastConfig& config, const int& block_m) {
         return block_m / (config.is_multicast_on_a ? config.num_multicast : 1);
     }
@@ -27,6 +36,10 @@ struct SM100ArchSpec {
 
     static int get_cd_store_block_n(const int& block_n) {
         return block_n;
+    }
+
+    static bool enable_cd_swizzle(const at::ScalarType& cd_dtype) {
+        return true;
     }
 
     static std::pair<int, int> get_sf_uttcp_aligned_block_sizes(
@@ -86,7 +99,7 @@ struct SM100ArchSpec {
         return false;
     }
 
-    static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type,
+    static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type, const int& num_groups,
                                                       const int& m, const int& n, const int& block_m, const int& block_n,
                                                       const int& num_sms) {
         // TODO: support other layouts
@@ -138,11 +151,16 @@ struct SM100ArchSpec {
         // TMA full/empty barriers, with-SF full barriers, tensor memory full/empty barriers
         // NOTES: 1D2D kernel will not use the with-SF full barriers
         // NOTES: some shapes may only have 1 epilogue stage, but we still allocate space for 2 stages
-        return num_stages * 8 * 3 + 2 * 8 * 2;
+        // NOTES: the last barrier is for tensor core utilization control
+        return num_stages * 8 * 3 + 2 * 8 * 2 + 8;
     }
 
     static int get_tmem_ptr_smem_size() {
         return 4;
+    }
+
+    static int get_tensormap_smem_size(const GemmType& gemm_type) {
+        return 0;
     }
 };
 

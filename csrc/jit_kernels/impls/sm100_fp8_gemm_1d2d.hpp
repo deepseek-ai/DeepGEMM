@@ -18,6 +18,7 @@ public:
     struct Args {
         int m, n, k, num_groups;
         const std::string& compiled_dims;
+        const std::optional<std::string>& epilogue_type;
 
         GemmConfig gemm_config;
         LaunchArgs launch_args;
@@ -46,7 +47,8 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
-        {}, {}
+        {}, {},
+        {}
     >);
 }};
 )",
@@ -59,7 +61,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.thread_config.num_non_epilogue_threads, args.gemm_config.thread_config.num_epilogue_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
         args.gemm_config.num_sms,
-        to_string(args.gemm_config.gemm_type), to_string(args.gemm_config.cd_dtype));
+        to_string(args.gemm_config.gemm_type), to_string(args.gemm_config.cd_dtype),
+        get_default_epilogue_type(args.epilogue_type));
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -78,7 +81,8 @@ static void sm100_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa
                                 const torch::Tensor& d,
                                 const int& m, const int& n, const int& k,
                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                const std::string& compiled_dims) {
+                                const std::string& compiled_dims,
+                                const std::optional<std::string>& epilogue_type = std::nullopt) {
     DG_HOST_ASSERT(not c.has_value());
 
     const auto& aligned_k = align(k, 128);
@@ -98,7 +102,7 @@ static void sm100_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa
                                                config.block_k,
                                                static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
                                                config.smem_config.swizzle_b_mode);
-    const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
+    const auto& tensor_map_d = make_tma_cd_desc(d, m, static_cast<int>(d.size(-1)),
                                                 SM100ArchSpec::get_cd_store_block_m(config.block_m),
                                                 SM100ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(d.stride(-2)), 1,
@@ -111,6 +115,7 @@ static void sm100_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa
         .m = m, .n = n, .k = aligned_k,
         .num_groups = 1,
         .compiled_dims = compiled_dims,
+        .epilogue_type = epilogue_type,
         .gemm_config = config,
         .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
@@ -164,6 +169,7 @@ static void sm100_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, con
         .m = m, .n = n, .k = aligned_k,
         .num_groups = num_groups,
         .compiled_dims = compiled_dims,
+        .epilogue_type = std::nullopt,
         .gemm_config = config,
         .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
@@ -218,6 +224,7 @@ static void sm100_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const t
         .m = m, .n = n, .k = aligned_k,
         .num_groups = num_groups,
         .compiled_dims = compiled_dims,
+        .epilogue_type = std::nullopt,
         .gemm_config = config,
         .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,

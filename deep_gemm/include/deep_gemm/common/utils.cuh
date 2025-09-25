@@ -104,6 +104,12 @@ __device__  __forceinline__ uint32_t ld_shared(const uint32_t* ptr) {
     return ret;
 }
 
+__device__  __forceinline__ float2 ld_shared(const float2* ptr) {
+    float2 ret;
+    asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(ret.x), "=f"(ret.y) : "l"(ptr));
+    return ret;
+}
+
 __device__  __forceinline__ float4 ld_shared(const float4* ptr) {
     float4 ret;
     asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w) : "l"(ptr));
@@ -126,8 +132,16 @@ __device__ __forceinline__ void st_shared(const float* ptr, float val) {
     asm volatile("st.shared.f32 [%0], %1;" :: "l"(ptr), "f"(val));
 }
 
+__device__ __forceinline__ void st_shared(const float2* ptr, float2 val) {
+    asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "l"(ptr), "f"(val.x), "f"(val.y));
+}
+
 __device__ __forceinline__ void st_shared(const uint32_t* ptr, uint32_t val) {
     asm volatile("st.shared.u32 [%0], %1;" :: "l"(ptr), "r"(val));
+}
+
+__device__  __forceinline__ void st_shared(const void* ptr, uint32_t x, uint32_t y) {
+    asm volatile("st.shared.v2.u32 [%0], {%1, %2};" :: "l"(ptr), "r"(x), "r"(y));
 }
 
 __device__  __forceinline__ void st_shared(const void* ptr, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {

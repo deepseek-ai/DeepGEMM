@@ -11,6 +11,15 @@ namespace deep_gemm {
 struct SM90ArchSpec {
     static constexpr int smem_capacity = 232448;
 
+    static std::vector<int> get_block_n_candidates(const at::ScalarType& cd_dtype) {
+        // Avoid bank conflicts for FP32 output
+        const auto& start = cd_dtype == torch::kFloat ? 8 : 16;
+        std::vector<int> candidates;
+        for (int i = start; i <= 256; i += 16)
+            candidates.push_back(i);
+        return candidates;
+    }
+
     static int get_ab_load_block_m(const MulticastConfig& multicast_config, const int& block_m) {
         return block_m;
     }
@@ -19,26 +28,35 @@ struct SM90ArchSpec {
         return block_n;
     }
 
-    static int get_cd_store_block_m(const int& block_m) {
-        return block_m;
+    static int get_cd_store_block_m(const int& block_m, const bool& single_warpgroup_sync = false) {
+        constexpr int wgmma_m = 64;
+        return single_warpgroup_sync ? wgmma_m : block_m;
     }
 
     static int get_cd_store_block_n(const int& block_n) {
         return block_n;
     }
 
+    static bool enable_cd_swizzle(const at::ScalarType& cd_dtype) {
+        return cd_dtype != torch::kFloat;
+    }
+
     static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                     const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
                                     const int& block_m, const int& block_n, const int& block_k) {
-        // FP32 output does not support `block_m == 256`
+        // SM90 FP32 output does not support `block_m == 256`
         if (cd_dtype == at::kFloat and block_m == 256)
             return false;
 
-        // TODO: more general block N selection
-        // Must be some fixed block N selections
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D1D and (block_n != 136 and block_n != 152))
-            return false;
+        // Avoid large C/D shared memory for FP32 output
+        // Ensure `num_stages >= 4` (for 1D1D Kernel), `num_stages >= 3` (for No SF kernel)
+        if (block_n > 128 and cd_dtype == torch::kFloat) {
+            if (kernel_type == KernelType::Kernel1D1D and block_n > 152)
+                return false;
+            if (kernel_type == KernelType::KernelNoSF and block_n > 200)
+                return false;
+        }
 
         // Too many scaling factors in a single block: `block_n > block_k and std::gcd(block_n, block_k) != block_n - block_k`
         // Or too many register spills
@@ -66,9 +84,13 @@ struct SM90ArchSpec {
         return true;
     }
 
-    static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type,
+    static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type, const int& num_groups,
                                                         const int& m, const int& n, const int& block_m, const int& block_n,
                                                         const int& num_sms) {
+        // Disable multicast when the number of k-groups is large (a heuristic)
+        if (gemm_type == GemmType::KGroupedContiguous and num_groups > 4)
+            return {false, false};
+
         return {
             is_multicast_legal(n, block_n, 2, num_sms, gemm_type == GemmType::MGroupedMasked),
             // For masked GEMM layout, divisibility on N is also required as we must ensure the total number of blocks is even
@@ -96,9 +118,10 @@ struct SM90ArchSpec {
 
         int smem_sfa_per_stage = block_m * static_cast<int>(sizeof(float));
         int smem_sfb_per_stage = 0;
-        // TODO: figure out here
-        if (kernel_type == KernelType::Kernel1D1D)
-            smem_sfb_per_stage = align(block_n * 4, block_k);
+        if (kernel_type == KernelType::Kernel1D1D) {
+            // NOTES: `128` is for 2D TMA alignment requirement
+            smem_sfb_per_stage = align(block_n * 4, 128);
+        }
         return {smem_sfa_per_stage, smem_sfb_per_stage};
     }
 
@@ -109,12 +132,15 @@ struct SM90ArchSpec {
     }
 
     static int get_barrier_smem_size(const int& num_stages) {
-        // For 1D1D kernels, there is an extra barrier for accumulation
-        return (num_stages + 1) * 8 * 2;
+        return num_stages * 8 * 2;
     }
 
     static int get_tmem_ptr_smem_size() {
         return 0;
+    }
+
+    static int get_tensormap_smem_size(const GemmType& gemm_type) {
+        return gemm_type == GemmType::KGroupedContiguous ? 4 * static_cast<int>(sizeof(CUtensorMap)) : 0;
     }
 };
 
