@@ -58,6 +58,7 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     // Calculate shared memory size
     const int smem_size = aligned_batch_size * static_cast<int>(sizeof(int));
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
+    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     // Launch
     const SMXXPagedMQALogitsMetadataRuntime::Args& args = {
@@ -164,6 +165,7 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
                                       const int& num_math_warp_groups) {
     const int num_specialized_threads = 128;
     const int num_math_threads = num_math_warp_groups * 128;
+    const int num_extra_threads = device_runtime->get_arch_major() == 10 ? 128 : 0;
     const int num_q_stages = 3, num_kv_stages = 3;
     const int split_kv = num_math_warp_groups * block_kv;
     DG_HOST_ASSERT(logits_stride % (num_math_warp_groups * block_kv) == 0);
@@ -183,6 +185,7 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
 
     // Calculate shared memory size
     const int swizzle_alignment = head_dim * 8;
+
     const int smem_q_size_per_stage = next_n * num_heads * head_dim * static_cast<int>(q.element_size());
     const int aligned_smem_weight_size_per_stage = align(next_n * num_heads * static_cast<int>(weights.element_size()), swizzle_alignment);
     const int smem_q_pipe_size = num_q_stages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage) + align(num_q_stages * 8 * 2, swizzle_alignment);
@@ -191,8 +194,13 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
     const int aligned_smem_kv_scale_size_per_stage = align(block_kv * static_cast<int>(kv_cache_scales.element_size()), swizzle_alignment);
     const int smem_kv_pipe_size = num_kv_stages * (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage) + align(num_kv_stages * 8 * 2, swizzle_alignment);
 
-    const int smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size;
+    // Allocate some shared memory for UMMA barriers and tensor memory pointer, although it is not used in SM90
+    const int smem_umma_barriers = num_math_warp_groups * 2 * 8;
+    const int smem_tmem_ptr = 4;
+
+    const int smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size + smem_umma_barriers + smem_tmem_ptr;
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
+    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     // Launch
     const SMXXFP8PagedMQALogitsRuntime::Args& args = {
@@ -217,7 +225,7 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
         .num_specialized_threads = num_specialized_threads,
         .num_math_threads = num_math_threads,
         .launch_args = LaunchArgs(num_sms,
-                                  num_specialized_threads + num_math_threads,
+                                  num_specialized_threads + num_math_threads + num_extra_threads,
                                   smem_size)
     };
     const auto& code = SMXXFP8PagedMQALogitsRuntime::generate(args);

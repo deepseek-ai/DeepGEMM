@@ -9,6 +9,8 @@
 // Attention kernels
 #include <deep_gemm/impls/sm90_fp8_mqa_logits.cuh>
 #include <deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh>
+#include <deep_gemm/impls/sm100_fp8_mqa_logits.cuh>
+#include <deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh>
 #include <deep_gemm/impls/smxx_clean_logits.cuh>
 
 // Einsum kernels
