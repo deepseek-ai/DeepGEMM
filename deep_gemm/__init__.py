@@ -41,6 +41,10 @@ from deep_gemm_cpp import (
     cublaslt_gemm_tn, cublaslt_gemm_tt,
     # Einsum kernels
     einsum,
+    # Attention kernels
+    fp8_mqa_logits,
+    get_paged_mqa_logits_metadata,
+    fp8_paged_mqa_logits,
     # Layout kernels
     transform_sf_into_required_layout
 )
