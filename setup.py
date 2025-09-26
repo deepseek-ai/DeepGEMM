@@ -96,7 +96,10 @@ def get_ext_modules():
 
     return [CUDAExtension(name='deep_gemm_cpp',
                           sources=sources,
-                          include_dirs=build_include_dirs,)]
+                          include_dirs=build_include_dirs,
+                          libraries=build_libraries,
+                          library_dirs=build_library_dirs,
+                          extra_compile_args=cxx_flags)]
 
 
 class CustomBuildPy(build_py):
