@@ -77,7 +77,7 @@ def get_wheel_url():
     python_version = f'cp{sys.version_info.major}{sys.version_info.minor}'
     platform_name = get_platform()
     deep_gemm_version = get_package_version()
-    cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
+    cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 
     # Determine the version numbers that will be used to determine the correct wheel
     # We're using the CUDA version used to build torch, not the one currently installed
@@ -85,7 +85,7 @@ def get_wheel_url():
     cuda_version = f'{cuda_version.major}'
 
     # Determine wheel URL based on CUDA version, torch version, python version and OS
-    wheel_filename = f'deep_gemm-{deep_gemm_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl'
+    wheel_filename = f'deep_gemm-{deep_gemm_version}+cu{cuda_version}-torch{torch_version}-cxx11abi{cxx11_abi}-{python_version}-{platform_name}.whl'
     wheel_url = base_wheel_url.format(tag_name=f'v{deep_gemm_version}', wheel_name=wheel_filename)
     return wheel_url, wheel_filename
 
@@ -149,7 +149,10 @@ class CachedWheelsCommand(_bdist_wheel):
         wheel_url, wheel_filename = get_wheel_url()
         print(f'Try to download wheel from URL: {wheel_url}')
         try:
-            urllib.request.urlretrieve(wheel_url, wheel_filename)
+            with urllib.request.urlopen(wheel_url, timeout=1) as response:
+                with open(wheel_filename, 'wb') as out_file:
+                    data = response.read()
+                    out_file.write(data)
 
             # Make the archive
             if not os.path.exists(self.dist_dir):
