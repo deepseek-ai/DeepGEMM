@@ -33,7 +33,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [ ] Larger TMA multicast size for some shapes
 - [x] MMA template refactor with CUTLASS
 - [x] Remove shape limitations on N and K
-- [ ] BF16 kernels
+- [x] BF16 kernels
 - [ ] Split/stream-k optimizations
 - [ ] Ampere kernels
 - [ ] Polish docs

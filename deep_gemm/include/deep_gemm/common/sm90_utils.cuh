@@ -1,7 +1,11 @@
 #pragma once
 
+#include <cute/arch/copy_sm90_tma.hpp>
+#include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/mma_sm90_gmma.hpp>
 #include <cute/arch/mma_sm90_gmma_ext.hpp>
+
+#include <deep_gemm/common/utils.cuh>
 
 namespace deep_gemm::sm90 {
 
@@ -29,6 +33,7 @@ struct FP8MMASelector {
 
     static constexpr auto select_mma() {
         using namespace cute::SM90::GMMA;
+        if constexpr (N == 8) return MMA_64x8x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 16) return MMA_64x16x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 24) return MMA_64x24x32_F32E4M3E4M3_SS_TN();
         if constexpr (N == 32) return MMA_64x32x32_F32E4M3E4M3_SS_TN();
@@ -93,6 +98,7 @@ struct BF16MMASelector {
 
     static constexpr auto select_mma() {
         using namespace cute::SM90::GMMA;
+        if constexpr (N == 8) return MMA_64x8x16_F32BF16BF16_SS<Major::K, Major::K>();
         if constexpr (N == 16) return MMA_64x16x16_F32BF16BF16_SS<Major::K, Major::K>();
         if constexpr (N == 24) return MMA_64x24x16_F32BF16BF16_SS<Major::K, Major::K>();
         if constexpr (N == 32) return MMA_64x32x16_F32BF16BF16_SS<Major::K, Major::K>();
@@ -141,6 +147,24 @@ struct SM90_U32x2_STSM_N {
         const uint32_t src[2] = {*reinterpret_cast<uint32_t*>(&src_0), *reinterpret_cast<uint32_t*>(&src_1)};
         asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16 [%0], {%1, %2};\n"
                      :: "l"(smem_dst), "r"(src[0]), "r"(src[1]));
+    }
+};
+
+struct SM90_U32x2_LDSM_N {
+    __device__ __forceinline__ static void
+    copy(uint32_t& dst_0, uint32_t& dst_1, void* smem_src) {
+        asm volatile("ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
+                     : "=r"(dst_0), "=r"(dst_1)
+                     : "l"(smem_src));
+    }
+};
+
+struct SM90_U32x4_LDSM_N {
+    __device__ __forceinline__ static void
+    copy(uint32_t& dst_0, uint32_t& dst_1, uint32_t& dst_2, uint32_t& dst_3, void* smem_src) {
+        asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                     : "=r"(dst_0), "=r"(dst_1), "=r"(dst_2), "=r"(dst_3)
+                     : "l"(smem_src));
     }
 };
 
@@ -221,6 +245,39 @@ tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
     } else if (cute::block_rank_in_cluster() == 0) {
         cute::SM90_TMA_LOAD_MULTICAST_2D::copy(desc_ptr, barrier_ptr, (1 << num_tma_multicast) - 1, cache_hint, smem_ptr, crd_0, crd_1);
     }
+}
+
+__device__ __forceinline__ void
+tma_3d_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
+            const uint32_t& crd_0, const uint32_t& crd_1, const uint32_t& crd_2) {
+    constexpr auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL);
+    cute::SM90_TMA_LOAD_3D::copy(desc_ptr, barrier_ptr, cache_hint, smem_ptr, crd_0, crd_1, crd_2);
+}
+
+// Tensormap related
+__device__ __forceinline__ void tensor_map_release_cta() {
+    asm volatile ("fence.proxy.tensormap::generic.release.cta;");
+}
+
+__device__ __forceinline__ void tensor_map_acquire_cta(const cute::TmaDescriptor* gmem_desc_ptr) {
+    auto gmem_int_desc = reinterpret_cast<uint64_t>(gmem_desc_ptr);
+    asm volatile ("fence.proxy.tensormap::generic.acquire.cta [%0], 128;" :: "l"(gmem_int_desc) : "memory");
+}
+
+__device__ __forceinline__ void tensor_map_replace_global_addr_in_smem(cute::TmaDescriptor* smem_desc, const void* new_addr) {
+    auto smem_int_desc = static_cast<uint32_t>(__cvta_generic_to_shared(smem_desc));
+    const auto new_int64_addr = reinterpret_cast<uint64_t>(new_addr);
+    asm volatile ("tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;" :: "r"(smem_int_desc), "l"(new_int64_addr));
+}
+
+__device__ __forceinline__ void tensor_map_replace_global_inner_dim_stride_in_smem(cute::TmaDescriptor* smem_desc, const uint32_t& new_dim, const uint64_t& new_stride) {
+    auto smem_int_desc = __cvta_generic_to_shared(smem_desc);
+    asm volatile ("tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 0, %1;" :: "l"(smem_int_desc), "r"(new_dim));
+#if ((__CUDACC_VER_MAJOR__ > 12) or ((__CUDACC_VER_MAJOR__ == 12) and (__CUDACC_VER_MINOR__ >= 5)))
+    asm volatile("tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [%0], 0, %1;" :: "l"(smem_int_desc), "l"(new_stride));
+#else
+    DG_STATIC_ASSERT(false, "Invalid CUDA version")
+#endif
 }
 
 } // namespace `deep_gemm::sm90`

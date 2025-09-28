@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cublasLt.h>
 #include <exception>
 #include <string>
 #include <sstream>
@@ -68,6 +69,18 @@ do { \
         std::stringstream ss; \
         ss << static_cast<int>(e) << " (" << cudaGetErrorName(e) << ", " << cudaGetErrorString(e) << ")"; \
         throw DGException("CUDA runtime", __FILE__, __LINE__, ss.str()); \
+    } \
+} while (0)
+#endif
+
+#ifndef DG_CUBLASLT_CHECK
+#define DG_CUBLASLT_CHECK(cmd) \
+do { \
+    const auto& e = (cmd); \
+    if (e != CUBLAS_STATUS_SUCCESS) { \
+        std::ostringstream ss; \
+        ss << static_cast<int>(e) << " (" << cublasGetStatusString(e) << ")"; \
+        throw DGException("cuBLASLt", __FILE__, __LINE__, ss.str()); \
     } \
 } while (0)
 #endif
