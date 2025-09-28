@@ -20,6 +20,7 @@ from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
+DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
 
 # Compiler flags
 cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
@@ -57,7 +58,7 @@ def get_package_version():
     public_version = ast.literal_eval(version_match.group(1))
     revision = ''
 
-    if int(os.getenv('DG_NO_LOCAL_VERSION', '0')) == 0:
+    if DG_USE_LOCAL_VERSION:
         # noinspection PyBroadException
         try:
             cmd = ['git', 'rev-parse', '--short', 'HEAD']

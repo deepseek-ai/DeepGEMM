@@ -170,7 +170,7 @@ jobs:
           export MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "129" ] && echo 1 || echo 2)
           export NVCC_THREADS=2
           export TORCH_CUDA_ARCH_LIST="7.0 7.2 7.5 8.0 8.6 8.7 9.0+PTX"
-          export DG_NO_LOCAL_VERSION=${{ inputs.use-local-version && '0' || '1' }}
+          export DG_USE_LOCAL_VERSION=${{ inputs.use-local-version && '1' || '0' }}
 
           # 5h timeout since GH allows max 6h and we want some buffer
           EXIT_CODE=0

@@ -83,7 +83,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Build core package
         env:
-          DG_NO_LOCAL_VERSION: "1"
+          DG_USE_LOCAL_VERSION: "0"
           DG_SKIP_CUDA_BUILD: "1"
         run: |
           python setup.py sdist --dist-dir=dist
