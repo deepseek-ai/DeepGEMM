@@ -18,6 +18,9 @@ from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
+DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
+DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
+
 # Compiler flags
 cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
@@ -91,7 +94,7 @@ def get_wheel_url():
 
 
 def get_ext_modules():
-    if os.getenv('DG_SKIP_CUDA_BUILD', '0') != 0:
+    if DG_SKIP_CUDA_BUILD:
         return []
 
     return [CUDAExtension(name='deep_gemm_cpp',
@@ -143,7 +146,7 @@ class CustomBuildPy(build_py):
 
 class CachedWheelsCommand(_bdist_wheel):
     def run(self):
-        if int(os.getenv('DG_FORCE_BUILD', '0')) != 0:
+        if DG_FORCE_BUILD:
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
