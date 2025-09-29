@@ -117,7 +117,7 @@ static void sm90_bf16_gemm(const torch::Tensor& a,
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_bf16_gemm", code);
-    SM90BF16GemmRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM90BF16GemmRuntime::launch(runtime, args));
 }
 
 static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
@@ -170,7 +170,7 @@ static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_m_grouped_bf16_gemm_contiguous", code);
-    SM90BF16GemmRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM90BF16GemmRuntime::launch(runtime, args));
 }
 
 static void sm90_bf16_m_grouped_gemm_masked(const torch::Tensor& a,
@@ -224,7 +224,7 @@ static void sm90_bf16_m_grouped_gemm_masked(const torch::Tensor& a,
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_bf16_m_grouped_gemm_masked", code);
-    SM90BF16GemmRuntime::launch(runtime, args);
+    MAYBE_LAUNCH(SM90BF16GemmRuntime::launch(runtime, args));
 }
 
 } // namespace deep_gemm

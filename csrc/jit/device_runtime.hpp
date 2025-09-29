@@ -11,6 +11,7 @@ namespace deep_gemm {
 class DeviceRuntime {
     int num_sms = 0, tc_util = 0;
     std::shared_ptr<cudaDeviceProp> cached_prop;
+    int compile_mode = 0;
 
     // cuBLASLt utils
     static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;
@@ -70,6 +71,15 @@ public:
         if (num_sms == 0)
             num_sms = get_prop()->multiProcessorCount;
         return num_sms;
+    }
+
+    void set_compile_mode(const int& new_compile_mode) {
+        DG_HOST_ASSERT(0 <= new_compile_mode and new_compile_mode <= 1);
+        compile_mode = new_compile_mode;
+    }
+
+    int get_compile_mode() {
+        return compile_mode;
     }
 
     void set_tc_util(const int& new_tc_util) {
