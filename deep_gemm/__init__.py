@@ -84,4 +84,4 @@ deep_gemm_cpp.init(
     _find_cuda_home()                           # CUDA home
 )
 
-__version__ = '2.0.0'
+__version__ = '2.1.1'
