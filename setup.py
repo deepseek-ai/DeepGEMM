@@ -56,15 +56,21 @@ def get_package_version():
     with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
-    revision = ''
 
+    revision = ''
     if DG_USE_LOCAL_VERSION:
         # noinspection PyBroadException
         try:
+            status_cmd = ['git', 'status', '--porcelain']
+            status_output = subprocess.check_output(status_cmd).decode('ascii').strip()
+            if status_output:
+                print(f'Warning: Git working directory is not clean. Uncommitted changes:\n{status_output}')
+                assert False, 'Git working directory is not clean'
+
             cmd = ['git', 'rev-parse', '--short', 'HEAD']
             revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
         except:
-            revision = ''
+            revision = '+local'
     return f'{public_version}{revision}'
 
 
