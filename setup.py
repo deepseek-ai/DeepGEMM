@@ -153,7 +153,7 @@ class CustomBuildPy(build_py):
 
 class CachedWheelsCommand(_bdist_wheel):
     def run(self):
-        if DG_FORCE_BUILD:
+        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
