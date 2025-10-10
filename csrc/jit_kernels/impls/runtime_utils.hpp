@@ -68,11 +68,14 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
 }
 
 static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const int& base) {
+#if CUDA_VERSION >= 12080
     if (base != 0) {
         DG_HOST_ASSERT(base == 32 and mode == 128);
         return CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B;
     }
+#endif
 
+    DG_HOST_ASSERT(base == 0);
     switch (mode) {
         case   0:
         case  16: return CU_TENSOR_MAP_SWIZZLE_NONE;
