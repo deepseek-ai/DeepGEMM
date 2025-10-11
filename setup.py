@@ -84,7 +84,11 @@ def get_platform():
 
 def get_wheel_url():
     torch_version = parse(torch.__version__)
-    torch_version = f'{torch_version.major}.{torch_version.minor}'
+    if os.environ.get("NVIDIA_PRODUCT_NAME", "") == "PyTorch":
+        torch_version = str(os.environ.get("NVIDIA_PYTORCH_VERSION"))
+    else:
+        torch_version = f'{torch_version.major}.{torch_version.minor}'
+
     python_version = f'cp{sys.version_info.major}{sys.version_info.minor}'
     platform_name = get_platform()
     deep_gemm_version = get_package_version()
@@ -94,6 +98,8 @@ def get_wheel_url():
     # We're using the CUDA version used to build torch, not the one currently installed
     cuda_version = parse(torch.version.cuda)
     cuda_version = f'{cuda_version.major}'
+
+    
 
     # Determine wheel URL based on CUDA version, torch version, python version and OS
     wheel_filename = f'deep_gemm-{deep_gemm_version}+cu{cuda_version}-torch{torch_version}-cxx11abi{cxx11_abi}-{python_version}-{platform_name}.whl'

@@ -64,6 +64,35 @@ jobs:
       release-version: ${{ needs.setup_release.outputs.release-version }}
       upload-to-release: true
       use-local-version: false
+  
+  check_for_ngc_images:
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.check_for_ngc_images.outputs.IMAGES }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for NGC PyTorch images
+        id: check_for_ngc_images
+        run: |
+          bash ./.github/scripts/check_for_ngc_images.sh
+          echo "IMAGES=$(cat ngc_images.json| jq -cr)" | tee -a $GITHUB_OUTPUT
+
+  build_ngc_wheels:
+    name: Build Wheel for NGC PyTorch
+    needs: [setup_release, check_for_ngc_images]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04]
+        container-image: ${{ fromJson(needs.check_for_ngc_images.outputs.images) }}
+    uses: ./.github/workflows/_build_in_container.yml
+    with:
+      runs-on: ${{ matrix.os }}
+      container-image: ${{ matrix.container-image }}
+      release-version: ${{ needs.setup_release.outputs.release-version }}
+      upload-to-release: true
 
   publish_package:
     name: Publish package
