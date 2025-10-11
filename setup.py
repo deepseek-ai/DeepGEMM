@@ -99,8 +99,6 @@ def get_wheel_url():
     cuda_version = parse(torch.version.cuda)
     cuda_version = f'{cuda_version.major}'
 
-    
-
     # Determine wheel URL based on CUDA version, torch version, python version and OS
     wheel_filename = f'deep_gemm-{deep_gemm_version}+cu{cuda_version}-torch{torch_version}-cxx11abi{cxx11_abi}-{python_version}-{platform_name}.whl'
     wheel_url = base_wheel_url.format(tag_name=f'v{deep_gemm_version}', wheel_name=wheel_filename)
