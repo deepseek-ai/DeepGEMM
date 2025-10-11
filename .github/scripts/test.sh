@@ -3,4 +3,4 @@
 set -exou pipefail
 
 pip install dist/*.whl
-python -c "import mamba_ssm; print(mamba_ssm.__version__)"
+python -c "import deep_gemm; print(deep_gemm.__version__)"
