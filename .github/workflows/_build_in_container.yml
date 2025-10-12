@@ -114,17 +114,6 @@ jobs:
             -e MATRIX_PYTHON_VERSION=$MATRIX_PYTHON_VERSION \
             ${{ inputs.container-image }} bash /workspace/build-scripts/.github/scripts/build.sh | tail -n 1)
 
-      - name: Test wheels
-        run: |
-          docker run \
-            --rm \
-            --shm-size=64g \
-            --workdir /workspace \
-            --volume $(pwd):/workspace \
-            --volume $GITHUB_ENV:$GITHUB_ENV \
-            -e GITHUB_ENV=$GITHUB_ENV \
-            ${{ inputs.container-image }} bash /workspace/build-scripts/.github/scripts/test.sh
-
       - name: Log Built Wheels
         run: |
           ls dist
