@@ -87,7 +87,7 @@ jobs:
 
       - name: Install CUDA ${{ inputs.cuda-version }}
         if: ${{ inputs.cuda-version != 'cpu' }}
-        uses: Jimver/cuda-toolkit@v0.2.26
+        uses: Jimver/cuda-toolkit@v0.2.28
         id: cuda-toolkit
         with:
           cuda: ${{ inputs.cuda-version }}
