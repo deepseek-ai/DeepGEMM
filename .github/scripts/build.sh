@@ -13,7 +13,12 @@ export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY
 # Limit MAX_JOBS otherwise the github runner goes OOM
 export MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "129" ] && echo 1 || echo 2)
 export NVCC_THREADS=2
-export TORCH_CUDA_ARCH_LIST="7.0 7.2 7.5 8.0 8.6 8.7 9.0+PTX"
+
+if [ "$MATRIX_CUDA_VERSION" == "118" ]; then
+  export TORCH_CUDA_ARCH_LIST="7.0 7.2 7.5 8.0 8.6 8.7+PTX"
+else
+  export TORCH_CUDA_ARCH_LIST="7.0 7.2 7.5 8.0 8.6 8.7 9.0+PTX"
+fi
 export DG_USE_LOCAL_VERSION=${DG_USE_LOCAL_VERSION:-0}
 
 # 5h timeout since GH allows max 6h and we want some buffer
