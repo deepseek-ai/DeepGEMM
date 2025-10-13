@@ -56,7 +56,7 @@ jobs:
         include:
           - os: "ubuntu-22.04"
             cxx11_abi: "FALSE"
-            cuda-version: "11.8.0"
+            cuda-version: "12.1.0"
             python-version: "3.8"
             torch-version: "2.1.0"
     uses: ./.github/workflows/_build.yml
