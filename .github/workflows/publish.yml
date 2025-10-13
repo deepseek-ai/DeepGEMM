@@ -55,6 +55,8 @@ jobs:
             python-version: "3.13"
           - cuda-version: "13.0.0"
             python-version: "3.8"
+          - torch: 2.8.0
+            python-version: "3.8"
     uses: ./.github/workflows/_build.yml
     with:
       runs-on: ${{ matrix.os }}
