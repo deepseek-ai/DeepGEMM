@@ -53,6 +53,8 @@ jobs:
           # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
           - torch-version: "2.4.0"
             python-version: "3.13"
+          - cuda-version: "13.0.0"
+            python-version: "3.8"
     uses: ./.github/workflows/_build.yml
     with:
       runs-on: ${{ matrix.os }}
