@@ -150,6 +150,113 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
+    int g_use_gps_configs_n = get_env<int>("DG_GPS_CONFIG_N", 8);
+    int g_use_gps_configs_m = get_env<int>("DG_GPS_CONFIG_M", 64);
+    // Use image-based configurations if enabled and value is valid
+    if (g_use_gps_configs_n != 0 && (g_use_gps_configs_m ==64 || g_use_gps_configs_m == 128 || g_use_gps_configs_m == 256 || g_use_gps_configs_m == 512)) {
+        // Image configurations: m=64, n from 8 to 256 (step 8), k=16
+        static const std::vector<int> all_n_values = {
+            16, 32, 48, 64, 80, 96, 112, 128, 
+            144, 160, 176, 192, 208, 224, 240, 256,
+            272, 288, 304, 320, 336, 352, 368, 384, 
+            400, 416, 432, 448, 464, 480, 496, 512
+        };
+        
+        // Check if the configured value is in the valid range
+        auto it = std::find(all_n_values.begin(), all_n_values.end(), g_use_gps_configs_n);
+        if (it != all_n_values.end()) {
+            int image_n = g_use_gps_configs_n;
+            int image_m = g_use_gps_configs_m;
+            int image_k = 128;
+            
+            MulticastConfig best_multicast_config = {1, true};
+            const auto& [is_legal_on_a, is_legal_on_b] = ArchSpec::get_multicast_legality(
+                gemm_type, m, n, image_m, image_n, num_sms);
+            const bool is_legal[2] = {is_legal_on_b, is_legal_on_a};
+            bool order[2] = {false, true};
+            if (image_m > image_n)
+                std::swap(order[0], order[1]);
+            for (const bool& is_multicast_on_a: order) {
+                if (m >= 512 and is_legal[static_cast<int>(is_multicast_on_a)]) {
+                    best_multicast_config = {2, is_multicast_on_a};
+                    break;
+                }
+            }
+
+            // Always pick the largest number of stage
+            constexpr int smem_capacity = ArchSpec::smem_capacity;
+            int best_num_stages = 0;
+            SharedMemoryConfig best_smem_config;
+            for (int num_stages = std::min(12, ceil_div(k, image_k)); num_stages > 0; -- num_stages) {
+                if (not ArchSpec::is_num_stages_legal(ab_dtype, cd_dtype, num_stages, image_m, image_n, image_k))
+                    continue;
+
+                best_smem_config = get_smem_config<ArchSpec>(kernel_type,
+                                                            m, n, k,
+                                                            image_m, image_n, image_k,
+                                                            major_a, major_b,
+                                                            ab_dtype, cd_dtype,
+                                                            num_stages, best_multicast_config);
+                if (best_smem_config.smem_size <= smem_capacity) {
+                    best_num_stages = num_stages;
+                    break;
+                }
+            }
+            DG_HOST_ASSERT(best_num_stages != 0);
+
+            const int& num_waves = ceil_div(ceil_div(m, image_m) * ceil_div(n, image_n) * num_groups, num_sms);
+            // Recompute the minimal number of SMs required
+            // NOTES: less L2 cache usage and less GPU frequency drop
+            int num_min_sms = num_sms;
+            if (ArchSpec::should_minimize_num_sms()) {
+                num_min_sms = ceil_div(ceil_div(m, image_m) * ceil_div(n, image_n) * num_groups, num_waves);
+                num_min_sms = align(num_min_sms, best_multicast_config.num_multicast);
+                DG_HOST_ASSERT(num_min_sms <= num_sms);
+            }
+            const auto& config = GemmConfig {
+                .gemm_type = gemm_type,
+                .kernel_type = kernel_type,
+                .ab_dtype = ab_dtype,
+                .cd_dtype = cd_dtype,
+                .major_a = major_a,
+                .major_b = major_b,
+                .with_accumulation = with_accumulation,
+                .block_m = image_m,
+                .block_n = image_n,
+                .block_k = image_k,
+                .num_stages = best_num_stages,
+                .num_last_stages = ceil_div(k, image_k) % best_num_stages,
+                .num_sms = num_min_sms,
+                .tc_util = device_runtime->get_tc_util(),
+                .multicast_config = best_multicast_config,
+                // ReSharper disable once CppLocalVariableMightNotBeInitialized
+                .smem_config = best_smem_config,
+                .thread_config = ArchSpec::get_thread_config(kernel_type, image_m, image_n)
+            };
+            if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
+                auto key = std::make_tuple(gemm_type, kernel_type, m, n, k, num_groups, major_a, major_b,
+                                        ab_dtype, cd_dtype, with_accumulation, num_sms, image_m+0, image_n+1, image_k+2);
+                static std::set<decltype(key)> printed;
+                if (printed.count(key) == 0) {
+                    printf("GEMM type: %d, kernel type: %d, M: %d, N: %d, K: %d, groups: %d, "
+                        "A major: %d, B major: %d, AB dtype: %s, CD dtype: %s, accumulation: %d, "
+                        "SM limit: %d -> block M: %d, block N: %d, block K: %d, stages: %d, last stages: %d, "
+                        "SMs: %d, multicast: %d, multicast on A: %d, shared memory: %d bytes, swizzle A: %d, "
+                        "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, waves: %d, TC util: %d%%\n",
+                        static_cast<int>(gemm_type), static_cast<int>(kernel_type), m, n, k, num_groups,
+                        static_cast<int>(major_a), static_cast<int>(major_b), c10::toString(ab_dtype), c10::toString(cd_dtype),
+                        static_cast<int>(with_accumulation), num_sms, image_m, image_n, image_k,
+                        best_num_stages, config.num_last_stages, num_min_sms, best_multicast_config.num_multicast,
+                        static_cast<int>(best_multicast_config.is_multicast_on_a),
+                        best_smem_config.smem_size, best_smem_config.swizzle_a_mode, best_smem_config.swizzle_b_mode,
+                        best_smem_config.swizzle_cd_mode, config.num_sms, config.thread_config.num_threads, num_waves,config.tc_util);
+                    printed.insert(key);
+                }
+            }
+            return config;
+        }
+    }
+
     // Select M/N block sizes
     // TODO: support `% 16 == 8` block size on SM90
     auto block_ms = std::vector{64, 128, 256};
@@ -293,14 +400,14 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                    "A major: %d, B major: %d, AB dtype: %s, CD dtype: %s, accumulation: %d, "
                    "SM limit: %d -> block M: %d, block N: %d, block K: %d, stages: %d, last stages: %d, "
                    "SMs: %d, multicast: %d, multicast on A: %d, shared memory: %d bytes, swizzle A: %d, "
-                   "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, TC util: %d%%\n",
+                   "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, waves: %d, TC util: %d%%\n",
                    static_cast<int>(gemm_type), static_cast<int>(kernel_type), m, n, k, num_groups,
                    static_cast<int>(major_a), static_cast<int>(major_b), c10::toString(ab_dtype), c10::toString(cd_dtype),
                    static_cast<int>(with_accumulation), num_sms, best_block_m, best_block_n, block_k,
                    best_num_stages, config.num_last_stages, num_min_sms, best_multicast_config.num_multicast,
                    static_cast<int>(best_multicast_config.is_multicast_on_a),
                    best_smem_config.smem_size, best_smem_config.swizzle_a_mode, best_smem_config.swizzle_b_mode,
-                   best_smem_config.swizzle_cd_mode, config.num_sms, config.thread_config.num_threads, config.tc_util);
+                   best_smem_config.swizzle_cd_mode, config.num_sms, config.thread_config.num_threads, best_num_waves, config.tc_util);
             printed.insert(key);
         }
     }

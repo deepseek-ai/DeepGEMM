@@ -77,7 +77,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const std::string& compiled_dims) {
     DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
-
+    // printf("sm90_fp8_gemm_1d2d  m: %d, n: %d, k: %d\n", m, n, k);
     const auto& aligned_k = align(k, 128);
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::Normal, KernelType::Kernel1D2D,
@@ -136,7 +136,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                     const std::string& compiled_dims) {
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
-
+    // printf("sm90_m_grouped_fp8_gemm_contiguous_1d2d  m: %d, n: %d, k: %d\n", m, n, k);
     const auto& aligned_k = align(k, 128);
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::MGroupedContiguous, KernelType::Kernel1D2D,
@@ -197,7 +197,7 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
     const auto& aligned_k = align(k, 128);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
-
+    // printf("sm90_m_grouped_fp8_gemm_masked_1d2d  m: %d, n: %d, k: %d\n", m, n, k);
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::MGroupedMasked, KernelType::Kernel1D2D,
         expected_m, n, k, num_groups, major_a, major_b,

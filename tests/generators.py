@@ -69,13 +69,69 @@ def get_major_ab(freeze_a: bool) -> tuple:
 
 
 def enumerate_normal(use_bf16: bool = False) -> Generator:
+    # for kernel_type in get_kernel_types(use_bf16):
+    #     for m in (128, 4096):
+    #         for n, k in [(2112, 7168), (24576, 1536), (32768, 512), (7168, 16384), (4096, 7168), (7168, 2048)]:
+    #             for major_a, major_b in get_major_ab(False):
+    #                 for out_dtype in get_out_dtype():
+    #                     for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
+    #                         yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
+
+    # # 添加基于性能分析的额外配置
+    # # 高性能配置：维度对齐良好，适合WGMMA指令
+    # for kernel_type in get_kernel_types(use_bf16):
+    #     # 高性能配置：M=64的倍数，N=64/128/256，K=128的倍数
+    #     for m in [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]:
+    #         for n in [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]:
+    #             for k in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]:  # 只保留128的倍数
+    #                 # 只选择对齐良好的组合
+    #                 if m % 64 == 0 and n % 64 == 0 and k % 128 == 0:
+    #                     for major_a, major_b in get_major_ab(False):
+    #                         for out_dtype in get_out_dtype():
+    #                             for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
+    #                                 yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
+
+    # # 中等性能配置：部分维度对齐，但K维度必须是128的倍数
+    # for kernel_type in get_kernel_types(use_bf16):
+    #     for m in [96, 192, 384, 768, 1536, 3072, 6144, 12288]:
+    #         for n in [96, 192, 384, 768, 1536, 3072, 6144, 12288]:
+    #             for k in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]:  # 只保留128的倍数
+    #                 if m % 32 == 0 and n % 32 == 0 and k % 128 == 0:
+    #                     for major_a, major_b in get_major_ab(False):
+    #                         for out_dtype in get_out_dtype():
+    #                             for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
+    #                                 yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
+
+    # # 低性能配置：维度不对齐，但K维度必须是128的倍数，且M/N维度满足基本对齐要求
+    # for kernel_type in get_kernel_types(use_bf16):
+    #     # 选择不对齐但满足基本要求的M和N维度
+    #     # M维度：不是64的倍数，但至少是8的倍数（满足swizzling要求）
+    #     # N维度：不是64的倍数，但至少是8的倍数（满足TMA存储要求）
+    #     for m in [56, 120, 248, 504, 1016, 2040, 4088, 8184]:  # 8的倍数但不是64的倍数
+    #         for n in [56, 120, 248, 504, 1016, 2040, 4088, 8184]:  # 8的倍数但不是64的倍数
+    #             for k in [128, 256, 512, 1024, 2048, 4096, 8192, 16384]:  # 只保留128的倍数
+    #                 # 故意选择不对齐的M和N维度（不是64的倍数），但满足基本对齐要求
+    #                 if m % 64 != 0 and n % 64 != 0 and m % 8 == 0 and n % 8 == 0 and k % 128 == 0:
+    #                     for major_a, major_b in get_major_ab(False):
+    #                         for out_dtype in get_out_dtype():
+    #                             for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
+    #                                 yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
+
+    # 极端配置：非常大或非常小的矩阵，确保K维度是128的倍数
     for kernel_type in get_kernel_types(use_bf16):
-        for m in (128, 4096):
-            for n, k in [(2112, 7168), (24576, 1536), (32768, 512), (7168, 16384), (4096, 7168), (7168, 2048)]:
-                for major_a, major_b in get_major_ab(False):
-                    for out_dtype in get_out_dtype():
-                        for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
-                            yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
+        # 超大矩阵配置
+        for m, n, k in [(16384, 16384, 16384), (32768, 16384, 16384), (16384, 32768, 16384), (16384, 16384, 32768), (32768, 32768, 32768)]:
+            for major_a, major_b in get_major_ab(False):
+                for out_dtype in get_out_dtype():
+                    for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
+                        yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
+
+    #     # 超小矩阵配置，确保K维度是128的倍数
+    #     for m, n, k in [(16, 16, 128), (32, 32, 128), (64, 64, 128), (128, 128, 128)]:
+    #         for major_a, major_b in get_major_ab(False):
+    #             for out_dtype in get_out_dtype():
+    #                 for accumulate in (False, ) if out_dtype == torch.bfloat16 or kernel_type.is_1d2d() else (False, True):
+    #                     yield kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype
 
 
 def enumerate_m_grouped_contiguous(use_bf16: bool = False) -> Generator:

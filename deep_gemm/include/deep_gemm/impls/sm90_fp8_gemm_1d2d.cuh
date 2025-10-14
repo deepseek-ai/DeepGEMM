@@ -49,7 +49,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
     DG_STATIC_ASSERT(constexpr_ceil_div(BLOCK_N, BLOCK_K) == 1 or (constexpr_gcd(BLOCK_N, BLOCK_K) == BLOCK_N - BLOCK_K), "Too much B scales in a single block");
-
+    printf("BLOCK_M: %u, BLOCK_N: %u, BLOCK_K: %u\n", BLOCK_M, BLOCK_N, BLOCK_K);
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type; // 根据BLOCK_N（N 维度的分块大小）选择适配的FP8 精度 warp 级 MMA 指令类型， WGMMA（可理解为 “Warp-Level MMA”）是选中的指令类型的别名，该类型中包含硬件指令支持的固定维度信息（如WGMMA::M、WGMMA::N、WGMMA::K，分别对应硬件一次能处理的 M、N、K 维度大小）
     using Barrier = cutlass::arch::ClusterTransactionBarrier; // 支持多个 CTA（线程块）组成的集群之间的同步
