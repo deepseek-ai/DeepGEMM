@@ -42,7 +42,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {}, {},
-        {}, {},
+        {},
         {}, {},
         {}, {},
         {},
@@ -56,7 +56,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.block_m, args.gemm_config.block_n, args.gemm_config.block_k,
         args.num_groups,
         args.gemm_config.smem_config.swizzle_a_mode, args.gemm_config.smem_config.swizzle_b_mode, args.gemm_config.smem_config.swizzle_cd_mode,
-        args.gemm_config.num_stages, args.gemm_config.num_last_stages,
+        args.gemm_config.num_stages,
         args.gemm_config.thread_config.num_non_epilogue_threads, args.gemm_config.thread_config.num_epilogue_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
         args.gemm_config.num_sms,
@@ -80,8 +80,7 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
                             const int& m, const int& n, const int& k,
                             const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                             const std::string& compiled_dims) {
-    // TODO: test other Ks
-    DG_HOST_ASSERT(k % 64 == 0);
+    const auto& aligned_k = align(k, 64);
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::Normal, KernelType::KernelNoSF,
         m, n, k, 1, major_a, major_b,
@@ -122,7 +121,7 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
 
     // Launch
     const SM100BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
+        .m = m, .n = n, .k = aligned_k,
         .num_groups = 1,
         .compiled_dims = compiled_dims,
         .gemm_config = config,

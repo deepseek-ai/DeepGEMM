@@ -5,6 +5,7 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
+#include <deep_gemm/common/epilogue_utils.cuh>
 #include <deep_gemm/common/scheduler.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/sm100_utils.cuh>
@@ -22,7 +23,8 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          GemmType kGemmType, typename cd_dtype_t>
+          GemmType kGemmType, typename cd_dtype_t,
+          typename epilogue_type_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                          uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -88,8 +90,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<kNumAccumTmemCols>();
 
     // Prefetch TMA descriptors at the very beginning
-    if (threadIdx.x == 0) {
-        // NOTES: `reinterpret_cast` must be here, or NVRTC will fail
+    if (warp_idx == 0 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_d);
@@ -133,7 +134,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // Initialize barriers
-    if (threadIdx.x == 0) {
+    if (warp_idx == 1 and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             // Arrive at all CTAs
@@ -149,9 +150,8 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         }
 
         // Make initialized barrier visible in async proxy
-        cutlass::arch::fence_view_async_shared();
         cutlass::arch::fence_barrier_init();
-    } else if (threadIdx.x >= 32 and threadIdx.x < 64) {
+    } else if (warp_idx == 2) {
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
@@ -174,7 +174,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
 
     // Register configurations
     constexpr uint32_t kNumNonEpilogueRegisters = 64;
@@ -435,7 +435,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // as we don't share pipeline stages between two blocks
             if (epilogue_thread_idx_in_warpgroup == 0)
                 cute::tma_store_wait<0>();
-            cutlass::arch::NamedBarrier(STORE_BLOCK_M, epilogue_warpgroup_idx).sync();
+            cutlass::arch::NamedBarrier::sync(STORE_BLOCK_M, epilogue_warpgroup_idx);
 
             // Write shared memory
             DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
@@ -449,13 +449,13 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 if (s >= kNumTMAStoreStages) {
                     if (epilogue_thread_idx_in_warpgroup == 0)
                         cute::tma_store_wait<kNumTMAStoreStages - 1>();
-                    cutlass::arch::NamedBarrier(STORE_BLOCK_M, epilogue_warpgroup_idx).sync();
+                    cutlass::arch::NamedBarrier::sync(STORE_BLOCK_M, epilogue_warpgroup_idx);
                 }
 
                 // The pipeline stage
                 const auto tma_stage_idx = s % kNumTMAStoreStages;
                 const auto m_idx = scheduler.get_global_idx<(kGemmType != GemmType::MGroupedContiguous)>(shape_m, BLOCK_M, m_block_idx);
-                const auto n_idx = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
+                const auto n_idx = epilogue_type_t::apply_index_n<STORE_BLOCK_N>(n_block_idx * BLOCK_N + s * STORE_BLOCK_N);
                 const auto local_smem_cd = smem_cd[tma_stage_idx] + epilogue_warpgroup_idx * STORE_BLOCK_M * STORE_BLOCK_N;
 
                 // Store into shared memory
@@ -502,7 +502,7 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
                 // Synchronize all threads and issue TMA
                 cute::tma_store_fence();
-                cutlass::arch::NamedBarrier(STORE_BLOCK_M, epilogue_warpgroup_idx).sync();
+                cutlass::arch::NamedBarrier::sync(STORE_BLOCK_M, epilogue_warpgroup_idx);
                 if (epilogue_thread_idx_in_warpgroup == 0) {
                     cute::SM90_TMA_STORE_2D::copy(
                         &tensor_map_d, local_smem_cd,
@@ -511,10 +511,6 @@ sm100_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 }
             }
         }
-
-        // Flush all stages in the pipeline to make TMA stores visible to the next kernel
-        if (epilogue_thread_idx_in_warpgroup == 0)
-            cute::tma_store_wait<0>();
 
         // Deallocate tensor memory by warp 1
         // NOTES: warp 0 is waiting TMA store

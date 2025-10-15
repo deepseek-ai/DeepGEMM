@@ -16,13 +16,16 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2 and x.size(1) % 128 == 0
+    assert x.dim() == 2
     m, n = x.shape
-    x_view = x.view(m, -1, 128)
+    padded_n = align(n, 128)
+    x_padded = torch.empty((m, padded_n), dtype=x.dtype, device=x.device).fill_(0)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
     sf = x_amax / 448.0
     sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), sf
+    return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, padded_n)[:, :n].contiguous(), sf
 
 
 def per_channel_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -1,11 +1,15 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
+#include <functional>
 #include <random>
 #include <string>
 #include <memory>
+#include <unistd.h>
 
 #include "exception.hpp"
+#include "format.hpp"
 
 namespace deep_gemm {
 
@@ -65,7 +69,10 @@ static std::filesystem::path make_dirs(const std::filesystem::path& path) {
     // OK if existed
     std::error_code capture;
     const bool& created = std::filesystem::create_directories(path, capture);
-    DG_HOST_ASSERT(created or capture.value() == 0);
+    if (not (created or capture.value() == 0)) {
+        DG_HOST_UNREACHABLE(fmt::format("Failed to make directory: {}, created: {}, value: {}",
+                                        path.c_str(), created, capture.value()));
+    }
     if (created and get_env<int>("DG_JIT_DEBUG"))
         printf("Create directory: %s\n", path.c_str());
     return path;

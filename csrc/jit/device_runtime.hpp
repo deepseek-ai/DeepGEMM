@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cublasLt.h>
 #include <ATen/cuda/CUDAContext.h>
 
 #include "../utils/exception.hpp"
@@ -11,12 +12,37 @@ class DeviceRuntime {
     int num_sms = 0, tc_util = 0;
     std::shared_ptr<cudaDeviceProp> cached_prop;
 
+    // cuBLASLt utils
+    static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;
+    cublasLtHandle_t cublaslt_handle{};
+    std::shared_ptr<torch::Tensor> cublaslt_workspace;
+
 public:
-    explicit DeviceRuntime() = default;
+    explicit DeviceRuntime() {
+        cublaslt_workspace = std::make_shared<torch::Tensor>(torch::empty({kCublasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA)));
+        DG_CUBLASLT_CHECK(cublasLtCreate(&cublaslt_handle));
+    }
+
+    ~DeviceRuntime() noexcept(false) {
+        DG_CUBLASLT_CHECK(cublasLtDestroy(cublaslt_handle));
+    }
+
+    cublasLtHandle_t get_cublaslt_handle() const {
+        return cublaslt_handle;
+    }
+
+    torch::Tensor get_cublaslt_workspace() const {
+        return *cublaslt_workspace;
+    }
 
     std::shared_ptr<cudaDeviceProp> get_prop() {
-        if (cached_prop == nullptr)
-            cached_prop = std::make_shared<cudaDeviceProp>(*at::cuda::getCurrentDeviceProperties());
+        if (cached_prop == nullptr) {
+            int device_idx;
+            cudaDeviceProp prop;
+            DG_CUDA_RUNTIME_CHECK(cudaGetDevice(&device_idx));
+            DG_CUDA_RUNTIME_CHECK(cudaGetDeviceProperties(&prop, device_idx));
+            cached_prop = std::make_shared<cudaDeviceProp>(prop);
+        }
         return cached_prop;
     }
 

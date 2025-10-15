@@ -1,5 +1,7 @@
 #pragma once
 
+#include <deep_gemm/common/types.hpp>
+
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
 
@@ -82,18 +84,19 @@ static bool is_multicast_legal(const int& shape_dim, const int& block_dim,
     return divisible and num_sms % num_multicast == 0;
 }
 
-static int get_swizzle_mode(const int& block_size, const int& elem_size) {
+template <typename size_type_t>
+static int get_swizzle_mode(const int& block_size, const size_type_t& elem_size) {
     // `> 0` means interleaving
     // 16B actually means non-swizzling (but interleaving)
     for (const int& mode: {128, 64, 32, 16}) {
-        if ((block_size * elem_size) % mode == 0)
+        if ((block_size * static_cast<int>(elem_size)) % mode == 0)
             return mode;
     }
     DG_HOST_UNREACHABLE("Unreachable");
 }
 
 template <typename ArchSpec>
-static SharedMemoryConfig get_smem_config(const KernelType& kernel_type,
+static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const KernelType& kernel_type,
                                           const int& m, const int& n, const int& k,
                                           const int& block_m, const int& block_n, const int& block_k,
                                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -107,7 +110,7 @@ static SharedMemoryConfig get_smem_config(const KernelType& kernel_type,
     const int& load_block_n = ArchSpec::get_ab_load_block_n(multicast_config, block_n);
     const int& swizzle_a_mode = get_swizzle_mode(major_a == cute::UMMA::Major::K ? block_k : load_block_m, ab_elem_size);
     const int& swizzle_b_mode = get_swizzle_mode(major_b == cute::UMMA::Major::K ? block_k : load_block_n, ab_elem_size);
-    const int& swizzle_cd_mode = get_swizzle_mode(block_n, cd_elem_size);
+    const int& swizzle_cd_mode = ArchSpec::enable_cd_swizzle(cd_dtype) ? get_swizzle_mode(block_n, cd_elem_size) : 0;
 
     // Different archs have different epilogue pipelines
     const int& smem_cd = ArchSpec::get_smem_cd_size(kernel_type, block_m, block_n, swizzle_cd_mode, split_k ? torch::kFloat : cd_dtype);
@@ -124,9 +127,11 @@ static SharedMemoryConfig get_smem_config(const KernelType& kernel_type,
     // M-barriers and tensor memory pointers
     const int& smem_barrier = ArchSpec::get_barrier_smem_size(num_stages + (split_k ? 1 : 0));
     const int& smem_tmem_ptr = ArchSpec::get_tmem_ptr_smem_size();
+    const int& smem_tensor_map = ArchSpec::get_tensormap_smem_size(gemm_type);
 
     // Sum them up
     int smem_size = 0;
+    smem_size += smem_tensor_map;
     smem_size += smem_cd;
     smem_size += num_stages * smem_a_per_stage;
     smem_size += num_stages * smem_b_per_stage;
@@ -173,12 +178,12 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
     // Select M/N block sizes
-    // TODO: support `% 16 == 8` block size on SM90
-    const auto& block_ms = gemm_type == GemmType::MGroupedContiguous ?
-        std::vector{get_mk_alignment_for_contiguous_layout()} : std::vector{64, 128, 256};
-    std::vector<int> block_ns;
-    for (int i = 16; i <= 256; i += 16)
-        block_ns.push_back(i);
+    auto block_ms = std::vector{64, 128, 256};
+    if (gemm_type == GemmType::MGroupedContiguous)
+        block_ms = std::vector{get_mk_alignment_for_contiguous_layout()};
+    if (gemm_type == GemmType::MGroupedMasked)  // Exclude 256 for performance
+        block_ms = std::vector{64, 128};
+    const auto block_ns = ArchSpec::get_block_n_candidates(cd_dtype);
 
     // K block size is selected in a fixed manner
     const auto& block_k = 128 / static_cast<int>(c10::elementSize(ab_dtype));
@@ -253,10 +258,10 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     int k_partitioned = k / best_k_slices;
 
     // Decide the number of TMA multicasts and whether broadcast on A
-    MulticastConfig best_multicast_config = {1, true};
+    MulticastConfig best_multicast_config = {1, false};
     const auto& [is_legal_on_a, is_legal_on_b] = ArchSpec::get_multicast_legality(
-        gemm_type, m, n, best_block_m, best_block_n, num_sms);
-    const bool is_legal[2] = {is_legal_on_a, is_legal_on_b};
+        gemm_type, num_groups, m, n, best_block_m, best_block_n, num_sms);
+    const bool is_legal[2] = {is_legal_on_b, is_legal_on_a};
     bool order[2] = {false, true};
     if (best_block_m > best_block_n)
         std::swap(order[0], order[1]);
@@ -275,11 +280,12 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     constexpr int smem_capacity = ArchSpec::smem_capacity;
     int best_num_stages = 0;
     SharedMemoryConfig best_smem_config;
-    for (int num_stages = std::min(12, ceil_div(k_partitioned, block_k)); num_stages > 0; -- num_stages) {
+
+    for (int num_stages = 12; num_stages > 0; -- num_stages) {
         if (not ArchSpec::is_num_stages_legal(ab_dtype, cd_dtype, num_stages, best_block_m, best_block_n, block_k))
             continue;
 
-        best_smem_config = get_smem_config<ArchSpec>(kernel_type,
+        best_smem_config = get_smem_config<ArchSpec>(gemm_type, kernel_type,
                                                      m, n, k_partitioned,
                                                      best_block_m, best_block_n, block_k,
                                                      major_a, major_b,

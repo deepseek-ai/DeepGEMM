@@ -25,15 +25,26 @@ from deep_gemm_cpp import (
     # FP8 GEMMs
     fp8_gemm_nt, fp8_gemm_nn,
     fp8_gemm_tn, fp8_gemm_tt,
+    fp8_gemm_nt_skip_head_mid,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nn_contiguous,
     m_grouped_fp8_gemm_nt_masked,
+    k_grouped_fp8_gemm_nt_contiguous,
     k_grouped_fp8_gemm_tn_contiguous,
     # BF16 GEMMs
     bf16_gemm_nt, bf16_gemm_nn,
     bf16_gemm_tn, bf16_gemm_tt,
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nt_masked,
+    # cuBLASLt GEMMs
+    cublaslt_gemm_nt, cublaslt_gemm_nn,
+    cublaslt_gemm_tn, cublaslt_gemm_tt,
+    # Einsum kernels
+    einsum,
+    # Attention kernels
+    fp8_mqa_logits,
+    get_paged_mqa_logits_metadata,
+    fp8_paged_mqa_logits,
     # Layout kernels
     transform_sf_into_required_layout
 )
@@ -72,3 +83,5 @@ deep_gemm_cpp.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     _find_cuda_home()                           # CUDA home
 )
+
+__version__ = '2.1.1'
