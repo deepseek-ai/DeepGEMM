@@ -5,11 +5,13 @@
 #include <deep_gemm/common/types.hpp>
 
 #include "common.hpp"
+#include "../../jit/device_runtime.hpp"
 
 namespace deep_gemm {
 
 struct SM90ArchSpec {
     static constexpr int smem_capacity = 232448;
+    static constexpr int num_sms_available_by_cluster_size_h20[8] = {78, 78, 54, 60, 50, 48, 49, 56};
 
     static std::vector<int> get_block_n_candidates(const at::ScalarType& cd_dtype) {
         // Avoid bank conflicts for FP32 output
@@ -81,6 +83,30 @@ struct SM90ArchSpec {
     }
 
     static bool should_minimize_num_sms() {
+        return true;
+    }
+
+    // Assuming one CTA per SM, max concurrently available number of SMs is limited by cluster size.
+    // To support other sm90 GPUs than H20, a num_sms_available_by_cluster_size array should be added.
+    // Otherwise, only cluster_size <= 2 will be selected to make good use of all the SMs.
+    static int get_num_sms_available_by_cluster_size(int cluster_size, int device_num_sms) {
+        if (cluster_size > 8 or cluster_size <= 1) {
+            return device_num_sms;
+        } else if (cluster_size == 2) {
+            return (device_num_sms / cluster_size) * cluster_size;
+        }
+        int result = (device_num_sms / cluster_size) * cluster_size;
+        int num_all_sms = device_runtime->get_num_sms();
+        if (num_all_sms == 78) { // H20
+            result = std::min(result, num_sms_available_by_cluster_size_h20[cluster_size - 1]);
+        } else {
+            // For other cases, we return max_num_sms as 1 to avoid using large cluster size.
+            result = 1;
+        }
+        return result;
+    }
+
+    static bool support_split_k() {
         return true;
     }
 
