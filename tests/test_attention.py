@@ -209,7 +209,7 @@ def test_paged_mqa_logits():
     print('Testing FP8 Paged MQA Logits:')
     max_model_len = 111 * 1000
     for is_context_lens_2d in (False, True):
-        for batch_size, next_n in [(64, 1), (64, 2), (128, 1)]:
+        for batch_size, next_n in [(64, 1), (64, 2), (64, 4), (128, 1)]:
             for heads, index_dim in [(64, 128)]:
                 for avg_kv in (8192, 32768):
                     num_blocks, blocksize = max_model_len * 3, 64
@@ -237,11 +237,13 @@ def test_paged_mqa_logits():
                     if is_context_lens_2d:
                         context_lens_2d = ((context_lens.unsqueeze(1) + 1) * torch.rand(batch_size, next_n, device='cuda')).int()
                         context_lens_2d[:, next_n-1] = context_lens
-                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens_2d, blocksize, deep_gemm.get_num_sms())
+                        num_clusters = deep_gemm.get_num_sms() // (2 if next_n == 4 else 1)
+                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens_2d, blocksize, num_clusters)
                         logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, clean_logits=False)
                         ref_neginf_mask = ~(positions < context_lens_2d.view(-1).unsqueeze(1))
                     else:
-                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms())
+                        num_clusters = deep_gemm.get_num_sms() // (2 if next_n == 4 else 1)
+                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, num_clusters)
                         logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
                         row_indices = torch.arange(batch_size * next_n, device='cuda') // next_n
                         next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
