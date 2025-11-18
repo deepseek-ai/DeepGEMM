@@ -154,16 +154,22 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     const auto& [batch_size__, max_block_len] = get_shape<2>(block_table);
     const auto& [schedule_meta_size, meta_info_size] = get_shape<2>(schedule_meta);
     const auto& num_sms = device_runtime->get_num_sms();
+    const auto& num_kv_multicast = next_n == 4 ? 2 : 1;
+    const auto& num_clusters = num_sms / num_kv_multicast;
     const auto& kv_cache_stride_bytes = fused_kv_cache.stride(0);
     const auto& block_table_stride = block_table.stride(0);
+    const auto& arch_major = device_runtime->get_arch_major();
 
     DG_HOST_ASSERT(batch_size == batch_size_ and batch_size == batch_size__);
     DG_HOST_ASSERT(batch_size_next_n == batch_size * next_n);
     DG_HOST_ASSERT(num_heads == num_heads_ and num_heads_kv == 1);
     DG_HOST_ASSERT(head_dim_with_sf == head_dim + static_cast<int>(sizeof(float)));
-    DG_HOST_ASSERT(schedule_meta_size == num_sms + 1 and meta_info_size == 2);
+    DG_HOST_ASSERT(num_sms % num_kv_multicast == 0);
+    DG_HOST_ASSERT(schedule_meta_size == num_clusters + 1 and meta_info_size == 2);
 
-    DG_HOST_ASSERT(next_n == 1 or next_n == 2);
+    DG_HOST_ASSERT(next_n == 1 or next_n == 2 or next_n == 4);
+    // SM90 does not support next_n == 4 for now
+    DG_HOST_ASSERT(!(arch_major == 9 and next_n == 4));
     DG_HOST_ASSERT(block_kv == 64);
 
     DG_HOST_ASSERT(q.is_contiguous());
@@ -204,7 +210,6 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     logits = logits.slice(-1, 0, max_context_len);
 
     // Dispatch implementation
-    const auto& arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 or arch_major == 10) {
         smxx_fp8_paged_mqa_logits(q, kv_cache, kv_cache_scales, weights, context_lens, logits, block_table, schedule_meta,
                                   batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv,
