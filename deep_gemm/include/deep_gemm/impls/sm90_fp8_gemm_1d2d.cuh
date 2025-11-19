@@ -14,6 +14,7 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/scheduler.cuh>
 #include <deep_gemm/common/sm90_utils.cuh>
+#include <deep_gemm/common/split_k_reduce.cuh>
 
 namespace deep_gemm {
 
@@ -33,6 +34,7 @@ __device__ void dispatch_num_former_iters(uint32_t num_former_iters, const func_
 template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSplitKSlices,
           uint32_t kSwizzleDMode,
           uint32_t kNumStages, uint32_t kNumLastStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
@@ -61,17 +63,21 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
 
+    DG_STATIC_ASSERT(kSplitKSlices > 0, "Invalid split K slices");
+    const uint32_t shape_k_partitioned = ceil_div(shape_k, kSplitKSlices);
+
     // Shared memory
     static constexpr bool kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0);
-    static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(__nv_bfloat16);
+    static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * (kSplitKSlices > 1 ? sizeof(float) : sizeof(__nv_bfloat16));
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
     const uint32_t& shape_k_scales = ceil_div(shape_k, BLOCK_K);
-    const uint32_t& smem_sfb_size = align<uint32_t>(shape_k_scales * (kMustUseUniformedScaleB ? 1 : 2) * sizeof(float), sizeof(Barrier));
+    const uint32_t& shape_k_scales_partitioned = ceil_div(shape_k_partitioned, BLOCK_K);
+    const uint32_t& smem_sfb_size = align<uint32_t>(shape_k_scales_partitioned * (kMustUseUniformedScaleB ? 1 : 2) * sizeof(float), sizeof(Barrier));
 
     // Configs
-    const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
+    const uint32_t num_total_k_blocks = ceil_div(shape_k_partitioned, BLOCK_K);
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = get_lane_idx();
 
@@ -106,6 +112,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(reinterpret_cast<uint8_t*>(smem_sfb) + smem_sfb_size);
     auto full_barriers     = PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers    = PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
+    auto split_k_reduce_full_barrier = barrier_start_ptr + 2 * kNumStages;
+    auto split_k_reduce_empty_barrier = split_k_reduce_full_barrier + 1;
 
     // Initialize barriers
     DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "Too many TMA multicast");
@@ -121,9 +129,18 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         // Make initialized barrier visible in async proxy
         cutlass::arch::fence_barrier_init();
     }
+    
+    if constexpr (kSplitKSlices > 1) {
+        if (threadIdx.x == 0) {
+            split_k_reduce_full_barrier->init(1);
+            split_k_reduce_empty_barrier->init(kSplitKSlices);
+            // Make initialized barrier visible in async proxy
+            cutlass::arch::fence_barrier_init();
+        }
+    }
 
     // Synchronize all threads to make barrier visible in normal memory model
-    (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+    (kNumTMAMulticast > 1 or kSplitKSlices > 1) ? cute::cluster_sync() : __syncthreads();
 
     // Register reconfigurations
     constexpr uint32_t kNumTMARegisters = 40;
@@ -131,7 +148,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
+    auto scheduler = Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumTMAMulticast, kIsTMAMulticastOnA, kNumSMs, kSplitKSlices>(shape_m, shape_n, shape_k, grouped_layout);
+
+    const uint32_t k_block_idx_offset =  kSplitKSlices > 1 ? blockIdx.y * num_total_k_blocks : 0;
+    const uint32_t rank_in_cluster_offset = kSplitKSlices > 1 ? cute::block_id_in_cluster().y * kNumTMAMulticast : 0;
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -154,10 +174,11 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 // Assign TMA multicast number into A and B
                 // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
-                const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
-                const uint32_t num_tma_multicast_b = (not kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
                 DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
-
+                uint32_t tma_multicast_cta_mask_a = (kNumTMAMulticast > 1 and kIsTMAMulticastOnA and is_tma_multicast_valid) ?
+                                                    ((1 << kNumTMAMulticast) - 1) << (kSplitKSlices > 1 ? rank_in_cluster_offset : 0): 0;
+                uint32_t tma_multicast_cta_mask_b = (kNumTMAMulticast > 1 and not kIsTMAMulticastOnA and is_tma_multicast_valid) ?
+                                                    ((1 << kNumTMAMulticast) - 1) << (kSplitKSlices > 1 ? rank_in_cluster_offset : 0): 0;
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                     // Wait consumer release
                     empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -165,18 +186,18 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     // Issue TMA A
                     constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
                     auto& full_barrier = *full_barriers[stage_idx];
-                    const uint32_t k_idx = k_block_idx * BLOCK_K;
+                    const uint32_t k_idx = (k_block_idx + k_block_idx_offset) * BLOCK_K;
                     tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
                              smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
-                             num_tma_multicast_a);
+                             tma_multicast_cta_mask_a);
                     tma_copy(&tensor_map_sfa, reinterpret_cast<uint64_t*>(&full_barrier),
-                             smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.get_global_idx<kWithGroupOffsetA>(shape_k_scales, 1, k_block_idx),
-                             num_tma_multicast_a);
+                             smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.get_global_idx<kWithGroupOffsetA>(shape_k_scales, 1, k_block_idx + k_block_idx_offset),
+                             tma_multicast_cta_mask_a);
 
                     // Issue TMA B
                     tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                              smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                             num_tma_multicast_b);
+                             tma_multicast_cta_mask_b);
                     full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
                 }
             }
@@ -209,16 +230,23 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
                 num_full_iters = min(shape_n - n_block_idx * BLOCK_N, BLOCK_N) / 8;
             }
-            uint32_t num_sfb = shape_k_scales * (num_former_iters >= num_full_iters ? 1 : 2);
+            uint32_t num_sfb = shape_k_scales_partitioned * (num_former_iters >= num_full_iters ? 1 : 2);
 
             // Load B scales with math warp-groups
             // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
             if (threadIdx.x >= 32) {
                 auto num_previous_lines = scheduler.get_global_idx<true>(ceil_div(shape_n, BLOCK_K), 0, 0, m_block_idx);
-                auto local_sfb = sfb + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * shape_k_scales;
+                auto local_sfb = sfb + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * shape_k_scales
+                                     + (kSplitKSlices > 1 ? k_block_idx_offset : 0);
+                
                 #pragma unroll
-                for (uint32_t i = threadIdx.x - 32; i < num_sfb; i += kNumMathThreads - 32)
-                    st_shared(smem_sfb + i, __ldg(local_sfb + i));
+                for (uint32_t i = threadIdx.x - 32; i < num_sfb; i += kNumMathThreads - 32) {
+                    if constexpr (kSplitKSlices > 1) {
+                        st_shared(smem_sfb + i, __ldg(local_sfb + i + (i >= shape_k_scales_partitioned ? shape_k_scales - shape_k_scales_partitioned : 0)));
+                    } else {
+                        st_shared(smem_sfb + i, __ldg(local_sfb + i));
+                    }
+                }
             }
             cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
 
@@ -232,7 +260,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 if constexpr (kNumTMAMulticast == 1) {
                     lane_idx == 0 ? empty_barriers[stage_idx]->arrive() : void();
                 } else {
-                    auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
+                    auto target_cta = scheduler.is_peer_cta_alive ? lane_idx + rank_in_cluster_offset : cute::block_rank_in_cluster();
                     lane_idx < kNumTMAMulticast ? empty_barriers[stage_idx]->arrive(target_cta) : void();
                 }
             };
@@ -255,7 +283,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         float scale_b_0 = ld_shared(smem_sfb + k_block_idx), scale_b_1;
                         // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
                         if constexpr (not kMustUseUniformedScaleB)
-                            scale_b_1 = ld_shared(smem_sfb + k_block_idx + shape_k_scales);
+                            scale_b_1 = ld_shared(smem_sfb + k_block_idx + shape_k_scales_partitioned);
 
                         // Wait TMA arrivals
                         full_barriers[stage_idx]->wait(phase);
@@ -329,9 +357,21 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             DG_STATIC_ASSERT(TMA_D_BLOCK_N % 8 == 0, "Invalid TMA block N");
 
             // Wait last TMA store to be finished
-            if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)
+            if (cute::block_id_in_cluster().y == 0 and threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)
                 cute::tma_store_wait<0>();
             cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+            // Reduce d across CTAs within a cluster
+            if constexpr (kSplitKSlices > 1) {
+                split_k_reduce<kSplitKSlices, kNumMathThreads, (BLOCK_M / WAVE_BLOCK_M) * WGMMA::kNumAccum, Barrier>(
+                    reinterpret_cast<float*>(smem_d), final_accum, split_k_reduce_empty_barrier, split_k_reduce_full_barrier, scheduler.current_iter
+                );
+                // Only the leader cta writes d to global memory
+                if (cute::block_id_in_cluster().y != 0) {
+                    continue;
+                }
+                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+            }
 
             // Write back to shared memory using STSM and issue TMA stores
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");

@@ -238,12 +238,12 @@ __device__ GmmaDescriptor make_smem_desc(PointerType smem_ptr, const int& layout
 
 __device__ __forceinline__ void
 tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
-         const uint32_t& crd_0, const uint32_t& crd_1, const uint32_t& num_tma_multicast = 1) {
+         const uint32_t& crd_0, const uint32_t& crd_1, const uint32_t& tma_multicast_cta_mask = 0) {
     constexpr auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL);
-    if (num_tma_multicast == 1) {
+    if (tma_multicast_cta_mask == 0) {
         cute::SM90_TMA_LOAD_2D::copy(desc_ptr, barrier_ptr, cache_hint, smem_ptr, crd_0, crd_1);
-    } else if (cute::block_rank_in_cluster() == 0) {
-        cute::SM90_TMA_LOAD_MULTICAST_2D::copy(desc_ptr, barrier_ptr, (1 << num_tma_multicast) - 1, cache_hint, smem_ptr, crd_0, crd_1);
+    } else if (cute::block_id_in_cluster().x == 0) {
+        cute::SM90_TMA_LOAD_MULTICAST_2D::copy(desc_ptr, barrier_ptr, tma_multicast_cta_mask, cache_hint, smem_ptr, crd_0, crd_1);
     }
 }
 

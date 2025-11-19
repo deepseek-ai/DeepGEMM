@@ -12,13 +12,13 @@ struct LaunchArgs {
     std::pair<int, int> grid_dim;
     int num_threads;
     int smem_size;
-    int cluster_dim;
+    std::pair<int, int> cluster_dim; // (tma_multicast_dim, split_k_dim)
 
-    LaunchArgs(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1):
-        grid_dim({grid_dim_x, 1}), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim) {}
+    LaunchArgs(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, const int& cluster_dim_x = 1, const int& cluster_dim_y = 1):
+        grid_dim({grid_dim_x, 1}), num_threads(num_threads), smem_size(smem_size), cluster_dim({cluster_dim_x, cluster_dim_y}) {}
 
-    LaunchArgs(const std::pair<int, int>& grid_dim, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1):
-        grid_dim(grid_dim), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim) {}
+    LaunchArgs(const std::pair<int, int>& grid_dim, const int& num_threads, const int& smem_size = 0, const int& cluster_dim_x = 1, const int& cluster_dim_y = 1):
+        grid_dim(grid_dim), num_threads(num_threads), smem_size(smem_size), cluster_dim({cluster_dim_x, cluster_dim_y}) {}
 };
 
 class KernelRuntime final {
@@ -102,14 +102,17 @@ public:
                                 static_cast<unsigned>(launch_args.grid_dim.second),
                                 1};
         const dim3& block_dim = {static_cast<unsigned>(launch_args.num_threads), 1, 1};
+        const dim3& cluster_dim = {static_cast<unsigned>(launch_args.cluster_dim.first),
+                                   static_cast<unsigned>(launch_args.cluster_dim.second),
+                                   1};
         auto config = construct_launch_config(kernel, stream, launch_args.smem_size,
-                                              grid_dim, block_dim, launch_args.cluster_dim);
+                                              grid_dim, block_dim, cluster_dim);
 
         // Launch in the derived class
         if (get_env<int>("DG_JIT_DEBUG")) {
-            printf("Launch kernel with {%d, %d} x %d, shared memory: %d bytes, cluster: %d, stream: %ld\n",
+            printf("Launch kernel with {%d, %d} x %d, shared memory: %d bytes, cluster: {%d, %d}, stream: %ld\n",
                    launch_args.grid_dim.first, launch_args.grid_dim.second, launch_args.num_threads,
-                   launch_args.smem_size, launch_args.cluster_dim, stream.id());
+                   launch_args.smem_size, launch_args.cluster_dim.first, launch_args.cluster_dim.second, stream.id());
         }
         Derived::launch_impl(kernel, config, args);
     }
