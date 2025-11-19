@@ -179,7 +179,7 @@ def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
 def test_paged_mqa_logits():
     print('Testing FP8 Paged MQA Logits:')
     max_model_len = 111 * 1000
-    for batch_size, next_n in [(64, 1), (64, 2), (128, 1)]:
+    for batch_size, next_n in [(64, 1), (64, 2), (64, 4), (128, 1)]:
         for heads, index_dim in [(64, 128)]:
             for avg_kv in (8192, 32768):
                 num_blocks, blocksize = max_model_len * 3, 64
@@ -204,7 +204,10 @@ def test_paged_mqa_logits():
                 q_fp8 = q.to(torch.float8_e4m3fn)
                 kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
 
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms())
+                num_kv_multicast = 2 if next_n == 4 else 1
+                num_clusters = deep_gemm.get_num_sms() // num_kv_multicast
+
+                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, num_clusters)
                 logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
 
                 ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len)
