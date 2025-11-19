@@ -333,7 +333,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv, con
 
                     auto sum = make_float2(0, 0);
 
-                        for (int j = 0; j < kNumWeightsInReg; j += 2) {
+                    for (int j = 0; j < kNumWeightsInReg; j += 2) {
                         auto a = make_float2(fmaxf(accum[j], 0),
                                              fmaxf(accum[j + 1], 0));
                         auto b = make_float2(weights[i][j], weights[i][j + 1]);
