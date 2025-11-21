@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cublasLt.h>
+#include <torch/version.h>
 #include <ATen/cuda/CUDAContext.h>
 
 #include "../utils/exception.hpp"
@@ -14,10 +15,24 @@ class DeviceRuntime {
 
     // cuBLASLt utils
     static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;
+
+public:
+#if TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3)
+    // For PyTorch 2.3+, share the PyTorch cuBLASLt handle
+    DeviceRuntime() = default;
+
+    static cublasLtHandle_t get_cublaslt_handle() {
+        return at::cuda::getCurrentCUDABlasLtHandle();
+    }
+
+    static torch::Tensor get_cublaslt_workspace() {
+        return torch::empty({kCublasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA));
+    }
+#else
+    // Otherwise, create the cuBLASLt handle ourselves
     cublasLtHandle_t cublaslt_handle{};
     std::shared_ptr<torch::Tensor> cublaslt_workspace;
 
-public:
     explicit DeviceRuntime() {
         cublaslt_workspace = std::make_shared<torch::Tensor>(torch::empty({kCublasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA)));
         DG_CUBLASLT_CHECK(cublasLtCreate(&cublaslt_handle));
@@ -34,6 +49,7 @@ public:
     torch::Tensor get_cublaslt_workspace() const {
         return *cublaslt_workspace;
     }
+#endif
 
     std::shared_ptr<cudaDeviceProp> get_prop() {
         if (cached_prop == nullptr) {
@@ -75,6 +91,10 @@ public:
         if (num_sms == 0)
             num_sms = get_prop()->multiProcessorCount;
         return num_sms;
+    }
+
+    int get_l2_cache_size() {
+        return get_prop()->l2CacheSize;
     }
 
     void set_tc_util(const int& new_tc_util) {

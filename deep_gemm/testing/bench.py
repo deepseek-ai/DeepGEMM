@@ -79,37 +79,34 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
                  suppress_kineto_output: bool = False,
                  trace_path: str = None, flush_l2: bool = True,
                  with_multiple_kernels: bool = False):
-    # Conflict with Nsight Systems
-    using_nsys = int(os.environ.get('DG_NSYS_PROFILING', 0))
+    assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
+    is_tuple = isinstance(kernel_names, tuple)
 
-    # By default, flush L2 with an excessive 8GB memset to give the GPU some (literal) chill time without full idle
+    # Skip profiling
+    # Conflict with Nsight Systems, Nsight Compute and Compute Sanitizer
+    if int(os.environ.get('DG_USE_NVIDIA_TOOLS', 0)):
+        return (1, ) * len(kernel_names) if is_tuple else 1
+
+    # By default, flush L2 with an excessive 8 GB memset to give the GPU some (literal) chill time without full idle
     flush_l2_size = int(8e9 // 4)
 
     # For some auto-tuning kernels with prints
     fn()
 
     # Profile
-    suppress = suppress_stdout_stderr if suppress_kineto_output and not using_nsys else empty_suppress
+    suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
-        schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1) if not using_nsys else None
-        profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) if not using_nsys else empty_suppress()
+        schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
+        profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule)
         with profiler:
             for i in range(2):
                 for _ in range(num_tests):
                     if flush_l2:
                         torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
                     fn()
-
-                if not using_nsys:
-                    profiler.step()
-
-    # Return 1 if using Nsight Systems
-    if using_nsys:
-        return 1
+                profiler.step()
 
     # Parse the profiling table
-    assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
-    is_tuple = isinstance(kernel_names, tuple)
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     if not with_multiple_kernels:

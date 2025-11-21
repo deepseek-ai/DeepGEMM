@@ -7,6 +7,7 @@ enum class GemmType {
     MGroupedContiguous  = 1,
     MGroupedMasked      = 2,
     KGroupedContiguous  = 3,
+    Batched             = 4
 };
 
 enum class KernelType {

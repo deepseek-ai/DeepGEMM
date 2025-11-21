@@ -4,7 +4,7 @@
 
 namespace deep_gemm {
 
-static uint64_t fnv1a(const std::string& data, const uint64_t& seed) {
+static uint64_t fnv1a(const std::vector<char>& data, const uint64_t& seed) {
     uint64_t h = seed;
     const uint64_t& prime = 0x100000001b3ull;
     for (const char& c: data) {
@@ -14,7 +14,7 @@ static uint64_t fnv1a(const std::string& data, const uint64_t& seed) {
     return h;
 }
 
-static std::string get_hex_digest(const std::string& data) {
+static std::string get_hex_digest(const std::vector<char>& data) {
     const auto& state_0 = fnv1a(data, 0xc6a4a7935bd1e995ull);
     const auto& state_1 = fnv1a(data, 0x9e3779b97f4a7c15ull);
 
@@ -30,6 +30,10 @@ static std::string get_hex_digest(const std::string& data) {
         << std::setw(16) << split_mix(state_0)
         << std::setw(16) << split_mix(state_1);
     return oss.str();
+}
+
+static std::string get_hex_digest(const std::string& data) {
+    return get_hex_digest(std::vector<char>{data.begin(), data.end()});
 }
 
 } // namespace deep_gemm

@@ -4,6 +4,7 @@
 
 #include "../../utils/math.hpp"
 #include "../../utils/layout.hpp"
+#include "../../utils/system.hpp"
 
 namespace deep_gemm {
 
@@ -156,12 +157,12 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
     // Select M/N block sizes
-    auto block_ms = std::vector{64, 128, 256};
+    auto block_ms = ArchSpec::get_block_m_candidates(kernel_type, major_a, m);
     if (gemm_type == GemmType::MGroupedContiguous)
         block_ms = std::vector{get_mk_alignment_for_contiguous_layout()};
     if (gemm_type == GemmType::MGroupedMasked)  // Exclude 256 for performance
         block_ms = std::vector{64, 128};
-    const auto block_ns = ArchSpec::get_block_n_candidates(cd_dtype);
+    const auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
 
     // K block size is selected in a fixed manner
     const auto& block_k = 128 / static_cast<int>(c10::elementSize(ab_dtype));
@@ -185,7 +186,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         for (const auto& block_n: block_ns) {
             const int& num_waves = get_num_waves(block_m, block_n);
             const auto& last_util = get_last_wave_util(block_m, block_n);
-            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, block_m, block_n, block_k))
+            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, m, n, k, block_m, block_n, block_k))
                 continue;
 
             bool success = false;
@@ -234,7 +235,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     constexpr int smem_capacity = ArchSpec::smem_capacity;
     int best_num_stages = 0;
     SharedMemoryConfig best_smem_config;
-    for (int num_stages = 12; num_stages > 0; -- num_stages) {
+    for (int num_stages = 32; num_stages > 0; -- num_stages) {
         if (not ArchSpec::is_num_stages_legal(ab_dtype, cd_dtype, num_stages, best_block_m, best_block_n, block_k))
             continue;
 

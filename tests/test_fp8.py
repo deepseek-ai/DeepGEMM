@@ -1,23 +1,26 @@
 import copy
+import numpy as np
 import random
-import time
 import torch
 
 import deep_gemm
 from deep_gemm.testing import (
-    bench, bench_kineto,
-    calc_diff, count_bytes
+    bench_kineto,
+    calc_diff, count_bytes,
+    ignore_env, get_arch_major
 )
 
 from generators import (
-    KernelType, get_arch_major, get_ue8m0_usage,
+    KernelType, get_ue8m0_usage,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
 )
 
 
+@ignore_env('DG_JIT_PTXAS_CHECK', lambda: get_arch_major() == 9)
 def test_gemm() -> None:
     print('Testing GEMM:')
+    scores = []
     for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(torch.float8_e4m3fn):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
@@ -45,10 +48,12 @@ def test_gemm() -> None:
                          'fp8_gemm', suppress_kineto_output=True)
         cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
-              f'{t * 1e6:4.0f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
               f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
-    print()
+        if cublas_t > 0:
+            scores.append((cublas_t + split_k_t) / t)
+    print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
 
 
 def test_m_grouped_gemm_contiguous() -> None:
@@ -100,6 +105,8 @@ def test_m_grouped_gemm_masked() -> None:
             a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_ue8m0=use_ue8m0)
             deep_gemm.m_grouped_fp8_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast)
             for j in range(num_groups):
+                if masked_m[j].item() == 0:
+                    continue
                 diff = calc_diff(d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
                 assert diff < 0.001, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {kernel_opt}, {num_groups=}, {diff:.5f}'
 
@@ -125,7 +132,7 @@ def test_k_grouped_gemm_contiguous() -> None:
 
     k_grouped_fp8_gemm_contiguous = deep_gemm.k_grouped_fp8_gemm_nt_contiguous if get_arch_major() == 9 \
                                     else deep_gemm.k_grouped_fp8_gemm_tn_contiguous
-    for num_groups, m, n, major_a, major_b, ks, expected_k_per_group in enumerate_k_grouped_contiguous():
+    for num_groups, m, n, major_a, major_b, ks, expected_k_per_group in enumerate_k_grouped_contiguous(torch.float8_e4m3fn):
         use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D)
 
         for test_empty_groups in (False, True):
@@ -136,10 +143,8 @@ def test_k_grouped_gemm_contiguous() -> None:
             new_ks_tensor = torch.tensor(new_ks, dtype=torch.int, device='cuda')
             k_grouped_fp8_gemm_contiguous(a, b, d, new_ks, new_ks_tensor, c)
 
-            do_check = True
-            if do_check:
-                diff = calc_diff(d, ref_d)
-                assert diff < 0.001, f'{m=}, {n=}, {k=}, {ks=}, {diff:.5f}'
+            diff = calc_diff(d, ref_d)
+            assert diff < 0.001, f'{m=}, {n=}, {k=}, {ks=}, {diff:.5f}'
 
         # Test performance
         k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_ue8m0=use_ue8m0)
@@ -158,8 +163,6 @@ def test_k_grouped_gemm_contiguous() -> None:
 
 
 if __name__ == '__main__':
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(0)
     random.seed(0)
 

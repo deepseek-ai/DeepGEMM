@@ -5,7 +5,7 @@
 
 namespace deep_gemm {
 
-enum class KGroupedIndexType {
+enum class IndexType {
     MN,
     K,
     SF_K,
@@ -70,7 +70,7 @@ struct Scheduler {
         num_m_blocks = ceil_div(shape_m, BLOCK_M);
         num_n_blocks = ceil_div(shape_n, BLOCK_N);
         current_shape_k = shape_k;
-        if constexpr (kGemmType == GemmType::Normal) {
+        if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::Batched) {
             num_blocks = num_m_blocks * num_n_blocks;
         } else if (kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_m_blocks * num_n_blocks;
@@ -123,7 +123,7 @@ struct Scheduler {
         }
     }
 
-    template <bool kWithGroupOffset, KGroupedIndexType kIndexType = KGroupedIndexType::MN>
+    template <bool kWithGroupOffset, IndexType kIndexType = IndexType::MN>
     __device__ __forceinline__ uint32_t get_global_idx(const uint32_t shape_dim, const uint32_t block_size,
                                                        const uint32_t& block_idx, const uint32_t& m_block_idx = 0) {
         if constexpr (kGemmType == GemmType::Normal) {
@@ -137,14 +137,18 @@ struct Scheduler {
         } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
             auto offset = 0;
             if constexpr (kWithGroupOffset) {
-                if constexpr (kIndexType == KGroupedIndexType::MN)
+                if constexpr (kIndexType == IndexType::MN)
                     offset = current_group_idx * shape_dim;
-                else if constexpr (kIndexType == KGroupedIndexType::K)
+                else if constexpr (kIndexType == IndexType::K)
                     offset = current_k_cumsum;
-                else if constexpr (kIndexType == KGroupedIndexType::SF_K)
+                else if constexpr (kIndexType == IndexType::SF_K)
                     offset = current_sf_k_cumsum;
             }
             return offset + block_idx * block_size;
+        } else if constexpr (kGemmType == GemmType::Batched) {
+            // Ignore kWithGroupOffset, and apply offset for IndexType::SF_K
+            const auto offset = kIndexType == IndexType::SF_K ? current_group_idx : 0;
+            return offset * shape_dim + block_idx * block_size;
         }
     }
 
@@ -168,7 +172,7 @@ struct Scheduler {
             }
 
             get_swizzled_block_idx(next_block_idx - current_m_cumsum * num_n_blocks, m_block_idx, n_block_idx);
-        } else if (kGemmType == GemmType::KGroupedContiguous) {
+        } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
             while (true) {
                 // End of the task
                 if (current_group_idx == kNumGroups)
@@ -189,6 +193,19 @@ struct Scheduler {
             }
 
             get_swizzled_block_idx(next_block_idx - current_num_valid_groups * num_m_blocks * num_n_blocks, m_block_idx, n_block_idx);
+        } else if constexpr (kGemmType == GemmType::Batched) {
+            if (next_block_idx >= num_blocks * kNumGroups)
+                return false;
+
+            current_group_idx = next_block_idx / num_blocks;
+            const auto& block_idx = next_block_idx - current_group_idx * num_blocks;
+            if constexpr (kIsMulticastOnA) {
+                m_block_idx = block_idx / num_n_blocks;
+                n_block_idx = block_idx % num_n_blocks;
+            } else {
+                m_block_idx = block_idx % num_m_blocks;
+                n_block_idx = block_idx / num_m_blocks;
+            }
         } else {
             if (next_block_idx >= num_blocks)
                 return false;
@@ -207,7 +224,8 @@ struct Scheduler {
     __device__ __forceinline__ bool is_tma_multicast_valid(const uint32_t& m_block_idx) const {
         if (num_blocks_in_group == 1)
             return false;
-        if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::MGroupedMasked or kGemmType == GemmType::KGroupedContiguous) {
+        if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::MGroupedMasked or
+                      kGemmType == GemmType::KGroupedContiguous or kGemmType == GemmType::Batched) {
             return true;
         } else {
             DG_STATIC_ASSERT(kGemmType == GemmType::MGroupedContiguous, "Invalid Gemm type");
@@ -224,7 +242,7 @@ struct Scheduler {
     // For SM90 only
     // ReSharper disable once CppNotAllPathsReturnValue
     __device__ __forceinline__ bool is_computation_valid(const uint32_t& m_block_idx, const uint32_t& m_offset) const {
-        if constexpr (kGemmType == GemmType::Normal) {
+        if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::Batched) {
             return true;
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) >= 0;

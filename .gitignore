@@ -9,3 +9,16 @@ dist
 # Third-party links created by `setup.py develop`
 deep_gemm/include/cute
 deep_gemm/include/cutlass
+
+# VS Code settings
+/.vscode
+
+# clangd settings
+/.clang*
+/.cache
+
+# Generated stub files
+stubs/
+
+# Symlinks to compiled extensions
+deep_gemm/*.so

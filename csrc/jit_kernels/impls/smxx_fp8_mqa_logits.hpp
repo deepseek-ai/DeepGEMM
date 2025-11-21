@@ -9,16 +9,18 @@
 
 namespace deep_gemm {
 
-class SM90FP8MQALogitsRuntime final: public LaunchRuntime<SM90FP8MQALogitsRuntime> {
+class SMXXFP8MQALogitsRuntime final: public LaunchRuntime<SMXXFP8MQALogitsRuntime> {
 public:
     struct Args {
         int seq_len;
         int seq_len_kv;
-        int stride_kv;
+        int max_seqlen_k;
+        int stride_logits;
         int num_heads, head_dim;
+        bool is_compressed_logits;
+
         int num_q_stages;
         int num_kv_stages;
-
         int block_q;
         int block_kv;
 
@@ -52,6 +54,7 @@ using namespace deep_gemm;
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm{}_fp8_mqa_logits<
         {}, {},
+        {},
         {}, {},
         {}, {},
         {}, {}
@@ -59,6 +62,7 @@ static void __instantiate_kernel() {{
 }};
 )", arch, arch,
     args.num_heads, args.head_dim,
+    args.is_compressed_logits,
     args.block_q, args.block_kv,
     args.num_q_stages, args.num_kv_stages,
     args.num_specialized_threads, args.num_math_threads);
@@ -66,7 +70,8 @@ static void __instantiate_kernel() {{
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.seq_len, args.seq_len_kv, static_cast<int64_t>(args.stride_kv),
+            args.seq_len, args.seq_len_kv,
+            args.max_seqlen_k, static_cast<int64_t>(args.stride_logits),
             args.cu_seq_len_k_start, args.cu_seq_len_k_end,
             args.logits,
             args.tensor_map_q, args.tensor_map_kv,
@@ -81,17 +86,21 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                 const torch::Tensor& cu_seq_len_k_start,
                                 const torch::Tensor& cu_seq_len_k_end,
                                 const torch::Tensor& logits,
-                                const int& seq_len, const int& seq_len_kv, const int& stride_kv,
+                                const int& seq_len, const int& seq_len_kv,
+                                const int& max_seqlen_k, const int& stride_logits,
                                 const int& num_heads, const int& head_dim,
                                 const int& seq_len_alignment) {
     constexpr int block_qh = 128;
     constexpr int block_kv = 256;
     constexpr int num_specialized_threads = 128;
-    const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
     constexpr int num_q_stages = 3, num_kv_stages = 3;
+    const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
     const int block_q = block_qh / num_heads;
     DG_HOST_ASSERT(block_qh % num_heads == 0);
     DG_HOST_ASSERT(seq_len_alignment % block_q == 0);
+
+    // Use compressed logits format when max_seqlen_k is specified
+    const bool is_compressed_logits = (max_seqlen_k > 0);
 
     // Construct TMAs
     DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
@@ -120,13 +129,16 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     smem_size += (num_q_stages * 2 + num_kv_stages * 2 + (num_math_threads / 128) * 2) * 8;
     smem_size += 4;
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
+    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     // Launch
-    const SM90FP8MQALogitsRuntime::Args& args = {
+    const SMXXFP8MQALogitsRuntime::Args& args = {
         .seq_len = seq_len,
         .seq_len_kv = seq_len_kv,
-        .stride_kv = stride_kv,
+        .max_seqlen_k = max_seqlen_k,
+        .stride_logits = stride_logits,
         .num_heads = num_heads, .head_dim = head_dim,
+        .is_compressed_logits = is_compressed_logits,
         .num_q_stages = num_q_stages,
         .num_kv_stages = num_kv_stages,
         .block_q = block_q,
@@ -144,9 +156,9 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                   num_specialized_threads + num_math_threads,
                                   smem_size)
     };
-    const auto& code = SM90FP8MQALogitsRuntime::generate(args);
-    const auto& runtime = compiler->build("sm90_fp8_mqa_logits", code);
-    SM90FP8MQALogitsRuntime::launch(runtime, args);
+    const auto& code = SMXXFP8MQALogitsRuntime::generate(args);
+    const auto& runtime = compiler->build("smxx_fp8_mqa_logits", code);
+    SMXXFP8MQALogitsRuntime::launch(runtime, args);
 }
 
 } // namespace deep_gemm

@@ -3,6 +3,7 @@ import random
 import torch
 from typing import Generator, List
 
+from deep_gemm.testing import get_arch_major
 from deep_gemm.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
@@ -36,11 +37,6 @@ class MajorTypeAB(enum.Enum):
         return self.value == 1
 
 
-def get_arch_major() -> int:
-    major, minor = torch.cuda.get_device_capability()
-    return major
-
-
 def get_ue8m0_usage(kernel_type: KernelType) -> bool:
     if get_arch_major() == 9:
         return False
@@ -51,9 +47,6 @@ def get_kernel_types(dtype: torch.dtype) -> tuple:
     if dtype == torch.bfloat16:
         return (KernelType.KernelNoSF, )
 
-    # TODO: SM100 1D2D kernels are going to be deprecated
-    # But if you want to test it, please use:
-    # `(KernelType.Kernel1D2D, ) if get_arch_major() == 9 else (KernelType.Kernel1D1D, KernelType.Kernel1D2D)`
     return (KernelType.Kernel1D2D, ) if get_arch_major() == 9 else (KernelType.Kernel1D1D, )
 
 
@@ -72,8 +65,8 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
 
     fp32_output_nk = [(256, 7168), (129280, 7168)]
     bf16_output_nk = [(2112, 7168), (576, 7168), (24576, 1536), (32768, 512), (7168, 16384), (4096, 7168), (7168, 2048)]
-    m_fwd_list, m_bwd_list = [128, 4096], [4096, ]
-    nk_list = bf16_output_nk
+    m_fwd_list, m_bwd_list = [1, 128, 4096], [4096, ]
+    nk_list = list(bf16_output_nk)
 
     # Only BF16 GEMM needs FP32 outputs
     if dtype == torch.bfloat16:
@@ -82,13 +75,10 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
     for kernel_type in get_kernel_types(dtype):
         # Forward
         for m in m_fwd_list:
-            for n, k in nk_list:
-                out_dtype = torch.float if (n, k) in fp32_output_nk else torch.bfloat16
+            for i in range(len(nk_list)):
+                n, k = nk_list[i]
+                out_dtype = torch.bfloat16 if i < len(bf16_output_nk) else torch.float
                 yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, out_dtype
-
-        # TODO: support BF16 SM90 MN-major kernels
-        if dtype == torch.bfloat16 and get_arch_major() == 9:
-            continue
 
         # Backward
         for m in m_bwd_list:
@@ -106,7 +96,7 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     for kernel_type in get_kernel_types(dtype):
         for num_groups, expected_m_per_group, n, k in ((4, 8192, 4096, 7168), (4, 8192, 7168, 2048), (8, 4096, 4096, 7168), (8, 4096, 7168, 2048)):
-            for major_a, major_b in get_major_ab(False, get_arch_major() > 9):
+            for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
                 yield kernel_type, num_groups, expected_m_per_group, n, k, major_a, major_b
 
 
@@ -118,9 +108,9 @@ def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
                 yield kernel_type, num_groups, max_m, m, n, k
 
 
-def enumerate_k_grouped_contiguous():
-    # Only K-major is supported for SM90
-    major_a, major_b = (MajorTypeAB.KMajor, MajorTypeAB.KMajor) if get_arch_major() == 9 \
+def enumerate_k_grouped_contiguous(dtype: torch.dtype):
+    # Only K-major is supported for SM90 FP8
+    major_a, major_b = (MajorTypeAB.KMajor, MajorTypeAB.KMajor) if get_arch_major() == 9 and dtype == torch.float8_e4m3fn \
                        else (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
     # Must with FP32 accumulation and 1D1D kernels
     for num_groups, m, n, expected_k_per_group in (( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
@@ -241,7 +231,8 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
     return a_fp8, b_fp8, masked_m, d, ref_d
 
 
-def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks: List[int], use_ue8m0: bool):
+def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks: List[int],
+                                  use_ue8m0: bool = False, use_bf16: bool = False):
     assert get_mk_alignment_for_contiguous_layout() % 128 == 0
     k = sum(ks)
 
@@ -256,6 +247,10 @@ def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: Majo
         end = start + group_k
         ref_d[i] = c[i] + (a[start:end].T @ b[start:end])
         start = end
+
+    if use_bf16:
+        assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
+        return k, a, b, c, d, ref_d
 
     a_fp8 = per_channel_cast_to_fp8(a, use_ue8m0=use_ue8m0)
     b_fp8 = per_channel_cast_to_fp8(b, use_ue8m0=use_ue8m0)

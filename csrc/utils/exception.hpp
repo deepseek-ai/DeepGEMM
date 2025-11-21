@@ -54,7 +54,7 @@ do { \
     if (e != CUDA_SUCCESS) { \
         std::stringstream ss; \
         const char *name, *info; \
-        cuGetErrorName(e, &name), cuGetErrorString(e, &info); \
+        lazy_cuGetErrorName(e, &name), lazy_cuGetErrorString(e, &info); \
         ss << static_cast<int>(e) << " (" << name << ", " << info << ")"; \
         throw DGException("CUDA driver", __FILE__, __LINE__, ss.str()); \
     } \

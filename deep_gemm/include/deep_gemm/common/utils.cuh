@@ -100,52 +100,52 @@ __forceinline__ __device__ uint32_t get_lane_idx() {
 
 __device__  __forceinline__ uint32_t ld_shared(const uint32_t* ptr) {
     uint32_t ret;
-    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(ret) : "l"(__cvta_generic_to_shared(ptr)));
     return ret;
 }
 
 __device__  __forceinline__ float2 ld_shared(const float2* ptr) {
     float2 ret;
-    asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(ret.x), "=f"(ret.y) : "l"(ptr));
+    asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(ret.x), "=f"(ret.y) : "l"(__cvta_generic_to_shared(ptr)));
     return ret;
 }
 
 __device__  __forceinline__ float4 ld_shared(const float4* ptr) {
     float4 ret;
-    asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w) : "l"(ptr));
+    asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w) : "l"(__cvta_generic_to_shared(ptr)));
     return ret;
 }
 
 __device__  __forceinline__ uint4 ld_shared(const uint4* ptr) {
     uint4 ret;
-    asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(ptr));
+    asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(__cvta_generic_to_shared(ptr)));
     return ret;
 }
 
 __device__  __forceinline__ float ld_shared(const float* ptr) {
     float ret;
-    asm volatile("ld.shared.f32 %0, [%1];" : "=f"(ret) : "l"(ptr));
+    asm volatile("ld.shared.f32 %0, [%1];" : "=f"(ret) : "l"(__cvta_generic_to_shared(ptr)));
     return ret;
 }
 
 __device__ __forceinline__ void st_shared(const float* ptr, float val) {
-    asm volatile("st.shared.f32 [%0], %1;" :: "l"(ptr), "f"(val));
+    asm volatile("st.shared.f32 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "f"(val));
 }
 
 __device__ __forceinline__ void st_shared(const float2* ptr, float2 val) {
-    asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "l"(ptr), "f"(val.x), "f"(val.y));
+    asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "l"(__cvta_generic_to_shared(ptr)), "f"(val.x), "f"(val.y));
 }
 
 __device__ __forceinline__ void st_shared(const uint32_t* ptr, uint32_t val) {
-    asm volatile("st.shared.u32 [%0], %1;" :: "l"(ptr), "r"(val));
+    asm volatile("st.shared.u32 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "r"(val));
 }
 
 __device__  __forceinline__ void st_shared(const void* ptr, uint32_t x, uint32_t y) {
-    asm volatile("st.shared.v2.u32 [%0], {%1, %2};" :: "l"(ptr), "r"(x), "r"(y));
+    asm volatile("st.shared.v2.u32 [%0], {%1, %2};" :: "l"(__cvta_generic_to_shared(ptr)), "r"(x), "r"(y));
 }
 
 __device__  __forceinline__ void st_shared(const void* ptr, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
-    asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(ptr), "r"(x), "r"(y), "r"(z), "r"(w));
+    asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(__cvta_generic_to_shared(ptr)), "r"(x), "r"(y), "r"(z), "r"(w));
 }
 
 template <typename old_t>

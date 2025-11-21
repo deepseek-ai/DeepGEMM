@@ -51,7 +51,7 @@ get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& 
     } else if (arch_major == 10) {
         DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt);
         return sfb_dtype == torch::kFloat ?
-            std::make_tuple(1, 128, 128):   // Legacy format or 1D2D kernels
+            std::make_tuple(1, 128, 128):   // Legacy format
             std::make_tuple(1,   1, 128);   // 1D1D kernels
     }
     DG_HOST_UNREACHABLE("Unknown recipe");
@@ -63,7 +63,7 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
                                      const int& gran_mn, const int& gran_k,
                                      const std::optional<int>& num_groups,
                                      const bool& tma_stride_check = false,
-                                     const bool& contiguous_check = false,
+                                     const bool& sm90_sfb_check = false,
                                      const std::optional<torch::ScalarType>& type_check = std::nullopt) {
     // Type check
     if (type_check.has_value())
@@ -82,13 +82,18 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
     if (tma_stride_check) {
         if (num_groups.has_value())
             DG_HOST_ASSERT(sf.stride(-3) == sf.stride(-1) * sf.size(-1));
-        DG_HOST_ASSERT(sf.stride(-2) == 1);
+        // Check contiguity in the MN direction
+        DG_HOST_ASSERT(sf.stride(-2) == 1 or mn == 1);
         DG_HOST_ASSERT(sf.stride(-1) == get_tma_aligned_size(mn, sf.element_size()));
     }
 
-    // Hopper SFB must be contiguous
-    if (contiguous_check)
-        DG_HOST_ASSERT(sf.is_contiguous());
+    // SM90 SFB must be contiguous, or contiguous after transposing the last two dimensions
+    if (sm90_sfb_check) {
+        if (num_groups.has_value())
+            DG_HOST_ASSERT(sf.stride(-3) == sf.size(-2) * sf.size(-1));
+        DG_HOST_ASSERT((sf.stride(-1) == 1 and sf.stride(-2) == sf.size(-1)) or
+                       (sf.stride(-1) == sf.size(-2) and sf.stride(-2) == 1));
+    }
     return sf;
 }
 

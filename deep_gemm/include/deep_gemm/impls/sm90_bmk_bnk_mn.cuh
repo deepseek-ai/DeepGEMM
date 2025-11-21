@@ -106,10 +106,11 @@ sm90_bmn_bnk_mn_gemm_impl(const uint32_t shape_s,
                 const uint32_t& k_idx = sk_idx % SHAPE_K;
                 const uint32_t& s_idx = sk_idx / SHAPE_K;
 
-                tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
-                         smem_a[stage_idx], k_idx, m_block_idx * BLOCK_M + s_idx * SHAPE_M, 1);
-                tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
-                         smem_b[stage_idx], k_idx, n_block_idx * BLOCK_N + s_idx * SHAPE_N, 1);
+                constexpr uint32_t kSwizzle = BLOCK_K * sizeof(nv_bfloat16);
+                tma_copy<BLOCK_K, BLOCK_M, kSwizzle>(
+                    &tensor_map_a, &full_barrier, smem_a[stage_idx], k_idx, m_block_idx * BLOCK_M + s_idx * SHAPE_M, 1);
+                tma_copy<BLOCK_K, BLOCK_N, kSwizzle>(
+                    &tensor_map_b, &full_barrier, smem_b[stage_idx], k_idx, n_block_idx * BLOCK_N + s_idx * SHAPE_N, 1);
                 full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
             }
         }

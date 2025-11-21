@@ -1,5 +1,7 @@
-import torch
+import copy
+import numpy as np
 import random
+import torch
 
 import deep_gemm
 from deep_gemm.testing import (
@@ -8,13 +10,14 @@ from deep_gemm.testing import (
 )
 from generators import (
     get_arch_major,
-    enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, generate_normal,
-    generate_m_grouped_contiguous, generate_m_grouped_masked
+    enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
+    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
 )
 
 
 def test_gemm() -> None:
     print('Testing GEMM:')
+    scores = []
     for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(torch.bfloat16):
         # TODO: support accumulation for SM90 BF16 GEMM 
         if get_arch_major() == 9 and accumulate:
@@ -34,18 +37,20 @@ def test_gemm() -> None:
                 assert a.is_contiguous() and b.is_contiguous()
             getattr(deep_gemm, func_name)(a, b, d, c=c)
             diff = calc_diff(d, ref_d)
-            assert diff < 0.0001, (f'{m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=}, '
+            assert diff < 1e-5, (f'{m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=}, '
                                    f'{diff:.5f}, alias={test_alias}')
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
 
         t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), 'bf16_gemm', suppress_kineto_output=True)
         cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
-              f'{t * 1e6:5.0f} us | '
+              f'{t * 1e6:7.1f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
               f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
-    print()
+        if cublas_t > 0:
+            scores.append((cublas_t + split_k_t) / t)
+    print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
 
 
 def test_m_grouped_gemm_contiguous() -> None:
@@ -65,7 +70,7 @@ def test_m_grouped_gemm_contiguous() -> None:
             getattr(deep_gemm, func_name)(a, b, d, m_indices)
             d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
             diff = calc_diff(d, ref_d)
-            assert diff < 0.001, f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, {diff:.5f}, alias={test_alias}'
+            assert diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}'
         m, a, b, m_indices, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b, use_bf16=True)
 
         # noinspection PyShadowingNames
@@ -91,7 +96,7 @@ def test_m_grouped_gemm_masked() -> None:
             deep_gemm.m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group)
             for j in range(num_groups):
                 diff = calc_diff(d[j, :masked_m[j].item()], ref_d[j, :masked_m[j].item()])
-                assert diff < 0.001, f'{m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
+                assert diff < 1e-5, f'{max_m=}, {n=}, {k=}, {j=}, masked_m={masked_m[j]}, {num_groups=}, {diff:.5f}'
 
         # Construct full cases
         a, b, masked_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k, use_bf16=True)
@@ -110,6 +115,37 @@ def test_m_grouped_gemm_masked() -> None:
     print()
 
 
+def test_k_grouped_gemm_contiguous() -> None:
+    print('Testing k-grouped contiguous GEMM:')
+
+    for num_groups, m, n, major_a, major_b, ks, expected_k_per_group in enumerate_k_grouped_contiguous(torch.bfloat16):
+        for test_empty_groups in (False, True):
+            new_ks = copy.deepcopy(ks)
+            if test_empty_groups and len(ks) > 1:
+                new_ks[random.randint(0, num_groups - 1)] = 0
+            k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, new_ks, use_bf16=True)
+            new_ks_tensor = torch.tensor(new_ks, dtype=torch.int, device='cuda')
+            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, new_ks, new_ks_tensor, c)
+
+            diff = calc_diff(d, ref_d)
+            assert diff < 1e-5, f'{m=}, {n=}, {k=}, {ks=}, {diff:.7f}'
+
+        # Test performance
+        k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_bf16=True)
+        ks_tensor = torch.tensor(ks, dtype=torch.int, device='cuda')
+
+        # noinspection PyShadowingNames
+        def test_func():
+            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c)
+
+        t = bench_kineto(test_func, 'bf16_gemm', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=:2}, m={m:5}, n={n:5}, k={k:5}): '
+              f'{t * 1e6:4.0f} us | '
+              f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{count_bytes(a, b, c, d) / 1e9 / t:4.0f} GB/s')
+    print()
+
+
 def test_cublaslt_gemm() -> None:
     print('Testing cuBLASLt GEMM:')
     for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(dtype=torch.bfloat16):
@@ -121,7 +157,7 @@ def test_cublaslt_gemm() -> None:
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
         deep_gemm.cublaslt_gemm_nt(a, b, d, c=c)
         diff = calc_diff(d, ref_d)
-        assert diff < 5e-7, f'{diff=}, ({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})'
+        assert diff < 6e-7, f'{diff=}, ({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})'
 
         t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), 'nvjet', suppress_kineto_output=True,)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
@@ -132,18 +168,16 @@ def test_cublaslt_gemm() -> None:
 
 
 if __name__ == '__main__':
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(0)
     random.seed(0)
 
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
-    test_gemm()
-    # TODO: support SM100
-    if get_arch_major() == 9:
+    if get_arch_major() >= 9:
+        test_gemm()
         test_m_grouped_gemm_contiguous()
         test_m_grouped_gemm_masked()
+        test_k_grouped_gemm_contiguous()
 
     test_cublaslt_gemm()

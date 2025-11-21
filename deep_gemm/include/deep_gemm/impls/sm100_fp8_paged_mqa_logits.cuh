@@ -19,6 +19,7 @@ using namespace deep_gemm::sm100;
 
 template <uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t BLOCK_KV,
+          bool kIsContextLens2D,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads>
@@ -98,7 +99,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
     auto full_kv_barriers  = PatternVisitor([&](const uint32_t& i) { return kv_barrier_ptr + i; });
     auto empty_kv_barriers = PatternVisitor([&](const uint32_t& i) { return kv_barrier_ptr + kNumKVStages + i; });
 
-    // UMMA barriers and TMEM pointer on shared memroy 
+    // UMMA barriers and TMEM pointer on shared memory
     auto umma_barrier_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_Q_PIPE_SIZE + SMEM_KV_PIPE_SIZE * kNumMathWarpGroups);
     auto full_umma_barriers  = PatternVisitor([&](const uint32_t& i) { return umma_barrier_ptr + i; });
     auto empty_umma_barriers = PatternVisitor([&](const uint32_t& i) { return umma_barrier_ptr + kNumMathWarpGroups + i; });
@@ -147,7 +148,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
     constexpr uint32_t kNumMathRegisters = 104;
 
     // Scheduler
-    auto scheduler = PagedMQALogitsScheduler<BLOCK_KV, kNumMathWarpGroups>(batch_size, blockIdx.x, context_lens, schedule_meta);
+    auto scheduler = PagedMQALogitsScheduler<kNextN, kIsContextLens2D, BLOCK_KV, kNumMathWarpGroups>(batch_size, blockIdx.x, context_lens, schedule_meta);
     DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
 
     // Q and KV pipeline
@@ -173,8 +174,8 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
 
         const auto& issue_tma_q = [&](const uint32_t& stage_idx, const uint32_t& q_idx) {
             if (kv_group_idx == 0 and cute::elect_one_sync()) {
-                tma_copy(&tensor_map_q, reinterpret_cast<uint64_t*>(full_q_barriers[stage_idx]), smem_q[stage_idx], 0, q_idx * kNextN * kNumHeads);
-                tma_copy(&tensor_map_weights, reinterpret_cast<uint64_t*>(full_q_barriers[stage_idx]), smem_weights[stage_idx], 0, q_idx);
+                tma_copy<kHeadDim, kNextN * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, q_idx * kNextN * kNumHeads);
+                tma_copy<kNextN * kNumHeads, 1, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, q_idx);
                 full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
             }
         };
@@ -209,7 +210,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
             // TODO: deal with `-1`?
             if (kv_idx == 0 or kv_block_idx_ptr == 32) {
                 kv_block_idx_ptr = 0;
-                kv_block_idx_storage = (kv_idx + kv_group_idx + + lane_idx * kNumMathWarpGroups < num_kv ?
+                kv_block_idx_storage = (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups < num_kv ?
                     __ldg(block_table + q_idx * block_table_stride + (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups)) : 0);
             }
             const auto& kv_block_idx = __shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
@@ -220,10 +221,10 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Issue TMA KV
             if (cute::elect_one_sync()) {
-                tma_3d_copy(&tensor_map_kv, reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
-                            smem_kv[kv_stage_idx], 0, 0, kv_block_idx);
-                tma_copy(&tensor_map_kv_scales, reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
-                            smem_kv_scales[kv_stage_idx], 0, kv_block_idx);
+                tma_copy<kHeadDim, BLOCK_KV, 0, __nv_fp8_e4m3, true>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
+                                                                     smem_kv[kv_stage_idx], 0, 0, 1, kv_block_idx);
+                tma_copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
+                                         smem_kv_scales[kv_stage_idx], 0, kv_block_idx);
                 full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
             }
 
@@ -363,7 +364,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
                 // Transform
                 const auto& transform_2 = [&](const uint32_t& j, const uint32_t& k, const float2& sum) {
                     auto a = make_float2(fmaxf(*reinterpret_cast<float*>(&shifted_accum[j * 4 + k]), 0),
-                                            fmaxf(*reinterpret_cast<float*>(&shifted_accum[j * 4 + k + 2]), 0));
+                                         fmaxf(*reinterpret_cast<float*>(&shifted_accum[j * 4 + k + 2]), 0));
                     auto b = make_float2(weights[i][j * 2 + k], weights[i][j * 2 + k]);
                     return __ffma2_rn(a, b, sum);
                 };

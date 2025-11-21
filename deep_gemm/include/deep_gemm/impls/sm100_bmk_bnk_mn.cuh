@@ -115,8 +115,8 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
 
             // Issue TMAs
             if (cute::elect_one_sync()) {
-                tma_copy<BLOCK_K, BLOCK_M, kSwizzleABMode, 1>(&tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx + s_idx * SHAPE_M);
-                tma_copy<BLOCK_K, BLOCK_N, kSwizzleABMode, 1>(&tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx + s_idx * SHAPE_N);
+                tma_copy<BLOCK_K, BLOCK_M, kSwizzleABMode>(&tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx + s_idx * SHAPE_M);
+                tma_copy<BLOCK_K, BLOCK_N, kSwizzleABMode>(&tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx + s_idx * SHAPE_N);
             }
 
             // Arrive at full barriers
@@ -258,7 +258,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
 
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
-        DG_DEVICE_ASSERT(false and "This kernel only support sm_100a/sm_101a");
+        DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
 #endif
 }
 

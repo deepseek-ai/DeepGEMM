@@ -27,7 +27,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [x] Fix TMA multicast compatibility for indivisible shapes
 - [x] Skip useless computation on M
 - [x] NVRTC as a faster compiler
-- [ ] Sanitizer for testing
+- [x] Sanitizer for testing
 - [x] Weight gradient kernels for dense models
 - [x] Weight gradient kernels for MoE models
 - [ ] Better `get_best_configs` modeling
@@ -69,9 +69,7 @@ cat develop.sh
 # Test all GEMM implements
 python tests/test_layout.py
 python tests/test_attention.py
-python tests/test_bf16.py
-python tests/test_fp8.py
-python tests/test_lazy_init.py
+python tests/test_core.py
 ```
 
 ### Installation

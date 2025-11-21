@@ -27,11 +27,13 @@ static constexpr int to_swizzle_cute_type() {
 }
 
 template <uint32_t kNumHeads, uint32_t kHeadDim,
+          bool kIsCompressedLogits,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads>
 __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
-void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv, const uint64_t stride_kv,
+void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
+                         const uint32_t max_seqlen_k, const uint64_t stride_logits,
                          uint32_t* cu_seq_len_k_start,
                          uint32_t* cu_seq_len_k_end,
                          float* logits,
@@ -125,6 +127,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv, cons
     const auto& get_next_block_q_idx = [&]() -> cute::tuple<uint32_t, uint32_t> {
         return {block_q_idx + gridDim.x, q_iter_idx + 1};
     };
+    uint32_t seq_k_start[BLOCK_Q];
     const auto& load_schedule = [&](const uint32_t& q_iter_offset = 0) -> cute::tuple<uint32_t, uint32_t, uint32_t, uint32_t> {
         uint32_t start = cute::numeric_limits<uint32_t>::max();
         uint32_t end = cute::numeric_limits<uint32_t>::min();
@@ -132,7 +135,8 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv, cons
         #pragma unroll
         for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
             const auto& q_idx = min(block_q_idx * BLOCK_Q + i, seq_len - 1);
-            start = min(start, min(__ldg(cu_seq_len_k_start + q_idx), seq_len_kv));
+            seq_k_start[i] = __ldg(cu_seq_len_k_start + q_idx);
+            start = min(start, min(seq_k_start[i], seq_len_kv));
             end = max(end, min(__ldg(cu_seq_len_k_end + q_idx), seq_len_kv));
         }
         start = start / 4 * 4;
@@ -160,8 +164,8 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv, cons
 
         // Prefetch
         const auto& issue_tma_q = [&](const uint32_t& stage_idx, const auto& block_idx) {
-            tma_copy(&tensor_map_q, reinterpret_cast<uint64_t*>(full_q_barriers[stage_idx]), smem_q[stage_idx], 0, block_idx * BLOCK_Q * kNumHeads);
-            tma_copy(&tensor_map_weights, reinterpret_cast<uint64_t*>(full_q_barriers[stage_idx]), smem_weights[stage_idx], 0, block_idx * BLOCK_Q);
+            tma_copy<kHeadDim, BLOCK_Q * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, block_idx * BLOCK_Q * kNumHeads);
+            tma_copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, block_idx * BLOCK_Q);
             full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
         };
         if (cute::elect_one_sync() and block_q_idx < num_q_blocks)
@@ -187,9 +191,9 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv, cons
                     empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
 
                     // Issue TMA KV
-                    tma_copy(&tensor_map_kv, reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
+                    tma_copy<kHeadDim, BLOCK_KV, kHeadDim>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
                              smem_kv[kv_stage_idx], 0, kv_start + kv_block_idx * BLOCK_KV);
-                    tma_copy(&tensor_map_kv_scales, reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
+                    tma_copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
                              smem_kv_scales[kv_stage_idx], kv_start + kv_block_idx * BLOCK_KV, 0);
                     full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
                 }
@@ -299,8 +303,15 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv, cons
                     // Store into the global memory
                     // NOTES: we have redundant writes here, consider more carefully
                     const uint32_t& q_idx = block_q_idx * BLOCK_Q + i;
-                    logits[q_idx * stride_kv + kv_offset + v_0_offset] = v_0;
-                    logits[q_idx * stride_kv + kv_offset + v_1_offset] = v_1;
+                    if constexpr (kIsCompressedLogits) {
+                        if (kv_offset + v_0_offset >= seq_k_start[i])
+                            logits[q_idx * stride_logits + kv_offset + v_0_offset - seq_k_start[i]] = v_0;
+                        if (kv_offset + v_1_offset >= seq_k_start[i])
+                            logits[q_idx * stride_logits + kv_offset + v_1_offset - seq_k_start[i]] = v_1;
+                    } else {
+                        logits[q_idx * stride_logits + kv_offset + v_0_offset] = v_0;
+                        logits[q_idx * stride_logits + kv_offset + v_1_offset] = v_1;
+                    }
                 }
             }
             num_total_kv_blocks += num_kv_blocks;

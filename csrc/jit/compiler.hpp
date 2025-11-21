@@ -26,12 +26,17 @@ public:
     static std::string library_version;
 
     static std::string get_library_version() {
-        std::stringstream ss;
+        std::vector<char> buffer;
         for (const auto& f: collect_files(library_include_path / "deep_gemm")) {
             std::ifstream in(f, std::ios::binary);
-            ss << in.rdbuf();
+            DG_HOST_ASSERT(in.is_open());
+
+            // Append into the buffer
+            buffer.insert(buffer.end(),
+                          std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>());
         }
-        return get_hex_digest(ss.str());
+        return get_hex_digest(buffer);
     }
 
     static void prepare_init(const std::string& library_root_path,
@@ -62,8 +67,8 @@ public:
         flags = fmt::format("-std=c++{} --diag-suppress=39,161,174,177,186,940 "
                             "--ptxas-options=--register-usage-level=10",
                             get_env<int>("DG_JIT_CPP_STANDARD", 20));
-        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))
-            flags += " --ptxas-options=--verbose";
+        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))
+            flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
         if (get_env("DG_JIT_WITH_LINEINFO", 0))
             flags += " -Xcompiler -rdynamic -lineinfo";
     }
@@ -177,6 +182,10 @@ public:
             printf("NVCC compilation failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "NVCC compilation failed");
         }
+
+        // Check local memory usage
+        if (get_env("DG_JIT_PTXAS_CHECK", 0))
+            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));
 
         // Print PTXAS log
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))

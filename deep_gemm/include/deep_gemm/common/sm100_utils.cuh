@@ -3,38 +3,12 @@
 #include <cute/atom/mma_traits_sm100.hpp>
 #include <cute/arch/mma_sm100_umma.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
+#include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/common/tma_utils.cuh>
 
 namespace deep_gemm::sm100 {
-
-template <uint32_t BLOCK_INNER, uint32_t kSwizzleMode, typename dtype_t>
-constexpr uint32_t get_inner_block_atom_size() {
-    return kSwizzleMode == 0 ? BLOCK_INNER : kSwizzleMode / sizeof(dtype_t);
-}
-
-template <uint32_t BLOCK_INNER, uint32_t BLOCK_OUTER,
-          uint32_t kSwizzleMode, uint32_t kNumMulticast,
-          typename dtype_t>
-__device__ __forceinline__ void
-tma_copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr,
-         dtype_t* smem_ptr, const uint32_t& inner_idx, const int32_t& outer_idx) {
-    DG_STATIC_ASSERT(1 <= kNumMulticast and kNumMulticast <= 2, "Invalid multicast config");
-    DG_STATIC_ASSERT(static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL) ==
-                     static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL), "Invalid cache hint");
-
-    // 2-CTA function will send signals to the leader CTA only
-    const auto copy_func = kNumMulticast == 1 ? cute::SM90_TMA_LOAD_2D::copy : cute::SM100_TMA_2SM_LOAD_2D::copy;
-
-    // Issue multiple TMAs
-    constexpr uint32_t BLOCK_INNER_ATOM = get_inner_block_atom_size<BLOCK_INNER, kSwizzleMode, dtype_t>();
-    #pragma unroll
-    for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
-        copy_func(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
-                  static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-                  smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM, inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
-    }
-}
 
 __device__ __forceinline__
 cute::UMMA::SmemDescriptor make_smem_desc(cute::UMMA::LayoutType layout, void* smem_ptr,

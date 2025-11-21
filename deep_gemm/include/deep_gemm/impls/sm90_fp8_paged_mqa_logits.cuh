@@ -14,14 +14,17 @@ namespace deep_gemm {
 
 template <uint32_t kAlignedBatchSize, uint32_t SPLIT_KV, uint32_t kNumSMs>
 __global__ __launch_bounds__(32, 1)
-void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t* context_lens, uint32_t* schedule_metadata) {
+void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t next_n, const bool is_context_lens_2d,
+                                    const uint32_t* context_lens, uint32_t* schedule_metadata) {
     DG_STATIC_ASSERT(kAlignedBatchSize % 32 == 0, "Invalid aligned batch size");
     const uint32_t lane_idx = get_lane_idx();
 
     uint32_t num_segs[kAlignedBatchSize / 32];
     #pragma unroll
     for (uint32_t k = 0; k < kAlignedBatchSize / 32; ++ k) {
-        const uint32_t& context_len = (k * 32 + lane_idx < batch_size ? __ldg(context_lens + k * 32 + lane_idx) : 0);
+        const uint32_t q_idx = k * 32 + lane_idx;
+        const uint32_t lens_idx = (is_context_lens_2d ? q_idx * next_n + next_n - 1 : q_idx);
+        const uint32_t& context_len = (q_idx < batch_size ? __ldg(context_lens + lens_idx) : 0);
         num_segs[k] = ceil_div(context_len, SPLIT_KV);
     }
 
@@ -54,7 +57,8 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t* c
     }
 }
 
-template <uint32_t BLOCK_KV, uint32_t kNumMathWarpGroups>
+template <uint32_t kNextN, bool kIsContextLens2D,
+          uint32_t BLOCK_KV, uint32_t kNumMathWarpGroups>
 struct PagedMQALogitsScheduler {
     uint32_t batch_size;
     const uint32_t* context_lens;
@@ -62,6 +66,11 @@ struct PagedMQALogitsScheduler {
     uint32_t current_q_idx, current_kv_idx;
     uint32_t end_q_idx, end_kv_idx;
     uint32_t current_num_kv;
+
+    __device__ __forceinline__ uint32_t get_num_kv(const uint32_t& q_idx) {
+        const auto& lens_idx = (kIsContextLens2D ? q_idx * kNextN + kNextN - 1 : q_idx);
+        return q_idx < batch_size ? ceil_div(__ldg(context_lens + lens_idx), BLOCK_KV) : 0;
+    }
 
     __device__ __forceinline__ explicit PagedMQALogitsScheduler(const uint32_t& batch_size, const uint32_t& sm_idx,
                                                                 const uint32_t* context_lens, const uint32_t* schedule_meta) {
@@ -73,7 +82,7 @@ struct PagedMQALogitsScheduler {
         current_q_idx = current_pack.x, current_kv_idx = current_pack.y * kNumMathWarpGroups;
         end_q_idx = end_pack.x, end_kv_idx = end_pack.y * kNumMathWarpGroups;
 
-        current_num_kv = current_q_idx < batch_size ? ceil_div(__ldg(this->context_lens + current_q_idx), BLOCK_KV) : 0;
+        current_num_kv = get_num_kv(current_q_idx);
     }
 
     __device__ __forceinline__ bool fetch_next_task(uint32_t &q_idx, uint32_t &kv_idx, uint32_t &num_kv) {
@@ -88,7 +97,7 @@ struct PagedMQALogitsScheduler {
         if (current_kv_idx >= current_num_kv) {
             ++ current_q_idx;
             current_kv_idx = 0;
-            current_num_kv = current_q_idx < batch_size ? ceil_div(__ldg(this->context_lens + current_q_idx), BLOCK_KV) : 0;
+            current_num_kv = get_num_kv(current_q_idx);
         }
 
         return true;
@@ -103,6 +112,7 @@ using namespace deep_gemm::sm90;
 
 template <uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t BLOCK_KV,
+          bool kIsContextLens2D,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads>
@@ -209,7 +219,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     constexpr uint32_t kNumMathRegisters = 104;
 
     // Scheduler
-    auto scheduler = PagedMQALogitsScheduler<BLOCK_KV, kNumMathWarpGroups>(batch_size, blockIdx.x, context_lens, schedule_meta);
+    auto scheduler = PagedMQALogitsScheduler<kNextN, kIsContextLens2D, BLOCK_KV, kNumMathWarpGroups>(batch_size, blockIdx.x, context_lens, schedule_meta);
     DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
 
     // Q and KV pipeline
@@ -229,8 +239,8 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
         const auto& issue_tma_q = [&](const uint32_t& stage_idx, const uint32_t& q_idx) {
             if (kv_group_idx == 0 and cute::elect_one_sync()) {
-                tma_copy(&tensor_map_q, reinterpret_cast<uint64_t*>(full_q_barriers[stage_idx]), smem_q[stage_idx], 0, q_idx * kNextN * kNumHeads);
-                tma_copy(&tensor_map_weights, reinterpret_cast<uint64_t*>(full_q_barriers[stage_idx]), smem_weights[stage_idx], 0, q_idx);
+                tma_copy<kHeadDim, kNextN * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, q_idx * kNextN * kNumHeads);
+                tma_copy<kNextN * kNumHeads, 1, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, q_idx);
                 full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
             }
         };
@@ -265,7 +275,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             // TODO: deal with `-1`?
             if (kv_idx == 0 or kv_block_idx_ptr == 32) {
                 kv_block_idx_ptr = 0;
-                kv_block_idx_storage = (kv_idx + kv_group_idx + + lane_idx * kNumMathWarpGroups < num_kv ?
+                kv_block_idx_storage = (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups < num_kv ?
                     __ldg(block_table + q_idx * block_table_stride + (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups)) : 0);
             }
             const auto& kv_block_idx = __shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
@@ -276,10 +286,10 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Issue TMA KV
             if (cute::elect_one_sync()) {
-                tma_3d_copy(&tensor_map_kv, reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
-                            smem_kv[kv_stage_idx], 0, 0, kv_block_idx);
-                tma_copy(&tensor_map_kv_scales, reinterpret_cast<uint64_t*>(full_kv_barriers[kv_stage_idx]),
-                            smem_kv_scales[kv_stage_idx], 0, kv_block_idx);
+                tma_copy<kHeadDim, BLOCK_KV, 0, __nv_fp8_e4m3, true>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
+                                                                     smem_kv[kv_stage_idx], 0, 0, 1, kv_block_idx);
+                tma_copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
+                                         smem_kv_scales[kv_stage_idx], 0, kv_block_idx);
                 full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
             }
 

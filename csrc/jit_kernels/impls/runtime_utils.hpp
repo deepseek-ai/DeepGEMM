@@ -3,8 +3,9 @@
 #include <cuda.h>
 #include <torch/python.h>
 
-#include "../../utils/math.hpp"
 #include "../heuristics/sm90.hpp"
+#include "../../jit/handle.hpp"
+#include "../../utils/math.hpp"
 #include "../../utils/system.hpp"
 #include "../../utils/exception.hpp"
 
@@ -40,6 +41,7 @@ static std::string to_string(const GemmType& type) {
         case GemmType::MGroupedContiguous:  return "GemmType::MGroupedContiguous";
         case GemmType::MGroupedMasked:      return "GemmType::MGroupedMasked";
         case GemmType::KGroupedContiguous:  return "GemmType::KGroupedContiguous";
+        case GemmType::Batched:             return "GemmType::Batched";
     }
     DG_HOST_UNREACHABLE("Unknown GEMM type");
 }
@@ -68,7 +70,7 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
 }
 
 static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const int& base) {
-#if CUDA_VERSION >= 12080
+#if CUDART_VERSION >= 12080
     if (base != 0) {
         DG_HOST_ASSERT(base == 32 and mode == 128);
         return CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B;
@@ -106,7 +108,7 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
                gmem_inner_dim, gmem_outer_dim, smem_inner_dim, smem_outer_dim,
                gmem_outer_stride, swizzle_mode, swizzle_base, elem_size);
     }
-    DG_CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(
+    DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
         &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32),
         2, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
@@ -115,14 +117,14 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
 }
 
 static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
-                                    const int& gmem_dim_0, const int& gmem_dim_1, const int& gmem_dim_2,
-                                    const int& smem_dim_0, const int& smem_dim_1, const int& smem_dim_2,
+                                    int gmem_dim_0, int gmem_dim_1, int gmem_dim_2,
+                                    int smem_dim_0, int smem_dim_1, int smem_dim_2,
                                     const int& gmem_stride_0, const int& gmem_stride_1,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
                                     const bool& allow_tf32 = false) {
     const auto& elem_size = static_cast<int>(t.element_size());
     if (swizzle_mode != 0)
-        DG_HOST_ASSERT(smem_dim_0 == swizzle_mode / elem_size);
+        smem_dim_0 = swizzle_mode / elem_size;
 
     CUtensorMap tensor_map;
     const cuuint64_t gmem_dims[3] = {static_cast<cuuint64_t>(gmem_dim_0), static_cast<cuuint64_t>(gmem_dim_1), static_cast<cuuint64_t>(gmem_dim_2),};
@@ -134,7 +136,7 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
                gmem_dim_0, gmem_dim_1, gmem_dim_2, smem_dim_0, smem_dim_1, smem_dim_2,
                gmem_stride_0, gmem_stride_1, swizzle_mode, elem_size);
     }
-    DG_CUDA_DRIVER_CHECK(cuTensorMapEncodeTiled(
+    DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
         &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32),
         3, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),

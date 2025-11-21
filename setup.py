@@ -16,6 +16,7 @@ from packaging.version import parse
 from pathlib import Path
 from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+from scripts.generate_pyi import generate_pyi_file
 
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
@@ -39,11 +40,8 @@ build_include_dirs = [
     'third-party/cutlass/include',
     'third-party/fmt/include',
 ]
-build_libraries = ['cuda', 'cudart', 'nvrtc']
-build_library_dirs = [
-    f'{CUDA_HOME}/lib64',
-    f'{CUDA_HOME}/lib64/stubs'
-]
+build_libraries = ['cudart', 'nvrtc']
+build_library_dirs = [f'{CUDA_HOME}/lib64']
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
@@ -84,11 +82,7 @@ def get_platform():
 
 def get_wheel_url():
     torch_version = parse(torch.__version__)
-    if os.environ.get("NVIDIA_PRODUCT_NAME", "") == "PyTorch":
-        torch_version = str(os.environ.get("NVIDIA_PYTORCH_VERSION"))
-    else:
-        torch_version = f'{torch_version.major}.{torch_version.minor}'
-
+    torch_version = f'{torch_version.major}.{torch_version.minor}'
     python_version = f'cp{sys.version_info.major}{sys.version_info.minor}'
     platform_name = get_platform()
     deep_gemm_version = get_package_version()
@@ -109,7 +103,7 @@ def get_ext_modules():
     if DG_SKIP_CUDA_BUILD:
         return []
 
-    return [CUDAExtension(name='deep_gemm_cpp',
+    return [CUDAExtension(name='deep_gemm._C',
                           sources=sources,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
@@ -125,8 +119,23 @@ class CustomBuildPy(build_py):
         # Second, make clusters' cache setting default into `envs.py`
         self.generate_default_envs()
 
+        # Third, generate and copy .pyi file to build root directory
+        self.generate_pyi_file()
+
         # Finally, run the regular build
         build_py.run(self)
+
+    def generate_pyi_file(self):
+        generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
+        pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
+        pyi_target = os.path.join(self.build_lib, 'deep_gemm', '_C.pyi')
+
+        if os.path.exists(pyi_source):
+            print(f"Copying .pyi file from {pyi_source} to {pyi_target}")
+            os.makedirs(os.path.dirname(pyi_target), exist_ok=True)
+            shutil.copy2(pyi_source, pyi_target)
+        else:
+            print(f"Warning: .pyi file not found at {pyi_source}")
 
     def generate_default_envs(self):
         code = '# Pre-installed environment variables\n'

@@ -21,6 +21,7 @@ using namespace deep_gemm::sm90;
 template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
           uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
@@ -35,7 +36,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
+                        const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid Threads");
@@ -73,7 +74,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
         cute::prefetch_tma_descriptor(&tensor_map_b_base);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
-        cute::prefetch_tma_descriptor(&tensor_map_d);
+        cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
     __syncwarp();
 
@@ -217,10 +218,10 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                     auto& full_barrier = *full_barriers[stage_idx];
                     const uint32_t& k_idx = k_block_idx * BLOCK_K;
                     const uint32_t& sf_k_idx = scheduler.current_sf_k_cumsum + k_block_idx;
-                    tma_copy(&tensor_map_sfa, reinterpret_cast<uint64_t*>(&full_barrier), smem_sfa[stage_idx], m_idx, sf_k_idx, num_tma_multicast_a);
-                    tma_copy(&tensor_map_sfb, reinterpret_cast<uint64_t*>(&full_barrier), smem_sfb[stage_idx], n_idx, sf_k_idx, num_tma_multicast_b);
-                    tma_copy(current_tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[stage_idx], k_idx, m_idx, num_tma_multicast_a);
-                    tma_copy(current_tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier), smem_b[stage_idx], k_idx, n_idx, num_tma_multicast_b);
+                    tma_copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier, smem_sfa[stage_idx], m_idx, sf_k_idx, num_tma_multicast_a);
+                    tma_copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, &full_barrier, smem_sfb[stage_idx], n_idx, sf_k_idx, num_tma_multicast_b);
+                    tma_copy<BLOCK_K, BLOCK_M, kSwizzleAMode>(current_tensor_map_a, &full_barrier, smem_a[stage_idx], k_idx, m_idx, num_tma_multicast_a);
+                    tma_copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(current_tensor_map_b, &full_barrier, smem_b[stage_idx], k_idx, n_idx, num_tma_multicast_b);
                     full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE);
                 }
             }
@@ -330,7 +331,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
             // Use TMA store to write back to global memory
             if (warp_idx % 4 == 0 and cute::elect_one_sync()) {
                 cute::SM90_TMA_REDUCE_ADD_2D::copy(
-                    &tensor_map_d, smem_d_0, n_block_idx * BLOCK_N,
+                    &tensor_map_cd, smem_d_0, n_block_idx * BLOCK_N,
                     current_group_idx * shape_m + m_block_idx * BLOCK_M + r_0);
                 cute::tma_store_arrive();
             }

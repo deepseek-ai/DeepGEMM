@@ -53,11 +53,6 @@ jobs:
           ref: ${{ inputs.release-version }}
           submodules: recursive
 
-      - name: Checkout build scripts
-        uses: actions/checkout@v4
-        with:
-          path: build-scripts/
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -87,7 +82,7 @@ jobs:
 
       - name: Install CUDA ${{ inputs.cuda-version }}
         if: ${{ inputs.cuda-version != 'cpu' }}
-        uses: Jimver/cuda-toolkit@v0.2.28
+        uses: Jimver/cuda-toolkit@v0.2.26
         id: cuda-toolkit
         with:
           cuda: ${{ inputs.cuda-version }}
@@ -114,8 +109,8 @@ jobs:
           # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
           # This code is ugly, maybe there's a better way to do this.
           export TORCH_CUDA_VERSION=$(python -c "from os import environ as env; \
-            minv = {'2.1': 121, '2.4': 118, '2.5': 118, '2.6': 118, '2.7': 118, '2.8': 126}[env['MATRIX_TORCH_VERSION']]; \
-            maxv = {'2.1': 121, '2.4': 124, '2.5': 124, '2.6': 126, '2.7': 128, '2.8': 129}[env['MATRIX_TORCH_VERSION']]; \
+            minv = {'2.4': 118, '2.5': 118, '2.6': 118, '2.7': 118, '2.8': 126}[env['MATRIX_TORCH_VERSION']]; \
+            maxv = {'2.4': 124, '2.5': 124, '2.6': 126, '2.7': 128, '2.8': 129}[env['MATRIX_TORCH_VERSION']]; \
             print(minv if int(env['MATRIX_CUDA_VERSION']) < 120 else maxv)" \
           )
           if [[ ${{ inputs.torch-version }} == *"dev"* ]]; then
@@ -161,23 +156,38 @@ jobs:
 
       - name: Build wheel
         id: build_wheel
-        env: 
-          CXX11_ABI: ${{ inputs.cxx11_abi }}
-          MATRIX_TORCH_VERSION: ${{ env.MATRIX_TORCH_VERSION}}
-          WHEEL_CUDA_VERSION: ${{ env.WHEEL_CUDA_VERSION }}
-          MATRIX_PYTHON_VERSION: ${{ env.MATRIX_PYTHON_VERSION }}
-          DG_USE_LOCAL_VERSION: ${{ inputs.use-local-version && '1' || '0' }}
         run: |
-          EXIT_CODE=$(bash build-scripts/.github/scripts/build.sh | tail -n 1)
+          # We want setuptools >= 49.6.0 otherwise we can't compile the extension if system CUDA version is 11.7 and pytorch cuda version is 11.6
+          # https://github.com/pytorch/pytorch/blob/664058fa83f1d8eede5d66418abff6e20bd76ca8/torch/utils/cpp_extension.py#L810
+          # However this still fails so I'm using a newer version of setuptools
+          pip install setuptools==75.8.0
+          pip install ninja packaging wheel
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+          # Limit MAX_JOBS otherwise the github runner goes OOM
+          # nvcc 11.8 can compile with 2 jobs, but nvcc 12.3 goes OOM
+
+          export MAX_JOBS=$([ "$MATRIX_CUDA_VERSION" == "129" ] && echo 1 || echo 2)
+          export NVCC_THREADS=2
+          export TORCH_CUDA_ARCH_LIST="7.0 7.2 7.5 8.0 8.6 8.7 9.0+PTX"
+          export DG_USE_LOCAL_VERSION=${{ inputs.use-local-version && '1' || '0' }}
+
+          # 5h timeout since GH allows max 6h and we want some buffer
+          EXIT_CODE=0
+          timeout 5h python setup.py bdist_wheel --dist-dir=dist || EXIT_CODE=$?
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            tmpname=cu${WHEEL_CUDA_VERSION}torch${MATRIX_TORCH_VERSION}cxx11abi${{ inputs.cxx11_abi }}
+            wheel_name=$(ls dist/*whl | xargs -n 1 basename | sed "s/-/+$tmpname-/2")
+            ls dist/*whl |xargs -I {} mv {} dist/${wheel_name}
+            echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+          fi
 
           # Store exit code in GitHub env for later steps
           echo "build_exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
 
+          # Do not fail the job if timeout killed the build
           exit $EXIT_CODE
-
-      - name: Log Built Wheels
-        run: |
-          ls dist
 
       - name: Log build logs after timeout
         if: always() && steps.build_wheel.outputs.build_exit_code == 124

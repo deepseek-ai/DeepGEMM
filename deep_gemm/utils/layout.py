@@ -1,4 +1,4 @@
-from deep_gemm_cpp import (
+from .._C import (
     get_tma_aligned_size,
     get_mk_alignment_for_contiguous_layout,
     get_mn_major_tma_aligned_tensor,

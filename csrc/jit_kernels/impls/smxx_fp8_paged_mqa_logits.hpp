@@ -14,8 +14,10 @@ public:
         int aligned_batch_size;
         int split_kv;
         int num_sms;
-
+        
         int batch_size;
+        int next_n;
+        bool is_context_lens_2d;
         int* context_lens;
         int* schedule_metadata;
 
@@ -41,6 +43,8 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.batch_size,
+            args.next_n,
+            args.is_context_lens_2d,
             args.context_lens,
             args.schedule_metadata
         ));
@@ -49,12 +53,14 @@ static void __instantiate_kernel() {{
 
 static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
                                            const torch::Tensor& schedule_metadata,
-                                           const int& batch_size, const int& block_kv, const int& num_sms) {
+                                           const int& batch_size, const int& next_n,
+                                           const int& block_kv, const int& num_sms,
+                                           const bool& is_context_lens_2d) {
     constexpr int num_math_warpgroups = 4;
     constexpr int num_threads = 32;
     const int aligned_batch_size = align(batch_size, 32);
     const int split_kv = block_kv * num_math_warpgroups;
-
+    
     // Calculate shared memory size
     const int smem_size = aligned_batch_size * static_cast<int>(sizeof(int));
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
@@ -66,6 +72,8 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
         .split_kv = split_kv,
         .num_sms = num_sms,
         .batch_size = batch_size,
+        .next_n = next_n,
+        .is_context_lens_2d = is_context_lens_2d,
         .context_lens = context_lens.data_ptr<int>(),
         .schedule_metadata = schedule_metadata.data_ptr<int>(),
         .launch_args = LaunchArgs(1, num_threads, smem_size)
@@ -83,6 +91,7 @@ public:
         int num_heads;
         int head_dim;
         int block_kv;
+        bool is_context_lens_2d;
         int block_table_stride;
         int logits_stride;
 
@@ -121,6 +130,7 @@ static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm{}_fp8_paged_mqa_logits<
         {}, {},
         {}, {},
+        {},
         {}, {},
         {},
         {}, {}
@@ -129,6 +139,7 @@ static void __instantiate_kernel() {{
 )", arch, arch,
     args.next_n, args.num_heads,
     args.head_dim, args.block_kv,
+    args.is_context_lens_2d,
     args.num_q_stages, args.num_kv_stages,
     args.split_kv,
     args.num_specialized_threads, args.num_math_threads);
@@ -158,6 +169,7 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
                                       const int& batch_size, const int& next_n,
                                       const int& num_heads, const int& head_dim,
                                       const int& num_kv_blocks, const int& block_kv,
+                                      const bool& is_context_lens_2d,
                                       const int& kv_cache_stride_bytes,
                                       const int& logits_stride,
                                       const int& block_table_stride,
@@ -209,6 +221,7 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
         .num_heads = num_heads,
         .head_dim = head_dim,
         .block_kv = block_kv,
+        .is_context_lens_2d = is_context_lens_2d,
         .block_table_stride = block_table_stride,
         .logits_stride = logits_stride,
         .num_q_stages = num_q_stages,
@@ -229,7 +242,7 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
                                   smem_size)
     };
     const auto& code = SMXXFP8PagedMQALogitsRuntime::generate(args);
-    const auto& runtime = compiler->build("sm90_fp8_paged_mqa_logits", code);
+    const auto& runtime = compiler->build("smxx_fp8_paged_mqa_logits", code);
     SMXXFP8PagedMQALogitsRuntime::launch(runtime, args);
 }
 

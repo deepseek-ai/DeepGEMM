@@ -1,7 +1,6 @@
-import time
 import torch
 import random
-from deep_gemm.testing import bench_kineto, count_bytes, calc_diff
+from deep_gemm.testing import bench_kineto, count_bytes
 from deep_gemm.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8,
@@ -12,7 +11,6 @@ from deep_gemm.utils import (
 )
 
 from generators import (
-    enumerate_transpose,
     enumerate_sf_layout,
     enumerate_k_grouped_sf_layout
 )
@@ -107,8 +105,6 @@ def test_k_grouped_sf_layout_kernels() -> None:
 
 
 if __name__ == '__main__':
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(1)
     random.seed(1)
 

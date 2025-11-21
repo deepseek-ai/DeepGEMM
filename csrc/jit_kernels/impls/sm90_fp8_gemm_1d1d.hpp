@@ -29,7 +29,7 @@ public:
         CUtensorMap tensor_map_b_base;
         CUtensorMap tensor_map_sfa;
         CUtensorMap tensor_map_sfb;
-        CUtensorMap tensor_map_d;
+        CUtensorMap tensor_map_cd;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -43,6 +43,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {}, {},
+        {}, {},
         {},
         {}, {},
         {}, {},
@@ -54,6 +55,7 @@ static void __instantiate_kernel() {{
         get_compiled_dim(args.m, 'm', args.compiled_dims), get_compiled_dim(args.n, 'n', args.compiled_dims), get_compiled_dim(args.k, 'k', args.compiled_dims),
         args.num_groups,
         args.gemm_config.block_m, args.gemm_config.block_n, args.gemm_config.block_k,
+        args.gemm_config.smem_config.swizzle_a_mode, args.gemm_config.smem_config.swizzle_b_mode,
         args.gemm_config.num_stages,
         args.gemm_config.thread_config.num_tma_threads, args.gemm_config.thread_config.num_math_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
@@ -69,7 +71,7 @@ static void __instantiate_kernel() {{
             args.m, args.n, args.k,
             args.tensor_map_a_base, args.tensor_map_b_base,
             args.tensor_map_sfa, args.tensor_map_sfb,
-            args.tensor_map_d));
+            args.tensor_map_cd));
     }
 };
 
@@ -105,11 +107,11 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                   config.block_m, config.block_k, 1, 0);
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                   config.block_n, config.block_k, 1, 0);
-    const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
-                                                SM90ArchSpec::get_cd_store_block_m(config.block_m, true),
-                                                SM90ArchSpec::get_cd_store_block_n(config.block_n),
-                                                static_cast<int>(d.stride(-2)), 1,
-                                                0);
+    const auto& tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                                 SM90ArchSpec::get_cd_store_block_m(config.block_m, true),
+                                                 SM90ArchSpec::get_cd_store_block_n(config.block_n),
+                                                 static_cast<int>(d.stride(-2)), 1,
+                                                 0);
 
     // Launch
     const SM90FP8Gemm1D1DRuntime::Args& args = {
@@ -128,7 +130,7 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_b_base = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_d = tensor_map_d,
+        .tensor_map_cd = tensor_map_cd,
     };
     const auto& code = SM90FP8Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_gemm_1d1d", code);
@@ -180,11 +182,11 @@ static void sm90_fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Te
                                                   config.block_m, config.block_k, 1, 0);
     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, sum_sf_k * 128,
                                                   config.block_n, config.block_k, 1, 0);
-    const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
-                                                SM90ArchSpec::get_cd_store_block_m(config.block_m, true),
-                                                SM90ArchSpec::get_cd_store_block_n(config.block_n),
-                                                static_cast<int>(d.stride(-2)), num_groups,
-                                                config.smem_config.swizzle_cd_mode);
+    const auto& tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                                 SM90ArchSpec::get_cd_store_block_m(config.block_m, true),
+                                                 SM90ArchSpec::get_cd_store_block_n(config.block_n),
+                                                 static_cast<int>(d.stride(-2)), num_groups,
+                                                 config.smem_config.swizzle_cd_mode);
 
     // Launch
     const SM90FP8Gemm1D1DRuntime::Args& args = {
@@ -203,7 +205,7 @@ static void sm90_fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Te
         .tensor_map_b_base = tensor_map_b_base,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_d = tensor_map_d,
+        .tensor_map_cd = tensor_map_cd,
     };
     const auto& code = SM90FP8Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_gemm_1d1d", code);

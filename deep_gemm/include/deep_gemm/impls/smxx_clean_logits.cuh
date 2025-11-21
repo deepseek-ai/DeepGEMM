@@ -9,7 +9,7 @@ namespace deep_gemm {
 
 template <uint32_t kNextN, uint32_t BLOCK_KV, uint32_t kNumWarps>
 __global__ __launch_bounds__(kNumWarps * 32, 1)
-void smxx_clean_logits(const uint32_t seq_len, const uint32_t seq_len_kv, const uint64_t stride_kv,
+void smxx_clean_logits(const uint32_t seq_len, const uint32_t seq_len_kv, const uint64_t stride_logits,
                        const uint32_t* cu_seq_len_k_start, const uint32_t* cu_seq_len_k_end, float* logits) {
     const uint32_t& num_sms = gridDim.x;
     const uint32_t& sm_idx = blockIdx.x;
@@ -40,14 +40,14 @@ void smxx_clean_logits(const uint32_t seq_len, const uint32_t seq_len_kv, const 
             const auto& aligned_ks = ks / 4 * 4, aligned_ke = (ke + 3) / 4 * 4;
 
             for (uint32_t left = 0; left < seq_len_kv; left += BLOCK_KV) {
-                const auto& right = min(left + BLOCK_KV, static_cast<uint32_t>(stride_kv));
+                const auto& right = min(left + BLOCK_KV, static_cast<uint32_t>(stride_logits));
                 if (right <= ks or ke <= left) {
-                    cute::SM90_BULK_COPY_S2G::copy(smem_buffer, logits + i * stride_kv + left, (right - left) * sizeof(float));
+                    cute::SM90_BULK_COPY_S2G::copy(smem_buffer, logits + i * stride_logits + left, (right - left) * sizeof(float));
                 } else {
                     if (left < aligned_ks)
-                        cute::SM90_BULK_COPY_S2G::copy(smem_buffer, logits + i * stride_kv + left, (aligned_ks - left) * sizeof(float));
+                        cute::SM90_BULK_COPY_S2G::copy(smem_buffer, logits + i * stride_logits + left, (aligned_ks - left) * sizeof(float));
                     if (aligned_ke < right)
-                        cute::SM90_BULK_COPY_S2G::copy(smem_buffer, logits + i * stride_kv + aligned_ke, (right - aligned_ke) * sizeof(float));
+                        cute::SM90_BULK_COPY_S2G::copy(smem_buffer, logits + i * stride_logits + aligned_ke, (right - aligned_ke) * sizeof(float));
                 }
             }
         }
@@ -58,9 +58,9 @@ void smxx_clean_logits(const uint32_t seq_len, const uint32_t seq_len_kv, const 
         const auto& ke = __ldg(cu_seq_len_k_end + i / kNextN) - kNextN + i % kNextN + 1;
         const auto& aligned_ks = ks / 4 * 4, aligned_ke = (ke + 3) / 4 * 4;
         for (uint32_t j = aligned_ks; j < ks; ++ j)
-            logits[i * stride_kv + j] = neg_inf;
+            logits[i * stride_logits + j] = neg_inf;
         for (uint32_t j = ke; j < aligned_ke; ++ j)
-            logits[i * stride_kv + j] = neg_inf;
+            logits[i * stride_logits + j] = neg_inf;
     }
 }
 
