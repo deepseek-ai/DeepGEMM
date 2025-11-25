@@ -79,6 +79,8 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
                 n, k = nk_list[i]
                 out_dtype = torch.bfloat16 if i < len(bf16_output_nk) else torch.float
                 yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, out_dtype
+                if dtype == torch.float8_e4m3fn and get_arch_major() == 10:
+                    yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, out_dtype
 
         # Backward
         for m in m_bwd_list:
