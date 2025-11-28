@@ -68,7 +68,7 @@ def get_package_version():
 
             cmd = ['git', 'rev-parse', '--short', 'HEAD']
             revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-        except:
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
             revision = '+local'
     return f'{public_version}{revision}'
 
