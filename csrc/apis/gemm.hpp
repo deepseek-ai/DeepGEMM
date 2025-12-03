@@ -22,27 +22,27 @@ static bool early_return(const int& m, const int &n, const int& k,
     if (m == 0 or n == 0)
         return true;
 
-    // Checks
-    const bool& is_cd_same = c.has_value() and c->data_ptr() == d.data_ptr();
-    if (is_cd_same)
-        DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
-    if (c.has_value()) {
-        check_major_type_cd(c.value());
-        DG_HOST_ASSERT((d.scalar_type() == torch::kFloat) or (d.scalar_type() == torch::kBFloat16));
-        DG_HOST_ASSERT((c.value().scalar_type() == torch::kFloat) or (c.value().scalar_type() == torch::kBFloat16));
-        DG_HOST_ASSERT(d.scalar_type() == c.value().scalar_type());
-    }
+    // // Checks
+    // const bool& is_cd_same = c.has_value() and c->data_ptr() == d.data_ptr();
+    // if (is_cd_same)
+    //     DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
+    // if (c.has_value()) {
+    //     check_major_type_cd(c.value());
+    //     DG_HOST_ASSERT((d.scalar_type() == torch::kFloat) or (d.scalar_type() == torch::kBFloat16));
+    //     DG_HOST_ASSERT((c.value().scalar_type() == torch::kFloat) or (c.value().scalar_type() == torch::kBFloat16));
+    //     DG_HOST_ASSERT(d.scalar_type() == c.value().scalar_type());
+    // }
 
-    // No accumulation
-    if (k == 0) {
-        if (not is_cd_same)
-            c.has_value() ? d.copy_(c.value()) : d.zero_();
-        return true;
-    }
+    // // No accumulation
+    // if (k == 0) {
+    //     if (not is_cd_same)
+    //         c.has_value() ? d.copy_(c.value()) : d.zero_();
+    //     return true;
+    // }
 
-    // With accumulation, do copy before GEMM (assuming the GEMM kernel does not support different C/D)
-    if (c.has_value() and not is_cd_same)
-        d.copy_(c.value());
+    // // With accumulation, do copy before GEMM (assuming the GEMM kernel does not support different C/D)
+    // if (c.has_value() and not is_cd_same)
+    //     d.copy_(c.value());
     return false;
 }
 
