@@ -56,11 +56,12 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
                                            const int& batch_size, const int& next_n,
                                            const int& block_kv, const int& num_sms,
                                            const bool& is_context_lens_2d) {
-    constexpr int num_math_warpgroups = 4;
+    const int arch_major = device_runtime->get_arch_major();
+    const int num_math_warpgroups = arch_major == 10 ? 2 : 4;
     constexpr int num_threads = 32;
     const int aligned_batch_size = align(batch_size, 32);
     const int split_kv = block_kv * num_math_warpgroups;
-    
+
     // Calculate shared memory size
     const int smem_size = aligned_batch_size * static_cast<int>(sizeof(int));
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
@@ -181,8 +182,7 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
     const int num_specialized_threads = 128;
     const int num_math_threads = num_math_warp_groups * 128;
     const int arch_major = device_runtime->get_arch_major();
-    const int num_extra_threads = arch_major == 10 ? 128 : 0;
-    const int compute_block_kv = 64;
+    const int compute_block_kv = arch_major == 10 ? 128 : 64;
     const int num_q_stages = 3, num_kv_stages = 3;
     const int split_kv = num_math_warp_groups * compute_block_kv;
     DG_HOST_ASSERT(logits_stride % (num_math_warp_groups * compute_block_kv) == 0);
@@ -248,7 +248,7 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
         .num_math_threads = num_math_threads,
         .num_kv_multicast = num_kv_multicast,
         .launch_args = LaunchArgs(num_sms,
-                                  num_specialized_threads + num_math_threads + num_extra_threads,
+                                  num_specialized_threads + num_math_threads,
                                   smem_size, num_kv_multicast)
     };
     const auto& code = SMXXFP8PagedMQALogitsRuntime::generate(args);

@@ -115,7 +115,8 @@ template <uint32_t kNextN, uint32_t kNumHeads,
           bool kIsContextLens2D,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
-          uint32_t kNumTMAThreads, uint32_t kNumMathThreads>
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumKVMulticast>
 __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
                                const uint64_t logits_stride, const uint64_t block_table_stride,
