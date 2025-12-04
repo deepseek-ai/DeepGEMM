@@ -212,66 +212,67 @@ def test_paged_mqa_logits():
         for batch_size, next_n in [(64, 1), (64, 2), (64, 4), (128, 1)]:
             for heads, index_dim in [(64, 128)]:
                 for avg_kv in (8192, 32768):
-                    num_blocks, blocksize = max_model_len * 3, 64
+                    for blocksize in (32, 64):
+                        num_blocks = max_model_len * 3
 
-                    q = torch.randn((batch_size, next_n, heads, index_dim), device='cuda', dtype=torch.bfloat16)
-                    kv_cache = torch.randn((num_blocks, blocksize, 1, index_dim), device='cuda', dtype=torch.bfloat16)
-                    weights = torch.randn((batch_size * next_n, heads), device='cuda', dtype=torch.float32)
-                    q_fp8 = q.to(torch.float8_e4m3fn)
-                    kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+                        q = torch.randn((batch_size, next_n, heads, index_dim), device='cuda', dtype=torch.bfloat16)
+                        kv_cache = torch.randn((num_blocks, blocksize, 1, index_dim), device='cuda', dtype=torch.bfloat16)
+                        weights = torch.randn((batch_size * next_n, heads), device='cuda', dtype=torch.float32)
+                        q_fp8 = q.to(torch.float8_e4m3fn)
+                        kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
 
-                    context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (batch_size, )).cuda().to(torch.int32)
-                    context_lens_list = context_lens.tolist()
-                    max_block_len = (max(context_lens_list) + blocksize - 1) // blocksize * blocksize
-                    block_tables = torch.zeros((batch_size, max_block_len), device='cuda', dtype=torch.int32)
+                        context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (batch_size, )).cuda().to(torch.int32)
+                        context_lens_list = context_lens.tolist()
+                        max_block_len = (max(context_lens_list) + blocksize - 1) // blocksize * blocksize
+                        block_tables = torch.zeros((batch_size, max_block_len), device='cuda', dtype=torch.int32)
 
-                    counter, block_idx_pool = 0, torch.randperm(num_blocks, device='cuda', dtype=torch.int32)
-                    for i in range(batch_size):
-                        num_blocks = ceil_div(context_lens_list[i], blocksize)
-                        block_tables[i][:num_blocks] = block_idx_pool[counter: counter+num_blocks]
-                        counter += num_blocks
+                        counter, block_idx_pool = 0, torch.randperm(num_blocks, device='cuda', dtype=torch.int32)
+                        for i in range(batch_size):
+                            num_blocks = ceil_div(context_lens_list[i], blocksize)
+                            block_tables[i][:num_blocks] = block_idx_pool[counter: counter+num_blocks]
+                            counter += num_blocks
 
-                    ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len, is_context_lens_2d)
-                    positions = torch.arange(max_model_len, device='cuda').unsqueeze(0).expand(batch_size * next_n, -1)
+                        ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len, is_context_lens_2d)
+                        positions = torch.arange(max_model_len, device='cuda').unsqueeze(0).expand(batch_size * next_n, -1)
 
-                    if is_context_lens_2d:
-                        context_lens_2d = ((context_lens.unsqueeze(1) + 1) * torch.rand(batch_size, next_n, device='cuda')).int()
-                        context_lens_2d[:, next_n-1] = context_lens
-                        num_clusters = deep_gemm.get_num_sms() // (2 if next_n == 4 else 1)
-                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens_2d, blocksize, num_clusters)
-                        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, clean_logits=False)
-                        ref_neginf_mask = ~(positions < context_lens_2d.view(-1).unsqueeze(1))
-                    else:
-                        num_clusters = deep_gemm.get_num_sms() // (2 if next_n == 4 else 1)
-                        schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, num_clusters)
-                        logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
-                        row_indices = torch.arange(batch_size * next_n, device='cuda') // next_n
-                        next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
-                        ref_neginf_mask = ~(positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1))
-                        neginf_mask = (logits == float('-inf'))
-                        assert torch.equal(neginf_mask, ref_neginf_mask)
+                        if is_context_lens_2d:
+                            context_lens_2d = ((context_lens.unsqueeze(1) + 1) * torch.rand(batch_size, next_n, device='cuda')).int()
+                            context_lens_2d[:, next_n-1] = context_lens
+                            num_clusters = deep_gemm.get_num_sms() // (2 if next_n == 4 else 1)
+                            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens_2d, num_clusters)
+                            logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, clean_logits=False)
+                            ref_neginf_mask = ~(positions < context_lens_2d.view(-1).unsqueeze(1))
+                        else:
+                            num_clusters = deep_gemm.get_num_sms() // (2 if next_n == 4 else 1)
+                            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, num_clusters)
+                            logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
+                            row_indices = torch.arange(batch_size * next_n, device='cuda') // next_n
+                            next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
+                            ref_neginf_mask = ~(positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1))
+                            neginf_mask = (logits == float('-inf'))
+                            assert torch.equal(neginf_mask, ref_neginf_mask)
 
-                    logits = logits.masked_fill(ref_neginf_mask, 0)
-                    ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
-                    diff = calc_diff(logits, ref_logits)
-                    assert diff < 1e-3, f"{diff=}"
+                        logits = logits.masked_fill(ref_neginf_mask, 0)
+                        ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
+                        diff = calc_diff(logits, ref_logits)
+                        assert diff < 1e-3, f"{diff=}"
 
-                    sum_lens = sum(context_lens.to(torch.int64))
-                    tflops = 2 * sum_lens * next_n * heads * index_dim / 1e12
-                    input_bytes = count_bytes(q_fp8, weights, context_lens) + sum_lens * (index_dim + 4) + (sum_lens / blocksize) * 4
-                    output_bytes = sum_lens * next_n * 4
-                    if is_context_lens_2d:
-                        t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, clean_logits=False),
-                                         'fp8_paged_mqa_logits')
-                    else:
-                        t, clean_t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
-                                                  ('fp8_paged_mqa_logits', 'clean_logits'))
-                    clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
-                    print(f' > BSZ={batch_size:3}, NextN={next_n:1}, H={heads:2}, D={index_dim:2}, L={avg_kv:6}: '
-                        f'{tflops / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, '
-                        f'{(input_bytes + output_bytes) / t / 1e9:4.0f} GB/s', end='')
-                    # noinspection PyUnboundLocalVariable
-                    print(f' | clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s' if not is_context_lens_2d else '')
+                        sum_lens = sum(context_lens.to(torch.int64))
+                        tflops = 2 * sum_lens * next_n * heads * index_dim / 1e12
+                        input_bytes = count_bytes(q_fp8, weights, context_lens) + sum_lens * (index_dim + 4) + (sum_lens / blocksize) * 4
+                        output_bytes = sum_lens * next_n * 4
+                        if is_context_lens_2d:
+                            t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens_2d, block_tables, schedule_metadata, max_model_len, clean_logits=False),
+                                            'fp8_paged_mqa_logits')
+                        else:
+                            t, clean_t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
+                                                    ('fp8_paged_mqa_logits', 'clean_logits'))
+                        clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
+                        print(f' > BSZ={batch_size:3}, NextN={next_n:1}, H={heads:2}, D={index_dim:2}, L={avg_kv:6}, BLKSZ={blocksize:2}: '
+                            f'{tflops / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, '
+                            f'{(input_bytes + output_bytes) / t / 1e9:4.0f} GB/s', end='')
+                        # noinspection PyUnboundLocalVariable
+                        print(f' | clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s' if not is_context_lens_2d else '')
     print()
 
 
