@@ -312,7 +312,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
 
         // Preload weights
         constexpr uint32_t kNumWeightsInReg = cute::min(52, kNumHeads);
-        float weights[kNextN][kNumWeightsInReg];
+        float weights[kNextNPerCTA][kNumWeightsInReg];
         DG_STATIC_ASSERT(kNumWeightsInReg % 4 == 0, "Invalid number of weights in registers");
 
         // Initialize `q_idx` outside `[0, batch_size)` to indicate it was none
@@ -334,7 +334,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
 
                 // Read weights
                 #pragma unroll
-                for (uint32_t i = 0; i < kNextN; ++ i) {
+                for (uint32_t i = 0; i < kNextNPerCTA; ++ i) {
                     for (uint32_t j = 0; j < kNumWeightsInReg; ++ j) {
                         weights[i][j] = ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + j);
                     }
