@@ -213,7 +213,7 @@ def test_paged_mqa_logits():
             for heads, index_dim in [(64, 128)]:
                 for avg_kv in (8192, 32768):
                     for blocksize in (32, 64):
-                        if get_arch_major() == 9 and (blocksize == 32 or next_n == 4):
+                        if get_arch_major() == 9 and next_n == 4:
                             continue
                         num_blocks = max_model_len * 3
 

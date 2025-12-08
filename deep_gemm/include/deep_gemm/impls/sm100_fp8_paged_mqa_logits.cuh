@@ -234,7 +234,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
                                                                               + (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups))
                                                                               : idx_storage_t{0});
             }
-            idx_storage_t kv_block_idx = shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr++);
+            idx_storage_t kv_block_idx = shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
 
             // Wait KV consumer release
             CUTE_TIE_DECL(get_kv_pipeline(kv_iter_idx ++), kv_stage_idx, kv_phase);

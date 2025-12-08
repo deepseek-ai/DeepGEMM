@@ -134,11 +134,12 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     const auto& warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const auto& warpgroup_idx = warp_idx / 4;
     const auto& lane_idx = get_lane_idx();
+    constexpr uint32_t kComputeBlockKV = 64;
 
     // Prefetch TMA descriptors
     static constexpr uint32_t kNumMathWarpGroups = kNumMathThreads / 128;
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
-    DG_STATIC_ASSERT(SPLIT_KV == BLOCK_KV * kNumMathWarpGroups, "Invalid `SPLIT_KV`");
+    DG_STATIC_ASSERT(SPLIT_KV == kComputeBlockKV * kNumMathWarpGroups, "Invalid `SPLIT_KV`");
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_q);
         cute::prefetch_tma_descriptor(&tensor_map_kv);
@@ -155,8 +156,8 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     static constexpr uint32_t SMEM_Q_PIPE_SIZE = kNumQStages * (SMEM_Q_SIZE_PER_STAGE + ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE) +
                                                  constexpr_align(kNumQStages * 8 * 2, kSwizzleAlignment);
 
-    static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = BLOCK_KV * kHeadDim * sizeof(__nv_fp8_e4m3);
-    static constexpr uint32_t SMEM_KV_SCALE_SIZE_PER_STAGE = BLOCK_KV * sizeof(float);
+    static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = kComputeBlockKV * kHeadDim * sizeof(__nv_fp8_e4m3);
+    static constexpr uint32_t SMEM_KV_SCALE_SIZE_PER_STAGE = kComputeBlockKV * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE = constexpr_align(SMEM_KV_SCALE_SIZE_PER_STAGE, kSwizzleAlignment);
     static constexpr uint32_t SMEM_KV_PIPE_SIZE = kNumKVStages * (SMEM_KV_SIZE_PER_STAGE + ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE) +
                                                   constexpr_align(kNumKVStages * 8 * 2, kSwizzleAlignment);
@@ -220,8 +221,8 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     constexpr uint32_t kNumMathRegisters = 104;
 
     // Scheduler
-    auto scheduler = PagedMQALogitsScheduler<kNextN, kIsContextLens2D, BLOCK_KV, kNumMathWarpGroups>(batch_size, blockIdx.x, context_lens, schedule_meta);
-    DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
+    auto scheduler = PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kComputeBlockKV, kNumMathWarpGroups>(batch_size, blockIdx.x, context_lens, schedule_meta);
+    DG_STATIC_ASSERT(SPLIT_KV % kComputeBlockKV == 0, "Unaligned SPLIT_KV");
 
     // Q and KV pipeline
     const auto& get_q_pipeline = [=](const uint32_t& q_iter_idx) -> cute::tuple<uint32_t, uint32_t> {
@@ -255,8 +256,15 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
         if ((fetched_next_task = scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv)))
             issue_tma_q(0, next_q_idx), q_iter_idx = 1;
 
+        constexpr uint32_t kNumBlocksPerMMA = kComputeBlockKV / BLOCK_KV;
+        DG_STATIC_ASSERT(kComputeBlockKV % BLOCK_KV == 0, "kComputeBlockKV must be a multiple of BLOCK_KV");
+        DG_STATIC_ASSERT(kNumBlocksPerMMA <= 4, "Invalid BLOCK_KV");
+
+        using idx_storage_t = std::conditional_t<kNumBlocksPerMMA == 1, uint32_t,
+                              std::conditional_t<kNumBlocksPerMMA == 2, uint2, uint4>>;
+
         int kv_block_idx_ptr = 32;
-        uint32_t kv_block_idx_storage;
+        idx_storage_t kv_block_idx_storage;
 
         while (fetched_next_task) {
             // Prefetch next Q when current Q changes
@@ -277,9 +285,11 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             if (kv_idx == 0 or kv_block_idx_ptr == 32) {
                 kv_block_idx_ptr = 0;
                 kv_block_idx_storage = (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups < num_kv ?
-                    __ldg(block_table + q_idx * block_table_stride + (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups)) : 0);
+                    __ldg(reinterpret_cast<const idx_storage_t*>(block_table) + q_idx * block_table_stride / kNumBlocksPerMMA
+                                                                              + (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups))
+                                                                              : idx_storage_t{0});
             }
-            const auto& kv_block_idx = __shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
+            idx_storage_t kv_block_idx = shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
 
             // Wait KV consumer release
             CUTE_TIE_DECL(get_kv_pipeline(kv_iter_idx ++), kv_stage_idx, kv_phase);
@@ -287,10 +297,14 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Issue TMA KV
             if (cute::elect_one_sync()) {
-                tma_copy<kHeadDim, BLOCK_KV, 0, __nv_fp8_e4m3, true>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
-                                                                     smem_kv[kv_stage_idx], 0, 0, 1, kv_block_idx);
-                tma_copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
-                                         smem_kv_scales[kv_stage_idx], 0, kv_block_idx);
+                const auto* kv_block_idx_array = reinterpret_cast<const uint32_t*>(&kv_block_idx);
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumBlocksPerMMA; ++ i) {
+                    tma_copy<kHeadDim, BLOCK_KV, 0, __nv_fp8_e4m3, true>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
+                        smem_kv[kv_stage_idx] + i * BLOCK_KV * kHeadDim, 0, 0, 1, kv_block_idx_array[i]);
+                    tma_copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
+                        smem_kv_scales[kv_stage_idx] + i * BLOCK_KV, 0, kv_block_idx_array[i]);
+                }
                 full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
             }
 
@@ -336,15 +350,14 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             kv_idx = next_kv_idx;
 
             // Calculate KV offset in advance
-            auto kv_offset = q_idx * kNextN * logits_stride + ((kv_idx + kv_group_idx) * BLOCK_KV + sub_warp_offset);
+            auto kv_offset = q_idx * kNextN * logits_stride + ((kv_idx + kv_group_idx) * kComputeBlockKV + sub_warp_offset);
 
-            // Compute `[kNextN * kNumHeads, kHeadDim] @ [BLOCK_KV, kHeadDim] -> [kNextN, BLOCK_KV]`
+            // Compute `[kNextN * kNumHeads, kHeadDim] @ [kComputeBlockKV, kHeadDim] -> [kNextN, kComputeBlockKV]`
             // Wait TMA KV arrival
             CUTE_TIE_DECL(get_kv_pipeline(kv_iter_idx ++), kv_stage_idx, kv_phase);
             full_kv_barriers[kv_stage_idx]->wait(kv_phase);
 
             // Issue WGMMA
-            DG_STATIC_ASSERT(BLOCK_KV == 64, "Invalid block size");
             DG_STATIC_ASSERT(kHeadDim % WGMMA::K == 0, "Invalid head dim");
             #pragma unroll
             for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
