@@ -202,10 +202,6 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     const int compute_block_kv = arch_major == 10 ? 128 : 64;
 
     DG_HOST_ASSERT(next_n == 1 or next_n == 2 or next_n == 4);
-    // SM90 does not support next_n == 4 for now
-    DG_HOST_ASSERT(!(arch_major == 9 and next_n == 4));
-    // SM90 only supports block_kv == 64 for now
-    DG_HOST_ASSERT(!(arch_major == 9 and block_kv != 64));
     DG_HOST_ASSERT(compute_block_kv % block_kv == 0 and compute_block_kv / block_kv <= 4);
 
     DG_HOST_ASSERT(q.is_contiguous());
