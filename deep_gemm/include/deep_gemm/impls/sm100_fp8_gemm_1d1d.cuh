@@ -22,7 +22,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          GemmType kGemmType, bool kWithAccumulation,typename cd_dtype_t,
+          GemmType kGemmType, bool kWithAccumulation, bool kWithBias, typename cd_dtype_t,
           typename epilogue_type_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
@@ -37,7 +37,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
-    constexpr bool kWithBias = true;
     // GEMM with accumulation must have FP32/BF16 output
     if constexpr (kWithAccumulation)
         DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
@@ -271,9 +270,11 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     num_arrival_bytes += (BLOCK_M + BLOCK_N) * sizeof(uint32_t);
                 }
 
-                if (k_block_idx == 0 and kWithBias){
-                    tma_copy<BLOCK_N, 1, 0, cd_dtype_t>(&tensor_map_bias, full_barriers[stage_idx], smem_bias[accum_stage_idx], n_block_idx * BLOCK_N, 0, 1, 0);
-                    num_arrival_bytes += BLOCK_N * sizeof(cd_dtype_t);
+                if constexpr (kWithBias){
+                    if (k_block_idx == 0){
+                        tma_copy<BLOCK_N, 1, 0, cd_dtype_t>(&tensor_map_bias, full_barriers[stage_idx], smem_bias[accum_stage_idx], n_block_idx * BLOCK_N, 0, 1, 0);
+                        num_arrival_bytes += BLOCK_N * sizeof(cd_dtype_t);
+                    }
                 }
 
                 // Arrive at full barriers
@@ -535,7 +536,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                 for (int b = 0; b < 8; ++b) {
                                     bias_vals[b] = static_cast<float>(bias_ptr[b]);
                                 }
-                                //TODO:fadd2
                                 values[0] = __float_as_uint(__uint_as_float(values[0]) + bias_vals[0]);
                                 values[1] = __float_as_uint(__uint_as_float(values[1]) + bias_vals[1]);
                                 values[2] = __float_as_uint(__uint_as_float(values[2]) + bias_vals[2]);
@@ -544,6 +544,26 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                 values[5] = __float_as_uint(__uint_as_float(values[5]) + bias_vals[5]);
                                 values[6] = __float_as_uint(__uint_as_float(values[6]) + bias_vals[6]);
                                 values[7] = __float_as_uint(__uint_as_float(values[7]) + bias_vals[7]);
+
+                                // float2 bias_vals[4];
+                                // #pragma unroll
+                                // for (int b = 0; b < 4; ++b) {
+                                //     bias_vals[b] = make_float2(static_cast<float>(bias_ptr[b * 2]), static_cast<float>(bias_ptr[b * 2 + 1]));
+                                // }
+                                // //TODO:fadd2
+                                // bias_vals[0] = __fadd2_rd(make_float2(__uint_as_float(values[0]), __uint_as_float(values[1])), bias_vals[0]);
+                                // bias_vals[1] = __fadd2_rd(make_float2(__uint_as_float(values[2]), __uint_as_float(values[3])), bias_vals[1]);
+                                // bias_vals[2] = __fadd2_rd(make_float2(__uint_as_float(values[4]), __uint_as_float(values[5])), bias_vals[2]);
+                                // bias_vals[3] = __fadd2_rd(make_float2(__uint_as_float(values[6]), __uint_as_float(values[7])), bias_vals[3]);
+
+                                // values[0] = __float_as_uint(bias_vals[0].x);
+                                // values[1] = __float_as_uint(bias_vals[0].y);
+                                // values[2] = __float_as_uint(bias_vals[1].x);
+                                // values[3] = __float_as_uint(bias_vals[1].y);
+                                // values[4] = __float_as_uint(bias_vals[2].x);
+                                // values[5] = __float_as_uint(bias_vals[2].y);
+                                // values[6] = __float_as_uint(bias_vals[3].x);
+                                // values[7] = __float_as_uint(bias_vals[3].y);
                             }
                             
                             st_shared(smem_ptr,
@@ -566,12 +586,12 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
                     if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                         if constexpr (kGemmType == GemmType::Batched) {
-                            using cute_tma_t = cute::conditional_t<false,
+                            using cute_tma_t = cute::conditional_t<kWithAccumulation,
                                 cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
                             cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx],
                                              n_idx, m_idx, scheduler.current_group_idx);
                         } else {
-                            using cute_tma_t = cute::conditional_t<false,
+                            using cute_tma_t = cute::conditional_t<kWithAccumulation,
                                 cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                             cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
                         }

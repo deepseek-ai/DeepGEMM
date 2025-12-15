@@ -19,6 +19,7 @@ class SM100FP8Gemm1D1DRuntime final: public LaunchRuntime<SM100FP8Gemm1D1DRuntim
 public:
     struct Args {
         int m, n, k, num_groups;
+        bool with_bias;
         const std::string& compiled_dims;
         const std::optional<std::string>& epilogue_type;
 
@@ -51,7 +52,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
-        {}, {}, {},
+        {}, {}, {}, {},
         {}
     >);
 }};
@@ -65,7 +66,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.thread_config.num_non_epilogue_threads, args.gemm_config.thread_config.num_epilogue_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
         args.gemm_config.num_sms,
-        to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, to_string(args.gemm_config.cd_dtype),
+        to_string(args.gemm_config.gemm_type), args.gemm_config.with_accumulation, args.with_bias, to_string(args.gemm_config.cd_dtype),
         get_default_epilogue_type(args.epilogue_type));
     }
 
@@ -82,6 +83,7 @@ static void __instantiate_kernel() {{
 static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                 const torch::Tensor& b, const torch::Tensor& sfb,
                                 const std::optional<torch::Tensor>& c,
+                                const std::optional<torch::Tensor>& bias,
                                 const torch::Tensor& d,
                                 const int& m, const int& n, const int& k,
                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -121,8 +123,8 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
 
     // Create tensor map for bias only if c has a value
     CUtensorMap tensor_map_bias{};
-    if (c.has_value()) {
-        tensor_map_bias = make_tma_bias_desc(cute::UMMA::Major::MN, c.value(), n, 1,
+    if (bias.has_value()) {
+        tensor_map_bias = make_tma_bias_desc(cute::UMMA::Major::MN, bias.value(), n, 1,
                                             config.block_n, 1,
                                             1, 0);
     }
@@ -131,6 +133,7 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
     const SM100FP8Gemm1D1DRuntime::Args& args = {
         .m = m, .n = n, .k = aligned_k,
         .num_groups = 1,
+        .with_bias = bias.has_value(),
         .compiled_dims = compiled_dims,
         .epilogue_type = epilogue_type,
         .gemm_config = config,

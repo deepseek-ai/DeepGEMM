@@ -64,8 +64,8 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
     assert dtype in (torch.float8_e4m3fn, torch.bfloat16)
 
     fp32_output_nk = [(256, 7168), (129280, 7168)]
-    bf16_output_nk = [(5120, 5120), (5120, 13824), (13824, 5120)]
-    m_fwd_list, m_bwd_list = [9614], [4096, ]
+    bf16_output_nk = [(512, 512), (5120, 13824), (13824, 5120)]
+    m_fwd_list, m_bwd_list = [5120], [4096, ]
     nk_list = list(bf16_output_nk)
 
     # Only BF16 GEMM needs FP32 outputs
@@ -78,9 +78,16 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
             for i in range(len(nk_list)):
                 n, k = nk_list[i]
                 out_dtype = torch.bfloat16 if i < len(bf16_output_nk) else torch.float
-                yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, out_dtype
+                yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, False, out_dtype
                 if dtype == torch.float8_e4m3fn and get_arch_major() == 10:
-                    yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, out_dtype
+                    # with accumulation, output = A[m,n] @ B[n,k] + C[m,n]
+                    # with bias, output = A[m,n] @ B[n,k] + bias[n]
+                    # With accumulation, no bias. 
+                    yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, False, out_dtype
+                    if out_dtype == torch.bfloat16:
+                        # With bias, no accumulation.
+                        yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, True, out_dtype
+
 
         # # Backward
         # for m in m_bwd_list:
@@ -97,7 +104,7 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     for kernel_type in get_kernel_types(dtype):
-        for num_groups, expected_m_per_group, n, k in ((1, 9614, 5120, 5120), (1, 9614, 13824, 5120), (1, 9614, 5120, 13824)):
+        for num_groups, expected_m_per_group, n, k in ((4, 8192, 4096, 7168), (4, 8192, 7168, 2048), (8, 4096, 4096, 7168), (8, 4096, 7168, 2048)):
             for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
                 yield kernel_type, num_groups, expected_m_per_group, n, k, major_a, major_b
 
@@ -149,33 +156,39 @@ def enumerate_transpose():
 
 def generate_normal(m: int, n: int, k: int,
                     major_a: MajorTypeAB, major_b: MajorTypeAB,
-                    accumulate: bool, out_dtype: torch.dtype,
+                    accumulate: bool, with_bias: bool, out_dtype: torch.dtype,
                     kernel_type: KernelType,
                     use_ue8m0: bool = False, use_bf16: bool = False):
     a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
         torch.empty((m, n), device='cuda', dtype=out_dtype)
-    c = torch.randn((n), device='cuda', dtype=out_dtype) if accumulate else None
-    ref_d = (a.float() @ b.float().t() + (c if accumulate else 0)).to(out_dtype)
+    c = d if accumulate else None
+    bias = torch.randn((n), device='cuda', dtype=out_dtype) * 16 if with_bias else None
+    if accumulate:
+        ref_d = (a.float() @ b.float().t() + c).to(out_dtype)
+    elif with_bias:
+        ref_d = (a.float() @ b.float().t() + bias).to(out_dtype)
+    else:
+        ref_d = (a.float() @ b.float().t()).to(out_dtype)
 
     if use_bf16:
         a = a if major_a.is_k_major() else a.T.contiguous().T
         b = b if major_b.is_k_major() else b.T.contiguous().T
-        return a, b, c, d, ref_d
+        return a, b, c, bias, d, ref_d
 
     a_fp8 = per_token_cast_to_fp8(a, use_ue8m0=use_ue8m0)
     b_fp8 = per_token_cast_to_fp8(b, use_ue8m0=use_ue8m0) if kernel_type.is_1d1d() and accumulate \
             else per_block_cast_to_fp8(b, use_ue8m0=use_ue8m0)
     a_fp8 = a_fp8 if major_a.is_k_major() else (a_fp8[0].T.contiguous().T, a_fp8[1])
     b_fp8 = b_fp8 if major_b.is_k_major() else (b_fp8[0].T.contiguous().T, b_fp8[1])
-    return a_fp8, b_fp8, c, d, ref_d
+    return a_fp8, b_fp8, c, bias, d, ref_d
 
 
 def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n: int, k: int,
                                   major_a: MajorTypeAB, major_b: MajorTypeAB,
                                   use_ue8m0: bool = False, use_bf16: bool = False):
-    actual_ms = [int(expected_m_per_group ) for _ in range(num_groups)]
+    actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
     aligned_ms = [align(actual_m, get_mk_alignment_for_contiguous_layout()) for actual_m in actual_ms]
     m = sum(aligned_ms)
 
