@@ -22,7 +22,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
+          GemmType kGemmType, bool kWithAccumulation,typename cd_dtype_t,
           typename epilogue_type_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
@@ -37,6 +37,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
+    constexpr bool kWithBias = true;
     // GEMM with accumulation must have FP32/BF16 output
     if constexpr (kWithAccumulation)
         DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
@@ -48,6 +49,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t kNumTMAStoreStages = 2;
     constexpr uint32_t kNumSFStagesPerLoad = sizeof(uint32_t) / sizeof(cutlass::float_ue8m0_t);
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
+    constexpr uint32_t kNumBiasAlignBytes = 128;
     DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
     DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
 
@@ -87,8 +89,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
     
     uint32_t SMEM_BIAS_SIZE_PER_STAGE = 0;
-    if constexpr (kWithAccumulation) {
-        SMEM_BIAS_SIZE_PER_STAGE = LOAD_BLOCK_N * sizeof(cd_dtype_t);
+    if constexpr (kWithBias) {
+        constexpr uint32_t BiasSizePerBlock = BLOCK_N * sizeof(cd_dtype_t);
+        SMEM_BIAS_SIZE_PER_STAGE = constexpr_align(BiasSizePerBlock, kNumBiasAlignBytes);
     }
 
     DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0 and SMEM_A_SIZE_PER_STAGE % 1024 == 0 and SMEM_B_SIZE_PER_STAGE % 1024 == 0, 
@@ -118,7 +121,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
         cute::prefetch_tma_descriptor(&tensor_map_cd);
-        if constexpr (kWithAccumulation){
+        if constexpr (kWithBias){
             cute::prefetch_tma_descriptor(&tensor_map_bias);
         }
     }
@@ -153,14 +156,13 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         SMEM_CD_SIZE +
         kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
         kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE) +
-        (kWithAccumulation ? kNumStages * SMEM_BIAS_SIZE_PER_STAGE : 0));
+        (kWithBias ? kNumEpilogueStages * SMEM_BIAS_SIZE_PER_STAGE : 0));
 
     auto full_barriers              = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
     auto empty_barriers             = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
     auto with_sf_full_barriers      = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
     auto tmem_full_barriers         = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
     auto tmem_empty_barriers        = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages + i); });
-    // auto bias_barriers              = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages * 2 + i); });
 
     // Fill the tensor memory pointer
     auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2);
@@ -183,14 +185,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             // Arrive only at the leader CTA
             tmem_empty_barriers[i]->init(kNumMulticast * kNumUMMAStoreThreads);
         }
-        
-        // // Initialize bias barriers
-        // if constexpr (kWithAccumulation) {
-        //     #pragma unroll
-        //     for (uint32_t i = 0; i < kNumTMAStoreStages; ++ i) {
-        //         bias_barriers[i]->init(1);
-        //     }
-        // }
 
         // Make initialized barrier visible in async proxy
         cutlass::arch::fence_barrier_init();
@@ -220,6 +214,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const auto& num_total_k_blocks = ceil_div(scheduler.current_shape_k, BLOCK_K);
+            auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
+
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -275,9 +271,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     num_arrival_bytes += (BLOCK_M + BLOCK_N) * sizeof(uint32_t);
                 }
 
-                if (k_block_idx == 0 and kWithAccumulation){
-                    tma_copy<LOAD_BLOCK_N, 1, 0, cutlass::bfloat16_t>(&tensor_map_bias, full_barriers[stage_idx], smem_bias[stage_idx], n_idx, 0, 1, 0);
-                    num_arrival_bytes += LOAD_BLOCK_N * sizeof(cd_dtype_t);
+                if (k_block_idx == 0 and kWithBias){
+                    tma_copy<BLOCK_N, 1, 0, cd_dtype_t>(&tensor_map_bias, full_barriers[stage_idx], smem_bias[accum_stage_idx], n_block_idx * BLOCK_N, 0, 1, 0);
+                    num_arrival_bytes += BLOCK_N * sizeof(cd_dtype_t);
                 }
 
                 // Arrive at full barriers
@@ -530,15 +526,16 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             
                             // Add bias (BF16 case - all lanes in same column read same bias value)
                             // Use 'i' (logical index) not 'col' (swizzled index) because bias has no swizzle
-                            if constexpr (kWithAccumulation) {
+                            if constexpr (kWithBias) {
                                 uint32_t n_offset_in_block = i * kNumElemsPerBankGroup;
-                                uint32_t store_block_offset = tma_stage_idx * STORE_BLOCK_N * sizeof(cd_dtype_t) ;
-                                cd_dtype_t* bias_ptr = smem_bias[0] + store_block_offset + n_offset_in_block;
+                                uint32_t store_block_offset = s * STORE_BLOCK_N;
+                                cd_dtype_t* bias_ptr = smem_bias[accum_stage_idx] + store_block_offset + n_offset_in_block;
                                 float bias_vals[8];
                                 #pragma unroll
                                 for (int b = 0; b < 8; ++b) {
                                     bias_vals[b] = static_cast<float>(bias_ptr[b]);
                                 }
+                                //TODO:fadd2
                                 values[0] = __float_as_uint(__uint_as_float(values[0]) + bias_vals[0]);
                                 values[1] = __float_as_uint(__uint_as_float(values[1]) + bias_vals[1]);
                                 values[2] = __float_as_uint(__uint_as_float(values[2]) + bias_vals[2]);
@@ -569,12 +566,12 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
                     if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                         if constexpr (kGemmType == GemmType::Batched) {
-                            using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                            using cute_tma_t = cute::conditional_t<false,
                                 cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
                             cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx],
                                              n_idx, m_idx, scheduler.current_group_idx);
                         } else {
-                            using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                            using cute_tma_t = cute::conditional_t<false,
                                 cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                             cute_tma_t::copy(&tensor_map_cd, smem_cd[tma_stage_idx], n_idx, m_idx);
                         }
