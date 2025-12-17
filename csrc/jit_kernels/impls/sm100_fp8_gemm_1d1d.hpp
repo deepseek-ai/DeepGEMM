@@ -94,13 +94,13 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         GemmType::Normal, KernelType::Kernel1D1D,
         m, n, k, 1, major_a, major_b,
         torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
-        device_runtime->get_num_sms());
+        device_runtime->get_num_sms(), bias.has_value());
 
     // Debug: print block sizes
     printf("DEBUG: block_m=%d, block_n=%d, block_k=%d, num_multicast=%d\n",
            config.block_m, config.block_n, config.block_k, config.multicast_config.num_multicast);
 
-    // const auto& cd = d;
+    const auto& cd = c.value_or(d);
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                                SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
                                                config.block_k,
@@ -124,9 +124,7 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
     // Create tensor map for bias only if c has a value
     CUtensorMap tensor_map_bias{};
     if (bias.has_value()) {
-        tensor_map_bias = make_tma_bias_desc(cute::UMMA::Major::MN, bias.value(), n, 1,
-                                            config.block_n, 1,
-                                            1, 0);
+        tensor_map_bias = make_tma_bias_desc(cute::UMMA::Major::MN, bias.value(), n, config.block_n, 1, 0);
     }
 
     // Launch

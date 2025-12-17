@@ -18,7 +18,7 @@ from generators import (
 def test_gemm() -> None:
     print('Testing GEMM:')
     scores = []
-    for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(torch.bfloat16):
+    for kernel_type, m, n, k, major_a, major_b, accumulate, _, out_dtype in enumerate_normal(torch.bfloat16):
         # TODO: support accumulation for SM90 BF16 GEMM 
         if get_arch_major() == 9 and accumulate:
             continue
@@ -29,7 +29,7 @@ def test_gemm() -> None:
         acc_opt    = f'acc={int(accumulate)}'
 
         for test_alias in (False, True):
-            a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
+            a, b, c, _, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, False, out_dtype, kernel_type, use_bf16=True)
             func_name = f'bf16_gemm_{major_opt.lower() if test_alias else "nt"}'
             if test_alias:
                 a = a if major_a.is_k_major() else a.T
@@ -39,7 +39,7 @@ def test_gemm() -> None:
             diff = calc_diff(d, ref_d)
             assert diff < 1e-5, (f'{m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=}, '
                                    f'{diff:.5f}, alias={test_alias}')
-        a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
+        a, b, c, _, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, False, out_dtype, kernel_type, use_bf16=True)
 
         t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), 'bf16_gemm', suppress_kineto_output=True)
         cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
@@ -148,13 +148,13 @@ def test_k_grouped_gemm_contiguous() -> None:
 
 def test_cublaslt_gemm() -> None:
     print('Testing cuBLASLt GEMM:')
-    for kernel_type, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(dtype=torch.bfloat16):
+    for kernel_type, m, n, k, major_a, major_b, accumulate, _, out_dtype in enumerate_normal(dtype=torch.bfloat16):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
         out_opt    = 'FP32' if out_dtype == torch.float else 'BF16'
         acc_opt    = f'acc={int(accumulate)}'
 
-        a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
+        a, b, c, _, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, False, out_dtype, kernel_type, use_bf16=True)
         deep_gemm.cublaslt_gemm_nt(a, b, d, c=c)
         diff = calc_diff(d, ref_d)
         assert diff < 6e-7, f'{diff=}, ({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})'

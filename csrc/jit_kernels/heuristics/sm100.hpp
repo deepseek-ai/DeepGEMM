@@ -156,9 +156,6 @@ struct SM100ArchSpec {
         // TMA full/empty barriers, with-SF full barriers, tensor memory full/empty barriers
         // NOTES: some shapes may only have 1 epilogue stage, but we still allocate space for 2 stages
         // NOTES: the last barrier is for tensor core utilization control
-        // NOTES: add 2 * 8 for bias_barriers when with_accumulation is true (2 TMA store stages)
-        // const int bias_barrier_size = with_accumulation ? 2 * 8 : 0;
-        // return num_stages * 8 * 3 + 2 * 8 * 2 + 8 + bias_barrier_size;
         return num_stages * 8 * 3 + 2 * 8 * 2 + 8;
     }
 

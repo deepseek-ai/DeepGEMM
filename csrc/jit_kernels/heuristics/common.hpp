@@ -100,7 +100,8 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
                                           const int& block_m, const int& block_n, const int& block_k,
                                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                           const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
-                                          const int& num_stages, const MulticastConfig& multicast_config) {
+                                          const int& num_stages, const MulticastConfig& multicast_config,
+                                          const bool& with_bias = false) {
     const int& ab_elem_size = static_cast<int>(c10::elementSize(ab_dtype));
     const int& cd_elem_size = static_cast<int>(c10::elementSize(cd_dtype));
 
@@ -112,6 +113,9 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
 
     // Different archs have different epilogue pipelines
     const int& smem_cd = ArchSpec::get_smem_cd_size(kernel_type, block_m, block_n, swizzle_cd_mode, cd_dtype);
+
+    // Bias shared memory (aligned to 128 bytes for TMA)， 2 = NumTMAStoreStages
+    const int& smem_bias = with_bias ? align(cd_elem_size * block_n, 128) * 2 : 0;
 
     // A/B shared memory
     const int& smem_a_per_stage = load_block_m * block_k * ab_elem_size;
@@ -131,6 +135,7 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
     int smem_size = 0;
     smem_size += smem_tensor_map;
     smem_size += smem_cd;
+    smem_size += smem_bias;
     smem_size += num_stages * smem_a_per_stage;
     smem_size += num_stages * smem_b_per_stage;
     smem_size += num_stages * smem_sfa_per_stage;
@@ -152,7 +157,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const int& m, const int& n, const int& k, const int& num_groups,
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
-                                  const bool& with_accumulation, const int& num_sms) {
+                                  const bool& with_accumulation, const int& num_sms, 
+                                  const bool& with_bias = false) {
     DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
@@ -244,7 +250,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                                      best_block_m, best_block_n, block_k,
                                                      major_a, major_b,
                                                      ab_dtype, cd_dtype,
-                                                     num_stages, best_multicast_config);
+                                                     num_stages, best_multicast_config,
+                                                     with_bias);
         if (best_smem_config.smem_size <= smem_capacity) {
             best_num_stages = num_stages;
             break;

@@ -64,8 +64,8 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
     assert dtype in (torch.float8_e4m3fn, torch.bfloat16)
 
     fp32_output_nk = [(256, 7168), (129280, 7168)]
-    bf16_output_nk = [(512, 512), (5120, 13824), (13824, 5120)]
-    m_fwd_list, m_bwd_list = [5120], [4096, ]
+    bf16_output_nk = [(2112, 7168), (576, 7168), (24576, 1536), (32768, 512), (7168, 16384), (4096, 7168), (7168, 2048)]
+    m_fwd_list, m_bwd_list = [1, 128, 4096], [4096, ]
     nk_list = list(bf16_output_nk)
 
     # Only BF16 GEMM needs FP32 outputs
@@ -89,17 +89,17 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
                         yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, True, out_dtype
 
 
-        # # Backward
-        # for m in m_bwd_list:
-        #     for n, k in nk_list:
-        #         override_major = MajorTypeAB.MNMajor
-        #         override_kernel_type = kernel_type
-        #         if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
-        #             override_major = MajorTypeAB.KMajor
-        #             override_kernel_type = KernelType.Kernel1D1D
-        #         yield kernel_type,          m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16     # Dgrad
-        #         yield override_kernel_type, n, m, k, override_major,     override_major, True,  torch.float        # Wgrad
-        #         yield override_kernel_type, n, m, k, override_major,     override_major, False, torch.bfloat16     # Wgrad
+        # Backward
+        for m in m_bwd_list:
+            for n, k in nk_list:
+                override_major = MajorTypeAB.MNMajor
+                override_kernel_type = kernel_type
+                if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
+                    override_major = MajorTypeAB.KMajor
+                    override_kernel_type = KernelType.Kernel1D1D
+                yield kernel_type,          m, k, n, MajorTypeAB.KMajor, override_major, False, False, torch.bfloat16     # Dgrad
+                yield override_kernel_type, n, m, k, override_major,     override_major, True,  False, torch.float        # Wgrad
+                yield override_kernel_type, n, m, k, override_major,     override_major, False, False, torch.bfloat16     # Wgrad
 
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
@@ -163,8 +163,17 @@ def generate_normal(m: int, n: int, k: int,
     b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
         torch.empty((m, n), device='cuda', dtype=out_dtype)
-    c = d if accumulate else None
-    bias = torch.randn((n), device='cuda', dtype=out_dtype) * 16 if with_bias else None
+
+    if accumulate:
+        if out_dtype == torch.bfloat16:
+            c = torch.ones_like(d) * 10
+        else:
+            c = d
+    else:
+        c = None
+
+    bias = torch.ones((n), device='cuda', dtype=out_dtype) * 10 if with_bias else None
+
     if accumulate:
         ref_d = (a.float() @ b.float().t() + c).to(out_dtype)
     elif with_bias:

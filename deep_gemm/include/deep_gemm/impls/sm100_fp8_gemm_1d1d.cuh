@@ -525,8 +525,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                 values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]);
                             cutlass::arch::fence_view_async_tmem_load();
                             
-                            // Add bias (BF16 case - all lanes in same column read same bias value)
-                            // Use 'i' (logical index) not 'col' (swizzled index) because bias has no swizzle
                             if constexpr (kWithBias) {
                                 uint32_t n_offset_in_block = i * kNumElemsPerBankGroup;
                                 uint32_t store_block_offset = s * STORE_BLOCK_N;
