@@ -542,26 +542,6 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                                 values[5] = __float_as_uint(__uint_as_float(values[5]) + bias_vals[5]);
                                 values[6] = __float_as_uint(__uint_as_float(values[6]) + bias_vals[6]);
                                 values[7] = __float_as_uint(__uint_as_float(values[7]) + bias_vals[7]);
-
-                                // float2 bias_vals[4];
-                                // #pragma unroll
-                                // for (int b = 0; b < 4; ++b) {
-                                //     bias_vals[b] = make_float2(static_cast<float>(bias_ptr[b * 2]), static_cast<float>(bias_ptr[b * 2 + 1]));
-                                // }
-                                // //TODO:fadd2
-                                // bias_vals[0] = __fadd2_rd(make_float2(__uint_as_float(values[0]), __uint_as_float(values[1])), bias_vals[0]);
-                                // bias_vals[1] = __fadd2_rd(make_float2(__uint_as_float(values[2]), __uint_as_float(values[3])), bias_vals[1]);
-                                // bias_vals[2] = __fadd2_rd(make_float2(__uint_as_float(values[4]), __uint_as_float(values[5])), bias_vals[2]);
-                                // bias_vals[3] = __fadd2_rd(make_float2(__uint_as_float(values[6]), __uint_as_float(values[7])), bias_vals[3]);
-
-                                // values[0] = __float_as_uint(bias_vals[0].x);
-                                // values[1] = __float_as_uint(bias_vals[0].y);
-                                // values[2] = __float_as_uint(bias_vals[1].x);
-                                // values[3] = __float_as_uint(bias_vals[1].y);
-                                // values[4] = __float_as_uint(bias_vals[2].x);
-                                // values[5] = __float_as_uint(bias_vals[2].y);
-                                // values[6] = __float_as_uint(bias_vals[3].x);
-                                // values[7] = __float_as_uint(bias_vals[3].y);
                             }
                             
                             st_shared(smem_ptr,

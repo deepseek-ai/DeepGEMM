@@ -96,10 +96,6 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms(), bias.has_value());
 
-    // Debug: print block sizes
-    printf("DEBUG: block_m=%d, block_n=%d, block_k=%d, num_multicast=%d\n",
-           config.block_m, config.block_n, config.block_k, config.multicast_config.num_multicast);
-
     const auto& cd = c.value_or(d);
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                                SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
