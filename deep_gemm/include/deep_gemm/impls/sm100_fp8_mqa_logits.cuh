@@ -278,7 +278,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         const auto& v_offset = lane_idx;
 
         // Preload weights
-        constexpr uint32_t kNumWeightsInReg = 52;
+        constexpr uint32_t kNumWeightsInReg = cute::min(52, kNumHeads);
         float weights[BLOCK_Q][kNumWeightsInReg];
         DG_STATIC_ASSERT(kNumWeightsInReg <= kNumHeads and kNumWeightsInReg % 4 == 0, "Invalid kNumWeightsInReg");
 
