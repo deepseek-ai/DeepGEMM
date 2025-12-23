@@ -229,11 +229,15 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
             // TODO: deal with `-1`?
             if (kv_idx == 0 or kv_block_idx_ptr == 32) {
                 kv_block_idx_ptr = 0;
-                kv_block_idx_storage = (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups < num_kv ?
-                    __ldg(reinterpret_cast<const idx_storage_t*>(block_table) + q_idx * block_table_stride / kNumBlocksPerMMA
-                                                                              + (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups))
-                                                                              : idx_storage_t{0});
+                uint32_t compute_block_kv_offset = (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups);
+                const auto* kv_block_idx_global = block_table + q_idx * block_table_stride + compute_block_kv_offset * kNumBlocksPerMMA;
+                auto* kv_block_idx_reg = reinterpret_cast<uint32_t*>(&kv_block_idx_storage);
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumBlocksPerMMA; ++ i) {
+                    kv_block_idx_reg[i] = compute_block_kv_offset < num_kv ? __ldg(kv_block_idx_global + i) : 0;
+                }
             }
+
             idx_storage_t kv_block_idx = shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
 
             // Wait KV consumer release
