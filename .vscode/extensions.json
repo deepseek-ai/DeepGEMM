@@ -1,0 +1,35 @@
+{
+    "recommendations": [
+        // Python
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+
+        // C++/CUDA
+        "ms-vscode.cpptools",
+        "nvidia.nsight-vscode-edition",
+        "llvm-vs-code-extensions.vscode-clangd",
+
+        // CMake
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+
+        // Git
+        "eamodio.gitlens",
+        "mhutchie.git-graph",
+
+        // Code Quality
+        "editorconfig.editorconfig",
+        "streetsidesoftware.code-spell-checker",
+        "timonwong.shellcheck",
+
+        // Markdown
+        "yzhang.markdown-all-in-one",
+        "davidanson.vscode-markdownlint",
+
+        // YAML/TOML
+        "redhat.vscode-yaml",
+        "tamasfe.even-better-toml"
+    ],
+    "unwantedRecommendations": []
+}
