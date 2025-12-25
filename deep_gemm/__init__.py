@@ -97,4 +97,13 @@ _C.init(
     _find_cuda_home()                           # CUDA home
 )
 
-__version__ = '2.2.0'
+# Version is automatically set by setuptools-scm from Git tags when available.
+# This ensures that post-release versions (e.g., 2.1.0.post1) are correctly derived
+# from Git tags without manual updates. See Issue #228 for context.
+try:
+    from ._version import version as __version__
+    from ._version import version_tuple as __version_tuple__
+except ImportError:
+    # Fallback for editable installs or when _version.py doesn't exist yet
+    __version__ = '2.2.0'
+    __version_tuple__ = (2, 2, 0)

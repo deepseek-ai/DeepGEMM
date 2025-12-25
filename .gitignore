@@ -22,3 +22,6 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+
+# Auto-generated version file (created by setuptools-scm)
+deep_gemm/_version.py

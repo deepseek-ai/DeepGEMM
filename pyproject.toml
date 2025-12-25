@@ -1,0 +1,60 @@
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "setuptools-scm>=8.0",
+    "wheel",
+    "torch>=2.1.0",
+    "packaging",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep_gemm"
+dynamic = ["version"]
+description = "DeepGEMM: Clean and efficient FP8 GEMM kernels with fine-grained scaling"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "packaging",
+]
+
+[project.urls]
+Homepage = "https://github.com/deepseek-ai/DeepGEMM"
+Repository = "https://github.com/deepseek-ai/DeepGEMM"
+Issues = "https://github.com/deepseek-ai/DeepGEMM/issues"
+
+[tool.setuptools]
+packages = ["deep_gemm", "deep_gemm.testing", "deep_gemm.utils", "deep_gemm.legacy"]
+
+[tool.setuptools.package-data]
+"deep_gemm" = [
+    "include/deep_gemm/**/*",
+    "include/cute/**/*",
+    "include/cutlass/**/*",
+]
+
+[tool.setuptools_scm]
+# Write version to a file that can be imported at runtime
+write_to = "deep_gemm/_version.py"
+# Use post-release versioning scheme (e.g., 2.1.0.post1 for commits after v2.1.0)
+version_scheme = "post-release"
+# Include git node and date in local version for development builds
+local_scheme = "node-and-date"
+# Fallback version when not in a git repo (e.g., from tarball without .git)
+fallback_version = "0.0.0"
