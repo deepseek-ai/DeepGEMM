@@ -5,6 +5,7 @@
 #include <deep_gemm/common/types.hpp>
 
 #include "common.hpp"
+#include "../../utils/system.hpp"
 
 namespace deep_gemm {
 
@@ -99,7 +100,8 @@ struct SM90ArchSpec {
     }
 
     static bool should_minimize_num_sms() {
-        return true;
+        static const bool minimize = get_env<bool>("DG_MINIMIZE_NUM_SMS", true);
+        return minimize;
     }
 
     static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type, const int& num_groups,

@@ -1,11 +1,14 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <random>
 #include <string>
-#include <memory>
 #include <unistd.h>
 
 #include "exception.hpp"
@@ -24,9 +27,21 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
     if constexpr (std::is_same_v<dtype_t, std::string>) {
         return std::string(c_str);
     } else if constexpr (std::is_same_v<dtype_t, int>) {
-        int value;
+        int value = default_value;
         std::sscanf(c_str, "%d", &value);
         return value;
+    } else if constexpr (std::is_same_v<dtype_t, bool>) {
+        auto str = std::string(c_str);
+        std::transform(str.begin(), str.end(), str.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (str == "1" or str == "true" or str == "yes" or str == "on")
+            return true;
+        if (str == "0" or str == "false" or str == "no" or str == "off")
+            return false;
+        int numeric = default_value ? 1 : 0;
+        if (std::sscanf(c_str, "%d", &numeric) == 1)
+            return numeric != 0;
+        return default_value;
     } else {
         DG_HOST_ASSERT(false and "Unexpected type");
     }
