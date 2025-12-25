@@ -1,0 +1,76 @@
+# Git attributes for DeepGEMM
+# https://git-scm.com/docs/gitattributes
+
+# Default behavior: auto-detect text files and normalize line endings to LF
+* text=auto eol=lf
+
+# Python files
+*.py text eol=lf diff=python
+*.pyi text eol=lf diff=python
+*.pyx text eol=lf
+
+# C/C++/CUDA files
+*.c text eol=lf diff=cpp
+*.cc text eol=lf diff=cpp
+*.cpp text eol=lf diff=cpp
+*.cxx text eol=lf diff=cpp
+*.h text eol=lf diff=cpp
+*.hh text eol=lf diff=cpp
+*.hpp text eol=lf diff=cpp
+*.hxx text eol=lf diff=cpp
+*.cu text eol=lf diff=cpp
+*.cuh text eol=lf diff=cpp
+
+# Build system
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+Makefile text eol=lf
+*.mk text eol=lf
+
+# Shell scripts
+*.sh text eol=lf diff=bash
+*.bash text eol=lf diff=bash
+
+# Configuration files
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.conf text eol=lf
+
+# Documentation
+*.md text eol=lf diff=markdown
+*.rst text eol=lf
+*.txt text eol=lf
+LICENSE text eol=lf
+
+# Git config
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.gitmodules text eol=lf
+
+# Binary files (do not modify)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.exe binary
+*.o binary
+*.a binary
+
+# Linguist overrides for GitHub language statistics
+# Exclude third-party and generated code from statistics
+third-party/** linguist-vendored
+deep_gemm/include/cutlass/** linguist-vendored
+deep_gemm/include/cute/** linguist-vendored
+stubs/** linguist-generated
