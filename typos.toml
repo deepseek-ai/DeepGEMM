@@ -1,0 +1,81 @@
+# Typos configuration for DeepGEMM
+# https://github.com/crate-ci/typos
+
+[default]
+extend-ignore-re = [
+    # Hex values and hashes
+    "[0-9a-fA-F]{8,}",
+]
+
+[default.extend-words]
+# CUDA/GPU terminology
+smem = "smem"           # Shared memory
+gmem = "gmem"           # Global memory
+wgmma = "wgmma"         # Warp Group Matrix Multiply-Accumulate
+tma = "tma"             # Tensor Memory Accelerator
+mma = "mma"             # Matrix Multiply-Accumulate
+ptx = "ptx"             # Parallel Thread Execution
+ldmatrix = "ldmatrix"   # Load matrix instruction
+stmatrix = "stmatrix"   # Store matrix instruction
+
+# CUTLASS/CuTe terminology
+cutlass = "cutlass"
+smem_buf = "smem_buf"
+
+# Math/ML terminology
+gemm = "gemm"           # General Matrix Multiply
+gemms = "gemms"
+matmul = "matmul"
+relu = "relu"
+tanh = "tanh"
+gelu = "gelu"
+softmax = "softmax"
+moe = "moe"             # Mixture of Experts
+dequant = "dequant"     # Dequantization
+quant = "quant"
+
+# Data type abbreviations
+fp8 = "fp8"
+bf16 = "bf16"
+fp16 = "fp16"
+fp32 = "fp32"
+uint = "uint"
+sint = "sint"
+
+# Common abbreviations
+cfg = "cfg"
+repr = "repr"
+init = "init"
+deinit = "deinit"
+desc = "desc"
+src = "src"
+dst = "dst"
+ptr = "ptr"
+idx = "idx"
+cnt = "cnt"
+len = "len"
+num = "num"
+buf = "buf"
+impl = "impl"
+iter = "iter"
+alloc = "alloc"
+dealloc = "dealloc"
+
+# Project-specific
+deepgemm = "deepgemm"
+deepseek = "deepseek"
+cublaslt = "cublaslt"
+nvcc = "nvcc"
+nvrtc = "nvrtc"
+
+[files]
+extend-exclude = [
+    "third-party/",
+    "deep_gemm/include/cutlass/",
+    "deep_gemm/include/cute/",
+    "stubs/",
+    "build/",
+    "dist/",
+    "*.egg-info/",
+    "__pycache__/",
+]
