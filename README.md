@@ -163,6 +163,7 @@ The library also provides some environment variables, which may be useful:
   - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print NVCC compilation command, `0` by default
 - Heuristic selection
   - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
+  - `DG_MINIMIZE_NUM_SMS`: `0` or `1`, minimize the number of SMs used for better L2 cache usage and reduced GPU frequency drops; may cause additional kernel compilations on first run, `1` by default
 
 For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
 
