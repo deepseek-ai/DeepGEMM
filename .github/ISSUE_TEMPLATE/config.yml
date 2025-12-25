@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: DeepGEMM Discussions
+    url: https://github.com/deepseek-ai/DeepGEMM/discussions
+    about: For general discussions and community support

@@ -1,0 +1,69 @@
+name: Feature Request
+description: Suggest a new feature or enhancement for DeepGEMM
+title: "[Feature Request] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please fill out the sections below to help us understand your request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: Is your feature request related to a problem? Please describe.
+      placeholder: A clear description of what the problem is. Ex. I'm always frustrated when...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the solution you'd like to see.
+      placeholder: A clear description of what you want to happen...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Describe any alternative solutions or features you've considered.
+      placeholder: Any workarounds or alternative approaches...
+    validations:
+      required: false
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Feature Category
+      description: What area does this feature relate to?
+      options:
+        - Performance optimization
+        - New GEMM kernel/variant
+        - API/Interface improvement
+        - Build/Installation
+        - Documentation
+        - Testing
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use Case
+      description: Describe your use case for this feature.
+      placeholder: How would you use this feature? What problem does it solve for you?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      description: Would you be willing to help implement this feature?
+      options:
+        - label: I would be willing to submit a PR to implement this feature

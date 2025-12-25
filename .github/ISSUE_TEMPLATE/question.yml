@@ -1,0 +1,59 @@
+name: Question
+description: Ask a question about DeepGEMM usage or implementation
+title: "[Question] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a question about DeepGEMM? We're here to help!
+
+        Before asking, please check:
+        - [README documentation](https://github.com/deepseek-ai/DeepGEMM#readme)
+        - [Existing issues](https://github.com/deepseek-ai/DeepGEMM/issues?q=is%3Aissue)
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What would you like to know?
+      placeholder: Your question...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: topic
+    attributes:
+      label: Topic
+      description: What area does your question relate to?
+      options:
+        - Usage/API
+        - Performance
+        - Installation/Build
+        - Integration (vLLM, SGLang, etc.)
+        - Implementation details
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Any relevant context, code snippets, or what you've tried.
+      placeholder: Additional context...
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment (if relevant)
+      description: Your environment details if the question is related to a specific setup.
+      placeholder: |
+        - GPU:
+        - CUDA Version:
+        - PyTorch Version:
+        - DeepGEMM Version:
+    validations:
+      required: false

@@ -1,0 +1,71 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in DeepGEMM
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the sections below to help us understand and reproduce the issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the bug...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Steps or code to reproduce the behavior.
+      placeholder: |
+        1. Import deep_gemm
+        2. Call function X with parameters Y
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+      placeholder: Describe what should have happened...
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error Message / Stack Trace
+      description: If applicable, paste the full error message or stack trace.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Please provide your environment details.
+      value: |
+        - GPU: [e.g., H100, H200, B200]
+        - CUDA Version: [e.g., 12.4]
+        - PyTorch Version: [e.g., 2.5.0]
+        - Python Version: [e.g., 3.10]
+        - DeepGEMM Version/Commit: [e.g., 2.2.0 or commit hash]
+        - OS: [e.g., Ubuntu 22.04]
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Add any other context, logs, or screenshots about the problem.
+    validations:
+      required: false
