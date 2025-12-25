@@ -13,8 +13,9 @@ deep_gemm/include/cutlass
 # VS Code settings
 /.vscode
 
-# clangd settings
-/.clang*
+# clangd settings (but keep .clang-format)
+/.clangd
+/.clang-tidy
 /.cache
 
 # Generated stub files
