@@ -1,0 +1,37 @@
+# Citation File Format (CFF) for DeepGEMM
+# https://citation-file-format.github.io/
+
+cff-version: 1.2.0
+title: DeepGEMM
+message: >-
+  If you use DeepGEMM in your research, please cite it using
+  the metadata from this file.
+type: software
+authors:
+  - name: DeepSeek AI
+    website: https://www.deepseek.com/
+repository-code: https://github.com/deepseek-ai/DeepGEMM
+url: https://github.com/deepseek-ai/DeepGEMM
+license: MIT
+keywords:
+  - GEMM
+  - CUDA
+  - FP8
+  - BF16
+  - GPU
+  - deep learning
+  - matrix multiplication
+  - MoE
+  - mixture of experts
+  - NVIDIA
+  - Hopper
+  - Blackwell
+abstract: >-
+  DeepGEMM is a library designed for clean and efficient
+  General Matrix Multiplications (GEMMs). It supports FP8
+  and BF16 for both normal and Mix-of-Experts (MoE) grouped
+  scenarios. Written in CUDA, the library compiles all kernels
+  at runtime using a lightweight Just-In-Time (JIT) module.
+  Despite its lightweight design, DeepGEMM's performance
+  matches or exceeds expert-tuned libraries across various
+  matrix shapes.
