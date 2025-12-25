@@ -1,0 +1,54 @@
+# Pre-commit hooks for DeepGEMM
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+exclude: |
+  (?x)^(
+    third-party/|
+    deep_gemm/include/|
+    build/|
+    dist/|
+    stubs/|
+    __pycache__/|
+    .*\.egg-info/
+  )
+
+repos:
+  # General hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-added-large-files
+        args: [--maxkb=1000]
+      - id: check-merge-conflict
+
+  # Python formatting with Ruff (includes formatting and linting)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        types_or: [python, pyi]
+      - id: ruff-format
+        types_or: [python, pyi]
+
+  # C++/CUDA formatting
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.5
+    hooks:
+      - id: clang-format
+        types_or: [c, c++, cuda]
+        files: ^csrc/
+
+  # Shell script linting
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: [--severity=warning]

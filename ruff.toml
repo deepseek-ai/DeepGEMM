@@ -1,0 +1,51 @@
+# Ruff configuration for DeepGEMM
+# https://docs.astral.sh/ruff/configuration/
+
+target-version = "py38"
+line-length = 120
+
+# Exclude directories
+exclude = [
+    ".git",
+    ".github",
+    "__pycache__",
+    "build",
+    "dist",
+    "*.egg-info",
+    "third-party",
+    "deep_gemm/include",
+    "stubs",
+]
+
+[lint]
+# Enable common rule sets
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "SIM",    # flake8-simplify
+]
+
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "B905",   # zip without explicit strict parameter
+    "SIM108", # use ternary operator instead of if-else
+]
+
+# Allow autofix for all enabled rules
+fixable = ["ALL"]
+unfixable = []
+
+[lint.isort]
+known-first-party = ["deep_gemm"]
+
+[format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
