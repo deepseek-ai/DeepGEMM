@@ -199,6 +199,7 @@ if __name__ == '__main__':
         packages=find_packages('.'),
         package_data={
             'deep_gemm': [
+                'py.typed',
                 'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',
