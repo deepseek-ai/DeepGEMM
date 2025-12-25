@@ -1,0 +1,26 @@
+# CODEOWNERS - Automatic review assignments for DeepGEMM
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything in the repo
+*                           @deepseek-ai/deepgemm-maintainers
+
+# CUDA kernel implementations
+/csrc/                      @deepseek-ai/deepgemm-maintainers
+
+# Python bindings and utilities
+/deep_gemm/                 @deepseek-ai/deepgemm-maintainers
+
+# Tests
+/tests/                     @deepseek-ai/deepgemm-maintainers
+
+# Build system and packaging
+/setup.py                   @deepseek-ai/deepgemm-maintainers
+/pyproject.toml             @deepseek-ai/deepgemm-maintainers
+/CMakeLists.txt             @deepseek-ai/deepgemm-maintainers
+
+# Documentation
+/README.md                  @deepseek-ai/deepgemm-maintainers
+/docs/                      @deepseek-ai/deepgemm-maintainers
+
+# CI/CD and GitHub configuration
+/.github/                   @deepseek-ai/deepgemm-maintainers
