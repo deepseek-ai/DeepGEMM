@@ -97,4 +97,8 @@ _C.init(
     _find_cuda_home()                           # CUDA home
 )
 
-__version__ = '2.2.0'
+try:
+    from importlib.metadata import version as _get_version
+    __version__ = _get_version('deep_gemm')
+except Exception:
+    __version__ = '2.2.0'  # Fallback for development without installation

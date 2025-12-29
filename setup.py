@@ -52,6 +52,18 @@ base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag
 
 
 def get_package_version():
+    # First, try to get version from exact git tag (for release builds like v2.1.1.post3)
+    try:
+        cmd = ['git', 'describe', '--tags', '--exact-match', 'HEAD']
+        tag = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('ascii').strip()
+        if tag.startswith('v'):
+            tag = tag[1:]  # Remove 'v' prefix
+        # Return exact tag version without any revision suffix
+        return tag
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        pass
+
+    # Fall back to reading base version from __init__.py for development builds
     with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
