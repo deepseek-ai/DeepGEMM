@@ -100,7 +100,9 @@ struct SM100ArchSpec {
     }
 
     static bool should_minimize_num_sms() {
-        return true;
+        // Allow control via environment variable (default: enabled)
+        // Set DG_MINIMIZE_NUM_SMS=0 to disable SM minimization for more stable TTFT
+        return get_env<int>("DG_MINIMIZE_NUM_SMS", 1) != 0;
     }
 
     static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type, const int& num_groups,
