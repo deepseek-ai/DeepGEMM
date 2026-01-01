@@ -46,7 +46,10 @@ def test_gemm() -> None:
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0)
         t = bench_kineto(lambda: deep_gemm.fp8_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe),
                          'fp8_gemm', suppress_kineto_output=True)
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
+        # Use per-tensor scaling for fair comparison (max of blockwise scales)
+        scale_a_max = a[1].max().reshape(1).to(torch.float32).contiguous()
+        scale_b_max = b[1].max().reshape(1).to(torch.float32).contiguous()
+        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_fp8_gemm_nt(a[0], b[0], d, c=c, scale_a=scale_a_max, scale_b=scale_b_max), ('nvjet', 'reduce'), suppress_kineto_output=True)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '

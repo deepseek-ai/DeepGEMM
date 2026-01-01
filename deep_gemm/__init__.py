@@ -30,6 +30,8 @@ from ._C import (
 )
 
 if version.parse(cuda_version) >= version.parse('12.1'):
+    # FP8 cuBLASLt with per-tensor scaling for fair comparison
+    from ._C import cublaslt_fp8_gemm_nt
     # DeepGEMM Kernels
     from ._C import (
         # FP8 GEMMs

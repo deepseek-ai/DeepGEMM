@@ -34,7 +34,9 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
                               const torch::Tensor& a,
                               const torch::Tensor& b,
                               const torch::Tensor& d,
-                              const bool& accumulate) {
+                              const bool& accumulate,
+                              const std::optional<torch::Tensor>& scale_a = std::nullopt,
+                              const std::optional<torch::Tensor>& scale_b = std::nullopt) {
     cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F_FAST_TF32;
     cudaDataType_t scale_type = CUDA_R_32F;
     const int& math_sms = device_runtime->get_num_sms();
@@ -46,11 +48,21 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, &math_sms, sizeof(math_sms)));
-    
+
 #if DG_FP8_COMPATIBLE
     bool fp8_fast_accumulate = false;
     if (a.scalar_type() == torch::kFloat8_e4m3fn)
         DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_FAST_ACCUM, &fp8_fast_accumulate, sizeof(fp8_fast_accumulate)));
+
+    // Set FP8 scale pointers if provided
+    if (scale_a.has_value()) {
+        const void* scale_a_ptr = scale_a->data_ptr();
+        DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_a_ptr, sizeof(scale_a_ptr)));
+    }
+    if (scale_b.has_value()) {
+        const void* scale_b_ptr = scale_b->data_ptr();
+        DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scale_b_ptr, sizeof(scale_b_ptr)));
+    }
 #endif
 
     // Get cuBLASLt handle, workspace, and stream
@@ -99,7 +111,9 @@ static void cublaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
                           const std::optional<torch::Tensor>& acc,
                           const torch::Tensor& out,
                           const int& m, const int& n, const int& k,
-                          const cute::UMMA::Major& a_major, const cute::UMMA::Major& b_major) {
+                          const cute::UMMA::Major& a_major, const cute::UMMA::Major& b_major,
+                          const std::optional<torch::Tensor>& scale_a = std::nullopt,
+                          const std::optional<torch::Tensor>& scale_b = std::nullopt) {
     const auto& trans_a = b_major == cute::UMMA::Major::K ? CUBLAS_OP_T : CUBLAS_OP_N;
     const auto& trans_b = a_major == cute::UMMA::Major::K ? CUBLAS_OP_N : CUBLAS_OP_T;
 
@@ -123,7 +137,7 @@ static void cublaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
                                                            : get_cublaslt_layout(cuda_type_b, m, k, lhs.stride(1));
     const auto& layout_d = get_cublaslt_layout(cuda_type_d, n, m, out.stride(0));
 
-    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, acc.has_value());
+    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, acc.has_value(), scale_a, scale_b);
 }
 
 

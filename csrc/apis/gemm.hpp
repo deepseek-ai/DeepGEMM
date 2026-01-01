@@ -560,6 +560,32 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
     cublaslt_gemm_nt(a.transpose(0, 1), b, d, c);
 }
 
+#if DG_FP8_COMPATIBLE
+// FP8 cuBLASLt GEMM with per-tensor scaling support
+// This allows fairer comparison with DeepGEMM's blockwise scaling by using
+// the max scale value from blockwise scales as a single per-tensor scale
+static void cublaslt_fp8_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
+                                  const torch::Tensor& d, const std::optional<torch::Tensor>& c,
+                                  const std::optional<torch::Tensor>& scale_a,
+                                  const std::optional<torch::Tensor>& scale_b) {
+    // Shape must be `[M, K] @ [N, K].T`
+    const auto& major_a = get_major_type_ab(a);
+    const auto& major_b = get_major_type_ab(b);
+
+    // Type and shape checks
+    const auto& [m , k ] = get_shape<2>(a);
+    const auto& [n , k_] = get_shape<2>(b);
+    const auto& [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+
+    // Early return for trivial cases
+    if (early_return(m, n, k, d, c))
+        return;
+
+    cublaslt_gemm(a, b, c, d, m, n, k, major_a, major_b, scale_a, scale_b);
+}
+#endif
+
 static void register_apis(pybind11::module_& m) {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
@@ -650,6 +676,15 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
     m.def("cublaslt_gemm_tt", &cublaslt_gemm_tt,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
+
+#if DG_FP8_COMPATIBLE
+    // FP8 cuBLASLt GEMM with per-tensor scaling for fair comparison
+    m.def("cublaslt_fp8_gemm_nt", &cublaslt_fp8_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("c") = std::nullopt,
+          py::arg("scale_a") = std::nullopt,
+          py::arg("scale_b") = std::nullopt);
+#endif
 }
 
 } // namespace deep_gemm::gemm
