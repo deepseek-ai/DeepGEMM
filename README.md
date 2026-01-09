@@ -69,7 +69,6 @@ cat develop.sh
 # Test all GEMM implements
 python tests/test_layout.py
 python tests/test_attention.py
-python tests/test_core.py
 ```
 
 ### Installation
