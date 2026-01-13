@@ -51,6 +51,16 @@ def per_block_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool) -> Tuple[torch.Tenso
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
 
 
+def global_cast_to_fp8(
+    x: torch.Tensor, use_ue8m0: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    x_amax = x.abs().float().amax().clamp(1e-4)  # Single global amax
+    sf = x_amax / 448.0
+    sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
+    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
+    return x_scaled, sf
+
 def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple, use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
     excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
     x_amax = x.abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)

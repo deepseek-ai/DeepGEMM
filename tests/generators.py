@@ -5,7 +5,7 @@ from typing import Generator, List
 
 from deep_gemm.utils import (
     align, ceil_div,
-    per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
+    per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8, global_cast_to_fp8,       
     get_mk_alignment_for_contiguous_layout
 )
 
@@ -210,9 +210,9 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
     assert major_a.is_k_major()
     a_fp8 = per_token_cast_to_fp8(a, use_ue8m0=use_ue8m0)
     b_fp8 = (torch.empty_like(b, dtype=torch.float8_e4m3fn),
-             torch.empty((num_groups, ceil_div(n, 128), ceil_div(k, 128)), device='cuda', dtype=torch.float))
+             torch.empty((num_groups), device='cuda', dtype=torch.float)) 
     for i in range(num_groups):
-        b_fp8[0][i], b_fp8[1][i] = per_block_cast_to_fp8(b[i], use_ue8m0=use_ue8m0)
+        b_fp8[0][i], b_fp8[1][i] = global_cast_to_fp8(b[i], use_ue8m0=use_ue8m0)
     b_fp8 = b_fp8 if major_b.is_k_major() else (b_fp8[0].mT.contiguous().mT, b_fp8[1])
     return m, a_fp8, b_fp8, m_indices, d, ref_d
 

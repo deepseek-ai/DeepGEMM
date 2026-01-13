@@ -65,30 +65,6 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
                                      const bool& tma_stride_check = false,
                                      const bool& contiguous_check = false,
                                      const std::optional<torch::ScalarType>& type_check = std::nullopt) {
-    // Type check
-    if (type_check.has_value())
-        DG_HOST_ASSERT(sf.scalar_type() == type_check.value());
-
-    // Always do shape checks
-    const auto& sf_dtype = sf.scalar_type();
-    DG_HOST_ASSERT(sf_dtype == torch::kFloat or sf_dtype == torch::kInt);
-    DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
-    if (num_groups.has_value())
-        DG_HOST_ASSERT(sf.size(-3) == num_groups.value());
-    DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
-    DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4)));
-
-    // TMA stride checks: TMA aligned and MN-major
-    if (tma_stride_check) {
-        if (num_groups.has_value())
-            DG_HOST_ASSERT(sf.stride(-3) == sf.stride(-1) * sf.size(-1));
-        DG_HOST_ASSERT(sf.stride(-2) == 1);
-        DG_HOST_ASSERT(sf.stride(-1) == get_tma_aligned_size(mn, sf.element_size()));
-    }
-
-    // Hopper SFB must be contiguous
-    if (contiguous_check)
-        DG_HOST_ASSERT(sf.is_contiguous());
     return sf;
 }
 

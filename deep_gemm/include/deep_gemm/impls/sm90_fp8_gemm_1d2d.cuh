@@ -142,7 +142,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
         phase ^= stage_idx == 0;
     };
-
+    bool load_sfb = true;
     if (warp_idx >= kNumMathThreads / 32) {
         // TMA warp-group for loading data
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
@@ -210,16 +210,13 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 num_full_iters = min(shape_n - n_block_idx * BLOCK_N, BLOCK_N) / 8;
             }
             uint32_t num_sfb = shape_k_scales * (num_former_iters >= num_full_iters ? 1 : 2);
-
-            // Load B scales with math warp-groups
-            // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
-            if (threadIdx.x >= 32) {
-                auto num_previous_lines = scheduler.get_global_idx<true>(ceil_div(shape_n, BLOCK_K), 0, 0, m_block_idx);
-                auto local_sfb = sfb + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * shape_k_scales;
+            auto group_index = scheduler.get_global_idx<true>(1, 0, 0, m_block_idx);
+            if (load_sfb && threadIdx.x >= 32) {
                 #pragma unroll
-                for (uint32_t i = threadIdx.x - 32; i < num_sfb; i += kNumMathThreads - 32)
-                    st_shared(smem_sfb + i, __ldg(local_sfb + i));
+                for (uint32_t i = threadIdx.x - 32; i < kNumGroups; i += kNumMathThreads - 32)
+                    st_shared(smem_sfb + i, __ldg(sfb + i));
             }
+            load_sfb = false;
             cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
 
             // Accumulation for WGMMA or CUDA promotion
@@ -252,10 +249,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const auto& b_desc_base_lo = b_desc_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
 
                         // Read B scales
-                        float scale_b_0 = ld_shared(smem_sfb + k_block_idx), scale_b_1;
-                        // NOTES: even some blocks do not need to read the second row, but we still load one to align with other blocks
-                        if constexpr (not kMustUseUniformedScaleB)
-                            scale_b_1 = ld_shared(smem_sfb + k_block_idx + shape_k_scales);
+                        float scale_b_0 = ld_shared(smem_sfb + group_index);
 
                         // Wait TMA arrivals
                         full_barriers[stage_idx]->wait(phase);
@@ -296,7 +290,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                             float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
                             float scale_0_1, scale_1_1;
                             if constexpr (not kMustUseUniformedScaleB)
-                                scale_0_1 = scale_a_0 * scale_b_1, scale_1_1 = scale_a_1 * scale_b_1;
+                                scale_0_1 = scale_a_0 * scale_b_0, scale_1_1 = scale_a_1 * scale_b_0;
 
                             auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                             #pragma unroll
