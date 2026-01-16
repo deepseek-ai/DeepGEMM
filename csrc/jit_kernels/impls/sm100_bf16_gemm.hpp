@@ -79,11 +79,11 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
                             const int& m, const int& n, const int& k,
                             const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                             const std::string& compiled_dims) {
-    const auto& aligned_k = align(k, 64);
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::Normal, KernelType::KernelNoSF,
         m, n, k, 1, major_a, major_b,
-        torch::kBFloat16, d.scalar_type(), c.has_value(),
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms());
 
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
@@ -104,7 +104,7 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
 
     // Launch
     const SM100BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = aligned_k,
+        .m = m, .n = n, .k = k,
         .num_groups = 1,
         .compiled_dims = compiled_dims,
         .gemm_config = config,
@@ -124,16 +124,25 @@ static void sm100_bf16_gemm(const torch::Tensor& a,
 static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                  const torch::Tensor& b,
                                                  const torch::Tensor& d,
-                                                 const torch::Tensor& m_indices,
+                                                 const torch::Tensor& grouped_layout,
                                                  const int& num_groups, const int& m, const int& n, const int& k,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                                 const std::string& compiled_dims) {
-    const auto& aligned_k = align(k, 64);
+                                                 const std::string& compiled_dims,
+                                                 const bool& use_psum_layout,
+                                                 const std::optional<int>& expected_m_for_psum_layout) {
+    const auto& gemm_type = use_psum_layout ? GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
+
+    // NOTES: If actual M is dynamic, estimate config via `num_groups` and `expected_m`.
+    //        Otherwise, treat the contiguous layout as a whole.
+    const auto& m_for_config = expected_m_for_psum_layout.has_value() ? expected_m_for_psum_layout.value() : m;
+    const auto& num_groups_for_config = expected_m_for_psum_layout.has_value() ? num_groups : 1;
+
     const auto& config = get_best_config<SM100ArchSpec>(
-        GemmType::MGroupedContiguous, KernelType::KernelNoSF,
+        gemm_type, KernelType::KernelNoSF,
         // NOTES: `num_groups` is 1, since the contiguous layout is seen as a whole
-        m, n, k, 1, major_a, major_b,
-        torch::kBFloat16, d.scalar_type(), false,
+        m_for_config, n, k, num_groups_for_config, major_a, major_b,
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
@@ -154,14 +163,14 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
 
     // Launch
     const SM100BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = aligned_k,
+        .m = m, .n = n, .k = k,
         .num_groups = num_groups,
         .compiled_dims = compiled_dims,
         .gemm_config = config,
         .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = m_indices.data_ptr(),
+        .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd
@@ -179,11 +188,11 @@ static void sm100_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                              const int& expected_m,
                                              const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                              const std::string& compiled_dims) {
-    const auto& aligned_k = align(k, 64);
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::MGroupedMasked, KernelType::KernelNoSF,
         expected_m, n, k, num_groups, major_a, major_b,
-        torch::kBFloat16, d.scalar_type(), false,
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
@@ -204,7 +213,7 @@ static void sm100_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
 
     // Launch
     const SM100BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = aligned_k,
+        .m = m, .n = n, .k = k,
         .num_groups = num_groups,
         .compiled_dims = compiled_dims,
         .gemm_config = config,
@@ -243,7 +252,8 @@ static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::KGroupedContiguous, KernelType::KernelNoSF,
         m, n, max_k, num_groups, cute::UMMA::Major::MN, cute::UMMA::Major::MN,
-        torch::kBFloat16, d.scalar_type(), c.has_value(),
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms());
 
     // Create tensor descriptors
@@ -290,7 +300,8 @@ static void sm100_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::Batched, KernelType::KernelNoSF,
         b, d, r, h, cute::UMMA::Major::K, cute::UMMA::Major::K,
-        torch::kBFloat16, tensor_d.scalar_type(), false,
+        tensor_a.scalar_type(), tensor_b.scalar_type(),
+        tensor_d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     const int& load_block_m = SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m);
@@ -337,7 +348,8 @@ static void sm100_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
     const auto& config = get_best_config<SM100ArchSpec>(
         GemmType::Batched, KernelType::KernelNoSF,
         b, r, d, h, cute::UMMA::Major::K, cute::UMMA::Major::MN,
-        torch::kBFloat16, tensor_d.scalar_type(), false,
+        tensor_a.scalar_type(), tensor_b.scalar_type(),
+        tensor_d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     const int& load_block_m = SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m);

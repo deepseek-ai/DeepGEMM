@@ -53,18 +53,18 @@ struct SM100ArchSpec {
     }
 
     static std::pair<int, int> get_sf_uttcp_aligned_block_sizes(
-        const int& block_m, const int& block_n, const at::ScalarType& ab_dtype) {
+        const int& block_m, const int& block_n, const MmaKind& mma_kind) {
         constexpr int num_utccp_aligned_elems = 128;
-        switch (ab_dtype) {
-            case torch::kBFloat16: return {0, 0};
-            case torch::kFloat8_e4m3fn: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+        switch (mma_kind) {
+            case MmaKind::BF16:     return {0, 0};
+            case MmaKind::MXFP8FP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }
 
     static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                    const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+                                    const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                     const int& m, const int& n, const int& k,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // Layout A/D does not support `block_n % 16 != 0`
@@ -82,7 +82,7 @@ struct SM100ArchSpec {
         // Check tensor memory validity
         int sf_block_m = 0, sf_block_n = 0;
         if (kernel_type == KernelType::Kernel1D1D) {
-            const auto& [sf_block_m_, sf_block_n_] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, ab_dtype);
+            const auto& [sf_block_m_, sf_block_n_] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind);
             sf_block_m = sf_block_m_, sf_block_n = sf_block_n_;
         }
         if (((2 * block_n) + (sf_block_m / 32) + (sf_block_n / 32)) > 512)
@@ -90,16 +90,12 @@ struct SM100ArchSpec {
 
         // NOTES: when B is MN-major, we restrict `block_n` to multiples of 64,
         // since TMA performance degrades when `swizzle_b <= 32B` (i.e., when `block_ns % 64 != 0`), even with 3D TMA
-        return major_b == cute::UMMA::Major::K or (block_n * c10::elementSize(ab_dtype)) % 64 == 0;
+        return major_b == cute::UMMA::Major::K or (block_n * get_element_size(mma_kind)) % 64 == 0;
     }
 
-    static bool is_num_stages_legal(const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+    static bool is_num_stages_legal(const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                     const int& num_stages,
                                     const int& block_m, const int& block_n, const int& block_k) {
-        return true;
-    }
-
-    static bool should_minimize_num_sms() {
         return true;
     }
 
@@ -129,14 +125,14 @@ struct SM100ArchSpec {
 
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,
                                                           const int& block_m, const int& block_n, const int& block_k,
-                                                          const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype) {
-        if (ab_dtype == torch::kBFloat16)
+                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype) {
+        if (mma_kind == MmaKind::BF16)
             return {0, 0};
 
         int smem_sfa_per_stage = 0;
         int smem_sfb_per_stage = 0;
         if (kernel_type == KernelType::Kernel1D1D) {
-            const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, ab_dtype);
+            const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind);
             smem_sfa_per_stage = sf_block_m * 4;
             smem_sfb_per_stage = sf_block_n * 4;
         } else {

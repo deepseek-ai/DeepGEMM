@@ -88,7 +88,8 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::Normal, KernelType::Kernel1D1D,
         m, n, k, 1, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms());
 
     // Requires no TMA splits
@@ -138,7 +139,7 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
     SM90FP8Gemm1D1DRuntime::launch(runtime, args);
 }
 
-static void sm90_fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                          const torch::Tensor& b, const torch::Tensor& sfb,
                                          const std::optional<torch::Tensor>& c,
                                          const torch::Tensor& d,
@@ -156,7 +157,8 @@ static void sm90_fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Te
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::KGroupedContiguous, KernelType::Kernel1D1D,
         m, n, max_k, num_groups, major_a, major_b,
-        torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms());
 
     // Requires no TMA splits

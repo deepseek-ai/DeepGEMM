@@ -24,6 +24,7 @@ public:
     static std::filesystem::path library_include_path;
     static std::filesystem::path cuda_home;
     static std::string library_version;
+    static std::filesystem::path cuobjdump_path;
 
     static std::string get_library_version() {
         std::vector<char> buffer;
@@ -45,6 +46,7 @@ public:
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::cuda_home = cuda_home_path_by_python;
         Compiler::library_version = get_library_version();
+        Compiler::cuobjdump_path = Compiler::cuda_home / "bin" / "cuobjdump";
     }
 
     std::string signature, flags;
@@ -56,6 +58,7 @@ public:
         DG_HOST_ASSERT(not library_include_path.empty());
         DG_HOST_ASSERT(not cuda_home.empty());
         DG_HOST_ASSERT(not library_version.empty());
+        DG_HOST_ASSERT(not cuobjdump_path.empty());
 
         // Cache settings
         cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_gemm";
@@ -108,25 +111,57 @@ public:
 
         // Compile into a temporary CUBIN
         const auto tmp_cubin_path = get_tmp_file_path();
-        compile(code, dir_path, tmp_cubin_path);
+        if (get_env<int>("DG_JIT_DUMP_ASM") or get_env<int>("DG_JIT_DUMP_PTX")) {
+            // Dump PTX if needed
+            const auto tmp_ptx_path = get_tmp_file_path();
+            compile(code, dir_path, tmp_cubin_path, tmp_ptx_path);
+
+            // Replace into the cache directory
+            std::filesystem::rename(tmp_ptx_path, dir_path / "kernel.ptx");
+        } else {
+            compile(code, dir_path, tmp_cubin_path);
+        }
 
         // Replace into the cache directory
-        make_dirs(dir_path);
-        std::filesystem::rename(tmp_cubin_path, dir_path / "kernel.cubin");
+        const auto cubin_path = dir_path / "kernel.cubin";
+        std::filesystem::rename(tmp_cubin_path, cubin_path);
+
+        // Disassemble if needed
+        if (get_env<int>("DG_JIT_DUMP_ASM") or get_env<int>("DG_JIT_DUMP_SASS")) {
+            // Dump into a temporary SASS
+            const auto tmp_sass_path = get_tmp_file_path();
+            disassemble(cubin_path, tmp_sass_path);
+
+            // Replace into the current directory
+            std::filesystem::rename(tmp_sass_path, dir_path / "kernel.sass");
+        }
 
         // Put into the runtime cache
-        const auto& runtime = kernel_runtime_cache->get(dir_path);
+        const auto runtime = kernel_runtime_cache->get(dir_path);
         DG_HOST_ASSERT(runtime != nullptr);
         return runtime;
     }
 
-    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const = 0;
+    static void disassemble(const std::filesystem::path &cubin_path, const std::filesystem::path &sass_path) {
+        // Disassemble the CUBIN file to SASS
+        const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.c_str(), cubin_path.c_str(), sass_path.c_str());
+        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
+            printf("Running cuobjdump command: %s\n", command.c_str());
+        const auto [return_code, output] = call_external_command(command);
+        if (return_code != 0) {
+            printf("cuobjdump failed: %s\n", output.c_str());
+            DG_HOST_ASSERT(false and "cuobjdump failed");
+        }
+    }
+
+    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path, const std::optional<std::filesystem::path> &ptx_path = std::nullopt) const = 0;
 };
 
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_include_path);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuda_home);
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_version);
+DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, cuobjdump_path);
 
 class NVCCCompiler final: public Compiler {
     std::filesystem::path nvcc_path;
@@ -164,23 +199,37 @@ public:
         const auto& arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
         flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
-                            "-cubin -O3 --expt-relaxed-constexpr --expt-extended-lambda",
+                            "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
                             flags, library_include_path.c_str(), arch);
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path,
+                 const std::filesystem::path &cubin_path,
+                 const std::optional<std::filesystem::path> &ptx_path) const override {
         // Write the code into the cache directory
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
 
         // Compile
-        const auto& command = fmt::format("{} {} -o {} {}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+        const auto& command = fmt::format("{} {} -cubin -o {} {}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running NVCC command: %s\n", command.c_str());
         const auto& [return_code, output] = call_external_command(command);
         if (return_code != 0) {
             printf("NVCC compilation failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "NVCC compilation failed");
+        }
+
+        // Compile to PTX if needed
+        if (ptx_path.has_value()) {
+            const auto ptx_command = fmt::format("{} {} -ptx -o {} {}", nvcc_path.c_str(), code_path.c_str(), ptx_path->c_str(), flags);
+            if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
+                printf("Running NVCC PTX command: %s\n", ptx_command.c_str());
+            const auto [ptx_return_code, ptx_output] = call_external_command(ptx_command);
+            if (ptx_return_code != 0) {
+                printf("NVCC PTX compilation failed: %s\n", ptx_output.c_str());
+                DG_HOST_ASSERT(false and "NVCC PTX compilation failed");
+            }
         }
 
         // Check local memory usage
@@ -219,11 +268,13 @@ public:
         // Override the compiler flags
         // Only NVRTC >= 12.9 supports arch-specific family suffix
         const auto& arch = device_runtime->get_arch(false, major > 12 or minor >= 9);
-        flags = fmt::format("{} {}--gpu-architecture=sm_{} -default-device {}",
+        flags = fmt::format("{} {}--gpu-architecture=sm_{} -default-device {} --device-int128",
                             flags, include_dirs, arch, pch_flags);
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &cubin_path) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path,
+                 const std::filesystem::path &cubin_path,
+                 const std::optional<std::filesystem::path> &ptx_path) const override {
         // Write the code into the cache directory
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
@@ -264,6 +315,17 @@ public:
                 DG_NVRTC_CHECK(nvrtcGetProgramLog(program, compilation_log.data()));
                 printf("NVRTC log: %s\n", compilation_log.c_str());
             }
+        }
+
+        if (ptx_path.has_value()) {
+            // Get PTX size and data if needed
+            size_t ptx_size;
+            DG_NVRTC_CHECK(nvrtcGetPTXSize(program, &ptx_size));
+            std::string ptx_data(ptx_size, '\0');
+            DG_NVRTC_CHECK(nvrtcGetPTX(program, ptx_data.data()));
+
+            // Write into the file system
+            put(ptx_path.value(), ptx_data);
         }
 
         // Get CUBIN size and data

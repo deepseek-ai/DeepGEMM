@@ -143,7 +143,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     const auto& get_next_block_q_idx = [&]() -> cute::tuple<uint32_t, uint32_t> {
         return {block_q_idx + gridDim.x, q_iter_idx + 1};
     };
-    uint32_t seq_k_start[BLOCK_Q];
+    uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
     const auto& load_schedule = [&](const uint32_t& q_iter_offset = 0) -> cute::tuple<uint32_t, uint32_t, uint32_t, uint32_t> {
         uint32_t start = cute::numeric_limits<uint32_t>::max();
         uint32_t end = cute::numeric_limits<uint32_t>::min();
@@ -152,8 +152,9 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
             const auto& q_idx = min(block_q_idx * BLOCK_Q + i, seq_len - 1);
             seq_k_start[i] = __ldg(cu_seq_len_k_start + q_idx);
+            seq_k_end[i] = __ldg(cu_seq_len_k_end + q_idx);
             start = min(start, min(seq_k_start[i], seq_len_kv));
-            end = max(end, min(__ldg(cu_seq_len_k_end + q_idx), seq_len_kv));
+            end = max(end, min(seq_k_end[i], seq_len_kv));
         }
         start = start / 4 * 4;
         return {(q_iter_idx + q_iter_offset) % kNumQStages,       // Q pipeline stage
@@ -278,9 +279,9 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         const auto& v_offset = lane_idx;
 
         // Preload weights
-        constexpr uint32_t kNumWeightsInReg = 52;
+        constexpr uint32_t kNumWeightsInReg = cute::min(52, kNumHeads);
         float weights[BLOCK_Q][kNumWeightsInReg];
-        DG_STATIC_ASSERT(kNumWeightsInReg <= kNumHeads and kNumWeightsInReg % 4 == 0, "Invalid kNumWeightsInReg");
+        DG_STATIC_ASSERT(kNumWeightsInReg % 4 == 0, "Invalid number of weights in registers");
 
         while (block_q_idx < num_q_blocks) {
             CUTE_TIE_DECL(load_schedule(), q_stage_idx, q_phase, kv_start, num_kv_blocks);
@@ -337,7 +338,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 
                 #pragma unroll
                 for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                    float* accum = reinterpret_cast<float*>(shifted_accum + i * kNumHeads);
+                    auto accum = reinterpret_cast<float*>(shifted_accum + i * kNumHeads);
 
                     auto sum_0 = make_float2(0, 0);
                     auto sum_1 = make_float2(0, 0);
@@ -367,14 +368,14 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                         sum_1 = transform_smem(j + 2, sum_1);
                     }
 
-                    float result = sum_0.x + sum_0.y + sum_1.x + sum_1.y;
-                    result *= scale_kv;
+                    auto sum = __fadd2_rn(sum_0, sum_1);
+                    float result = scale_kv * (sum.x + sum.y);
 
                     // Store into the global memory
                     // NOTES: we have redundant writes here, consider more carefully
                     const uint32_t& q_idx = block_q_idx * BLOCK_Q + i;
                     if constexpr (kIsCompressedLogits) {
-                        if (kv_offset + v_offset >= seq_k_start[i])
+                        if (seq_k_start[i] <= kv_offset + v_offset and kv_offset + v_offset < seq_k_end[i])
                             logits[q_idx * stride_logits + kv_offset + v_offset - seq_k_start[i]] = result;
                     } else {
                         logits[q_idx * stride_logits + kv_offset + v_offset] = result;

@@ -139,7 +139,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                     const torch::Tensor& b, const torch::Tensor& sfb,
                     const torch::Tensor& d,
                     const std::optional<torch::Tensor>& c,
-                    const std::tuple<int, int, int>& recipe,
+                    std::optional<std::tuple<int, int, int>> recipe,
                     const std::string& compiled_dims) {
     // Shape must be `[B, M, K] @ [B, N, K].T`
     const auto& major_a = a.stride(-1) == 1 ? cute::UMMA::Major::K : cute::UMMA::Major::MN;
@@ -163,15 +163,16 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         return;
 
     // Transform scaling factors
-    const auto& transformed_sfa = layout::transform_sf_into_required_layout(sfa, m, k, recipe, batch_size,  true, false);
-    const auto& transformed_sfb = layout::transform_sf_into_required_layout(sfb, n, k, recipe, batch_size, false, false);
+    const auto& [transformed_sfa, transformed_sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        sfa, sfb, m, n, k, recipe, std::nullopt, std::nullopt, batch_size, batch_size, false);
 
     // Dispatch implementation
-    const auto& arch_major = device_runtime->get_arch_major();
+    const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 10) {
         sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, major_a, major_b, compiled_dims);
     } else {
-        DG_HOST_UNREACHABLE("Unsupported architecture");
+        const auto& major_sfb = get_major_type_ab(sfb);
+        sm90_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, major_a, major_b, major_sfb, compiled_dims);
     }
 }
 
@@ -182,6 +183,7 @@ static void fp8_einsum(const std::string& expr,
                        const std::optional<torch::Tensor>& c,
                        const std::tuple<int, int, int>& recipe) {
     // Some hardcoded Einstein sum kernels
+    const auto arch_major = device_runtime->get_arch_major();
     if (expr == "bhr,hdr->bhd") {
         // Permute dims to satisfy the order of (batch_size, m, n, k)
         // (batch_size, m, n, k): (h, b, d, r)
@@ -190,7 +192,7 @@ static void fp8_einsum(const std::string& expr,
         const auto& perm_d = d.permute({1, 0, 2});
         const auto& perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk");
-    } else if (expr == "bhd,hdr->bhr") {
+    } else if (expr == "bhd,hdr->bhr" and arch_major == 10) {
         // (batch_size, m, n, k): (h, b, r, d)
         const auto& perm_a = a.first.permute({1, 0, 2});
         const auto& perm_sfa = a.second.permute({1, 0, 2});
@@ -199,7 +201,7 @@ static void fp8_einsum(const std::string& expr,
         const auto& perm_d = d.permute({1, 0, 2});
         const auto& perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk");
-    } else if (expr == "bhd,bhr->hdr") {
+    } else if (expr == "bhd,bhr->hdr" and arch_major == 10) {
         // (batch_size, m, n, k): (h, d, r, b)
         const auto& perm_a = a.first.permute({1, 2, 0});
         const auto& perm_sfa = a.second.permute({1, 2, 0});

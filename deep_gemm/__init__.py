@@ -1,8 +1,6 @@
 import os
 import subprocess
 import torch
-from torch.version import cuda as cuda_version
-from packaging import version
 
 # Set some default environment provided at setup
 try:
@@ -29,9 +27,15 @@ from ._C import (
     cublaslt_gemm_tn, cublaslt_gemm_tt,
 )
 
-if version.parse(cuda_version) >= version.parse('12.1'):
+try:
     # DeepGEMM Kernels
     from ._C import (
+        # FP8 FP4 GEMMs
+        fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
+        fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
+        m_grouped_fp8_fp4_gemm_nt_contiguous,
+        m_grouped_fp8_fp4_gemm_nn_contiguous,
+        m_grouped_fp8_fp4_gemm_nt_masked,
         # FP8 GEMMs
         fp8_gemm_nt, fp8_gemm_nn,
         fp8_gemm_tn, fp8_gemm_tt,
@@ -55,6 +59,8 @@ if version.parse(cuda_version) >= version.parse('12.1'):
         fp8_mqa_logits,
         get_paged_mqa_logits_metadata,
         fp8_paged_mqa_logits,
+        # Hyperconnection kernels
+        tf32_hc_prenorm_gemm,
         # Layout kernels
         transform_sf_into_required_layout,
         get_mk_alignment_for_contiguous_layout
@@ -64,6 +70,9 @@ if version.parse(cuda_version) >= version.parse('12.1'):
     # TODO: remove these later
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
+except ImportError:
+    # Expected behavior for CUDA runtime version before 12.1
+    pass
 
 # Some utils
 from . import testing
@@ -71,7 +80,10 @@ from . import utils
 from .utils import *
 
 # Legacy Triton kernels for A100
-from . import legacy
+try:
+    from . import legacy
+except Exception as e:
+    print(f'Failed to load legacy DeepGEMM A100 Triton kernels: {e}')
 
 # Initialize CPP modules
 def _find_cuda_home() -> str:
@@ -97,4 +109,4 @@ _C.init(
     _find_cuda_home()                           # CUDA home
 )
 
-__version__ = '2.2.0'
+__version__ = '2.3.0'

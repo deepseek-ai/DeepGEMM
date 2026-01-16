@@ -127,7 +127,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     const auto& get_next_block_q_idx = [&]() -> cute::tuple<uint32_t, uint32_t> {
         return {block_q_idx + gridDim.x, q_iter_idx + 1};
     };
-    uint32_t seq_k_start[BLOCK_Q];
+    uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
     const auto& load_schedule = [&](const uint32_t& q_iter_offset = 0) -> cute::tuple<uint32_t, uint32_t, uint32_t, uint32_t> {
         uint32_t start = cute::numeric_limits<uint32_t>::max();
         uint32_t end = cute::numeric_limits<uint32_t>::min();
@@ -136,8 +136,9 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
             const auto& q_idx = min(block_q_idx * BLOCK_Q + i, seq_len - 1);
             seq_k_start[i] = __ldg(cu_seq_len_k_start + q_idx);
+            seq_k_end[i] = __ldg(cu_seq_len_k_end + q_idx);
             start = min(start, min(seq_k_start[i], seq_len_kv));
-            end = max(end, min(__ldg(cu_seq_len_k_end + q_idx), seq_len_kv));
+            end = max(end, min(seq_k_end[i], seq_len_kv));
         }
         start = start / 4 * 4;
         return {(q_iter_idx + q_iter_offset) % kNumQStages,       // Q pipeline stage
@@ -304,9 +305,9 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                     // NOTES: we have redundant writes here, consider more carefully
                     const uint32_t& q_idx = block_q_idx * BLOCK_Q + i;
                     if constexpr (kIsCompressedLogits) {
-                        if (kv_offset + v_0_offset >= seq_k_start[i])
+                        if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
                             logits[q_idx * stride_logits + kv_offset + v_0_offset - seq_k_start[i]] = v_0;
-                        if (kv_offset + v_1_offset >= seq_k_start[i])
+                        if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
                             logits[q_idx * stride_logits + kv_offset + v_1_offset - seq_k_start[i]] = v_1;
                     } else {
                         logits[q_idx * stride_logits + kv_offset + v_0_offset] = v_0;

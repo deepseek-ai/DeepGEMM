@@ -60,7 +60,7 @@ struct SM90ArchSpec {
 
     static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                    const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+                                    const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                     const int& m, const int& n, const int& k,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // SM90 FP32 output does not support `block_m == 256`
@@ -89,16 +89,12 @@ struct SM90ArchSpec {
         return block_m <= 128 or block_n <= 128;
     }
 
-    static bool is_num_stages_legal(const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+    static bool is_num_stages_legal(const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                     const int& num_stages,
                                     const int& block_m, const int& block_n, const int& block_k) {
         // Unrolling both stages and `num_former_iters` will cause large code size
-        if (ab_dtype == torch::kFloat8_e4m3fn and block_k % block_n != 0 and block_k / std::gcd(block_n, block_k) <= 4)
+        if (mma_kind == MmaKind::MXFP8FP4 and block_k % block_n != 0 and block_k / std::gcd(block_n, block_k) <= 4)
             return num_stages <= 4;
-        return true;
-    }
-
-    static bool should_minimize_num_sms() {
         return true;
     }
 
@@ -134,8 +130,8 @@ struct SM90ArchSpec {
 
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,
                                                           const int& block_m, const int& block_n, const int& block_k,
-                                                          const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype) {
-        if (ab_dtype == torch::kBFloat16)
+                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype) {
+        if (mma_kind == MmaKind::BF16)
             return {0, 0};
 
         // NOTES: 128 is for 2D TMA alignment requirement

@@ -79,13 +79,11 @@ static void sm90_bf16_gemm(const torch::Tensor& a,
                            const int& m, const int& n, const int& k,
                            const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                            const std::string& compiled_dims) {
-    DG_HOST_ASSERT(not c.has_value());
-
-    const auto& aligned_k = align(k, 64);
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::Normal, KernelType::KernelNoSF,
         m, n, k, 1, major_a, major_b,
-        torch::kBFloat16, d.scalar_type(), c.has_value(),
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms());
 
     // Requires no TMA splits
@@ -107,7 +105,7 @@ static void sm90_bf16_gemm(const torch::Tensor& a,
 
     // Launch
     const SM90BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = aligned_k,
+        .m = m, .n = n, .k = k,
         .num_groups = 1,
         .compiled_dims = compiled_dims,
         .gemm_config = config,
@@ -138,7 +136,8 @@ static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::MGroupedContiguous, KernelType::KernelNoSF,
         m, n, k, 1, major_a, major_b,
-        torch::kBFloat16, d.scalar_type(), false,
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     // Requires no TMA splits
@@ -192,7 +191,8 @@ static void sm90_bf16_m_grouped_gemm_masked(const torch::Tensor& a,
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::MGroupedMasked, KernelType::KernelNoSF,
         expected_m, n, k, num_groups, major_a, major_b,
-        torch::kBFloat16, d.scalar_type(), false,
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     // Requires no TMA splits
@@ -253,7 +253,8 @@ static void sm90_bf16_k_grouped_gemm(const torch::Tensor& a,
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::KGroupedContiguous, KernelType::KernelNoSF,
         m, n, max_k, num_groups, cute::UMMA::Major::MN, cute::UMMA::Major::MN,
-        torch::kBFloat16, d.scalar_type(), c.has_value(),
+        a.scalar_type(), b.scalar_type(),
+        d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms());
 
     // Create tensor descriptors
@@ -300,7 +301,8 @@ static void sm90_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::Batched, KernelType::KernelNoSF,
         b, d, r, h, cute::UMMA::Major::K, cute::UMMA::Major::K,
-        torch::kBFloat16, tensor_d.scalar_type(), false,
+        tensor_a.scalar_type(), tensor_b.scalar_type(),
+        tensor_d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     const int& load_block_m = SM90ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m);
@@ -346,7 +348,8 @@ static void sm90_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
     const auto& config = get_best_config<SM90ArchSpec>(
         GemmType::Batched, KernelType::KernelNoSF,
         b, r, d, h, cute::UMMA::Major::K, cute::UMMA::Major::MN,
-        torch::kBFloat16, tensor_d.scalar_type(), false,
+        tensor_a.scalar_type(), tensor_b.scalar_type(),
+        tensor_d.scalar_type(), false,
         device_runtime->get_num_sms());
 
     const int& load_block_m = SM90ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m);

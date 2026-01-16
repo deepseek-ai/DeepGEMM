@@ -58,7 +58,7 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
 }
 
 template <uint32_t kNextN, bool kIsContextLens2D,
-          uint32_t BLOCK_KV, uint32_t kNumMathWarpGroups>
+          uint32_t BLOCK_KV, uint32_t kNumBlocksPerSplit>
 struct PagedMQALogitsScheduler {
     uint32_t batch_size;
     const uint32_t* context_lens;
@@ -79,8 +79,8 @@ struct PagedMQALogitsScheduler {
 
         const auto& current_pack = __ldg(reinterpret_cast<const uint2*>(schedule_meta) + sm_idx);
         const auto& end_pack = __ldg(reinterpret_cast<const uint2*>(schedule_meta) + sm_idx + 1);
-        current_q_idx = current_pack.x, current_kv_idx = current_pack.y * kNumMathWarpGroups;
-        end_q_idx = end_pack.x, end_kv_idx = end_pack.y * kNumMathWarpGroups;
+        current_q_idx = current_pack.x, current_kv_idx = current_pack.y * kNumBlocksPerSplit;
+        end_q_idx = end_pack.x, end_kv_idx = end_pack.y * kNumBlocksPerSplit;
 
         current_num_kv = get_num_kv(current_q_idx);
     }
@@ -93,7 +93,7 @@ struct PagedMQALogitsScheduler {
         if (q_idx == end_q_idx and kv_idx == end_kv_idx)
             return false;
 
-        current_kv_idx += kNumMathWarpGroups;
+        current_kv_idx += kNumBlocksPerSplit;
         if (current_kv_idx >= current_num_kv) {
             ++ current_q_idx;
             current_kv_idx = 0;

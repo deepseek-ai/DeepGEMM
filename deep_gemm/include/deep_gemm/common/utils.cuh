@@ -148,6 +148,10 @@ __device__  __forceinline__ void st_shared(const void* ptr, uint32_t x, uint32_t
     asm volatile("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(__cvta_generic_to_shared(ptr)), "r"(x), "r"(y), "r"(z), "r"(w));
 }
 
+__device__ __forceinline__ void st_shared(const __int128_t* ptr, __int128_t val) {
+    asm volatile("st.shared.b128 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "q"(val));
+}
+
 template <typename old_t>
 __device__ __forceinline__ int cast_into_bf16_and_pack(old_t& x, old_t& y) {
     auto bf16x2 = __float22bfloat162_rn({*reinterpret_cast<float*>(&x), *reinterpret_cast<float*>(&y)});

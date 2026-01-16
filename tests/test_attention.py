@@ -1,12 +1,14 @@
+import dataclasses
 import random
 import torch
-from typing import Tuple
+from typing import Tuple, List
 
 import deep_gemm
 from deep_gemm.testing import (
     bench_kineto,
     calc_diff, count_bytes,
-    ignore_env, get_arch_major
+    ignore_env, get_arch_major,
+    test_filter
 )
 from deep_gemm.utils import ceil_div, per_custom_dims_cast_to_fp8
 
@@ -154,7 +156,7 @@ def test_mqa_logits():
                         ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
                         logits = logits.masked_fill(neginf_mask, 0)
                         diff = calc_diff(logits, ref_logits)
-                        assert diff < 1e-3, f"{diff=}"
+                        assert diff < 1e-3, f'{diff=}'
                     else:
                         ref_cost = ref_fp8_mqa_logits(q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, cost_only=True)
 
@@ -204,8 +206,6 @@ def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
 
 
 def test_paged_mqa_logits():
-    # TODO: fully refactor with PyTest
-
     print('Testing FP8 Paged MQA Logits:')
     max_model_len = 111 * 1000
     for is_context_lens_2d in (False, True):
@@ -264,13 +264,15 @@ def test_paged_mqa_logits():
                     else:
                         t, clean_t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
                                                   ('fp8_paged_mqa_logits', 'clean_logits'))
-                    clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
+                        clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
                     print(f' > BSZ={batch_size:3}, NextN={next_n:1}, H={heads:2}, D={index_dim:2}, L={avg_kv:6}: '
                         f'{tflops / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, '
                         f'{(input_bytes + output_bytes) / t / 1e9:4.0f} GB/s', end='')
                     # noinspection PyUnboundLocalVariable
                     print(f' | clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s' if not is_context_lens_2d else '')
     print()
+
+
 
 
 if __name__ == '__main__':

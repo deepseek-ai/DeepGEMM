@@ -13,7 +13,7 @@ from generators import (
 
 def test_m_grouped_gemm_contiguous_tl() -> None:    
     print('Testing m-grouped contiguous Triton GEMM:')
-    for _, num_groups, expected_m_per_group, n, k, major_a, major_b in enumerate_m_grouped_contiguous(torch.bfloat16):
+    for _, _, num_groups, expected_m_per_group, n, k, major_a, major_b, _ in enumerate_m_grouped_contiguous(torch.bfloat16):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
 

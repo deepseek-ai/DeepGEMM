@@ -51,6 +51,8 @@ struct Scheduler {
     uint32_t current_group_idx = 0;
     // Only used for masked layout
     uint32_t current_m_cumsum = 0;
+    // Only used for countiguous psum layout
+    uint32_t last_psum_m = 0, current_psum_m, current_m_block_cumsum = 0;
     // Only used for k-grouped layout
     uint32_t current_shape_k, current_num_valid_groups = 0, current_k_cumsum = 0, current_sf_k_cumsum = 0;
     uint32_t next_group_idx, next_shape_k;
@@ -72,12 +74,16 @@ struct Scheduler {
         current_shape_k = shape_k;
         if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::Batched) {
             num_blocks = num_m_blocks * num_n_blocks;
-        } else if (kGemmType == GemmType::MGroupedContiguous) {
+        } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             num_blocks = num_m_blocks * num_n_blocks;
             this->grouped_layout = grouped_layout;
-        } else if (kGemmType == GemmType::MGroupedMasked) {
+        } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
             this->grouped_layout = grouped_layout;
-        } else if (kGemmType == GemmType::KGroupedContiguous) {
+        } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
+            this->grouped_layout = grouped_layout;
+            current_psum_m = __ldg(grouped_layout);
+            num_m_blocks = ceil_div(current_psum_m, BLOCK_M);
+        } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
             this->grouped_layout = grouped_layout;
             get_next_k_group(current_group_idx, current_shape_k);
             next_group_idx = current_group_idx + 1;
@@ -131,7 +137,7 @@ struct Scheduler {
         } else if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             const auto offset = kWithGroupOffset ? cute::max(0, __ldg(grouped_layout + m_block_idx * BLOCK_M)) : 0;
             return offset * shape_dim + block_idx * block_size;
-        } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
+        } else if constexpr (kGemmType == GemmType::MGroupedMasked or kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
             const auto offset = kWithGroupOffset ? current_group_idx : 0;
             return offset * shape_dim + block_idx * block_size;
         } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
@@ -172,6 +178,28 @@ struct Scheduler {
             }
 
             get_swizzled_block_idx(next_block_idx - current_m_cumsum * num_n_blocks, m_block_idx, n_block_idx);
+        } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) { 
+            while (true) {
+                // Within current group
+                if (next_block_idx < (current_m_block_cumsum + num_m_blocks) * num_n_blocks)
+                    break;
+
+                // Move to check the next group
+                if (++ current_group_idx == kNumGroups)
+                    return false;
+
+                // NOTES: `num_m_blocks` varies with the increase of the group index
+                last_psum_m = align(current_psum_m, 128u);
+                current_psum_m = __ldg(grouped_layout + current_group_idx);
+                current_m_block_cumsum += num_m_blocks;
+                num_m_blocks = ceil_div(current_psum_m - last_psum_m, BLOCK_M);
+            }
+
+            get_swizzled_block_idx(next_block_idx - current_m_block_cumsum * num_n_blocks, m_block_idx, n_block_idx);
+
+            // NOTES: `last_psum_m` is aligned with 128
+            m_block_idx += last_psum_m / BLOCK_M;
+            DG_STATIC_ASSERT(128 % BLOCK_M == 0, "Invalid BLOCK_M");
         } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
             while (true) {
                 // End of the task
@@ -248,6 +276,9 @@ struct Scheduler {
             return __ldg(grouped_layout + m_offset + m_block_idx * BLOCK_M) >= 0;
         } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
             return m_offset + m_block_idx * BLOCK_M < __ldg(grouped_layout + current_group_idx);
+        } else {
+            // Unreachable 
+            DG_TRAP_ONLY_DEVICE_ASSERT(false);
         }
     }
 };

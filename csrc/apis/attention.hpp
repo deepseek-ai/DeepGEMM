@@ -53,11 +53,10 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
         return;
 
     // Transform SFA and SFB into compute-required layout
-    if (not recipe.has_value())
-        recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
-    DG_HOST_ASSERT(recipe.value() == std::make_tuple(1, 1, 128) or recipe.value() == std::make_tuple(1, 128, 128));
-    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), std::nullopt,  true, disable_ue8m0_cast);
-    const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), std::nullopt, false, disable_ue8m0_cast);
+    const auto& [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, disable_ue8m0_cast);
+    DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
 
     // Dispatch into different implements
     const auto& arch_major = device_runtime->get_arch_major();
@@ -66,7 +65,9 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
         const auto& major_sfb = get_major_type_ab(sfb);
         sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, epilogue_type);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, compiled_dims, epilogue_type);
+        // NOTES: Only granularity 128 and FP8 are exposed in the API
+        sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k,
+                                128, 128, major_a, major_b, compiled_dims, epilogue_type);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -229,8 +230,8 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     );
 
     // Allocate output
-    constexpr int num_math_warp_groups = 4;
-    const auto& aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv);
+    constexpr int split_kv = 256;
+    const auto& aligned_max_context_len = align(max_context_len, split_kv);
     auto logits = torch::empty({batch_size * next_n, aligned_max_context_len}, q.options().dtype(torch::kFloat));
     logits = logits.slice(-1, 0, max_context_len);
 
@@ -239,7 +240,7 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     if (arch_major == 9 or arch_major == 10) {
         smxx_fp8_paged_mqa_logits(q, kv_cache, kv_cache_scales, weights, context_lens, logits, block_table, schedule_meta,
                                   batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
-                                  kv_cache_stride_bytes, aligned_max_context_len, block_table_stride, num_sms, num_math_warp_groups);
+                                  kv_cache_stride_bytes, aligned_max_context_len, block_table_stride, num_sms, split_kv);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -251,7 +252,8 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     }
     return logits;
 }
-#endif 
+
+#endif
 
 static void register_apis(pybind11::module_& m) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
