@@ -163,16 +163,9 @@ def generate_normal(m: int, n: int, k: int,
     b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
         torch.empty((m, n), device='cuda', dtype=out_dtype)
+    c = d if accumulate else None
 
-    if accumulate:
-        if out_dtype == torch.bfloat16:
-            c = torch.ones_like(d) * 10
-        else:
-            c = d
-    else:
-        c = None
-
-    bias = torch.ones((n), device='cuda', dtype=out_dtype) * 10 if with_bias else None
+    bias = torch.randn((n), device='cuda', dtype=out_dtype) * 10 if with_bias else None
 
     if accumulate:
         ref_d = (a.float() @ b.float().t() + c).to(out_dtype)

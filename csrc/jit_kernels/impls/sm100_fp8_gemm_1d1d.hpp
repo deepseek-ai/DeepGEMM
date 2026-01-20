@@ -95,7 +95,7 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         m, n, k, 1, major_a, major_b,
         torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
         device_runtime->get_num_sms(), bias.has_value());
-
+    
     const auto& cd = c.value_or(d);
     const auto& tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                                SM100ArchSpec::get_ab_load_block_m(config.multicast_config, config.block_m),
@@ -132,7 +132,7 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         .epilogue_type = epilogue_type,
         .gemm_config = config,
         .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
-                                  232448-128, 
+                                  config.smem_config.smem_size, 
                                   config.multicast_config.num_multicast),
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,

@@ -114,8 +114,8 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
     // Different archs have different epilogue pipelines
     const int& smem_cd = ArchSpec::get_smem_cd_size(kernel_type, block_m, block_n, swizzle_cd_mode, cd_dtype);
 
-    // Bias shared memory (aligned to 128 bytes for TMA)， 2 = NumTMAStoreStages
-    const int& smem_bias = with_bias ? align(cd_elem_size * block_n, 128) * 2 : 0;
+    // Bias shared memory (aligned to 128 bytes for TMA) and 32 bytes for bias barrier， 2 = NumTMAStoreStages
+    const int& smem_bias = with_bias ? align(cd_elem_size * block_n, 128) * 2 + 32: 0;
 
     // A/B shared memory
     const int& smem_a_per_stage = load_block_m * block_k * ab_elem_size;

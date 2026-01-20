@@ -162,9 +162,15 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     auto with_sf_full_barriers      = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
     auto tmem_full_barriers         = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
     auto tmem_empty_barriers        = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages + i); });
+    auto bias_full_barriers       = PatternVisitor([=](const uint32_t& i) { if constexpr (! kWithBias) { std::abort(); } return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages * 2 + i); });
+    auto bias_empty_barriers      = PatternVisitor([=](const uint32_t& i) { if constexpr (! kWithBias) { std::abort(); } return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages * 3 + i); });
 
     // Fill the tensor memory pointer
-    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2);
+    uint32_t barrier_offset = kNumStages * 3 + kNumEpilogueStages * 2;
+    if constexpr (kWithBias) {
+        barrier_offset += kNumEpilogueStages * 2;
+    }
+    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + barrier_offset);
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // Initialize barriers
@@ -183,6 +189,14 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             tmem_full_barriers[i]->init(1);
             // Arrive only at the leader CTA
             tmem_empty_barriers[i]->init(kNumMulticast * kNumUMMAStoreThreads);
+        }
+
+        if constexpr (kWithBias) {
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
+                bias_empty_barriers[i]->init(kNumUMMAStoreThreads);
+                bias_full_barriers[i]->init(1);
+            }
         }
 
         // Make initialized barrier visible in async proxy
@@ -270,18 +284,31 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     num_arrival_bytes += (BLOCK_M + BLOCK_N) * sizeof(uint32_t);
                 }
 
-                if constexpr (kWithBias){
-                    if (k_block_idx == 0){
-                        tma_copy<BLOCK_N, 1, 0, cd_dtype_t>(&tensor_map_bias, full_barriers[stage_idx], smem_bias[accum_stage_idx], n_block_idx * BLOCK_N, 0, 1, 0);
-                        num_arrival_bytes += BLOCK_N * sizeof(cd_dtype_t);
-                    }
-                }
-
                 // Arrive at full barriers
                 full_barriers[stage_idx]->arrive_and_expect_tx(num_arrival_bytes);
             }
         }
-    } else if (warp_idx == 1 and is_leader_cta) {
+    } else if (warp_idx == 3 and cute::elect_one_sync()) {
+        if constexpr (kWithBias) {
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
+                auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
+
+                uint32_t wait_bytes = BLOCK_N * sizeof(cd_dtype_t);
+                bias_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
+                tma_copy<BLOCK_N, 1, 0, cd_dtype_t>(&tensor_map_bias,
+                     bias_full_barriers[accum_stage_idx], smem_bias[accum_stage_idx], n_block_idx * BLOCK_N, 0, 1, 0);
+                bias_full_barriers[accum_stage_idx]->arrive_and_expect_tx(wait_bytes);
+            }
+
+            const auto& iter_idx = scheduler.current_iter - 1;
+            if (kNumMulticast > 1 and iter_idx >= 0) {
+                const auto& accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
+                bias_empty_barriers[iter_idx % kNumEpilogueStages]->wait(accum_phase_idx);
+            }
+        }
+    }
+    else if (warp_idx == 1 and is_leader_cta) {
         // MMA issue warp
         // NOTES: only the leader CTA will do this
         // Make instruction descriptor
@@ -465,6 +492,10 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
             tcgen05_after_thread_sync();
 
+            if constexpr (kWithBias) {
+                bias_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
+            }
+
             // Load from tensor memory into registers, and write shared memory with STSM
             DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
             DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
@@ -557,6 +588,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     if (w == kNumMWaves - 1 and s == BLOCK_N / STORE_BLOCK_N - 1) {
                         tcgen05_before_thread_sync();
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        if constexpr (kWithBias) {
+                            bias_empty_barriers[accum_stage_idx]->arrive();
+                        }
                     }
 
                     // Synchronize all threads and issue TMA
