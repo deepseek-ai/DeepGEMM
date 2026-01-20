@@ -4,6 +4,7 @@
 #include <exception>
 #include <string>
 #include <sstream>
+#include <source_location>
 
 #include "compatibility.hpp"
 
@@ -17,20 +18,25 @@ public:
         message = std::string(name) + " error (" + file + ":" + std::to_string(line) + "): " + error;
     }
 
+    explicit DGException(const char *name, const char* file, const int line, const std::string& error, const std::source_location& caller) {
+        message = std::string(name) + " error (" + file + ":" + std::to_string(line) + "): " + error
+        + "\ncaller: " + caller.file_name() + '(' + caller.line() + ')' + caller.function_name();
+    }
+
     const char *what() const noexcept override {
         return message.c_str();
     }
 };
 
 #ifndef DG_STATIC_ASSERT
-#define DG_STATIC_ASSERT(cond, ...) static_assert(cond, __VA_ARGS__)
+#define DG_STATIC_ASSERT(cond, ...) static_assert(cond __VA_OPT__(,) __VA_ARGS__)
 #endif
 
 #ifndef DG_HOST_ASSERT
-#define DG_HOST_ASSERT(cond) \
+#define DG_HOST_ASSERT(cond, ...) \
 do { \
     if (not (cond)) { \
-        throw DGException("Assertion", __FILE__, __LINE__, #cond); \
+        throw DGException("Assertion", __FILE__, __LINE__, #cond __VA_OPT__(,) __VA_ARGS__); \
     } \
 } while (0)
 #endif
