@@ -41,7 +41,7 @@ struct SM90ArchSpec {
         return cd_dtype != torch::kFloat;
     }
 
-    static bool is_block_size_legal(const KernelType& kernel_type,
+static bool is_block_size_legal(const KernelType& kernel_type,
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                     const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
                                     const int& block_m, const int& block_n, const int& block_k) {
@@ -56,19 +56,13 @@ struct SM90ArchSpec {
                 return false;
             if (kernel_type == KernelType::KernelNoSF and block_n > 200)
                 return false;
+            }
+        
+        if (block_m * block_n > 60000) {
+            return false;
         }
 
-        // Too many scaling factors in a single block: `block_n > block_k and std::gcd(block_n, block_k) != block_n - block_k`
-        // Or too many register spills
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 192))
-            return false;
-
-        // Avoid bank conflicts for FP32 output
-        if (cd_dtype == torch::kFloat and block_n % 16 == 0)
-            return false;
-
-        // The block sizes cannot be too large (for enough registers), so at least one dim less than 128
-        return block_m <= 128 or block_n <= 128;
+        return true;
     }
 
     static bool is_num_stages_legal(const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,

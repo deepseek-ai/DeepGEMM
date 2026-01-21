@@ -28,7 +28,7 @@ public:
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_d;
-        CUtensorMap tensor_map_sfa;
+        void *sfa;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -68,7 +68,7 @@ static void __instantiate_kernel() {{
             args.sfb, args.grouped_layout,
             args.m, args.n, args.k,
             args.tensor_map_a, args.tensor_map_b,
-            args.tensor_map_d, args.tensor_map_sfa));
+            args.tensor_map_d, args.sfa));
     }
 };
 
@@ -108,8 +108,6 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                 SM90ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.smem_config.swizzle_cd_mode);
-    const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                  config.block_m, config.block_k, 1, 0);
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
@@ -126,7 +124,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
-        .tensor_map_sfa = tensor_map_sfa,
+        .sfa = sfa.data_ptr(),
     };
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_gemm_1d2d", code);
@@ -168,8 +166,6 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                 SM90ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.smem_config.swizzle_cd_mode);
-    const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                  config.block_m, config.block_k, 1, 0);
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
@@ -186,7 +182,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
-        .tensor_map_sfa = tensor_map_sfa,
+        .sfa = sfa.data_ptr(),
     };
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_m_grouped_fp8_gemm_contiguous_1d2d", code);
@@ -229,8 +225,6 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
                                                 SM90ArchSpec::get_cd_store_block_n(config.block_n),
                                                 static_cast<int>(d.stride(-2)), num_groups,
                                                 config.smem_config.swizzle_cd_mode);
-    const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                  config.block_m, config.block_k, num_groups, 0);
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
@@ -247,7 +241,7 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
-        .tensor_map_sfa = tensor_map_sfa,
+        .sfa = sfa.data_ptr(),
     };
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_m_grouped_gemm_masked_1d2d", code);

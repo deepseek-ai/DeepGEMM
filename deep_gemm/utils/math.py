@@ -28,6 +28,20 @@ def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool) -> Tuple[torch.Tenso
     return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, padded_n)[:, :n].contiguous(), sf
 
 
+def per_token_cast_to_fp8_static(x: torch.Tensor, use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    m, n = x.shape
+    
+    scale = 2.0
+    # Static scale of 0.010 for all tokens
+    sf = torch.full((m, 1), scale, dtype=torch.float32, device=x.device)
+    
+    # Apply the static scale and convert to fp8
+    x_fp8 = (x * (1.0 / scale)).to(torch.float8_e4m3fn).contiguous()
+    
+    return x_fp8, sf.squeeze(1)
+
+
 def per_channel_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(0) % 128 == 0
     m, n = x.shape

@@ -5,7 +5,7 @@ from typing import Generator, List
 
 from deep_gemm.utils import (
     align, ceil_div,
-    per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8, global_cast_to_fp8,       
+    per_token_cast_to_fp8, per_token_cast_to_fp8_static, per_channel_cast_to_fp8, per_block_cast_to_fp8, global_cast_to_fp8,       
     get_mk_alignment_for_contiguous_layout
 )
 
@@ -192,6 +192,27 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
     m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
     d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_d = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
+    # Quantize a to FP8
+    a_fp8, a_scale = per_token_cast_to_fp8_static(a, use_ue8m0=False)
+
+    # Dequantize back to bfloat16 - fix the unsqueeze dimension
+    a = (a_fp8.to(torch.bfloat16) * a_scale.unsqueeze(1)).to(torch.bfloat16)
+
+
+    # Quantize b to FP8 (per group)
+    b_fp8_list = []
+    b_scale_list = []
+    for i in range(num_groups):
+        b_i_fp8, b_i_scale = per_token_cast_to_fp8_static(b[i], use_ue8m0=False)
+        b_fp8_list.append(b_i_fp8)
+        b_scale_list.append(b_i_scale)
+    
+    # Stack back into (num_groups, n, k) shape
+    b_fp8 = torch.stack(b_fp8_list, dim=0)
+    b_scales = torch.stack(b_scale_list, dim=0)
+    
+    # Dequantize back to bfloat16
+    b = (b_fp8.to(torch.bfloat16) * b_scales.unsqueeze(2)).to(torch.bfloat16)
 
     start = 0
     for i, (actual_m, aligned_m) in enumerate(zip(actual_ms, aligned_ms)):
@@ -208,7 +229,7 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
         return m, a, b, m_indices, d, ref_d
 
     assert major_a.is_k_major()
-    a_fp8 = per_token_cast_to_fp8(a, use_ue8m0=use_ue8m0)
+    a_fp8 = per_token_cast_to_fp8_static(a, use_ue8m0=use_ue8m0)
     b_fp8 = (torch.empty_like(b, dtype=torch.float8_e4m3fn),
              torch.empty((num_groups), device='cuda', dtype=torch.float)) 
     for i in range(num_groups):

@@ -45,17 +45,13 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                         const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+                        float* sfa) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
-    DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(constexpr_ceil_div(BLOCK_N, BLOCK_K) == 1 or (constexpr_gcd(BLOCK_N, BLOCK_K) == BLOCK_N - BLOCK_K), "Too much B scales in a single block");
-
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     DG_STATIC_ASSERT(BLOCK_M % WGMMA::M == 0, "Invalid block size");
-
     // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
@@ -74,12 +70,14 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     const uint32_t num_total_k_blocks = ceil_div(shape_k, BLOCK_K);
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = get_lane_idx();
+    float scaleA = sfa[0];
+    //printf("scaleA = %f\n", scaleA);
+
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
-        cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_d);
     }
     __syncwarp();
@@ -143,6 +141,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
         phase ^= stage_idx == 0;
     };
     bool load_sfb = true;
+    // printf("lets f go \n");
     if (warp_idx >= kNumMathThreads / 32) {
         // TMA warp-group for loading data
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
@@ -169,15 +168,12 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier),
                              smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
                              num_tma_multicast_a);
-                    tma_copy(&tensor_map_sfa, reinterpret_cast<uint64_t*>(&full_barrier),
-                             smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.get_global_idx<kWithGroupOffsetA>(shape_k_scales, 1, k_block_idx),
-                             num_tma_multicast_a);
 
                     // Issue TMA B
                     tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                              smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                              num_tma_multicast_b);
-                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
+                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
                 }
             }
 
@@ -222,8 +218,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // Accumulation for WGMMA or CUDA promotion
             constexpr uint32_t WAVE_BLOCK_M = WGMMA::M * (BLOCK_M <= 64 ? 1 : 2);
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
-            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
-
+            float final_accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};
             // Empty barrier arrival
             auto empty_barrier_arrive = [&]() {
                 if constexpr (kNumTMAMulticast == 1) {
@@ -248,9 +243,6 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         const auto& a_desc_base_lo = a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
                         const auto& b_desc_base_lo = b_desc_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
 
-                        // Read B scales
-                        float scale_b_0 = ld_shared(smem_sfb + group_index);
-
                         // Wait TMA arrivals
                         full_barriers[stage_idx]->wait(phase);
 
@@ -258,51 +250,28 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         #pragma unroll
                         for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
                             auto m_offset = local_idx * WAVE_BLOCK_M;
+                            auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
 
-                            // Read A scales
-                            // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
-                            auto scale_a_0 = ld_shared(smem_sfa[stage_idx] + r_0 + m_offset);
-                            auto scale_a_1 = ld_shared(smem_sfa[stage_idx] + r_1 + m_offset);
 
                             // Commit WGMMA instructions
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                                warpgroup_fence_operand(accum[i]);
+                                warpgroup_fence_operand(shifted_accum[i]);
                             warpgroup_arrive();
                             #pragma unroll
                             for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
                                 a_desc.reg32_[0] = a_desc_base_lo + (m_offset * BLOCK_K + k * WGMMA::K) / 16;
                                 b_desc.reg32_[0] = b_desc_base_lo + k * WGMMA::K / 16;
-                                WGMMA::wgmma(a_desc, b_desc, accum, k);
+                                // todo: remove zeroing shifted_accum
+                                WGMMA::wgmma(a_desc, b_desc, shifted_accum, true);
                             }
                             warpgroup_commit_batch();
-                            #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                                warpgroup_fence_operand(accum[i]);
-                            warpgroup_wait<0>();
-
-                            // Notify barrier arrival at the last warpgroup wave
-                            if (local_idx == BLOCK_M / WAVE_BLOCK_M - 1)
-                                empty_barrier_arrive();
-
-                            // Promote with scales
-                            // NOTES: making it as predicates is very important for performance, comparing to two loops
-                            float scale_0_0 = scale_a_0 * scale_b_0, scale_1_0 = scale_a_1 * scale_b_0;
-                            float scale_0_1, scale_1_1;
-                            if constexpr (not kMustUseUniformedScaleB)
-                                scale_0_1 = scale_a_0 * scale_b_0, scale_1_1 = scale_a_1 * scale_b_0;
-
-                            auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
-                            #pragma unroll
-                            for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                                // NOTES: for unrolled `num_former_iters` cases, we expect the compiler to automatically make it a constant
-                                bool predicate = kMustUseUniformedScaleB or i < num_former_iters;
-                                shifted_accum[i * 4 + 0] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 0];
-                                shifted_accum[i * 4 + 1] += (predicate ? scale_0_0 : scale_0_1) * accum[i * 4 + 1];
-                                shifted_accum[i * 4 + 2] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 2];
-                                shifted_accum[i * 4 + 3] += (predicate ? scale_1_0 : scale_1_1) * accum[i * 4 + 3];
-                            }
+                            //#pragma unroll
+                            //for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+                            //    warpgroup_fence_operand(shifted_accum[i]);
                         }
+                        warpgroup_wait<0>();
+                        empty_barrier_arrive();
                     }
                 });
             } else {
@@ -327,6 +296,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 cute::tma_store_wait<0>();
             cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
 
+            // Read B scales
+            float scale = ld_shared(smem_sfb + group_index) * scaleA;
             // Write back to shared memory using STSM and issue TMA stores
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
             #pragma unroll
@@ -334,6 +305,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 auto m_offset = local_idx * WAVE_BLOCK_M;
                 auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                 #pragma unroll
+
                 for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
                     // Swizzle or padding into the correct address
                     uint8_t* smem_ptr = nullptr;
@@ -367,8 +339,8 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
                     // NOTES: only 16 lanes' addresses are used
                     SM90_U32x2_STSM_N<nv_bfloat162>::copy(
-                        __float22bfloat162_rn({shifted_accum[i * 4 + 0], shifted_accum[i * 4 + 1]}),
-                        __float22bfloat162_rn({shifted_accum[i * 4 + 2], shifted_accum[i * 4 + 3]}),
+                        __float22bfloat162_rn({shifted_accum[i * 4 + 0] * scale, shifted_accum[i * 4 + 1] * scale}),
+                        __float22bfloat162_rn({shifted_accum[i * 4 + 2] * scale, shifted_accum[i * 4 + 3] * scale}),
                         smem_ptr
                     );
                 }

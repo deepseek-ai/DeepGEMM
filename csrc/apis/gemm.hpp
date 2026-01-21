@@ -145,20 +145,13 @@ static void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     // Transform SFA and SFB into compute-required layout
     if (not recipe.has_value())
         recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
-    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), std::nullopt,  true, disable_ue8m0_cast);
     const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(),   num_groups, false, disable_ue8m0_cast);
 
     // Dispatch implementation
     const auto& arch_major = device_runtime->get_arch_major();
-    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
-        sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, m_indices,
+    if (arch_major == 9 and a.second.scalar_type() == torch::kFloat) {
+        sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, a.second, b.first, sfb, d, m_indices,
                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_m_grouped_fp8_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, m_indices,
-                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kFloat) {
-        sm100_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, m_indices,
-                                                 num_groups, m, n, k, major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
