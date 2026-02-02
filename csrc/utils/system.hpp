@@ -6,8 +6,8 @@
 #include <random>
 #include <string>
 #include <memory>
-#include <unistd.h>
 
+#include "msvc_compat.hpp"
 #include "exception.hpp"
 #include "format.hpp"
 

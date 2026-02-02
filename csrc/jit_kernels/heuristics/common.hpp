@@ -119,7 +119,8 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
     const int& smem_b_per_stage = load_block_n * block_k * ab_elem_size;
 
     // SF shared memory
-    const auto& [smem_sfa_per_stage, smem_sfb_per_stage] =
+    int smem_sfa_per_stage, smem_sfb_per_stage;
+    std::tie(smem_sfa_per_stage, smem_sfb_per_stage) =
         ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_m, block_n, block_k, mma_kind, cd_dtype);
     const int& smem_extra_sfb = ArchSpec::get_extra_sfb_smem_size(m, n, k, block_m, block_n, block_k);
 
@@ -233,7 +234,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // Decide the number of TMA multicasts and whether broadcast on A
     MulticastConfig best_multicast_config = {1, false};
-    auto [is_legal_on_a, is_legal_on_b] = ArchSpec::get_multicast_legality(
+    bool is_legal_on_a, is_legal_on_b;
+    std::tie(is_legal_on_a, is_legal_on_b) = ArchSpec::get_multicast_legality(
         gemm_type, num_groups, m, n, best_block_m, best_block_n, num_sms);
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B

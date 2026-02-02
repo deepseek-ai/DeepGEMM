@@ -69,9 +69,10 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
 
     // Type and shape checks
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
-    const auto [n , k_] = check_ab_fp8_fp4(b.first, major_b, arch_major);
-    const auto [m_, n_] = get_shape<2>(d);
+    int m, k, n, k_, m_, n_;
+    std::tie(m, k) = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    std::tie(n, k_) = check_ab_fp8_fp4(b.first, major_b, arch_major);
+    std::tie(m_, n_) = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
@@ -80,7 +81,9 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         return;
 
     // Transform SFA and SFB into compute-required layout
-    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+    torch::Tensor sfa, sfb;
+    int gran_k_a, gran_k_b;
+    std::tie(sfa, sfb, gran_k_a, gran_k_b) = layout::transform_sf_pair_into_required_layout(
         a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
 
     // Dispatch into different implements
@@ -161,9 +164,10 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
 
     // Type and shape checks
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
-    const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
-    const auto [m_, n_] = get_shape<2>(d);
+    int m, k, num_groups, n, k_, m_, n_;
+    std::tie(m, k) = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    std::tie(num_groups, n, k_) = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
+    std::tie(m_, n_) = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
@@ -171,10 +175,12 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
 
     // Layout checks
     if (use_psum_layout) {
-        const auto& [num_groups_] = get_shape<1>(grouped_layout);
+        int num_groups_;
+        std::tie(num_groups_) = get_shape<1>(grouped_layout);
         DG_HOST_ASSERT(num_groups == num_groups_);
     } else {
-        const auto& [m__] = get_shape<1>(grouped_layout);
+        int m__;
+        std::tie(m__) = get_shape<1>(grouped_layout);
         DG_HOST_ASSERT(m == m__);
         DG_HOST_ASSERT(not expected_m_for_psum_layout.has_value());
     }
@@ -187,7 +193,9 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         return;
 
     // Transform SFA and SFB into compute-required layout
-    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+    torch::Tensor sfa, sfb;
+    int gran_k_a, gran_k_b;
+    std::tie(sfa, sfb, gran_k_a, gran_k_b) = layout::transform_sf_pair_into_required_layout(
         a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, num_groups, disable_ue8m0_cast);
 
     // Dispatch implementation
@@ -237,9 +245,10 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
 
     // Type and shape checks
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [num_groups  , m , k ] = check_grouped_ab_fp8_fp4(a.first, major_a, arch_major);
-    const auto [num_groups_ , n , k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
-    const auto [num_groups__, m_, n_] = get_shape<3>(d);
+    int num_groups, m, k, num_groups_, n, k_, num_groups__, m_, n_;
+    std::tie(num_groups, m, k) = check_grouped_ab_fp8_fp4(a.first, major_a, arch_major);
+    std::tie(num_groups_, n, k_) = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
+    std::tie(num_groups__, m_, n_) = get_shape<3>(d);
     const auto num_groups___ = static_cast<int>(masked_m.numel());
     DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
@@ -251,7 +260,9 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
     check_major_type_cd(d);
 
     // Transform scaling factors
-    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+    torch::Tensor sfa, sfb;
+    int gran_k_a, gran_k_b;
+    std::tie(sfa, sfb, gran_k_a, gran_k_b) = layout::transform_sf_pair_into_required_layout(
         a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, num_groups, num_groups, disable_ue8m0_cast);
 
     // Dispatch implementation
@@ -280,9 +291,10 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
     DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 128));
 
     // Shape checks
-    const auto& [num_groups, m, n] = get_shape<3>(d);
-    const auto& [sum_k_ , m_] = get_shape<2>(a.first);
-    const auto& [sum_k__, n_] = get_shape<2>(b.first);
+    int num_groups, m, n, sum_k_, m_, sum_k__, n_;
+    std::tie(num_groups, m, n) = get_shape<3>(d);
+    std::tie(sum_k_, m_) = get_shape<2>(a.first);
+    std::tie(sum_k__, n_) = get_shape<2>(b.first);
     const int sum_k = std::accumulate(ks.begin(), ks.end(), 0);
     DG_HOST_ASSERT(m == m_ and n == n_ and sum_k == sum_k_ and sum_k == sum_k__);
 
@@ -322,7 +334,8 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 128));
 
     // Shape checks
-    const auto& [num_groups, m, n] = get_shape<3>(d);
+    int num_groups, m, n;
+    std::tie(num_groups, m, n) = get_shape<3>(d);
     const auto& sum_mk = a.first.numel();
     const auto& sum_nk = b.first.numel();
     const int sum_k = std::accumulate(ks.begin(), ks.end(), 0);
@@ -374,9 +387,10 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     check_major_type_cd(d);
 
     // Type and shape checks
-    const auto& [m , k ] = get_shape<2>(a);
-    const auto& [n , k_] = get_shape<2>(b);
-    const auto& [m_, n_] = get_shape<2>(d);
+    int m, k, n, k_, m_, n_;
+    std::tie(m, k) = get_shape<2>(a);
+    std::tie(n, k_) = get_shape<2>(b);
+    std::tie(m_, n_) = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
@@ -433,9 +447,10 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
     DG_HOST_ASSERT(grouped_layout.is_contiguous());
 
     // Type and shape checks
-    const auto& [m, k] = get_shape<2>(a);
-    const auto& [num_groups, n, k_] = get_shape<3>(b);
-    const auto& [m_, n_] = get_shape<2>(d);
+    int m, k, num_groups, n, k_, m_, n_;
+    std::tie(m, k) = get_shape<2>(a);
+    std::tie(num_groups, n, k_) = get_shape<3>(b);
+    std::tie(m_, n_) = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
     DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
@@ -445,10 +460,12 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
 
     // Layout checks
     if (use_psum_layout) {
-        const auto& [num_groups_] = get_shape<1>(grouped_layout);
+        int num_groups_;
+        std::tie(num_groups_) = get_shape<1>(grouped_layout);
         DG_HOST_ASSERT(num_groups == num_groups_);
     } else {
-        const auto& [m__] = get_shape<1>(grouped_layout);
+        int m__;
+        std::tie(m__) = get_shape<1>(grouped_layout);
         DG_HOST_ASSERT(m == m__);
         DG_HOST_ASSERT(not expected_m_for_psum_layout.has_value());
     }
@@ -493,9 +510,10 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
     DG_HOST_ASSERT(masked_m.is_contiguous());
 
     // Type and shape checks
-    const auto& [num_groups, m, k] = get_shape<3>(a);
-    const auto& [num_groups_, n, k_] = get_shape<3>(b);
-    const auto& [num_groups__, m_, n_] = get_shape<3>(d);
+    int num_groups, m, k, num_groups_, n, k_, num_groups__, m_, n_;
+    std::tie(num_groups, m, k) = get_shape<3>(a);
+    std::tie(num_groups_, n, k_) = get_shape<3>(b);
+    std::tie(num_groups__, m_, n_) = get_shape<3>(d);
     const auto& num_groups___ = static_cast<int>(masked_m.numel());
     DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
@@ -529,9 +547,10 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                                               const std::optional<torch::Tensor>& c,
                                               const std::string& compiled_dims) {
     // Shape checks
-    const auto& [num_groups, m, n] = get_shape<3>(d);
-    const auto& [sum_k_ , m_] = get_shape<2>(a);
-    const auto& [sum_k__, n_] = get_shape<2>(b);
+    int num_groups, m, n, sum_k_, m_, sum_k__, n_;
+    std::tie(num_groups, m, n) = get_shape<3>(d);
+    std::tie(sum_k_, m_) = get_shape<2>(a);
+    std::tie(sum_k__, n_) = get_shape<2>(b);
     const int sum_k = std::accumulate(ks.begin(), ks.end(), 0);
     DG_HOST_ASSERT(m == m_ and n == n_ and sum_k == sum_k_ and sum_k == sum_k__);
 
@@ -566,9 +585,10 @@ static void cublaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
     const auto& major_b = get_major_type_ab(b);
 
     // Type and shape checks
-    const auto& [m , k ] = get_shape<2>(a);
-    const auto& [n , k_] = get_shape<2>(b);
-    const auto& [m_, n_] = get_shape<2>(d);
+    int m, k, n, k_, m_, n_;
+    std::tie(m, k) = get_shape<2>(a);
+    std::tie(n, k_) = get_shape<2>(b);
+    std::tie(m_, n_) = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
 
     // Early return for trivial cases
