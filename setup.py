@@ -29,7 +29,7 @@ IS_WINDOWS = sys.platform.startswith('win')
 
 # Compiler flags (platform-specific)
 if IS_WINDOWS:
-    cxx_flags = ['/std:c++17', '/O2', '/EHsc', '/Zc:__cplusplus', '/permissive-']
+    cxx_flags = ['/std:c++17', '/O2', '/EHsc', '/Zc:__cplusplus', '/permissive-', '/utf-8']
 else:
     cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
                  f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']

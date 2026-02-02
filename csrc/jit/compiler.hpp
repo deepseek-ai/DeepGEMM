@@ -156,7 +156,7 @@ public:
 
     static void disassemble(const std::filesystem::path &cubin_path, const std::filesystem::path &sass_path) {
         // Disassemble the CUBIN file to SASS
-        const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.c_str(), cubin_path.c_str(), sass_path.c_str());
+        const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.string(), cubin_path.string(), sass_path.string());
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running cuobjdump command: %s\n", command.c_str());
         int return_code;
@@ -222,12 +222,12 @@ public:
         flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=/O2,/EHsc,/Zc:__cplusplus "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, library_include_path.string(), arch);
 #else
         flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, library_include_path.string(), arch);
 #endif
     }
 
@@ -239,7 +239,7 @@ public:
         put(code_path, code);
 
         // Compile
-        const auto& command = fmt::format("{} {} -cubin -o {} {}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+        const auto& command = fmt::format("{} {} -cubin -o {} {}", nvcc_path.string(), code_path.string(), cubin_path.string(), flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running NVCC command: %s\n", command.c_str());
         int return_code;
@@ -252,7 +252,7 @@ public:
 
         // Compile to PTX if needed
         if (ptx_path.has_value()) {
-            const auto ptx_command = fmt::format("{} {} -ptx -o {} {}", nvcc_path.c_str(), code_path.c_str(), ptx_path->c_str(), flags);
+            const auto ptx_command = fmt::format("{} {} -ptx -o {} {}", nvcc_path.string(), code_path.string(), ptx_path->string(), flags);
             if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
                 printf("Running NVCC PTX command: %s\n", ptx_command.c_str());
             int ptx_return_code;
