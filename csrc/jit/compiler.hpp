@@ -184,7 +184,7 @@ class NVCCCompiler final: public Compiler {
         DG_HOST_ASSERT(std::filesystem::exists(nvcc_path));
 
         // Call the version command
-        const auto& command = std::string(nvcc_path) + " --version";
+        const auto& command = nvcc_path.string() + " --version";
         int return_code;
         std::string output;
         std::tie(return_code, output) = call_external_command(command);

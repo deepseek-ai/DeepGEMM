@@ -58,17 +58,17 @@ static void smxx_clean_logits(const torch::Tensor& logits,
     const int smem_size = block_kv * sizeof(float);
 
     // Launch
-    const SMXXCleanLogitsRuntime::Args& args = {
-        .next_n = next_n,
-        .seq_len = seq_len,
-        .seq_len_kv = seq_len_kv,
-        .stride_logits = stride_logits,
-        .cu_seq_len_k_start = cu_seq_len_k_start.has_value() ? cu_seq_len_k_start.value().data_ptr<int>() : nullptr,
-        .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
-        .logits = logits.data_ptr<float>(),
-        .block_kv = block_kv,
-        .num_warps = num_warps,
-        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
+    SMXXCleanLogitsRuntime::Args args = {
+        next_n,
+        seq_len,
+        seq_len_kv,
+        stride_logits,
+        cu_seq_len_k_start.has_value() ? cu_seq_len_k_start.value().data_ptr<int>() : nullptr,
+        cu_seq_len_k_end.data_ptr<int>(),
+        logits.data_ptr<float>(),
+        block_kv,
+        num_warps,
+        make_launch_args(device_runtime->get_num_sms(),
                                   num_warps * 32, smem_size)
     };
     const auto& code = SMXXCleanLogitsRuntime::generate(args);

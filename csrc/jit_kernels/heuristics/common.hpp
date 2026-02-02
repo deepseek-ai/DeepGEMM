@@ -9,14 +9,18 @@
 namespace deep_gemm {
 
 struct MulticastConfig {
-    int num_multicast;
-    bool is_multicast_on_a;
-
-    MulticastConfig(const int& num_multicast, const bool& is_multicast_on_a):
-        num_multicast(num_multicast), is_multicast_on_a(is_multicast_on_a) {
-        DG_HOST_ASSERT(1 <= num_multicast and num_multicast <= 2);
-    }
+    int num_multicast = 1;
+    bool is_multicast_on_a = false;
 };
+
+// Helper function to create MulticastConfig with validation
+inline MulticastConfig make_multicast_config(const int& num_multicast, const bool& is_multicast_on_a) {
+    DG_HOST_ASSERT(1 <= num_multicast and num_multicast <= 2);
+    MulticastConfig config;
+    config.num_multicast = num_multicast;
+    config.is_multicast_on_a = is_multicast_on_a;
+    return config;
+}
 
 struct SharedMemoryConfig {
     int smem_size;

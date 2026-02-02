@@ -29,7 +29,8 @@ IS_WINDOWS = sys.platform.startswith('win')
 
 # Compiler flags (platform-specific)
 if IS_WINDOWS:
-    cxx_flags = ['/std:c++17', '/O2', '/EHsc', '/Zc:__cplusplus', '/permissive-', '/utf-8']
+    cxx_flags = ['/std:c++latest', '/O2', '/EHsc', '/Zc:__cplusplus', '/permissive-', '/utf-8',
+                 '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN']
 else:
     cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
                  f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
@@ -46,7 +47,7 @@ build_include_dirs = [
     'third-party/cutlass/include',
     'third-party/fmt/include',
 ]
-build_libraries = ['cudart', 'nvrtc']
+build_libraries = ['cudart', 'nvrtc', 'cublasLt', 'cublas']
 if IS_WINDOWS:
     build_library_dirs = [f'{CUDA_HOME}/lib/x64']
 else:
@@ -86,7 +87,8 @@ def get_platform():
     if sys.platform.startswith('linux'):
         return f'linux_{platform.uname().machine}'
     elif sys.platform.startswith('win'):
-        return f'win_{platform.uname().machine}'
+        # Wheel platform tag must be lowercase (e.g., win_amd64, not win_AMD64)
+        return f'win_{platform.uname().machine.lower()}'
     else:
         raise ValueError('Unsupported platform: {}'.format(sys.platform))
 
@@ -177,7 +179,11 @@ class CustomBuildPy(build_py):
 
 
 def get_detailed_wheel_name():
-    """Generate a detailed wheel filename with version info."""
+    """Generate a detailed wheel filename with version info.
+
+    Wheel filename format: {name}-{version}-{python}-{abi}-{platform}.whl
+    We encode CUDA/torch/ABI info in the version's local segment.
+    """
     torch_version = parse(torch.__version__)
     torch_version_str = f'{torch_version.major}.{torch_version.minor}'
     python_version = f'cp{sys.version_info.major}{sys.version_info.minor}'
@@ -188,14 +194,18 @@ def get_detailed_wheel_name():
     cuda_version = parse(torch.version.cuda)
     cuda_version_str = f'{cuda_version.major}{cuda_version.minor}'
 
-    # CXX11 ABI flag (Linux only)
+    # CXX11 ABI flag (Linux only, encoded in version)
     if IS_WINDOWS:
         abi_str = ''
     else:
         cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
-        abi_str = f'-cxx11abi{cxx11_abi}'
+        abi_str = f'.cxx11abi{cxx11_abi}'
 
-    return f'deep_gemm-{deep_gemm_version}+cu{cuda_version_str}-torch{torch_version_str}{abi_str}-{python_version}-{platform_name}.whl'
+    # Version format: 2.3.0+cu128.torch2.10.cxx11abi1 (local version uses dots, not dashes)
+    full_version = f'{deep_gemm_version}+cu{cuda_version_str}.torch{torch_version_str}{abi_str}'
+
+    # Standard wheel format: {name}-{version}-{python}-{abi}-{platform}.whl
+    return f'deep_gemm-{full_version}-{python_version}-{python_version}-{platform_name}.whl'
 
 
 class CachedWheelsCommand(_bdist_wheel):

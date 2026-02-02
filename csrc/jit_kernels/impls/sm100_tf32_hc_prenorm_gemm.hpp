@@ -127,19 +127,18 @@ static void sm100_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     }
 
     // Launch
-    const SM100BF16HCPrenormGemmRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .block_m = block_m, .block_n = block_n, .block_k = block_k,
-        .num_splits = num_splits,
-        .swizzle_cd_mode = swizzle_cd_mode,
-        .num_stages = num_stages,
-        .num_mma_threads = num_mma_threads,
-        .num_cast_and_reduce_threads = num_cast_and_reduce_threads,
-        .launch_args = LaunchArgs(num_splits * ceil_div(m, block_m), num_mma_threads + num_cast_and_reduce_threads, smem_size, 1),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_d = tensor_map_d,
-        .sqr_sum = sqr_sum.data_ptr<float>()
+    SM100BF16HCPrenormGemmRuntime::Args args = {
+        m, n, k,
+        block_m, block_n, block_k,
+        num_splits,
+        swizzle_cd_mode,
+        num_stages,
+        num_mma_threads, num_cast_and_reduce_threads,
+        make_launch_args(num_splits * ceil_div(m, block_m), num_mma_threads + num_cast_and_reduce_threads, smem_size, 1),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_d,
+        sqr_sum.data_ptr<float>()
     };
     const auto& code = SM100BF16HCPrenormGemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_tf32_hc_prenorm_gemm", code);

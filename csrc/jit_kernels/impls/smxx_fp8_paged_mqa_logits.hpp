@@ -67,16 +67,16 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
     // Launch
-    const SMXXPagedMQALogitsMetadataRuntime::Args& args = {
-        .aligned_batch_size = aligned_batch_size,
-        .split_kv = split_kv,
-        .num_sms = num_sms,
-        .batch_size = batch_size,
-        .next_n = next_n,
-        .is_context_lens_2d = is_context_lens_2d,
-        .context_lens = context_lens.data_ptr<int>(),
-        .schedule_metadata = schedule_metadata.data_ptr<int>(),
-        .launch_args = LaunchArgs(1, num_threads, smem_size)
+    SMXXPagedMQALogitsMetadataRuntime::Args args = {
+        aligned_batch_size,
+        split_kv,
+        num_sms,
+        batch_size,
+        next_n,
+        is_context_lens_2d,
+        context_lens.data_ptr<int>(),
+        schedule_metadata.data_ptr<int>(),
+        make_launch_args(1, num_threads, smem_size)
     };
     const auto& code = SMXXPagedMQALogitsMetadataRuntime::generate(args);
     const auto& runtime = compiler->build("smxx_paged_mqa_logits_metadata", code);
@@ -231,29 +231,29 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
     }
 
     // Launch
-    const SMXXFP8PagedMQALogitsRuntime::Args& args = {
-        .batch_size = batch_size,
-        .next_n = next_n,
-        .num_heads = num_heads,
-        .head_dim = head_dim,
-        .block_kv = block_kv,
-        .is_context_lens_2d = is_context_lens_2d,
-        .block_table_stride = block_table_stride,
-        .logits_stride = logits_stride,
-        .num_q_stages = num_q_stages,
-        .num_kv_stages = num_kv_stages,
-        .split_kv = split_kv,
-        .context_lens = context_lens.data_ptr<int>(),
-        .logits = logits.data_ptr<float>(),
-        .block_table = block_table.data_ptr<int>(),
-        .schedule_meta = schedule_meta.data_ptr<int>(),
-        .tensor_map_q = tensor_map_q,
-        .tensor_map_kv = tensor_map_kv,
-        .tensor_map_kv_scales = tensor_map_kv_scales,
-        .tensor_map_weights = tensor_map_weights,
-        .num_specialized_threads = num_specialized_threads,
-        .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(num_sms,
+    SMXXFP8PagedMQALogitsRuntime::Args args = {
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        block_kv,
+        is_context_lens_2d,
+        block_table_stride,
+        logits_stride,
+        num_q_stages,
+        num_kv_stages,
+        split_kv,
+        context_lens.data_ptr<int>(),
+        logits.data_ptr<float>(),
+        block_table.data_ptr<int>(),
+        schedule_meta.data_ptr<int>(),
+        tensor_map_q,
+        tensor_map_kv,
+        tensor_map_kv_scales,
+        tensor_map_weights,
+        num_specialized_threads,
+        num_math_threads,
+        make_launch_args(num_sms,
                                   num_specialized_threads + num_math_threads,
                                   smem_size)
     };
