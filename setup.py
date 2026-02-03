@@ -24,11 +24,18 @@ DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
 
-# Compiler flags
-cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
-             f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
+# Platform detection
+IS_WINDOWS = sys.platform.startswith('win')
+
+# Compiler flags (platform-specific)
+if IS_WINDOWS:
+    cxx_flags = ['/std:c++latest', '/O2', '/EHsc', '/Zc:__cplusplus', '/permissive-', '/utf-8',
+                 '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN']
+else:
+    cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
+                 f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
 if DG_JIT_USE_RUNTIME_API:
-    cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
+    cxx_flags.append('-DDG_JIT_USE_RUNTIME_API' if not IS_WINDOWS else '/DDG_JIT_USE_RUNTIME_API')
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -40,8 +47,11 @@ build_include_dirs = [
     'third-party/cutlass/include',
     'third-party/fmt/include',
 ]
-build_libraries = ['cudart', 'nvrtc']
-build_library_dirs = [f'{CUDA_HOME}/lib64']
+build_libraries = ['cudart', 'nvrtc', 'cublasLt', 'cublas']
+if IS_WINDOWS:
+    build_library_dirs = [f'{CUDA_HOME}/lib/x64']
+else:
+    build_library_dirs = [f'{CUDA_HOME}/lib64']
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
@@ -76,6 +86,9 @@ def get_package_version():
 def get_platform():
     if sys.platform.startswith('linux'):
         return f'linux_{platform.uname().machine}'
+    elif sys.platform.startswith('win'):
+        # Wheel platform tag must be lowercase (e.g., win_amd64, not win_AMD64)
+        return f'win_{platform.uname().machine.lower()}'
     else:
         raise ValueError('Unsupported platform: {}'.format(sys.platform))
 
@@ -165,10 +178,42 @@ class CustomBuildPy(build_py):
             shutil.copytree(src_dir, dst_dir)
 
 
+def get_detailed_wheel_name():
+    """Generate a detailed wheel filename with version info.
+
+    Wheel filename format: {name}-{version}-{python}-{abi}-{platform}.whl
+    We encode CUDA/torch/ABI info in the version's local segment.
+    """
+    torch_version = parse(torch.__version__)
+    torch_version_str = f'{torch_version.major}.{torch_version.minor}'
+    python_version = f'cp{sys.version_info.major}{sys.version_info.minor}'
+    platform_name = get_platform()
+    deep_gemm_version = get_package_version()
+
+    # Get CUDA version from torch
+    cuda_version = parse(torch.version.cuda)
+    cuda_version_str = f'{cuda_version.major}{cuda_version.minor}'
+
+    # CXX11 ABI flag (Linux only, encoded in version)
+    if IS_WINDOWS:
+        abi_str = ''
+    else:
+        cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
+        abi_str = f'.cxx11abi{cxx11_abi}'
+
+    # Version format: 2.3.0+cu128.torch2.10.cxx11abi1 (local version uses dots, not dashes)
+    full_version = f'{deep_gemm_version}+cu{cuda_version_str}.torch{torch_version_str}{abi_str}'
+
+    # Standard wheel format: {name}-{version}-{python}-{abi}-{platform}.whl
+    return f'deep_gemm-{full_version}-{python_version}-{python_version}-{platform_name}.whl'
+
+
 class CachedWheelsCommand(_bdist_wheel):
     def run(self):
         if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
-            return super().run()
+            super().run()
+            self._rename_wheel()
+            return
 
         wheel_url, wheel_filename = get_wheel_url()
         print(f'Try to download wheel from URL: {wheel_url}')
@@ -189,6 +234,26 @@ class CachedWheelsCommand(_bdist_wheel):
             print('Precompiled wheel not found. Building from source...')
             # If the wheel could not be downloaded, build from source
             super().run()
+            self._rename_wheel()
+
+    def _rename_wheel(self):
+        """Rename the wheel to include detailed version info."""
+        if not os.path.exists(self.dist_dir):
+            return
+
+        # Find the generated wheel
+        for filename in os.listdir(self.dist_dir):
+            if filename.startswith('deep_gemm') and filename.endswith('.whl'):
+                old_path = os.path.join(self.dist_dir, filename)
+                new_filename = get_detailed_wheel_name()
+                new_path = os.path.join(self.dist_dir, new_filename)
+
+                if old_path != new_path:
+                    if os.path.exists(new_path):
+                        os.remove(new_path)
+                    os.rename(old_path, new_path)
+                    print(f'Renamed wheel: {filename} -> {new_filename}')
+                break
 
 
 if __name__ == '__main__':

@@ -82,8 +82,7 @@ struct SM100ArchSpec {
         // Check tensor memory validity
         int sf_block_m = 0, sf_block_n = 0;
         if (kernel_type == KernelType::Kernel1D1D) {
-            const auto& [sf_block_m_, sf_block_n_] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind);
-            sf_block_m = sf_block_m_, sf_block_n = sf_block_n_;
+            std::tie(sf_block_m, sf_block_n) = get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind);
         }
         if (((2 * block_n) + (sf_block_m / 32) + (sf_block_n / 32)) > 512)
             return false;
@@ -132,7 +131,8 @@ struct SM100ArchSpec {
         int smem_sfa_per_stage = 0;
         int smem_sfb_per_stage = 0;
         if (kernel_type == KernelType::Kernel1D1D) {
-            const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind);
+            int sf_block_m, sf_block_n;
+            std::tie(sf_block_m, sf_block_n) = get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind);
             smem_sfa_per_stage = sf_block_m * 4;
             smem_sfb_per_stage = sf_block_n * 4;
         } else {

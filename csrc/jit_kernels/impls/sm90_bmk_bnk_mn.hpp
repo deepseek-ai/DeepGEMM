@@ -111,17 +111,16 @@ static void sm90_bmn_bnk_mn_gemm(const torch::Tensor &a,
     const auto& tensor_map_a = make_tma_2d_desc(a, k, s * m, block_k, block_m, k, swizzle_ab_mode);
     const auto& tensor_map_b = make_tma_2d_desc(b, k, s * n, block_k, block_n, k, swizzle_ab_mode);
 
-    const SM90BmkBnkMnRuntime::Args& args = {
-        .s = s, .m = m, .n = n, .k = k,
-        .block_m = block_m, .block_n = block_n, .block_k = block_k,
-        .split_factor = split_factor,
-        .num_stages = num_stages,
-        .num_tma_threads = num_tma_threads,
-        .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(num_mn_blocks * ceil_div(num_sk_blocks, split_factor), num_tma_threads + num_math_threads, smem_size),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .d = d.data_ptr<float>()
+    SM90BmkBnkMnRuntime::Args args = {
+        s, m, n, k,
+        block_m, block_n, block_k,
+        split_factor,
+        num_stages,
+        num_tma_threads, num_math_threads,
+        make_launch_args(num_mn_blocks * ceil_div(num_sk_blocks, split_factor), num_tma_threads + num_math_threads, smem_size),
+        tensor_map_a,
+        tensor_map_b,
+        d.data_ptr<float>()
     };
     const auto& code = SM90BmkBnkMnRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_bmn_bnk_mn_gemm", code);

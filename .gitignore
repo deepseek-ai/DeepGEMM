@@ -22,3 +22,10 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+deep_gemm/*.pyd
+
+# Claude Code workspace
+.claude/
+
+# Windows null device artifact
+nul

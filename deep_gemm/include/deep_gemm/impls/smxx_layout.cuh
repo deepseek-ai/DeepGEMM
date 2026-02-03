@@ -66,8 +66,8 @@ __global__ void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out, con
     const auto num_uint4 = num_values / 4;
     #pragma unroll
     for (uint32_t i = threadIdx.x; i < num_uint4; i += kNumThreads) {
-        const auto& [x, y, z, w] = __ldg(reinterpret_cast<uint4*>(local_sf) + i);
-        st_shared(reinterpret_cast<uint4*>(smem_buffer) + i, x, y, z, w);
+        const uint4 loaded = __ldg(reinterpret_cast<uint4*>(local_sf) + i);
+        st_shared(reinterpret_cast<uint4*>(smem_buffer) + i, loaded.x, loaded.y, loaded.z, loaded.w);
     }
 
     // Fill unaligned values as well

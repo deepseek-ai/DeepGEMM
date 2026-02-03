@@ -130,13 +130,12 @@ static torch::Tensor get_mn_major_tma_aligned_tensor(const torch::Tensor& sf) {
         constexpr int block_mn = 64;
         constexpr int num_threads = 512;
         const auto& smem_size = block_mn * (sf_k + (1 - (sf_k % 2))) * static_cast<int>(sizeof(float));
-        const TransposeFP32Runtime::Args& args = {
-            .mn = mn,
-            .sf_k = sf_k,
-            .block_mn = block_mn,
-            .sf = batched_sf.data_ptr(),
-            .out = out.data_ptr(),
-            .launch_args = LaunchArgs({ceil_div(mn, block_mn), num_groups}, num_threads, smem_size)
+        TransposeFP32Runtime::Args args = {
+            mn, sf_k,
+            block_mn,
+            batched_sf.data_ptr(),
+            out.data_ptr(),
+            make_launch_args({ceil_div(mn, block_mn), num_groups}, num_threads, smem_size)
         };
 
         const auto& code = TransposeFP32Runtime::generate(args);
@@ -184,13 +183,12 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
 
         constexpr int block_mn = 48;
         constexpr int num_threads = 512;
-        const TransposeAndPackFP32IntoUE8M0Runtime::Args& args = {
-            .mn = mn,
-            .sf_k = sf_k,
-            .block_mn = block_mn,
-            .sf = batched_sf.data_ptr(),
-            .out = out.data_ptr(),
-            .launch_args = LaunchArgs({ceil_div(mn, block_mn), num_groups}, num_threads, block_mn * sf_k * 4)
+        TransposeAndPackFP32IntoUE8M0Runtime::Args args = {
+            mn, sf_k,
+            block_mn,
+            batched_sf.data_ptr(),
+            out.data_ptr(),
+            make_launch_args({ceil_div(mn, block_mn), num_groups}, num_threads, block_mn * sf_k * 4)
         };
 
         const auto& code = TransposeAndPackFP32IntoUE8M0Runtime::generate(args);
@@ -204,17 +202,14 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor(const torch::T
         constexpr int block_mn = 128;
         constexpr int block_packed_sf_k = 16;
         constexpr int num_threads = 512;
-        const PackFP32IntoUE8M0Runtime::Args& args = {
-            .num_groups = 1,
-            .mn = mn,
-            .sf_k = sf_k,
-            .packed_sf_k = packed_sf_k,
-            .block_mn = block_mn,
-            .block_packed_sf_k = block_packed_sf_k,
-            .sf = batched_sf.data_ptr(),
-            .out = out.data_ptr(),
-            .ks = nullptr,
-            .launch_args = LaunchArgs({ceil_div(mn, block_mn), ceil_div(packed_sf_k, block_packed_sf_k)}, num_threads)
+        PackFP32IntoUE8M0Runtime::Args args = {
+            1,
+            mn, sf_k, packed_sf_k,
+            block_mn, block_packed_sf_k,
+            batched_sf.data_ptr(),
+            out.data_ptr(),
+            nullptr,
+            make_launch_args({ceil_div(mn, block_mn), ceil_div(packed_sf_k, block_packed_sf_k)}, num_threads)
         };
 
         const auto& code = PackFP32IntoUE8M0Runtime::generate(args);
@@ -242,17 +237,14 @@ static torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(cons
     constexpr int block_mn = 128;
     constexpr int block_packed_sf_k = 16;
     constexpr int num_threads = 512;
-    const PackFP32IntoUE8M0Runtime::Args& args = {
-        .num_groups = num_groups,
-        .mn = mn,
-        .sf_k = sf_k,
-        .packed_sf_k = packed_sf_k,
-        .block_mn = block_mn,
-        .block_packed_sf_k = block_packed_sf_k,
-        .sf = sf.data_ptr(),
-        .out = out.data_ptr(),
-        .ks = ks_tensor.data_ptr(),
-        .launch_args = LaunchArgs({ceil_div(mn, block_mn), ceil_div(packed_sf_k, block_packed_sf_k)}, num_threads)
+    PackFP32IntoUE8M0Runtime::Args args = {
+        num_groups,
+        mn, sf_k, packed_sf_k,
+        block_mn, block_packed_sf_k,
+        sf.data_ptr(),
+        out.data_ptr(),
+        ks_tensor.data_ptr(),
+        make_launch_args({ceil_div(mn, block_mn), ceil_div(packed_sf_k, block_packed_sf_k)}, num_threads)
     };
 
     const auto& code = PackFP32IntoUE8M0Runtime::generate(args);
