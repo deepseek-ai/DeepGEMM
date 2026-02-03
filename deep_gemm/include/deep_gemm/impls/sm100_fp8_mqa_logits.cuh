@@ -252,6 +252,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumMathWarpGroups; ++ i) {
                     empty_umma_barriers[i]->wait(((num_total_kv_blocks + kv_block_idx) & 1) ^ 1);
+                    tcgen05_after_thread_sync();
                     #pragma unroll
                     for (uint32_t k = 0; k < kHeadDim / UMMA_K; ++ k) {
                         auto a_desc = make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kHeadDim>(
@@ -310,6 +311,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
                 // Wait UMMA arrival
                 full_umma_barriers[warpgroup_idx]->wait((num_total_kv_blocks + kv_block_idx) & 1);
+                tcgen05_after_thread_sync();
 
                 // Release KV empty
                 empty_kv_barriers[kv_stage_idx]->arrive();
@@ -334,6 +336,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 [&]<size_t... Is>(cute::index_sequence<Is...>) { tmem_load(Is...); }(cute::make_index_sequence<kNumLDTMElems>{});
                 cutlass::arch::fence_view_async_tmem_load();
 
+                tcgen05_before_thread_sync();
                 empty_umma_barriers[warpgroup_idx]->arrive();
                 
                 #pragma unroll
