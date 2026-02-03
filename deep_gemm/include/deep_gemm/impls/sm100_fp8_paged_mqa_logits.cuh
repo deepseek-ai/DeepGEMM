@@ -283,6 +283,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
         while (scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv)) {
             if (q_idx != next_q_idx) {
                 CUTE_TIE(get_q_pipeline(q_iter_idx ++), q_stage_idx, q_phase);
+                full_q_barriers[q_stage_idx]->wait(q_phase);
             }
 
             q_idx = next_q_idx;
@@ -294,6 +295,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
             DG_STATIC_ASSERT(kHeadDim % UMMA_K == 0, "Invalid head dim");
 
             empty_umma_barriers[kv_group_idx]->wait(umma_phase & 1);
+            tcgen05_after_thread_sync();
             #pragma unroll
             for (uint32_t k = 0; k < kHeadDim / UMMA_K; ++ k) {
                 auto a_desc = make_umma_desc<cute::UMMA::Major::K, 0, kHeadDim, kHeadDim>(
@@ -362,6 +364,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Wait UMMA arrival
             full_umma_barriers[warpgroup_idx]->wait(umma_phase & 1);
+            tcgen05_after_thread_sync();
             umma_phase ^= 1;
 
             // Release KV empty
@@ -381,6 +384,8 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
             };
             [&]<size_t... Is>(cute::index_sequence<Is...>) { tmem_load(Is...); }(cute::make_index_sequence<kNumLDTMElems>{});
             cutlass::arch::fence_view_async_tmem_load();
+
+            tcgen05_before_thread_sync();
             empty_umma_barriers[warpgroup_idx]->arrive();
 
             // Reduce over the head dim and store
