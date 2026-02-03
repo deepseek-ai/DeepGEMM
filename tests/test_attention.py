@@ -42,7 +42,7 @@ def test_gemm_skip_head_mid() -> None:
                 use_ue8m0 = get_ue8m0_usage(kernel_type)
                 disable_ue8m0_cast = not use_ue8m0
 
-                a, b, _, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0)
+                a, b, _, _, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, False, out_dtype, kernel_type, use_ue8m0=use_ue8m0)
                 d = apply_skip_head_mid(d, head_splits)
                 ref_d = apply_skip_head_mid(ref_d, head_splits)
 

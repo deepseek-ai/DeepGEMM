@@ -78,9 +78,16 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
             for i in range(len(nk_list)):
                 n, k = nk_list[i]
                 out_dtype = torch.bfloat16 if i < len(bf16_output_nk) else torch.float
-                yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, out_dtype
+                yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, False, out_dtype
                 if dtype == torch.float8_e4m3fn and get_arch_major() == 10:
-                    yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, out_dtype
+                    # with accumulation, output = A[m,n] @ B[n,k] + C[m,n]
+                    # with bias, output = A[m,n] @ B[n,k] + bias[n]
+                    # With accumulation, no bias. 
+                    yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, False, out_dtype
+                    if out_dtype == torch.bfloat16:
+                        # With bias, no accumulation.
+                        yield kernel_type, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, True, out_dtype
+
 
         # Backward
         for m in m_bwd_list:
@@ -90,9 +97,9 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
                 if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
                     override_major = MajorTypeAB.KMajor
                     override_kernel_type = KernelType.Kernel1D1D
-                yield kernel_type,          m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16     # Dgrad
-                yield override_kernel_type, n, m, k, override_major,     override_major, True,  torch.float        # Wgrad
-                yield override_kernel_type, n, m, k, override_major,     override_major, False, torch.bfloat16     # Wgrad
+                yield kernel_type,          m, k, n, MajorTypeAB.KMajor, override_major, False, False, torch.bfloat16     # Dgrad
+                yield override_kernel_type, n, m, k, override_major,     override_major, True,  False, torch.float        # Wgrad
+                yield override_kernel_type, n, m, k, override_major,     override_major, False, False, torch.bfloat16     # Wgrad
 
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
@@ -149,7 +156,7 @@ def enumerate_transpose():
 
 def generate_normal(m: int, n: int, k: int,
                     major_a: MajorTypeAB, major_b: MajorTypeAB,
-                    accumulate: bool, out_dtype: torch.dtype,
+                    accumulate: bool, with_bias: bool, out_dtype: torch.dtype,
                     kernel_type: KernelType,
                     use_ue8m0: bool = False, use_bf16: bool = False):
     a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
@@ -157,19 +164,27 @@ def generate_normal(m: int, n: int, k: int,
     d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
         torch.empty((m, n), device='cuda', dtype=out_dtype)
     c = d if accumulate else None
-    ref_d = (a.float() @ b.float().t() + (c if accumulate else 0)).to(out_dtype)
+
+    bias = torch.randn((n), device='cuda', dtype=out_dtype) * 10 if with_bias else None
+
+    if accumulate:
+        ref_d = (a.float() @ b.float().t() + c).to(out_dtype)
+    elif with_bias:
+        ref_d = (a.float() @ b.float().t() + bias).to(out_dtype)
+    else:
+        ref_d = (a.float() @ b.float().t()).to(out_dtype)
 
     if use_bf16:
         a = a if major_a.is_k_major() else a.T.contiguous().T
         b = b if major_b.is_k_major() else b.T.contiguous().T
-        return a, b, c, d, ref_d
+        return a, b, c, bias, d, ref_d
 
     a_fp8 = per_token_cast_to_fp8(a, use_ue8m0=use_ue8m0)
     b_fp8 = per_token_cast_to_fp8(b, use_ue8m0=use_ue8m0) if kernel_type.is_1d1d() and accumulate \
             else per_block_cast_to_fp8(b, use_ue8m0=use_ue8m0)
     a_fp8 = a_fp8 if major_a.is_k_major() else (a_fp8[0].T.contiguous().T, a_fp8[1])
     b_fp8 = b_fp8 if major_b.is_k_major() else (b_fp8[0].T.contiguous().T, b_fp8[1])
-    return a_fp8, b_fp8, c, d, ref_d
+    return a_fp8, b_fp8, c, bias, d, ref_d
 
 
 def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n: int, k: int,

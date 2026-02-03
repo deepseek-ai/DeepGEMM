@@ -51,6 +51,7 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                         const std::pair<torch::Tensor, torch::Tensor>& b,
                         const torch::Tensor& d,
                         const std::optional<torch::Tensor>& c,
+                        const std::optional<torch::Tensor>& bias,
                         std::optional<std::tuple<int, int, int>> recipe,
                         const std::string& compiled_dims,
                         const bool& disable_ue8m0_cast) {
@@ -74,6 +75,14 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
+    if (bias.has_value()) {
+        const auto& arch_major = device_runtime->get_arch_major();
+        DG_HOST_ASSERT(arch_major == 10);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(bias.value().scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(d.scalar_type() == bias.value().scalar_type());     
+    }
+
     // Early return for trivial cases
     if (early_return(m, n, k, d, c))
         return;
@@ -95,7 +104,7 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
             sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
         }
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+        sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, bias, d, m, n, k, major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -105,34 +114,37 @@ static void fp8_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
                         const std::pair<torch::Tensor, torch::Tensor>& b,
                         const torch::Tensor& d,
                         const std::optional<torch::Tensor>& c,
+                        const std::optional<torch::Tensor>& bias,
                         const std::optional<std::tuple<int, int, int>>& recipe,
                         const std::string& compiled_dims,
                         const bool& disable_ue8m0_cast) {
     fp8_gemm_nt(a, {b.first.transpose(0, 1), b.second.transpose(0, 1)},
-                d, c, recipe, compiled_dims, disable_ue8m0_cast);
+                d, c, bias, recipe, compiled_dims, disable_ue8m0_cast);
 }
 
 static void fp8_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
                         const std::pair<torch::Tensor, torch::Tensor>& b,
                         const torch::Tensor& d,
                         const std::optional<torch::Tensor>& c,
+                        const std::optional<torch::Tensor>& bias,
                         const std::optional<std::tuple<int, int, int>>& recipe,
                         const std::string& compiled_dims,
                         const bool& disable_ue8m0_cast) {
     fp8_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)},
                 {b.first.transpose(0, 1), b.second.transpose(0, 1)},
-                d, c, recipe, compiled_dims, disable_ue8m0_cast);
+                d, c, bias, recipe, compiled_dims, disable_ue8m0_cast);
 }
 
 static void fp8_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
                         const std::pair<torch::Tensor, torch::Tensor>& b,
                         const torch::Tensor& d,
                         const std::optional<torch::Tensor>& c,
+                        const std::optional<torch::Tensor>& bias,
                         const std::optional<std::tuple<int, int, int>>& recipe,
                         const std::string& compiled_dims,
                         const bool& disable_ue8m0_cast) {
     fp8_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)}, b,
-                d, c, recipe, compiled_dims, disable_ue8m0_cast);
+                d, c, bias, recipe, compiled_dims, disable_ue8m0_cast);
 }
 
 static void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -567,22 +579,30 @@ static void register_apis(pybind11::module_& m) {
     // FP8 GEMMs
     m.def("fp8_gemm_nt", &fp8_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
+          py::arg("c") = std::nullopt, 
+          py::arg("bias") = std::nullopt,
+          py::arg("recipe") = std::nullopt,
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false);
     m.def("fp8_gemm_nn", &fp8_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
+          py::arg("c") = std::nullopt, 
+          py::arg("bias") = std::nullopt,
+          py::arg("recipe") = std::nullopt,
           py::arg("compiled_dims") = "nk",
           py::arg("disable_ue8m0_cast") = false);
     m.def("fp8_gemm_tn", &fp8_gemm_tn,
           py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
+          py::arg("c") = std::nullopt,
+          py::arg("bias") = std::nullopt,
+          py::arg("recipe") = std::nullopt,
           py::arg("compiled_dims") = "mn",
           py::arg("disable_ue8m0_cast") = false);
     m.def("fp8_gemm_tt", &fp8_gemm_tt,
           py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
+          py::arg("c") = std::nullopt,
+          py::arg("bias") = std::nullopt,
+          py::arg("recipe") = std::nullopt,
           py::arg("compiled_dims") = "mn",
           py::arg("disable_ue8m0_cast") = false);
     m.def("m_grouped_fp8_gemm_nt_contiguous", &m_grouped_fp8_gemm_nt_contiguous,

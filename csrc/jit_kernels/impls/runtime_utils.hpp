@@ -222,4 +222,23 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                             allow_tf32);
 }
 
+static CUtensorMap make_tma_bias_desc(const cute::UMMA::Major& major,
+                                    const torch::Tensor& t,
+                                    int shape_mn,
+                                    const int& block_mn,
+                                    const int& num_groups,
+                                    const int& swizzle_mode, const int& swizzle_base = 0,
+                                    const bool& allow_tf32 = false) {
+    DG_HOST_ASSERT(major == cute::UMMA::Major::MN);
+
+    DG_HOST_ASSERT(swizzle_mode == 0);
+    shape_mn = get_tma_aligned_size(shape_mn, static_cast<int>(t.element_size()));
+    return make_tma_2d_desc(t,
+                            shape_mn, num_groups,
+                            block_mn, 1,
+                            shape_mn,
+                            swizzle_mode, swizzle_base,
+                            allow_tf32);
+}
+
 } // namespace deep_gemm

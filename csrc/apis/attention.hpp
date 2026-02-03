@@ -66,7 +66,7 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
         const auto& major_sfb = get_major_type_ab(sfb);
         sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, major_sfb, compiled_dims, epilogue_type);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k, major_a, major_b, compiled_dims, epilogue_type);
+        sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, std::nullopt, d, m, n, k, major_a, major_b, compiled_dims, epilogue_type);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }

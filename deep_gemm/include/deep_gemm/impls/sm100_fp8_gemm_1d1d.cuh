@@ -22,7 +22,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
+          GemmType kGemmType, bool kWithAccumulation, bool kWithBias, typename cd_dtype_t,
           typename epilogue_type_t>
 __global__ void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
@@ -31,7 +31,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                         const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_bias) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
@@ -47,6 +48,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t kNumTMAStoreStages = 2;
     constexpr uint32_t kNumSFStagesPerLoad = sizeof(uint32_t) / sizeof(cutlass::float_ue8m0_t);
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
+    constexpr uint32_t kNumBiasAlignBytes = 128;
     DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
     DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
 
@@ -84,6 +86,13 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t SF_BLOCK_N = constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * sizeof(uint32_t);
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * sizeof(uint32_t);
+    
+    uint32_t SMEM_BIAS_SIZE_PER_STAGE = 0;
+    if constexpr (kWithBias) {
+        constexpr uint32_t BiasSizePerBlock = BLOCK_N * sizeof(cd_dtype_t);
+        SMEM_BIAS_SIZE_PER_STAGE = constexpr_align(BiasSizePerBlock, kNumBiasAlignBytes);
+    }
+
     DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0 and SMEM_A_SIZE_PER_STAGE % 1024 == 0 and SMEM_B_SIZE_PER_STAGE % 1024 == 0, 
                      "Shared memory of A/B must be aligned to 1024 bytes");
     DG_STATIC_ASSERT(kNumTMAStoreStages >= 1, "Invalid number of TMA stages");
@@ -111,6 +120,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
         cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (kWithBias){
+            cute::prefetch_tma_descriptor(&tensor_map_bias);
+        }
     }
 
     // D/A/B shared memory
@@ -133,19 +145,32 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         return reinterpret_cast<uint32_t*>(sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE + i * SMEM_SFB_SIZE_PER_STAGE);
     });
 
+    auto bias_start_ptr = sf_start_ptr + kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE);
+    auto smem_bias = PatternVisitor([=](const uint32_t& i) {
+        return reinterpret_cast<cd_dtype_t*>(bias_start_ptr + i * SMEM_BIAS_SIZE_PER_STAGE);
+    });
+
     // Fill barriers
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer +
         SMEM_CD_SIZE +
         kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
-        kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE));
+        kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE) +
+        (kWithBias ? kNumEpilogueStages * SMEM_BIAS_SIZE_PER_STAGE : 0));
+
     auto full_barriers              = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
     auto empty_barriers             = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
     auto with_sf_full_barriers      = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
     auto tmem_full_barriers         = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
     auto tmem_empty_barriers        = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages + i); });
+    auto bias_full_barriers       = PatternVisitor([=](const uint32_t& i) { if constexpr (! kWithBias) { std::abort(); } return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages * 2 + i); });
+    auto bias_empty_barriers      = PatternVisitor([=](const uint32_t& i) { if constexpr (! kWithBias) { std::abort(); } return barrier_start_ptr + (kNumStages * 3 + kNumEpilogueStages * 3 + i); });
 
     // Fill the tensor memory pointer
-    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumStages * 3 + kNumEpilogueStages * 2);
+    uint32_t barrier_offset = kNumStages * 3 + kNumEpilogueStages * 2;
+    if constexpr (kWithBias) {
+        barrier_offset += kNumEpilogueStages * 2;
+    }
+    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(barrier_start_ptr + barrier_offset);
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // Initialize barriers
@@ -164,6 +189,14 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             tmem_full_barriers[i]->init(1);
             // Arrive only at the leader CTA
             tmem_empty_barriers[i]->init(kNumMulticast * kNumUMMAStoreThreads);
+        }
+
+        if constexpr (kWithBias) {
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
+                bias_empty_barriers[i]->init(kNumUMMAStoreThreads);
+                bias_full_barriers[i]->init(1);
+            }
         }
 
         // Make initialized barrier visible in async proxy
@@ -194,6 +227,8 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
         // Persistently schedule over blocks
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const auto& num_total_k_blocks = ceil_div(scheduler.current_shape_k, BLOCK_K);
+            auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
+
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -253,7 +288,27 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                 full_barriers[stage_idx]->arrive_and_expect_tx(num_arrival_bytes);
             }
         }
-    } else if (warp_idx == 1 and is_leader_cta) {
+    } else if (warp_idx == 3 and cute::elect_one_sync()) {
+        if constexpr (kWithBias) {
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                auto accum_stage_idx = scheduler.current_iter % kNumEpilogueStages;
+                auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
+
+                uint32_t wait_bytes = BLOCK_N * sizeof(cd_dtype_t);
+                bias_empty_barriers[accum_stage_idx]->wait(accum_phase_idx ^ 1);
+                tma_copy<BLOCK_N, 1, 0, cd_dtype_t>(&tensor_map_bias,
+                     bias_full_barriers[accum_stage_idx], smem_bias[accum_stage_idx], n_block_idx * BLOCK_N, 0, 1, 0);
+                bias_full_barriers[accum_stage_idx]->arrive_and_expect_tx(wait_bytes);
+            }
+
+            const auto& iter_idx = scheduler.current_iter - 1;
+            if (kNumMulticast > 1 and iter_idx >= 0) {
+                const auto& accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
+                bias_empty_barriers[iter_idx % kNumEpilogueStages]->wait(accum_phase_idx);
+            }
+        }
+    }
+    else if (warp_idx == 1 and is_leader_cta) {
         // MMA issue warp
         // NOTES: only the leader CTA will do this
         // Make instruction descriptor
@@ -437,6 +492,10 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
             tcgen05_after_thread_sync();
 
+            if constexpr (kWithBias) {
+                bias_full_barriers[accum_stage_idx]->wait(accum_phase_idx);
+            }
+
             // Load from tensor memory into registers, and write shared memory with STSM
             DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
             DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
@@ -456,6 +515,7 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     // The pipeline stage
                     const auto m_idx = scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), IndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * WAVE_BLOCK_M;
                     const auto n_idx = epilogue_type_t::apply_index_n<STORE_BLOCK_N>(n_block_idx * BLOCK_N + s * STORE_BLOCK_N);
+
 
                     // Store into shared memory
                     #pragma unroll
@@ -493,9 +553,28 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                             // For BF16 output, read, cast and store
                             DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8 and cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid type");
                             cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
-                                values[0], values[1], values[2], values[3],
-                                values[4], values[5], values[6], values[7]);
+                                values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]);
                             cutlass::arch::fence_view_async_tmem_load();
+                            
+                            if constexpr (kWithBias) {
+                                uint32_t n_offset_in_block = i * kNumElemsPerBankGroup;
+                                uint32_t store_block_offset = s * STORE_BLOCK_N;
+                                cd_dtype_t* bias_ptr = smem_bias[accum_stage_idx] + store_block_offset + n_offset_in_block;
+                                float bias_vals[8];
+                                #pragma unroll
+                                for (int b = 0; b < 8; ++b) {
+                                    bias_vals[b] = static_cast<float>(bias_ptr[b]);
+                                }
+                                values[0] = __float_as_uint(__uint_as_float(values[0]) + bias_vals[0]);
+                                values[1] = __float_as_uint(__uint_as_float(values[1]) + bias_vals[1]);
+                                values[2] = __float_as_uint(__uint_as_float(values[2]) + bias_vals[2]);
+                                values[3] = __float_as_uint(__uint_as_float(values[3]) + bias_vals[3]);
+                                values[4] = __float_as_uint(__uint_as_float(values[4]) + bias_vals[4]);
+                                values[5] = __float_as_uint(__uint_as_float(values[5]) + bias_vals[5]);
+                                values[6] = __float_as_uint(__uint_as_float(values[6]) + bias_vals[6]);
+                                values[7] = __float_as_uint(__uint_as_float(values[7]) + bias_vals[7]);
+                            }
+                            
                             st_shared(smem_ptr,
                                       cast_into_bf16_and_pack(values[0], values[1]),
                                       cast_into_bf16_and_pack(values[2], values[3]),
@@ -509,6 +588,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
                     if (w == kNumMWaves - 1 and s == BLOCK_N / STORE_BLOCK_N - 1) {
                         tcgen05_before_thread_sync();
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        if constexpr (kWithBias) {
+                            bias_empty_barriers[accum_stage_idx]->arrive();
+                        }
                     }
 
                     // Synchronize all threads and issue TMA
