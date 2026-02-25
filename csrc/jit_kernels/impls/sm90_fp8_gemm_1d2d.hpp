@@ -19,8 +19,8 @@ public:
     struct Args {
         cute::UMMA::Major major_sfb;
         int m, n, k, num_groups;
-        const std::string& compiled_dims;
-        const std::optional<std::string>& epilogue_type;
+        std::string compiled_dims;
+        std::optional<std::string> epilogue_type;
 
         GemmConfig gemm_config;
         LaunchArgs launch_args;
@@ -116,22 +116,22 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                   config.block_m, config.block_k, 1, 0);
 
     // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
-        .major_sfb = major_sfb,
-        .m = m, .n = n, .k = k,
-        .num_groups = 1,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = epilogue_type,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90FP8Gemm1D2DRuntime::Args args = {
+        major_sfb,
+        m, n, k,
+        1,
+        compiled_dims,
+        epilogue_type,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .sfb = sfb.data_ptr(),
-        .grouped_layout = nullptr,
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_d = tensor_map_d,
-        .tensor_map_sfa = tensor_map_sfa,
+        sfb.data_ptr(),
+        nullptr,
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_d,
+        tensor_map_sfa
     };
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_gemm_1d2d", code);
@@ -177,22 +177,22 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                   config.block_m, config.block_k, 1, 0);
 
     // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
-        .major_sfb = major_sfb,
-        .m = m, .n = n, .k = k,
-        .num_groups = num_groups,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = std::nullopt,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90FP8Gemm1D2DRuntime::Args args = {
+        major_sfb,
+        m, n, k,
+        num_groups,
+        compiled_dims,
+        std::nullopt,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .sfb = sfb.data_ptr(),
-        .grouped_layout = m_indices.data_ptr(),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_d = tensor_map_d,
-        .tensor_map_sfa = tensor_map_sfa,
+        sfb.data_ptr(),
+        m_indices.data_ptr(),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_d,
+        tensor_map_sfa
     };
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_m_grouped_fp8_gemm_contiguous_1d2d", code);
@@ -239,22 +239,22 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
                                                   config.block_m, config.block_k, num_groups, 0);
 
     // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
-        .major_sfb = major_sfb,
-        .m = m, .n = n, .k = k,
-        .num_groups = num_groups,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = std::nullopt,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90FP8Gemm1D2DRuntime::Args args = {
+        major_sfb,
+        m, n, k,
+        num_groups,
+        compiled_dims,
+        std::nullopt,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .sfb = sfb.data_ptr(),
-        .grouped_layout = masked_m.data_ptr(),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_d = tensor_map_d,
-        .tensor_map_sfa = tensor_map_sfa,
+        sfb.data_ptr(),
+        masked_m.data_ptr(),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_d,
+        tensor_map_sfa
     };
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_m_grouped_gemm_masked_1d2d", code);
@@ -306,22 +306,22 @@ static void sm90_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                                                   config.block_m, config.block_k, batch_size, 0);
 
     // Launch
-    const SM90FP8Gemm1D2DRuntime::Args& args = {
-        .major_sfb = major_sfb,
-        .m = m, .n = n, .k = k,
-        .num_groups = batch_size,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = std::nullopt,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90FP8Gemm1D2DRuntime::Args args = {
+        major_sfb,
+        m, n, k,
+        batch_size,
+        compiled_dims,
+        std::nullopt,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .sfb = sfb.data_ptr(),
-        .grouped_layout = nullptr,
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_d = tensor_map_d,
-        .tensor_map_sfa = tensor_map_sfa,
+        sfb.data_ptr(),
+        nullptr,
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_d,
+        tensor_map_sfa
     };
     const auto& code = SM90FP8Gemm1D2DRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_fp8_gemm_1d2d", code);
