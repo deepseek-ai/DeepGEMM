@@ -25,7 +25,10 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
         return std::string(c_str);
     } else if constexpr (std::is_same_v<dtype_t, int>) {
         int value;
-        std::sscanf(c_str, "%d", &value);
+        if (std::sscanf(c_str, "%d", &value) != 1) {
+            // Failed to parse as int, return default value
+            return default_value;
+        }
         return value;
     } else {
         DG_HOST_ASSERT(false and "Unexpected type");
