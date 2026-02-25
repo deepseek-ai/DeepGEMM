@@ -358,6 +358,124 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 }
+
+// ====================
+// SM90 W4AFP8 APIs
+// Dedicated W4AFP8 (INT4-bit weight, FP8 activation) GEMM entry points for SM90.
+// Algorithm compatible with https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8
+// but uses a custom weight layout (see convert_fp8_to_int4 in tests/generators.py).
+// ====================
+
+static void sm90_w4afp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                const std::pair<torch::Tensor, torch::Tensor>& b,
+                                const torch::Tensor& d,
+                                const std::optional<torch::Tensor>& c,
+                                const std::string& compiled_dims) {
+    // Shape: `[M, K] @ [N, K/2].T` (INT4-bit weight, K packed to K/2)
+    const auto& major_a = get_major_type_ab(a.first);
+    const auto& major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+    check_major_type_cd(d);
+
+    // Type and shape checks
+    const auto& [m , k ] = get_shape<2>(a.first);
+    const auto& [n , k_] = get_shape<2>(b.first);
+    const auto& [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_ * 2);
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+
+    if (early_return(m, n, k, d, c))
+        return;
+
+    // W4 fixed recipe: (gran_m=m, gran_n=1, gran_k=128)
+    const auto recipe = std::make_tuple(m, 1, 128);
+    const auto& sfa = a.second;  // Per-tensor activation scale (no TMA transform needed)
+    const auto sfb = layout::transform_sf_into_required_layout(
+        b.second, n, k, recipe, std::nullopt, std::nullopt, false, false);
+    const auto& major_sfb = cute::UMMA::Major::K;
+
+    sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k,
+                       major_a, major_b, major_sfb, compiled_dims);
+}
+
+static void sm90_m_grouped_w4afp8_gemm_nt_contiguous(
+        const std::pair<torch::Tensor, torch::Tensor>& a,
+        const std::pair<torch::Tensor, torch::Tensor>& b,
+        const torch::Tensor& d,
+        const torch::Tensor& m_indices,
+        const std::string& compiled_dims) {
+    // Shape: `[M, K] @ [G, N, K/2].mT` (INT4-bit weight)
+    const auto& major_a = get_major_type_ab(a.first);
+    const auto& major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(m_indices.is_contiguous());
+    check_major_type_cd(d);
+
+    // Type and shape checks
+    const auto& [m , k ] = get_shape<2>(a.first);
+    const auto& [num_groups, n, k_] = get_shape<3>(b.first);
+    const auto& [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_ * 2);
+    DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(m_indices.scalar_type() == torch::kInt);
+
+    const auto& [m__] = get_shape<1>(m_indices);
+    DG_HOST_ASSERT(m == m__);
+
+    if (m == 0)
+        return;
+
+    // W4 fixed recipe
+    const auto recipe = std::make_tuple(m, 1, 128);
+    const auto& sfa = a.second;  // Per-tensor activation scale (no TMA transform needed)
+    const auto sfb = layout::transform_sf_into_required_layout(
+        b.second, n, k, recipe, std::nullopt, num_groups, false, false);
+    const auto& major_sfb = cute::UMMA::Major::K;
+
+    sm90_m_grouped_fp8_gemm_contiguous_1d2d(a.first, sfa, b.first, sfb, d, m_indices,
+                                            num_groups, m, n, k, major_a, major_b, major_sfb, compiled_dims);
+}
+
+static void sm90_m_grouped_w4afp8_gemm_nt_masked(
+        const std::pair<torch::Tensor, torch::Tensor>& a,
+        const std::pair<torch::Tensor, torch::Tensor>& b,
+        const torch::Tensor& d,
+        const torch::Tensor& masked_m,
+        const int& expected_m,
+        const std::string& compiled_dims) {
+    // Shape: `[G, M, K] @ [G, N, K/2].mT` (INT4-bit weight)
+    const auto& major_a = get_major_type_ab(a.first);
+    const auto& major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(masked_m.is_contiguous());
+    check_major_type_cd(d);
+
+    // Type and shape checks
+    const auto& [num_groups  , m , k ] = get_shape<3>(a.first);
+    const auto& [num_groups_ , n , k_] = get_shape<3>(b.first);
+    const auto& [num_groups__, m_, n_] = get_shape<3>(d);
+    const auto num_groups___ = static_cast<int>(masked_m.numel());
+    DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_ * 2);
+    DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+
+    // W4 fixed recipe
+    const auto recipe = std::make_tuple(m, 1, 128);
+    const auto& sfa = a.second;  // Per-tensor activation scale (no TMA transform needed)
+    const auto sfb = layout::transform_sf_into_required_layout(
+        b.second, n, k, recipe, std::nullopt, num_groups, false, false);
+    const auto& major_sfb = cute::UMMA::Major::K;
+
+    sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
+                                        num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
+}
+
 #endif
 
 #if DG_TENSORMAP_COMPATIBLE
@@ -515,7 +633,7 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else if (arch_major == 10) {
         sm100_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
-                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
+                                        num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -660,6 +778,19 @@ static void register_apis(pybind11::module_& m) {
     m.attr("m_grouped_fp8_gemm_nt_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nt_contiguous");
     m.attr("m_grouped_fp8_gemm_nn_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nn_contiguous");
     m.attr("m_grouped_fp8_gemm_nt_masked") = m.attr("m_grouped_fp8_fp4_gemm_nt_masked");
+
+    // SM90 W4AFP8 GEMMs
+    m.def("sm90_w4afp8_gemm_nt", &sm90_w4afp8_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("c") = std::nullopt,
+          py::arg("compiled_dims") = "nk");
+    m.def("sm90_m_grouped_w4afp8_gemm_nt_contiguous", &sm90_m_grouped_w4afp8_gemm_nt_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
+          py::arg("compiled_dims") = "nk");
+    m.def("sm90_m_grouped_w4afp8_gemm_nt_masked", &sm90_m_grouped_w4afp8_gemm_nt_masked,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
+          py::arg("expected_m"),
+          py::arg("compiled_dims") = "nk");
 #endif
 
 #if DG_TENSORMAP_COMPATIBLE

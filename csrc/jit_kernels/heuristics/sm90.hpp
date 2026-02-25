@@ -84,6 +84,7 @@ struct SM90ArchSpec {
         // Or too many register spills
         if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 192))
             return false;
+        // W4: add condition: "and block_m > 64" to make "block_n == 256" valid, but Negative optimization
 
         // The block sizes cannot be too large (for enough registers), so at least one dim less than 128
         return block_m <= 128 or block_n <= 128;
@@ -130,12 +131,13 @@ struct SM90ArchSpec {
 
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,
                                                           const int& block_m, const int& block_n, const int& block_k,
-                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype) {
+                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
+                                                          const bool is_w4 = false) {
         if (mma_kind == MmaKind::BF16)
             return {0, 0};
 
         // NOTES: 128 is for 2D TMA alignment requirement
-        int smem_sfa_per_stage = align(block_m * static_cast<int>(sizeof(float)), 128);
+        int smem_sfa_per_stage = align((is_w4 ? block_n : block_m)  * static_cast<int>(sizeof(float)), 128);
         int smem_sfb_per_stage = 0;
         if (kernel_type == KernelType::Kernel1D1D)
             smem_sfb_per_stage = align(block_n * 4, 128);

@@ -101,14 +101,17 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
                                           const int& block_m, const int& block_n, const int& block_k,
                                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                           const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
-                                          const int& num_stages, const MulticastConfig& multicast_config) {
+                                          const int& num_stages, const MulticastConfig& multicast_config,
+                                          const bool is_w4 = false) {
     const int& ab_elem_size = static_cast<int>(get_element_size(mma_kind));
     const int& cd_elem_size = static_cast<int>(c10::elementSize(cd_dtype));
+
+    const int weight_ratio = is_w4 ? 2 : 1;
 
     const int& load_block_m = ArchSpec::get_ab_load_block_m(multicast_config, block_m);
     const int& load_block_n = ArchSpec::get_ab_load_block_n(multicast_config, block_n);
     const int& swizzle_a_mode = get_swizzle_mode(major_a == cute::UMMA::Major::K ? block_k : load_block_m, ab_elem_size);
-    const int& swizzle_b_mode = get_swizzle_mode(major_b == cute::UMMA::Major::K ? block_k : load_block_n, ab_elem_size);
+    const int& swizzle_b_mode = get_swizzle_mode(major_b == cute::UMMA::Major::K ? (block_k / weight_ratio) : load_block_n, ab_elem_size);
     const int& swizzle_cd_mode = ArchSpec::enable_cd_swizzle(cd_dtype) ? get_swizzle_mode(block_n, cd_elem_size) : 0;
 
     // Different archs have different epilogue pipelines
@@ -116,11 +119,11 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
 
     // A/B shared memory
     const int& smem_a_per_stage = load_block_m * block_k * ab_elem_size;
-    const int& smem_b_per_stage = load_block_n * block_k * ab_elem_size;
+    const int& smem_b_per_stage = load_block_n * block_k * ab_elem_size / weight_ratio;
 
     // SF shared memory
     const auto& [smem_sfa_per_stage, smem_sfb_per_stage] =
-        ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_m, block_n, block_k, mma_kind, cd_dtype);
+        ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_m, block_n, block_k, mma_kind, cd_dtype, is_w4);
     const int& smem_extra_sfb = ArchSpec::get_extra_sfb_smem_size(m, n, k, block_m, block_n, block_k);
 
     // M-barriers and tensor memory pointers
@@ -154,7 +157,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                   const at::ScalarType& a_dtype, const at::ScalarType& b_dtype,
                                   const at::ScalarType& cd_dtype,
-                                  const bool& with_accumulation, const int& num_sms) {
+                                  const bool& with_accumulation, const int& num_sms,
+                                  const bool is_w4 = false) {
     const auto mma_kind = (a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4);
     if (mma_kind == MmaKind::BF16) {
         DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
@@ -165,12 +169,21 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
     // Select M/N block sizes
-    auto block_ms = ArchSpec::get_block_m_candidates(kernel_type, major_a, m);
+    // W4 uses swap_ab: block_m tiles the N dimension, block_n tiles the M dimension after swap
+    // Don't use ArchSpec::get_block_m_candidates for W4 — it adds {16, 32} for small m, which
+    // are invalid for W4 (STSM pattern requires BLOCK_M >= 64)
+    auto block_ms = is_w4 ? std::vector{64, 128, 256} : ArchSpec::get_block_m_candidates(kernel_type, major_a, m);
     if (gemm_type == GemmType::MGroupedContiguous)
         block_ms = std::vector{get_mk_alignment_for_contiguous_layout()};
     if (gemm_type == GemmType::MGroupedMasked or gemm_type == GemmType::MGroupedContiguousWithPsumLayout) 
         block_ms = std::vector{64, 128};    // Exclude 256 for performance
-    auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
+
+    // W4 with very small m (compiled SHAPE_M, MMA_N=SHAPE_M): STSM only fills MMA_N/64 of
+    // the smem_d atom. When 2 warp-groups are used (block_n > 64), the STSM layout causes
+    // NaN due to reading uninitialized smem_d. Restrict block_ns to {64} for small-m W4.
+    const bool w4_small_m = is_w4 and (gemm_type == GemmType::Normal) and (m > 0 and m <= 56);
+    auto block_ns = is_w4 ? (w4_small_m ? std::vector{64} : std::vector{64, 128, 256})
+                          : ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
 
     // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
     // TODO: Optimize it
@@ -201,7 +214,11 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         for (const auto& block_n: block_ns) {
             const int& num_waves = get_num_waves(block_m, block_n);
             const auto& last_util = get_last_wave_util(block_m, block_n);
-            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, mma_kind, cd_dtype, m, n, k, block_m, block_n, block_k))
+
+            // make BLOCK_N(256) valid for W4
+            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, mma_kind, cd_dtype, m, n, k,
+                is_w4 ? block_n : block_m,
+                is_w4 ? block_m : block_n, block_k))
                 continue;
 
             bool success = false;
@@ -267,7 +284,8 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
                                                      best_block_m, best_block_n, block_k,
                                                      major_a, major_b,
                                                      mma_kind, cd_dtype,
-                                                     num_stages, best_multicast_config);
+                                                     num_stages, best_multicast_config,
+                                                     is_w4);
         if (best_smem_config.smem_size <= smem_capacity) {
             best_num_stages = num_stages;
             break;
@@ -304,7 +322,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         .multicast_config = best_multicast_config,
         // ReSharper disable once CppLocalVariableMightNotBeInitialized
         .smem_config = best_smem_config,
-        .thread_config = ArchSpec::get_thread_config(kernel_type, best_block_m, best_block_n)
+        .thread_config = ArchSpec::get_thread_config(kernel_type, is_w4 ? best_block_n : best_block_m, best_block_n)
     };
 
     // Only SM100 BF16 kernels support tensor core control

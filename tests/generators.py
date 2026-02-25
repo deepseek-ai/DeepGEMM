@@ -355,6 +355,174 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
     return a, b, masked_m, psum_m, d, ref_d
 
 
+## ====================
+## W4AFP8 generators
+## ====================
+def per_tensor_quant_fp8(x: torch.Tensor):
+    FP8_E4M3_MAX = 448
+
+    amax = x.abs().max()
+    s = amax / FP8_E4M3_MAX
+    eps = torch.finfo(torch.float).tiny
+    s = torch.clamp(s, min=eps)
+
+    q_fp8 = torch.clamp(x / s, min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+
+    return q_fp8, s.to(torch.float)
+
+
+w4_group_size = 128
+
+
+def convert_fp8_to_int4(b):
+    assert b.dim() == 2
+    n, k = b.shape
+
+    b_int8 = b.to(torch.int8)
+
+    b_int8_1 = b_int8.reshape(n // 16, 16, k // 32, 32).permute(0, 2, 1, 3)
+    b_int8_2 = b_int8_1.reshape(n // 16, k // 32, 2, 8, 2, 4, 4).permute(0, 1, 4, 3, 5, 2, 6)
+    b_int8_permuted = b_int8_2.reshape(n // 16, k // 32, 16, 32).permute(0, 2, 1, 3).reshape(n, k)
+
+    b_uint8_view = b_int8_permuted.view(torch.uint8)
+    b_int4 = (b_uint8_view[:, 1::2] << 4) | \
+             (b_uint8_view[:, 0::2] & 0x0F)
+    b_q = b_int4.view(torch.float8_e4m3fn)
+
+    b_s_dim = (1, w4_group_size)
+    debug = False
+    affine_coeff = 0.005
+
+    if debug:
+        b_s = torch.ones((ceil_div(n, b_s_dim[0]), ceil_div(k, b_s_dim[1])), device=b_q.device, dtype=torch.float) * affine_coeff
+    else:
+        b_s = torch.randn(ceil_div(n, b_s_dim[0]), ceil_div(k, b_s_dim[1]),  device=b_q.device, dtype=torch.float) * affine_coeff
+
+    return b_q, b_s
+
+
+def enumerate_normal_w4() -> Generator:
+    m_list = [1, 128, 4096]
+    nk_list = [(2112, 7168), (576, 7168), (24576, 1536), (32768, 512), (7168, 16384), (4096, 7168), (7168, 2048)]
+    reset_seed()
+    for m in m_list:
+        for n, k in nk_list:
+            yield m, n, k
+
+
+def enumerate_m_grouped_contiguous_w4() -> Generator:
+    group_list = [4, 8, 16]
+    n_k_list = [(4096, 7168), (7168, 2048)]
+    expected_m_per_group_list = [128, 256, 512, 1024]
+
+    reset_seed()
+    for num_groups in group_list:
+        for n, k in n_k_list:
+            for expected_m_per_group in expected_m_per_group_list:
+                yield num_groups, expected_m_per_group, n, k
+
+
+def enumerate_m_grouped_masked_w4() -> Generator:
+    max_m = 4096
+    group_list = [8, 16]
+    m_list = [16, 24, 32, 40, 48, 56, 64]
+    n_k_list = [(4096, 7168), (7168, 2048)]
+
+    reset_seed()
+    for num_groups in group_list:
+        for n, k in n_k_list:
+            for m in m_list:
+                yield num_groups, max_m, m, n, k
+
+
+def generate_normal_w4(m: int, n: int, k: int, accumulate: bool, out_dtype: torch.dtype):
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.empty((n, k), device='cuda', dtype=torch.bfloat16).uniform_(-8.0, 8.0).to(torch.int8)
+    d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
+        torch.empty((m, n), device='cuda', dtype=out_dtype)
+    c = d if accumulate else None
+
+    b_q, b_s = convert_fp8_to_int4(b)
+
+    a_q, a_s = per_tensor_quant_fp8(a)
+    a_fp32 = a_q.float() * a_s.item()
+
+    b_dequant = (b.float().reshape(-1, w4_group_size) * b_s.reshape(-1, 1)).reshape(n, k)
+    ref_d = (a_fp32 @ b_dequant.t() + (c if accumulate else 0)).to(out_dtype)
+
+    a_fp8 = (a_q, a_s)
+    b_fp8 = (b_q, b_s)
+    return a_fp8, b_fp8, c, d, ref_d
+
+
+def generate_m_grouped_contiguous_w4(num_groups: int, expected_m_per_group: int, n: int, k: int):
+    actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
+    aligned_ms = [align(actual_m, get_mk_alignment_for_contiguous_layout()) for actual_m in actual_ms]
+    m = sum(aligned_ms)
+
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.empty((num_groups, n, k), device='cuda', dtype=torch.bfloat16).uniform_(-8.0, 8.0).to(torch.int8)
+
+    a_q, a_s = per_tensor_quant_fp8(a)
+    a_fp8 = (a_q, a_s)
+
+    b_fp8 = (torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.float8_e4m3fn),
+             torch.empty((num_groups, n, ceil_div(k, w4_group_size)), device='cuda', dtype=torch.float))
+
+    m_indices = torch.empty(m, device='cuda', dtype=torch.int32)
+    d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    ref_d = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
+
+    start = 0
+    for i, (actual_m, aligned_m) in enumerate(zip(actual_ms, aligned_ms)):
+        actual_end = start + actual_m
+        aligned_end = start + aligned_m
+        m_indices[start: actual_end] = i
+        m_indices[actual_end: aligned_end] = -1
+        a[actual_end: aligned_end] = 0
+
+        b_fp8[0][i], b_fp8[1][i] = convert_fp8_to_int4(b[i])
+        b_dequant = (b[i].float().reshape(-1, w4_group_size) * b_fp8[1][i].reshape(-1, 1)).reshape(n, k)
+
+        a_fp32 = a_q[start:aligned_end].float() * a_s.item()
+        ref_d[start:aligned_end] = (a_fp32 @ b_dequant.t()).to(torch.bfloat16)
+        start = aligned_end
+
+    # Zero ref_d for padding rows (m_indices == -1), matching what the test does for d
+    ref_d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(ref_d), ref_d)
+    return m, a_fp8, b_fp8, m_indices, d, ref_d
+
+
+def generate_m_grouped_masked_w4(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int):
+    a = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.empty((num_groups, n, k), device='cuda', dtype=torch.bfloat16).uniform_(-8.0, 8.0).to(torch.int8)
+    d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.bfloat16)
+    d.fill_(-1)
+    ref_d = torch.empty_like(d)
+
+    masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
+    psum_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
+    for j in range(num_groups):
+        masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
+        psum_m[j] = (0 if j == 0 else align(psum_m[j - 1], 128)) + masked_m[j]
+    assert masked_m.amax().item() <= max_m
+
+    b_fp8 = (torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.float8_e4m3fn),
+             torch.empty((num_groups, n, ceil_div(k, w4_group_size)), device='cuda', dtype=torch.float))
+
+    a_q, a_s = per_tensor_quant_fp8(a)
+    a_fp8 = (a_q, a_s)
+
+    for i in range(num_groups):
+        b_fp8[0][i], b_fp8[1][i] = convert_fp8_to_int4(b[i])
+        b_dequant = (b[i].float().reshape(-1, w4_group_size) * b_fp8[1][i].reshape(-1, 1)).reshape(n, k)
+
+        a_fp32 = a_q[i].float() * a_s.item()
+        ref_d[i] = (a_fp32 @ b_dequant.t()).to(torch.bfloat16)
+
+    return a_fp8, b_fp8, masked_m, d, ref_d
+
+
 def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks: List[int],
                                   use_ue8m0: bool = False, use_bf16: bool = False):
     assert get_mk_alignment_for_contiguous_layout() % 128 == 0

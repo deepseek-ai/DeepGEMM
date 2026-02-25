@@ -11,6 +11,106 @@
 #include <deep_gemm/common/tma_utils.cuh>
 
 namespace deep_gemm::sm90 {
+template <bool Trans, int NVElem, typename DT>
+__device__ inline void ldmatrix (uint32_t* frag, const DT* smem) {
+    uint32_t addr = __cvta_generic_to_shared (smem);
+    if constexpr (Trans == false) {
+        if constexpr (NVElem * sizeof(uint32_t) == 8)
+            asm volatile ("ldmatrix.sync.aligned.m8n8.shared.b16.x2 {%0, %1}, [%2];\n"
+                :"=r"(frag[0]),"=r"(frag[1])
+                : "r"(addr)
+            );
+        else
+            asm volatile ("ldmatrix.sync.aligned.m8n8.shared.b16.x4 {%0, %1, %2, %3}, [%4];\n"
+                :"=r"(frag[0]),"=r"(frag[1]),"=r"(frag[2]),"=r"(frag[3])
+                : "r"(addr)
+            );
+    } else {
+        if constexpr (NVElem * sizeof(uint32_t) == 8)
+            asm volatile ("ldmatrix.sync.aligned.m8n8.shared.b16.x2.trans {%0, %1}, [%2];\n"
+                :"=r"(frag[0]),"=r"(frag[1])
+                : "r"(addr)
+            );
+        else
+            asm volatile ("ldmatrix.sync.aligned.m8n8.shared.b16.x4.trans {%0, %1, %2, %3}, [%4];\n"
+                :"=r"(frag[0]),"=r"(frag[1]),"=r"(frag[2]),"=r"(frag[3])
+                : "r"(addr)
+            );
+    }
+}
+
+template <uint32_t COL_BYTES, uint32_t NV>
+__device__ inline auto permute_col (const uint32_t sRow, const uint32_t sCol) {
+    constexpr uint32_t strd = 128 / std::min (uint32_t(128), COL_BYTES);
+    const uint32_t pCol = (sCol / NV) ^ (sRow % 8 / strd);
+    return pCol * NV;
+}
+
+template <int N_, typename MMA>
+struct FP8MMARS {
+
+    template <size_t ...Idx>
+    __forceinline__ __device__ static void call_fma_impl(uint32_t const* a, uint64_t const& desc_b, float* d, bool scale_d,
+        cute::index_sequence<Idx...>) {
+        using namespace cute::SM90::GMMA;
+        MMA::fma(a[0], a[1], a[2], a[3], desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
+    }
+
+    __forceinline__ __device__ static void wgmma(uint32_t const* a, uint64_t const& desc_b, float* d, bool scale_d) {
+        call_fma_impl(a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
+    }
+
+    static constexpr int M = 64;
+    static constexpr int N = N_;
+    static constexpr int K = 32;
+    static constexpr int kNumAccum = M * N / 128;
+};
+
+template <int N>
+struct FP8MMASelectorRS {
+
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        if constexpr (N == 8) return MMA_64x8x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 16) return MMA_64x16x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 24) return MMA_64x24x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 32) return MMA_64x32x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 40) return MMA_64x40x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 48) return MMA_64x48x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 56) return MMA_64x56x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 64) return MMA_64x64x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 72) return MMA_64x72x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 80) return MMA_64x80x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 88) return MMA_64x88x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 96) return MMA_64x96x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 104) return MMA_64x104x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 112) return MMA_64x112x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 120) return MMA_64x120x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 128) return MMA_64x128x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 136) return MMA_64x136x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 144) return MMA_64x144x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 152) return MMA_64x152x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 160) return MMA_64x160x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 168) return MMA_64x168x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 176) return MMA_64x176x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 184) return MMA_64x184x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 192) return MMA_64x192x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 200) return MMA_64x200x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 208) return MMA_64x208x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 216) return MMA_64x216x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 224) return MMA_64x224x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 232) return MMA_64x232x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 240) return MMA_64x240x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 248) return MMA_64x248x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 256) return MMA_64x256x32_F32E4M3E4M3_RS_TN();
+    }
+
+    static constexpr auto select_type() {
+        return FP8MMARS<N, decltype(select_mma())>();
+    }
+
+    using type = decltype(select_type());
+};
 
 template <int N_, typename MMA>
 struct FP8MMA {
@@ -200,11 +300,18 @@ struct TF32MMASelector {
 
 template <typename dtype_t>
 struct SM90_U32x2_STSM_N {
+    template<bool kIsW4 = false>
     __device__ __forceinline__ static void
     copy(dtype_t src_0, dtype_t src_1, void* smem_dst) {
         const uint32_t src[2] = {*reinterpret_cast<uint32_t*>(&src_0), *reinterpret_cast<uint32_t*>(&src_1)};
-        asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16 [%0], {%1, %2};\n"
+
+        if constexpr (kIsW4) {
+            asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16.trans [%0], {%1, %2};\n"
+                        :: "l"(__cvta_generic_to_shared(smem_dst)), "r"(src[0]), "r"(src[1]));
+        } else {
+            asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16 [%0], {%1, %2};\n"
                      :: "l"(__cvta_generic_to_shared(smem_dst)), "r"(src[0]), "r"(src[1]));
+        }
     }
 };
 
@@ -242,6 +349,42 @@ template <int N>
 __forceinline__ __device__ void warpgroup_wait() {
     DG_STATIC_ASSERT(N >= 0 and N <= 7, "WGMMA wait: N must be in range [0, 7]");
     asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(N) : "memory");
+}
+
+// reference: https://zhuanlan.zhihu.com/p/1920936840573191766
+// https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/detail/collective/mixed_input_utils.hpp
+__device__ inline void fast_int4_to_fp8_convert(uint32_t outputs[2], uint32_t input) {
+    constexpr uint32_t neg0 = 0xcaccced0;
+    constexpr uint32_t neg1 = 0xb8c0c4c8;
+    constexpr uint32_t pos0 = 0x44403800;
+    constexpr uint32_t pos1 = 0x4e4c4a48;
+
+    constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
+    uint32_t sign; // ((reg & 0x88888888) | 0x64206420) >> 1
+    asm volatile(
+        "{\n"
+        "  lop3.b32 %0, %1, %2, %3, %4;\n"
+        "}\n"
+        : "=r"(sign)
+        : "r"(input), "n"(0x88888888), "n"(0x64206420), "n"(immLut));
+    sign = sign >> 1;
+
+    // Ignore sign bit when indexing into LUT
+    uint32_t lut_idx = input & 0x77777777;
+
+    #pragma unroll
+    for (int i = 0; i < 2; ++i, lut_idx >>= 16, sign >>= 16)
+    {
+        asm volatile(
+            "{\n"
+            "  .reg .b32 pos, neg                    ;\n"
+            "  prmt .b32 neg, %3, %4, %1             ;\n"
+            "  prmt .b32 pos, %5, %6, %1             ;\n"
+            "  prmt .b32 %0, pos, neg, %2            ;\n"
+            "}\n"
+            : "=r"(outputs[i])
+            : "r"(lut_idx), "r"(sign), "r"(neg0), "r"(neg1), "r"(pos0),"r"(pos1));
+    }
 }
 
 template <class PointerType>

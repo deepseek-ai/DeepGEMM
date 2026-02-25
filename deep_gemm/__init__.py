@@ -36,6 +36,10 @@ try:
         m_grouped_fp8_fp4_gemm_nt_contiguous,
         m_grouped_fp8_fp4_gemm_nn_contiguous,
         m_grouped_fp8_fp4_gemm_nt_masked,
+        # SM90 W4AFP8 GEMMs
+        sm90_w4afp8_gemm_nt,
+        sm90_m_grouped_w4afp8_gemm_nt_contiguous,
+        sm90_m_grouped_w4afp8_gemm_nt_masked,
         # FP8 GEMMs
         fp8_gemm_nt, fp8_gemm_nn,
         fp8_gemm_tn, fp8_gemm_tt,

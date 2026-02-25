@@ -123,9 +123,11 @@ struct SM100ArchSpec {
         return std::min(block_m, layout_ad_m) * swizzle_cd_mode * 2;
     }
 
+    // add param is_w4 for compilation(W4 on sm90)
     static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,
                                                           const int& block_m, const int& block_n, const int& block_k,
-                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype) {
+                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
+                                                          const bool is_w4 = false) {
         if (mma_kind == MmaKind::BF16)
             return {0, 0};
 

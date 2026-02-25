@@ -110,6 +110,11 @@ During the inference decoding phase, when CUDA graph is enabled and the CPU is u
 
 Use `m_grouped_fp8_gemm_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
 
+#### W4Afp8
+- W4AFP8 (INT4-bit weight, FP8 activation) GEMM kernel for Hopper (SM90). Supports Normal GEMM, M-Grouped Contiguous GEMM, and M-Grouped Masked GEMM.
+
+- Algorithm compatible with https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8, but uses a custom weight layout (see `convert_fp8_to_int4` in `tests/generators.py`).
+
 #### V3.2 MQA kernels for the indexer
 
 The kernel family has two versions, non-paged (for prefilling) and paged (for decoding).
