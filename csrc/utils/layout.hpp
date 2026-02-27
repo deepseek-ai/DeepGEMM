@@ -36,15 +36,34 @@ static bool fp8_requires_k_major() {
 // Tensor utils
 template <int N>
 static auto get_shape(const torch::Tensor& t) {
+    DG_HOST_ASSERT(t.dim() == N);
     return [&t] <size_t... Is> (std::index_sequence<Is...>) {
         return std::make_tuple(static_cast<int>(t.sizes()[Is])...);
     }(std::make_index_sequence<N>());
 }
 
+static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
+    auto [mn, k] = get_shape<2>(ab);
+    if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
+        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10);
+        major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
+    }
+    return std::make_tuple(mn, k);
+}
+
+static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
+    auto [num_groups, mn, k] = get_shape<3>(ab);
+    if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
+        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10);
+        major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
+    }
+    return std::make_tuple(num_groups, mn, k);
+}
+
 // Recipe
 static std::tuple<int, int, int>
 get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& sfb_dtype) {
-    const auto& arch_major = device_runtime->get_arch_major();
+    const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
@@ -70,7 +89,7 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
         DG_HOST_ASSERT(sf.scalar_type() == type_check.value());
 
     // Always do shape checks
-    const auto& sf_dtype = sf.scalar_type();
+    const auto sf_dtype = sf.scalar_type();
     DG_HOST_ASSERT(sf_dtype == torch::kFloat or sf_dtype == torch::kInt);
     DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
     if (num_groups.has_value())

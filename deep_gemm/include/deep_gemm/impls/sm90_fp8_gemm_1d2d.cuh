@@ -171,20 +171,23 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                     empty_barriers[stage_idx]->wait(phase ^ 1);
 
                     // Issue TMA A
+                    constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
+                    const uint32_t batch_idx = (kIsBatchedMM ? scheduler.current_group_idx : 0);
+
                     constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
                     auto& full_barrier = *full_barriers[stage_idx];
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
-                    tma_copy<BLOCK_K, BLOCK_M, kSwizzleAMode>(&tensor_map_a, &full_barrier,
+                    tma_copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_a, &full_barrier,
                              smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
-                             num_tma_multicast_a);
+                             num_tma_multicast_a, batch_idx);
                     tma_copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
-                             smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.get_global_idx<kWithGroupOffsetA>(shape_k_scales, 1, k_block_idx),
+                             smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.template get_global_idx<kWithGroupOffsetA, IndexType::SF_K>(shape_k_scales, 1, k_block_idx),
                              num_tma_multicast_a);
 
                     // Issue TMA B
-                    tma_copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(&tensor_map_b, &full_barrier,
+                    tma_copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
                              smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                             num_tma_multicast_b);
+                             num_tma_multicast_b, batch_idx);
                     full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
                 }
             }
@@ -222,7 +225,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             // Load B scales with math warp-groups
             // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
             if (threadIdx.x >= 32) {
-                auto previous_group_offset = scheduler.get_global_idx<true>(shape_n_sfb * shape_k_scales, 0, 0, m_block_idx);
+                auto previous_group_offset = scheduler.template get_global_idx<true, IndexType::SF_K>(shape_n_sfb * shape_k_scales, 0, 0, m_block_idx);
                 const uint32_t stride_n_sfb = kMajorSFB == cute::UMMA::Major::MN ? 1 : shape_k_scales;
                 const uint32_t stride_k_sfb = kMajorSFB == cute::UMMA::Major::MN ? shape_n_sfb : 1;
                 auto local_sfb = sfb + previous_group_offset + ((n_block_idx * BLOCK_N) / BLOCK_K) * stride_n_sfb;
@@ -413,9 +416,14 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
-                cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr,
-                                            epilogue_type_t::apply_index_n<TMA_D_BLOCK_N>(n_block_idx * BLOCK_N + in_block_n_offset),
-                                            scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx));
+                auto n_idx = epilogue_type_t::apply_index_n<TMA_D_BLOCK_N>(n_block_idx * BLOCK_N + in_block_n_offset);
+                auto m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
+                if constexpr (kGemmType == GemmType::Batched) {
+                    cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,
+                                                  n_idx, m_idx, scheduler.current_group_idx);
+                } else {
+                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr, n_idx, m_idx);
+                }
                 cute::tma_store_arrive();
             }
             __syncwarp();

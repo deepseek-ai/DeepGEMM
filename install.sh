@@ -7,7 +7,7 @@ cd "$script_dir"
 rm -rf build dist
 rm -rf *.egg-info
 python setup.py bdist_wheel
-pip install dist/*.whl
+pip install dist/*.whl --force-reinstall
 
 # Open users' original directory
 cd "$original_dir"

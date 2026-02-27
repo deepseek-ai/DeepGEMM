@@ -59,7 +59,8 @@ struct GemmConfig {
     // Templated configs
     GemmType gemm_type;
     KernelType kernel_type;
-    at::ScalarType ab_dtype, cd_dtype;
+    MmaKind mma_kind;
+    at::ScalarType a_dtype, b_dtype, cd_dtype;
     cute::UMMA::Major major_a;
     cute::UMMA::Major major_b;
     bool with_accumulation;
@@ -99,9 +100,9 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
                                           const int& m, const int& n, const int& k,
                                           const int& block_m, const int& block_n, const int& block_k,
                                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                          const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                           const int& num_stages, const MulticastConfig& multicast_config) {
-    const int& ab_elem_size = static_cast<int>(c10::elementSize(ab_dtype));
+    const int& ab_elem_size = static_cast<int>(get_element_size(mma_kind));
     const int& cd_elem_size = static_cast<int>(c10::elementSize(cd_dtype));
 
     const int& load_block_m = ArchSpec::get_ab_load_block_m(multicast_config, block_m);
@@ -119,7 +120,7 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
 
     // SF shared memory
     const auto& [smem_sfa_per_stage, smem_sfb_per_stage] =
-        ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_m, block_n, block_k, ab_dtype, cd_dtype);
+        ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_m, block_n, block_k, mma_kind, cd_dtype);
     const int& smem_extra_sfb = ArchSpec::get_extra_sfb_smem_size(m, n, k, block_m, block_n, block_k);
 
     // M-barriers and tensor memory pointers
@@ -151,21 +152,35 @@ template <typename ArchSpec>
 static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& kernel_type,
                                   const int& m, const int& n, const int& k, const int& num_groups,
                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                  const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+                                  const at::ScalarType& a_dtype, const at::ScalarType& b_dtype,
+                                  const at::ScalarType& cd_dtype,
                                   const bool& with_accumulation, const int& num_sms) {
-    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
+    const auto mma_kind = (a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4);
+    if (mma_kind == MmaKind::BF16) {
+        DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
+    } else {
+        DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
+        DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
+    }
     DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
 
     // Select M/N block sizes
     auto block_ms = ArchSpec::get_block_m_candidates(kernel_type, major_a, m);
     if (gemm_type == GemmType::MGroupedContiguous)
         block_ms = std::vector{get_mk_alignment_for_contiguous_layout()};
-    if (gemm_type == GemmType::MGroupedMasked)  // Exclude 256 for performance
-        block_ms = std::vector{64, 128};
-    const auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
+    if (gemm_type == GemmType::MGroupedMasked or gemm_type == GemmType::MGroupedContiguousWithPsumLayout) 
+        block_ms = std::vector{64, 128};    // Exclude 256 for performance
+    auto block_ns = ArchSpec::get_block_n_candidates(kernel_type, cd_dtype);
+
+    // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
+    // TODO: Optimize it
+    if (a_dtype == kPackedFP4 and major_a == cute::UMMA::Major::MN)
+        block_ms = std::vector{128};
+    if (b_dtype == kPackedFP4 and major_b == cute::UMMA::Major::MN)
+        block_ns = std::vector{128};
 
     // K block size is selected in a fixed manner
-    const auto& block_k = 128 / static_cast<int>(c10::elementSize(ab_dtype));
+    const auto& block_k = (mma_kind == MmaKind::BF16 ? 64 : 128);
 
     // Some util functions
     const auto& get_num_blocks = [=](const int& block_m, const int& block_n) {
@@ -186,7 +201,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
         for (const auto& block_n: block_ns) {
             const int& num_waves = get_num_waves(block_m, block_n);
             const auto& last_util = get_last_wave_util(block_m, block_n);
-            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, ab_dtype, cd_dtype, m, n, k, block_m, block_n, block_k))
+            if (not ArchSpec::is_block_size_legal(kernel_type, major_a, major_b, mma_kind, cd_dtype, m, n, k, block_m, block_n, block_k))
                 continue;
 
             bool success = false;
@@ -218,8 +233,16 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // Decide the number of TMA multicasts and whether broadcast on A
     MulticastConfig best_multicast_config = {1, false};
-    const auto& [is_legal_on_a, is_legal_on_b] = ArchSpec::get_multicast_legality(
+    auto [is_legal_on_a, is_legal_on_b] = ArchSpec::get_multicast_legality(
         gemm_type, num_groups, m, n, best_block_m, best_block_n, num_sms);
+
+    // NOTES: TMA copy .b4x16_p64 only supports Swizzle 128B
+    // TODO: Optimize it
+    if (a_dtype == kPackedFP4 and major_a == cute::UMMA::Major::MN)
+        is_legal_on_a = false;
+    if (b_dtype == kPackedFP4 and major_b == cute::UMMA::Major::MN)
+        is_legal_on_b = false;
+
     const bool is_legal[2] = {is_legal_on_b, is_legal_on_a};
     bool order[2] = {false, true};
     if (best_block_m > best_block_n)
@@ -236,14 +259,14 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     int best_num_stages = 0;
     SharedMemoryConfig best_smem_config;
     for (int num_stages = 32; num_stages > 0; -- num_stages) {
-        if (not ArchSpec::is_num_stages_legal(ab_dtype, cd_dtype, num_stages, best_block_m, best_block_n, block_k))
+        if (not ArchSpec::is_num_stages_legal(mma_kind, cd_dtype, num_stages, best_block_m, best_block_n, block_k))
             continue;
 
         best_smem_config = get_smem_config<ArchSpec>(gemm_type, kernel_type,
                                                      m, n, k,
                                                      best_block_m, best_block_n, block_k,
                                                      major_a, major_b,
-                                                     ab_dtype, cd_dtype,
+                                                     mma_kind, cd_dtype,
                                                      num_stages, best_multicast_config);
         if (best_smem_config.smem_size <= smem_capacity) {
             best_num_stages = num_stages;
@@ -255,7 +278,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     // Recompute the minimal number of SMs required
     // NOTES: less L2 cache usage and less GPU frequency drop
     int num_min_sms = num_sms;
-    if (ArchSpec::should_minimize_num_sms()) {
+    if (get_env<int>("DG_JIT_MINIMIZE_NUM_SMS", 0)) {
         num_min_sms = ceil_div(ceil_div(m, best_block_m) * ceil_div(n, best_block_n) * num_groups, best_num_waves);
         num_min_sms = align(num_min_sms, best_multicast_config.num_multicast);
         DG_HOST_ASSERT(num_min_sms <= num_sms);
@@ -264,7 +287,9 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
     const auto& config = GemmConfig {
         .gemm_type = gemm_type,
         .kernel_type = kernel_type,
-        .ab_dtype = ab_dtype,
+        .mma_kind = mma_kind,
+        .a_dtype = a_dtype,
+        .b_dtype = b_dtype,
         .cd_dtype = cd_dtype,
         .major_a = major_a,
         .major_b = major_b,
@@ -284,21 +309,22 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
 
     // Only SM100 BF16 kernels support tensor core control
     if (config.tc_util < 100)
-        DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and ab_dtype == torch::kBFloat16);
+        DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and mma_kind == MmaKind::BF16);
 
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         auto key = std::make_tuple(gemm_type, kernel_type, m, n, k, num_groups, major_a, major_b,
-                                   ab_dtype, cd_dtype, with_accumulation, num_sms);
+                                   mma_kind, a_dtype, b_dtype, cd_dtype, with_accumulation, num_sms);
         static std::set<decltype(key)> printed;
         if (printed.count(key) == 0) {
             printf("GEMM type: %d, kernel type: %d, M: %d, N: %d, K: %d, groups: %d, "
-                   "A major: %d, B major: %d, AB dtype: %s, CD dtype: %s, accumulation: %d, "
+                   "A major: %d, B major: %d, MMA kind: %d, A dtype: %s, B dtype: %s, CD dtype: %s, accumulation: %d, "
                    "SM limit: %d -> block M: %d, block N: %d, block K: %d, stages: %d, last stages: %d, "
                    "SMs: %d, multicast: %d, multicast on A: %d, shared memory: %d bytes, swizzle A: %d, "
                    "swizzle B: %d, swizzle CD: %d, SMs: %d, threads: %d, TC util: %d%%\n",
                    static_cast<int>(gemm_type), static_cast<int>(kernel_type), m, n, k, num_groups,
-                   static_cast<int>(major_a), static_cast<int>(major_b), c10::toString(ab_dtype), c10::toString(cd_dtype),
+                   static_cast<int>(major_a), static_cast<int>(major_b), static_cast<int>(mma_kind),
+                   c10::toString(a_dtype), c10::toString(b_dtype), c10::toString(cd_dtype),
                    static_cast<int>(with_accumulation), num_sms, best_block_m, best_block_n, block_k,
                    best_num_stages, config.num_last_stages, num_min_sms, best_multicast_config.num_multicast,
                    static_cast<int>(best_multicast_config.is_multicast_on_a),

@@ -37,11 +37,12 @@ static std::string to_string(const cute::UMMA::Major& major) {
 
 static std::string to_string(const GemmType& type) {
     switch (type) {
-        case GemmType::Normal:              return "GemmType::Normal";
-        case GemmType::MGroupedContiguous:  return "GemmType::MGroupedContiguous";
-        case GemmType::MGroupedMasked:      return "GemmType::MGroupedMasked";
-        case GemmType::KGroupedContiguous:  return "GemmType::KGroupedContiguous";
-        case GemmType::Batched:             return "GemmType::Batched";
+        case GemmType::Normal:                              return "GemmType::Normal";
+        case GemmType::MGroupedContiguous:                  return "GemmType::MGroupedContiguous";
+        case GemmType::MGroupedMasked:                      return "GemmType::MGroupedMasked";
+        case GemmType::MGroupedContiguousWithPsumLayout:    return "GemmType::MGroupedContiguousWithPsumLayout";
+        case GemmType::KGroupedContiguous:                  return "GemmType::KGroupedContiguous";
+        case GemmType::Batched:                             return "GemmType::Batched";
     }
     DG_HOST_UNREACHABLE("Unknown GEMM type");
 }
@@ -51,6 +52,8 @@ static std::string to_string(const at::ScalarType& dtype) {
         case torch::kInt:           return "int";
         case torch::kFloat:         return "float";
         case torch::kBFloat16:      return "cutlass::bfloat16_t";
+        case torch::kFloat8_e4m3fn: return "cutlass::float_e4m3_t";
+        case kPackedFP4:            return "cutlass::detail::float_e2m1_unpacksmem_t";
         default: DG_HOST_UNREACHABLE("Unsupported dtype");
     }
 }
@@ -65,6 +68,7 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+        case kPackedFP4:            return CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
         default: DG_HOST_UNREACHABLE("Unsupported dtype");
     }
 }
@@ -98,6 +102,10 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
     if (swizzle_mode != 0)
         smem_inner_dim = swizzle_mode / elem_size;
 
+    // Inner dim must be a multiple of 64B for .b4x16_p64
+    if (t.scalar_type() == kPackedFP4)
+        DG_HOST_ASSERT(gmem_inner_dim % 128 == 0);
+
     CUtensorMap tensor_map;
     const cuuint64_t gmem_dims[2] = {static_cast<cuuint64_t>(gmem_inner_dim), static_cast<cuuint64_t>(gmem_outer_dim)};
     const cuuint32_t smem_dims[2] = {static_cast<cuuint32_t>(smem_inner_dim), static_cast<cuuint32_t>(smem_outer_dim)};
@@ -125,6 +133,10 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
     const auto& elem_size = static_cast<int>(t.element_size());
     if (swizzle_mode != 0)
         smem_dim_0 = swizzle_mode / elem_size;
+
+    // Inner dim must be a multiple of 64B for .b4x16_p64
+    if (t.scalar_type() == kPackedFP4)
+        DG_HOST_ASSERT(gmem_dim_0 % 128 == 0);
 
     CUtensorMap tensor_map;
     const cuuint64_t gmem_dims[3] = {static_cast<cuuint64_t>(gmem_dim_0), static_cast<cuuint64_t>(gmem_dim_1), static_cast<cuuint64_t>(gmem_dim_2),};
@@ -204,7 +216,7 @@ static CUtensorMap make_tma_cd_desc(const torch::Tensor& t,
 static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                                     const torch::Tensor& t,
                                     int shape_mn, int shape_k,
-                                    const int& block_mn, const int& block_k,
+                                    const int& block_mn, const int& gran_k,
                                     const int& num_groups,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
                                     const bool& allow_tf32 = false) {
@@ -215,7 +227,7 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
 
     shape_mn = get_tma_aligned_size(shape_mn, static_cast<int>(t.element_size()));
     return make_tma_2d_desc(t,
-                            shape_mn, ceil_div(shape_k, block_k * (t.scalar_type() == torch::kFloat ? 1 : 4)) * num_groups,
+                            shape_mn, ceil_div(shape_k, gran_k * (t.scalar_type() == torch::kFloat ? 1 : 4)) * num_groups,
                             block_mn, 1,
                             shape_mn,
                             swizzle_mode, swizzle_base,

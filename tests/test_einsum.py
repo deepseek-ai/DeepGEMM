@@ -80,7 +80,6 @@ def test_bhd_hdr_bhr():
     print()
 
 
-@test_filter(lambda: get_arch_major() >= 10)
 def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
     print('Testing FP8 "bhr, hdr -> bhd":')
     for h, r, d in [(8, 4096, 1024)]:

@@ -388,7 +388,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                     cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
 
                     // The pipeline stage
-                    const auto m_idx = scheduler.template get_global_idx<(kGemmType != GemmType::MGroupedContiguous), IndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * WAVE_BLOCK_M;
+                    const auto m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), IndexType::MN>(shape_m, BLOCK_M, m_block_idx) + w * WAVE_BLOCK_M;
                     const auto n_idx = n_block_idx * BLOCK_N + s * STORE_BLOCK_N;
 
                     // Store into shared memory

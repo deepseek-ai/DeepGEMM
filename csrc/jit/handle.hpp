@@ -40,10 +40,7 @@ DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleLoad);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleUnload);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleGetFunction);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLaunchKernelEx);
-
-#if DG_TENSORMAP_COMPATIBLE
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuTensorMapEncodeTiled);
-#endif
 
 #if CUDART_VERSION >= 12080 and defined(DG_JIT_USE_RUNTIME_API)
 
@@ -166,7 +163,6 @@ static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& 
     void *ptr_args[] = { &args... };
     return lazy_cuLaunchKernelEx(&config, kernel, ptr_args, nullptr);
 }
-
 #endif
 
 } // namespace deep_gemm
