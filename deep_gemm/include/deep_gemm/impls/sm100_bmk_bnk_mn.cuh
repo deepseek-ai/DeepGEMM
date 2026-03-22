@@ -251,6 +251,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
         }
     }
 
+    __syncthreads();
     // Deallocate tensor memory by warp 1
     // NOTES: warp 0 is doing TMA stores
     if (warp_idx == 1)
