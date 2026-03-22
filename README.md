@@ -1,6 +1,6 @@
 # DeepGEMM
 
-DeepGEMM is a library designed for clean and efficient General Matrix Multiplications (GEMMs). It supports FP8 and BF16 (working in progress) for both normal and Mix-of-Experts (MoE) grouped scenarios. Written in CUDA, the library has no kernel compilation need during installation, by compiling all kernels at runtime using a lightweight Just-In-Time (JIT) module.
+DeepGEMM is a library designed for clean and efficient General Matrix Multiplications (GEMMs). It supports FP8 and BF16 for both normal and Mix-of-Experts (MoE) grouped scenarios. Written in CUDA, the library has no kernel compilation need during installation, by compiling all kernels at runtime using a lightweight Just-In-Time (JIT) module.
 
 DeepGEMM leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), it avoids heavy reliance on their templates or algebras. Instead, the library is designed for simplicity, with only a limited number of core kernel functions. This makes it a clean and accessible resource for learning NVIDIA GPU kernel optimization techniques.
 
@@ -38,7 +38,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - [x] BF16 kernels
 - [ ] Split/stream-k optimizations
 - [ ] Ampere kernels
-- [ ] Polish docs
+- [x] Polish docs
 
 ## Quick start
 
@@ -69,7 +69,9 @@ cat develop.sh
 # Test all GEMM implements
 python tests/test_layout.py
 python tests/test_attention.py
-python tests/test_core.py
+python tests/test_fp8.py
+python tests/test_bf16.py
+python tests/test_einsum.py
 ```
 
 ### Installation
@@ -98,6 +100,8 @@ Please note that operations like input transposition or FP8 casting must be hand
 
 To perform a basic non-grouped FP8 GEMM, call the `fp8_gemm_{nt, nn, tn, tt}` function. For more details, please refer to the function documentation.
 
+A specialized variant `fp8_gemm_nt_skip_head_mid` is also provided for the [lightning indexer](https://github.com/deepseek-ai/DeepGEMM/pull/200) scoring pass in DeepSeek v3.2, which skips computation over unused head/mid positions.
+
 #### Grouped GEMMs (contiguous layout)
 
 Unlike traditional grouped GEMMs in CUTLASS, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape. For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_mk_alignment_for_contiguous_layout()`).  For more information, please refer to the `m_grouped_fp8_gemm_{nt, nn}_contiguous` function documentation.
@@ -109,6 +113,16 @@ We also provide a K-axis-grouped API for MoE weight backward (with M and N must 
 During the inference decoding phase, when CUDA graph is enabled and the CPU is unaware of the number of tokens each expert receives, we support masked grouped GEMMs. By providing a mask tensor, the kernel computes only the valid portions.
 
 Use `m_grouped_fp8_gemm_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
+
+#### Einsum kernels
+
+DeepGEMM provides fused einsum kernels for batched contraction patterns commonly found in attention mechanisms. Use `deep_gemm.einsum` for BF16 contractions and `deep_gemm.fp8_einsum` for FP8 contractions (SM100 only). Currently supported contraction patterns:
+
+- `bmk,bnk->mn` — batched weight gradient accumulation
+- `bhr,hdr->bhd` and `bhd,hdr->bhr` — MLA-style attention projections
+- `bhd,bhr->hdr` — FP8 batched weight gradient (SM100 only)
+
+For usage examples, please refer to [`tests/test_einsum.py`](tests/test_einsum.py).
 
 #### V3.2 MQA kernels for the indexer
 
@@ -142,6 +156,8 @@ The library provides some utility functions besides the above kernels:
 - `deep_gemm.get_num_sms`: get the current SM maximum count (return the device SM count if not set)
 - `deep_gemm.set_tc_util`: set an approximated tensor core utilization ratio
 - `deep_gemm.get_tc_util`: get the current tensor core utilization ratio
+- `deep_gemm.einsum`: fused BF16 batched-contraction einsum kernel
+- `deep_gemm.fp8_einsum`: fused FP8 batched-contraction einsum kernel (SM100 only)
 - `deep_gemm.transform_sf_into_required_layout`: transform scaling factors into required layout
 - `deep_gemm.get_tma_aligned_size`: get the required TMA alignment size
 - `deep_gemm.get_mk_alignment_for_contiguous_layout`: get the group-level alignment requirement for grouped contiguous layout
@@ -164,7 +180,7 @@ The library also provides some environment variables, which may be useful:
 - Heuristic selection
   - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
 
-For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
+For additional examples and details, please refer to [the test code](tests/test_fp8.py) or review the corresponding Python documentation.
 
 ## Acknowledgement
 
