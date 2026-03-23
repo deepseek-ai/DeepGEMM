@@ -9,17 +9,30 @@
 namespace deep_gemm {
 
 struct LaunchArgs {
-    std::pair<int, int> grid_dim;
-    int num_threads;
-    int smem_size;
-    int cluster_dim;
-
-    LaunchArgs(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1):
-        grid_dim({grid_dim_x, 1}), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim) {}
-
-    LaunchArgs(const std::pair<int, int>& grid_dim, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1):
-        grid_dim(grid_dim), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim) {}
+    std::pair<int, int> grid_dim = {0, 0};
+    int num_threads = 0;
+    int smem_size = 0;
+    int cluster_dim = 1;
 };
+
+// Helper functions to create LaunchArgs (for backward compatibility)
+inline LaunchArgs make_launch_args(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1) {
+    LaunchArgs args;
+    args.grid_dim = {grid_dim_x, 1};
+    args.num_threads = num_threads;
+    args.smem_size = smem_size;
+    args.cluster_dim = cluster_dim;
+    return args;
+}
+
+inline LaunchArgs make_launch_args(const std::pair<int, int>& grid_dim, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1) {
+    LaunchArgs args;
+    args.grid_dim = grid_dim;
+    args.num_threads = num_threads;
+    args.smem_size = smem_size;
+    args.cluster_dim = cluster_dim;
+    return args;
+}
 
 class KernelRuntime final {
 public:
@@ -33,15 +46,19 @@ public:
         DG_HOST_ASSERT(not cuda_home.empty());
 
         // NOLINT(*-pro-type-member-init)
+#if DG_MSVC
+        const auto& cuobjdump_path = cuda_home / "bin" / "cuobjdump.exe";
+#else
         const auto& cuobjdump_path = cuda_home / "bin" / "cuobjdump";
+#endif
         const auto& cubin_path = dir_path / "kernel.cubin";
         if (get_env<int>("DG_JIT_DEBUG"))
-            printf("Loading CUBIN: %s\n", cubin_path.c_str());
+            printf("Loading CUBIN: %s\n", cubin_path.string().c_str());
 
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
-        const auto& [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
+        const auto& [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.string(), cubin_path.string()));
         DG_HOST_ASSERT(exit_code == 0);
         std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;

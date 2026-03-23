@@ -15,7 +15,7 @@ class SM90BF16GemmRuntime final: public LaunchRuntime<SM90BF16GemmRuntime> {
 public:
     struct Args {
         int m, n, k, num_groups;
-        const std::string& compiled_dims;
+        std::string compiled_dims;
 
         GemmConfig gemm_config;
         LaunchArgs launch_args;
@@ -104,18 +104,18 @@ static void sm90_bf16_gemm(const torch::Tensor& a,
                                                 config.smem_config.swizzle_cd_mode);
 
     // Launch
-    const SM90BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .num_groups = 1,
-        .compiled_dims = compiled_dims,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90BF16GemmRuntime::Args args = {
+        m, n, k,
+        1,
+        compiled_dims,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = nullptr,
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd,
+        nullptr,
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_cd
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_bf16_gemm", code);
@@ -158,18 +158,18 @@ static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                 config.smem_config.swizzle_cd_mode);
 
     // Launch
-    const SM90BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .num_groups = num_groups,
-        .compiled_dims = compiled_dims,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90BF16GemmRuntime::Args args = {
+        m, n, k,
+        num_groups,
+        compiled_dims,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = m_indices.data_ptr(),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd,
+        m_indices.data_ptr(),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_cd
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_m_grouped_bf16_gemm_contiguous", code);
@@ -213,18 +213,18 @@ static void sm90_bf16_m_grouped_gemm_masked(const torch::Tensor& a,
                                                 config.smem_config.swizzle_cd_mode);
 
     // Launch
-    const SM90BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .num_groups = num_groups,
-        .compiled_dims = compiled_dims,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90BF16GemmRuntime::Args args = {
+        m, n, k,
+        num_groups,
+        compiled_dims,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = masked_m.data_ptr(),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd,
+        masked_m.data_ptr(),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_cd
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_bf16_m_grouped_gemm_masked", code);
@@ -275,18 +275,18 @@ static void sm90_bf16_k_grouped_gemm(const torch::Tensor& a,
                                                  config.smem_config.swizzle_cd_mode);
 
     // Launch kernel
-    const SM90BF16GemmRuntime::Args& args = {
-        .m = m, .n = n, .k = sum_k,
-        .num_groups = num_groups,
-        .compiled_dims = compiled_dims,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90BF16GemmRuntime::Args args = {
+        m, n, sum_k,
+        num_groups,
+        compiled_dims,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = ks_tensor.data_ptr(),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd,
+        ks_tensor.data_ptr(),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_cd
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_bf16_k_grouped_gemm", code);
@@ -322,18 +322,18 @@ static void sm90_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
                                                 tensor_d.stride(0), tensor_d.stride(1),
                                                 config.smem_config.swizzle_cd_mode);
     // Launch
-    const SM90BF16GemmRuntime::Args& args = {
-        .m = b, .n = d, .k = r,
-        .num_groups = h,
-        .compiled_dims = compiled_dims,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90BF16GemmRuntime::Args args = {
+        b, d, r,
+        h,
+        compiled_dims,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = nullptr,
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd,
+        nullptr,
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_cd
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_bf16_bhr_hdr_bhd", code);
@@ -369,18 +369,18 @@ static void sm90_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
                                                 tensor_d.stride(0), tensor_d.stride(1),
                                                 config.smem_config.swizzle_cd_mode);
     // Launch
-    const SM90BF16GemmRuntime::Args& args = {
-        .m = b, .n = r, .k = d,
-        .num_groups = h,
-        .compiled_dims = compiled_dims,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM90BF16GemmRuntime::Args args = {
+        b, r, d,
+        h,
+        compiled_dims,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = nullptr,
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_cd = tensor_map_cd,
+        nullptr,
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_cd
     };
     const auto& code = SM90BF16GemmRuntime::generate(args);
     const auto& runtime = compiler->build("sm90_bf16_bhd_hdr_bhr", code);

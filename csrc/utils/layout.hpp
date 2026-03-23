@@ -43,7 +43,8 @@ static auto get_shape(const torch::Tensor& t) {
 }
 
 static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
-    auto [mn, k] = get_shape<2>(ab);
+    int mn, k;
+    std::tie(mn, k) = get_shape<2>(ab);
     if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
         DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10);
         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
@@ -52,7 +53,8 @@ static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute
 }
 
 static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
-    auto [num_groups, mn, k] = get_shape<3>(ab);
+    int num_groups, mn, k;
+    std::tie(num_groups, mn, k) = get_shape<3>(ab);
     if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
         DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10);
         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);

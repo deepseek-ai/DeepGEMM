@@ -72,7 +72,7 @@ python tests/test_attention.py
 python tests/test_core.py
 ```
 
-### Installation
+### Installation (Linux)
 
 ```bash
 cat install.sh
@@ -80,6 +80,63 @@ cat install.sh
 ```
 
 Then, import `deep_gemm` in your Python project, and enjoy!
+
+### Installation (Windows)
+
+DeepGEMM supports building on Windows with MSVC. Follow these steps:
+
+#### Prerequisites
+
+- **Visual Studio 2022** (or 2019) with C++ desktop development workload
+- **CUDA Toolkit 12.3+** (12.9+ recommended for best performance)
+- **Python 3.8+** with pip
+- **PyTorch 2.1+** with CUDA support
+
+#### Build Steps
+
+```cmd
+:: Clone the repository
+git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
+cd DeepGEMM
+
+:: Create and activate virtual environment (using uv or venv)
+uv venv --python 3.10
+.venv\Scripts\activate
+
+:: Install dependencies
+uv pip install packaging wheel setuptools ninja numpy==1.26.4 pip build psutil
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+
+:: Clear environment variables and initialize VS developer environment
+set INCLUDE=
+set LIB=
+set LIBPATH=
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+:: Configure CUDA
+set CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+set PATH=%CUDA_HOME%\bin;%PATH%
+set DISTUTILS_USE_SDK=1
+
+:: Set target architectures (adjust based on your GPU)
+set TORCH_CUDA_ARCH_LIST=8.0;8.6;8.9;9.0
+
+:: Initialize submodules
+git submodule sync
+git submodule update --init --recursive
+
+:: Build the wheel
+set DG_USE_LOCAL_VERSION=0
+python setup.py bdist_wheel
+```
+
+The built wheel will be located in the `dist/` directory.
+
+#### Troubleshooting
+
+- **Linker errors (LNK1104)**: Ensure `vcvarsall.bat` was executed in the same terminal session
+- **CUDA not found**: Verify `CUDA_HOME` points to your CUDA installation directory
+- **Missing cuBLASLt symbols**: The build system should automatically link cuBLASLt; ensure CUDA Toolkit is properly installed
 
 ## Interfaces
 

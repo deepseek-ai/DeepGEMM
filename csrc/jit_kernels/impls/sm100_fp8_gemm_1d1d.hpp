@@ -20,8 +20,8 @@ public:
     struct Args {
         int m, n, k, num_groups;
         int gran_k_a, gran_k_b;
-        const std::string& compiled_dims;
-        const std::optional<std::string>& epilogue_type;
+        std::string compiled_dims;
+        std::optional<std::string> epilogue_type;
 
         GemmConfig gemm_config;
         LaunchArgs launch_args;
@@ -121,23 +121,22 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                                   config.block_n, gran_k_b, 1, 0);
 
     // Launch
-    const SM100FP8FP4Gemm1D1DRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .num_groups = 1,
-        .gran_k_a = gran_k_a,
-        .gran_k_b = gran_k_b,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = epilogue_type,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM100FP8FP4Gemm1D1DRuntime::Args args = {
+        m, n, k,
+        1,
+        gran_k_a, gran_k_b,
+        compiled_dims,
+        epilogue_type,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = nullptr,
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_sfa = tensor_map_sfa,
-        .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        nullptr,
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_sfa,
+        tensor_map_sfb,
+        tensor_map_cd
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_fp8_fp4_gemm_1d1d", code);
@@ -190,23 +189,22 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                                   config.block_n, gran_k_b, num_groups, 0);
 
     // Launch kernel
-    const SM100FP8FP4Gemm1D1DRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .num_groups = num_groups,
-        .gran_k_a = gran_k_a,
-        .gran_k_b = gran_k_b,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = std::nullopt,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM100FP8FP4Gemm1D1DRuntime::Args args = {
+        m, n, k,
+        num_groups,
+        gran_k_a, gran_k_b,
+        compiled_dims,
+        std::nullopt,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = grouped_layout.data_ptr(),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_sfa = tensor_map_sfa,
-        .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        grouped_layout.data_ptr(),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_sfa,
+        tensor_map_sfb,
+        tensor_map_cd
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d", code);
@@ -251,23 +249,22 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
                                                   config.block_n, gran_k_b, num_groups, 0);
 
     // Launch kernel
-    const SM100FP8FP4Gemm1D1DRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .num_groups = num_groups,
-        .gran_k_a = gran_k_a,
-        .gran_k_b = gran_k_b,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = std::nullopt,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM100FP8FP4Gemm1D1DRuntime::Args args = {
+        m, n, k,
+        num_groups,
+        gran_k_a, gran_k_b,
+        compiled_dims,
+        std::nullopt,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = masked_m.data_ptr(),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_sfa = tensor_map_sfa,
-        .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        masked_m.data_ptr(),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_sfa,
+        tensor_map_sfb,
+        tensor_map_cd
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_m_grouped_fp8_fp4_gemm_masked_1d1d", code);
@@ -322,23 +319,22 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::T
                                                   config.block_n, config.block_k, 1, 0);
 
     // Launch kernel
-    const SM100FP8FP4Gemm1D1DRuntime::Args& args = {
-        .m = m, .n = n, .k = sum_k,
-        .num_groups = num_groups,
-        .gran_k_a = 128,
-        .gran_k_b = 128,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = std::nullopt,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM100FP8FP4Gemm1D1DRuntime::Args args = {
+        m, n, sum_k,
+        num_groups,
+        128, 128,
+        compiled_dims,
+        std::nullopt,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = ks_tensor.data_ptr(),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_sfa = tensor_map_sfa,
-        .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        ks_tensor.data_ptr(),
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_sfa,
+        tensor_map_sfb,
+        tensor_map_cd
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_k_grouped_fp8_gemm_1d1d", code);
@@ -390,23 +386,22 @@ static void sm100_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                                                   config.block_n, config.block_k, batch_size, 0);
 
     // Launch
-    const SM100FP8FP4Gemm1D1DRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .num_groups = batch_size,
-        .gran_k_a = 128,
-        .gran_k_b = 128,
-        .compiled_dims = compiled_dims,
-        .epilogue_type = std::nullopt,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(config.num_sms, config.thread_config.num_threads,
+    SM100FP8FP4Gemm1D1DRuntime::Args args = {
+        m, n, k,
+        batch_size,
+        128, 128,
+        compiled_dims,
+        std::nullopt,
+        config,
+        make_launch_args(config.num_sms, config.thread_config.num_threads,
                                   config.smem_config.smem_size,
                                   config.multicast_config.num_multicast),
-        .grouped_layout = nullptr,
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_sfa = tensor_map_sfa,
-        .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        nullptr,
+        tensor_map_a,
+        tensor_map_b,
+        tensor_map_sfa,
+        tensor_map_sfb,
+        tensor_map_cd
     };
     const auto& code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
     const auto& runtime = compiler->build("sm100_fp8_gemm_1d1d", code);

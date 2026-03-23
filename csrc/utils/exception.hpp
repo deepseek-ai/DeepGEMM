@@ -6,6 +6,7 @@
 #include <sstream>
 
 #include "compatibility.hpp"
+#include "msvc_compat.hpp"
 
 namespace deep_gemm {
 

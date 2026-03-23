@@ -46,7 +46,11 @@ public:
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::cuda_home = cuda_home_path_by_python;
         Compiler::library_version = get_library_version();
+#if DG_MSVC
+        Compiler::cuobjdump_path = Compiler::cuda_home / "bin" / "cuobjdump.exe";
+#else
         Compiler::cuobjdump_path = Compiler::cuda_home / "bin" / "cuobjdump";
+#endif
     }
 
     std::string signature, flags;
@@ -61,7 +65,15 @@ public:
         DG_HOST_ASSERT(not cuobjdump_path.empty());
 
         // Cache settings
+#if DG_MSVC
+        // On Windows, use LOCALAPPDATA or USERPROFILE for cache directory
+        auto home_path = get_env<std::string>("LOCALAPPDATA");
+        if (home_path.empty())
+            home_path = get_env<std::string>("USERPROFILE");
+        cache_dir_path = std::filesystem::path(home_path) / ".deep_gemm";
+#else
         cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_gemm";
+#endif
         if (const auto& env_cache_dir_path = get_env<std::string>("DG_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
             cache_dir_path = env_cache_dir_path;
 
@@ -144,10 +156,12 @@ public:
 
     static void disassemble(const std::filesystem::path &cubin_path, const std::filesystem::path &sass_path) {
         // Disassemble the CUBIN file to SASS
-        const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.c_str(), cubin_path.c_str(), sass_path.c_str());
+        const auto command = fmt::format("{} --dump-sass {} > {}", cuobjdump_path.string(), cubin_path.string(), sass_path.string());
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running cuobjdump command: %s\n", command.c_str());
-        const auto [return_code, output] = call_external_command(command);
+        int return_code;
+        std::string output;
+        std::tie(return_code, output) = call_external_command(command);
         if (return_code != 0) {
             printf("cuobjdump failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "cuobjdump failed");
@@ -170,8 +184,10 @@ class NVCCCompiler final: public Compiler {
         DG_HOST_ASSERT(std::filesystem::exists(nvcc_path));
 
         // Call the version command
-        const auto& command = std::string(nvcc_path) + " --version";
-        const auto& [return_code, output] = call_external_command(command);
+        const auto& command = nvcc_path.string() + " --version";
+        int return_code;
+        std::string output;
+        std::tie(return_code, output) = call_external_command(command);
         DG_HOST_ASSERT(return_code == 0);
 
         // The version should be at least 12.3, for the best performance with 12.9
@@ -188,19 +204,31 @@ class NVCCCompiler final: public Compiler {
 public:
     NVCCCompiler() {
         // Override the compiler signature
+#if DG_MSVC
+        nvcc_path = cuda_home / "bin" / "nvcc.exe";
+#else
         nvcc_path = cuda_home / "bin" / "nvcc";
+#endif
         if (const auto& env_nvcc_path = get_env<std::string>("DG_JIT_NVCC_COMPILER"); not env_nvcc_path.empty())
             nvcc_path = env_nvcc_path;
-        const auto& [nvcc_major, nvcc_minor] = get_nvcc_version();
+        int nvcc_major, nvcc_minor;
+        std::tie(nvcc_major, nvcc_minor) = get_nvcc_version();
         signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);
 
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto& arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
+#if DG_MSVC
+        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
+                            "--compiler-options=/O2,/EHsc,/Zc:__cplusplus "
+                            "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
+                            flags, library_include_path.string(), arch);
+#else
         flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, library_include_path.string(), arch);
+#endif
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
@@ -211,10 +239,12 @@ public:
         put(code_path, code);
 
         // Compile
-        const auto& command = fmt::format("{} {} -cubin -o {} {}", nvcc_path.c_str(), code_path.c_str(), cubin_path.c_str(), flags);
+        const auto& command = fmt::format("{} {} -cubin -o {} {}", nvcc_path.string(), code_path.string(), cubin_path.string(), flags);
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
             printf("Running NVCC command: %s\n", command.c_str());
-        const auto& [return_code, output] = call_external_command(command);
+        int return_code;
+        std::string output;
+        std::tie(return_code, output) = call_external_command(command);
         if (return_code != 0) {
             printf("NVCC compilation failed: %s\n", output.c_str());
             DG_HOST_ASSERT(false and "NVCC compilation failed");
@@ -222,10 +252,12 @@ public:
 
         // Compile to PTX if needed
         if (ptx_path.has_value()) {
-            const auto ptx_command = fmt::format("{} {} -ptx -o {} {}", nvcc_path.c_str(), code_path.c_str(), ptx_path->c_str(), flags);
+            const auto ptx_command = fmt::format("{} {} -ptx -o {} {}", nvcc_path.string(), code_path.string(), ptx_path->string(), flags);
             if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PRINT_COMPILER_COMMAND", 0))
                 printf("Running NVCC PTX command: %s\n", ptx_command.c_str());
-            const auto [ptx_return_code, ptx_output] = call_external_command(ptx_command);
+            int ptx_return_code;
+            std::string ptx_output;
+            std::tie(ptx_return_code, ptx_output) = call_external_command(ptx_command);
             if (ptx_return_code != 0) {
                 printf("NVCC PTX compilation failed: %s\n", ptx_output.c_str());
                 DG_HOST_ASSERT(false and "NVCC PTX compilation failed");
