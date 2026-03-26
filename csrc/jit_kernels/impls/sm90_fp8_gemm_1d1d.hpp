@@ -48,7 +48,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
-        {}, {}
+        {}, {}, {}
     >);
 }};
 )",
@@ -60,6 +60,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.thread_config.num_tma_threads, args.gemm_config.thread_config.num_math_threads,
         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
         args.gemm_config.num_sms, to_string(args.gemm_config.gemm_type),
+        args.gemm_config.with_accumulation,
         to_string(args.gemm_config.cd_dtype));
     }
 
@@ -82,7 +83,7 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                const int& m, const int& n, const int& k,
                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat or d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const auto& config = get_best_config<SM90ArchSpec>(
@@ -148,7 +149,8 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
                                          const torch::Tensor& tensor_map_buffer,
                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                          const std::string& compiled_dims) {
-    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat or d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(c.has_value());
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     // Get config using max K for better performance
@@ -188,7 +190,7 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
                                                  SM90ArchSpec::get_cd_store_block_m(config.block_m, true),
                                                  SM90ArchSpec::get_cd_store_block_n(config.block_n),
                                                  static_cast<int>(d.stride(-2)), num_groups,
-                                                 config.smem_config.swizzle_cd_mode);
+                                                 0);
 
     // Launch
     const SM90FP8Gemm1D1DRuntime::Args& args = {
