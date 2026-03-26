@@ -26,7 +26,7 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs,
-          GemmType kGemmType, typename cd_dtype_t>
+          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t>
 __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                         int* grouped_layout,
@@ -41,7 +41,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     // Scaling checks
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid Threads");
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous, "Invalid GEMM type");
 
     // Types
@@ -56,7 +56,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
 
     // Shared memory
     static constexpr uint32_t SMEM_TENSOR_MAP_SIZE = (kGemmType == GemmType::KGroupedContiguous ? sizeof(cute::TmaDescriptor) * 4 : 0);
-    static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(float);
+    static constexpr uint32_t SMEM_D_SIZE = constexpr_align(BLOCK_M * BLOCK_N * static_cast<uint32_t>(sizeof(cd_dtype_t)), 1024u);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
@@ -93,7 +93,7 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
     auto gmem_tensor_map_b = PatternVisitor([=](const uint32_t& i) { return tensor_map_buffer + blockIdx.x * 4 + 2 + i; });
 
     // Data on shared memory
-    auto smem_d = reinterpret_cast<float*>(smem_buffer + SMEM_TENSOR_MAP_SIZE);
+    auto smem_d = reinterpret_cast<cd_dtype_t*>(smem_buffer + SMEM_TENSOR_MAP_SIZE);
     auto smem_a = PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + (SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE)); 
     });
@@ -348,20 +348,34 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
             cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
 
             // Store to D shared memory
-            const auto& smem_d_0 = reinterpret_cast<float2*>(smem_d + r_0 * BLOCK_N + col_idx * 2);
-            const auto& smem_d_1 = reinterpret_cast<float2*>(smem_d + r_1 * BLOCK_N + col_idx * 2);
-            #pragma unroll
-            for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                st_shared(smem_d_0 + i * 4, {final_accum[i * 4 + 0], final_accum[i * 4 + 1]});
-                st_shared(smem_d_1 + i * 4, {final_accum[i * 4 + 2], final_accum[i * 4 + 3]});
+            if constexpr (cute::is_same_v<cd_dtype_t, float>) {
+                const auto& smem_d_0 = reinterpret_cast<float2*>(smem_d + r_0 * BLOCK_N + col_idx * 2);
+                const auto& smem_d_1 = reinterpret_cast<float2*>(smem_d + r_1 * BLOCK_N + col_idx * 2);
+                #pragma unroll
+                for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                    st_shared(smem_d_0 + i * 4, {final_accum[i * 4 + 0], final_accum[i * 4 + 1]});
+                    st_shared(smem_d_1 + i * 4, {final_accum[i * 4 + 2], final_accum[i * 4 + 3]});
+                }
+            } else {
+                #pragma unroll
+                for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+                    auto packed_0 = cast_into_bf16_and_pack(final_accum[i * 4 + 0], final_accum[i * 4 + 1]);
+                    auto packed_1 = cast_into_bf16_and_pack(final_accum[i * 4 + 2], final_accum[i * 4 + 3]);
+                    st_shared(reinterpret_cast<const uint32_t*>(smem_d + r_0 * BLOCK_N + col_idx * 2 + i * 8),
+                              static_cast<uint32_t>(packed_0));
+                    st_shared(reinterpret_cast<const uint32_t*>(smem_d + r_1 * BLOCK_N + col_idx * 2 + i * 8),
+                              static_cast<uint32_t>(packed_1));
+                }
             }
             cute::tma_store_fence();
             cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
 
             // Use TMA store to write back to global memory
             if (warp_idx % 4 == 0 and cute::elect_one_sync()) {
-                cute::SM90_TMA_REDUCE_ADD_2D::copy(
-                    &tensor_map_cd, smem_d_0, n_block_idx * BLOCK_N,
+                using tma_store_t = cute::conditional_t<kWithAccumulation,
+                    cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
+                tma_store_t::copy(
+                    &tensor_map_cd, smem_d + r_0 * BLOCK_N + col_idx * 2, n_block_idx * BLOCK_N,
                     current_group_idx * shape_m + m_block_idx * BLOCK_M + r_0);
                 cute::tma_store_arrive();
             }

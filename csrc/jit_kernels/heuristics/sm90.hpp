@@ -24,9 +24,9 @@ struct SM90ArchSpec {
     static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype) {
         int start = 16;
 
-        // Avoid bank conflicts for 1D1D kernel FP32 output
+        // Avoid bank conflicts for 1D1D kernel (applies to both FP32 and BF16 since no D-swizzling)
         std::vector<int> candidates;
-        if (kernel_type == KernelType::Kernel1D1D and cd_dtype == torch::kFloat) {
+        if (kernel_type == KernelType::Kernel1D1D) {
             candidates.push_back(16);
             start = 24;
         }
@@ -63,15 +63,15 @@ struct SM90ArchSpec {
                                     const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
                                     const int& m, const int& n, const int& k,
                                     const int& block_m, const int& block_n, const int& block_k) {
-        // SM90 FP32 output does not support `block_m == 256`
-        if (cd_dtype == at::kFloat and block_m == 256)
+        // SM90 FP32 output does not support `block_m == 256`; 1D1D kernel only supports block_m <= 128
+        if (block_m == 256 and (cd_dtype == at::kFloat or kernel_type == KernelType::Kernel1D1D))
             return false;
 
-        // Avoid large C/D shared memory for FP32 output
+        // Avoid large C/D shared memory
         // Ensure `num_stages >= 4` (for 1D1D Kernel), `num_stages >= 3` (for No SF kernel)
+        if (kernel_type == KernelType::Kernel1D1D and block_n > 152)
+            return false;
         if (block_n > 128 and cd_dtype == torch::kFloat) {
-            if (kernel_type == KernelType::Kernel1D1D and block_n > 152)
-                return false;
             if (kernel_type == KernelType::KernelNoSF and block_n > 200)
                 return false;
         }

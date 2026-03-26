@@ -28,8 +28,8 @@ static bool early_return(const int& m, const int &n, const int& k,
         DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
     if (c.has_value()) {
         check_major_type_cd(c.value());
-        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
-        DG_HOST_ASSERT(c.value().scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat or d.scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(c.value().scalar_type() == d.scalar_type());
     }
 
     // No accumulation
