@@ -7,6 +7,7 @@
 #include <nvrtc.h>
 #include <regex>
 #include <string>
+#include <sys/file.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
@@ -17,6 +18,29 @@
 #include "device_runtime.hpp"
 
 namespace deep_gemm {
+
+// RAII cross-process file lock for JIT compilation
+class FileLock {
+    int fd_ = -1;
+
+public:
+    explicit FileLock(const std::filesystem::path& lock_path) {
+        fd_ = open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+        DG_HOST_ASSERT(fd_ >= 0 and "Failed to open lock file");
+        int ret = flock(fd_, LOCK_EX);
+        DG_HOST_ASSERT(ret == 0 and "Failed to acquire file lock");
+    }
+
+    ~FileLock() {
+        if (fd_ >= 0) {
+            flock(fd_, LOCK_UN);
+            close(fd_);
+        }
+    }
+
+    FileLock(const FileLock&) = delete;
+    FileLock& operator=(const FileLock&) = delete;
+};
 
 class Compiler {
 public:
@@ -103,6 +127,15 @@ public:
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
+        if (const auto& runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
+            return runtime;
+
+        // Cross-process lock to prevent concurrent compilation of the same kernel
+        make_dirs(cache_dir_path / "locks");
+        const auto lock_path = cache_dir_path / "locks" / fmt::format("kernel.{}.{}.lock", name, get_hex_digest(kernel_signature));
+        FileLock lock(lock_path);
+
+        // Re-check after acquiring lock
         if (const auto& runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
             return runtime;
 
