@@ -91,10 +91,13 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                 const int& num_heads, const int& head_dim,
                                 const int& seq_len_alignment) {
     constexpr int block_qh = 128;
-    constexpr int block_kv = 256;
     constexpr int num_specialized_threads = 128;
-    constexpr int num_q_stages = 3, num_kv_stages = 5;
-    const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
+    const bool is_sm100 = (device_runtime->get_arch_major() == 10);
+    // SM90: use 256 math threads (2 warpgroups) with BLOCK_KV=128 to enable 2 blocks/SM
+    // SM100: use 256 math threads with BLOCK_KV=256
+    const int num_math_threads = 256;
+    const int block_kv = (is_sm100 ? 256 : 128);
+    constexpr int num_q_stages = 3, num_kv_stages = 3;
     const int block_q = block_qh / num_heads;
     DG_HOST_ASSERT(block_qh % num_heads == 0);
     DG_HOST_ASSERT(seq_len_alignment % block_q == 0);

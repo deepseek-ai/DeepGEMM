@@ -31,7 +31,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads>
-__global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
+__global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 2)
 void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                          const uint32_t max_seqlen_k, const uint64_t stride_logits,
                          uint32_t* cu_seq_len_k_start,
@@ -120,7 +120,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // Register reconfigurations
     constexpr uint32_t kNumTMARegisters = 32;
-    constexpr uint32_t kNumMathRegisters = 112;
+    constexpr uint32_t kNumMathRegisters = 80;
 
     // Block scheduler
     uint32_t block_q_idx = blockIdx.x, q_iter_idx = 0;
@@ -213,7 +213,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         const auto& warp_idx = __shfl_sync(0xffffffff, thread_idx / 32, 0);
         const auto& warpgroup_idx = warp_idx / 4;
         const auto& lane_idx = get_lane_idx();
-        float accum[WGMMA::kNumAccum], weights[BLOCK_Q][kNumHeads / 4];
+        float accum[WGMMA::kNumAccum];
 
         const auto& warp_offset = warp_idx * 16;
         const auto& v_0_offset = lane_idx / 4 + 0;
@@ -224,14 +224,6 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
             // Wait TMA Q arrival
             full_q_barriers[q_stage_idx]->wait(q_phase);
-
-            // Read weights
-            #pragma unroll
-            for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                #pragma unroll
-                for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
-                    weights[i][j] = ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
-            }
 
             // Compute over KV blocks
             #pragma unroll
@@ -278,8 +270,11 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 #pragma unroll
                 for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                     auto shifted_accum = accum + i * kNumAccumPerReduce;
+                    const auto& load_weight = [&](const uint32_t& j) -> float {
+                        return ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + (j / 4) * 8 + (j & 1) + (lane_idx % 4) * 2);
+                    };
                     const auto& transform = [&](const uint32_t& j) {
-                        return fmaxf(shifted_accum[j], 0) * weights[i][(j / 4) * 2 + (j & 1)];
+                        return fmaxf(shifted_accum[j], 0) * load_weight(j);
                     };
 
                     // Intra-thread reduction
