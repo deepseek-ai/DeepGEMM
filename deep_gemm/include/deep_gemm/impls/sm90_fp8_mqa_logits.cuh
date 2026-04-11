@@ -31,7 +31,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads>
-__global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 2)
+__global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                          const uint32_t max_seqlen_k, const uint64_t stride_logits,
                          uint32_t* cu_seq_len_k_start,
@@ -120,7 +120,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // Register reconfigurations
     constexpr uint32_t kNumTMARegisters = 32;
-    constexpr uint32_t kNumMathRegisters = 80;
+    constexpr uint32_t kNumMathRegisters = 96;
 
     // Block scheduler
     uint32_t block_q_idx = blockIdx.x, q_iter_idx = 0;
