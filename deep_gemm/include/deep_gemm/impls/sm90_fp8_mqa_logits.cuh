@@ -302,16 +302,18 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                     }
 
                     // Store into the global memory
-                    // NOTES: we have redundant writes here, consider more carefully
-                    const uint32_t& q_idx = block_q_idx * BLOCK_Q + i;
-                    if constexpr (kIsCompressedLogits) {
-                        if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
-                            logits[q_idx * stride_logits + kv_offset + v_0_offset - seq_k_start[i]] = v_0;
-                        if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
-                            logits[q_idx * stride_logits + kv_offset + v_1_offset - seq_k_start[i]] = v_1;
-                    } else {
-                        logits[q_idx * stride_logits + kv_offset + v_0_offset] = v_0;
-                        logits[q_idx * stride_logits + kv_offset + v_1_offset] = v_1;
+                    // Only one thread per group of 4 needs to write (lanes 0-3 share the same offsets)
+                    if (lane_idx % 4 == 0) {
+                        const uint32_t& q_idx = block_q_idx * BLOCK_Q + i;
+                        if constexpr (kIsCompressedLogits) {
+                            if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
+                                logits[q_idx * stride_logits + kv_offset + v_0_offset - seq_k_start[i]] = v_0;
+                            if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
+                                logits[q_idx * stride_logits + kv_offset + v_1_offset - seq_k_start[i]] = v_1;
+                        } else {
+                            logits[q_idx * stride_logits + kv_offset + v_0_offset] = v_0;
+                            logits[q_idx * stride_logits + kv_offset + v_1_offset] = v_1;
+                        }
                     }
                 }
             }

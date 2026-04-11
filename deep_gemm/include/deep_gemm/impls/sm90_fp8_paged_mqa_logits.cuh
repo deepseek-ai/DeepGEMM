@@ -402,9 +402,11 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
                 }
 
                 // Store into the global memory
-                // NOTES: we have redundant writes here, consider more carefully
-                logits[kv_offset + i * logits_stride + v_0_offset] = v_0;
-                logits[kv_offset + i * logits_stride + v_1_offset] = v_1;
+                // Only one thread per group of 4 needs to write (lanes 0-3 share the same offsets)
+                if (lane_idx % 4 == 0) {
+                    logits[kv_offset + i * logits_stride + v_0_offset] = v_0;
+                    logits[kv_offset + i * logits_stride + v_1_offset] = v_1;
+                }
             }
         }
     }
