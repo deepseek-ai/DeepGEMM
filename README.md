@@ -142,13 +142,15 @@ For the full example with multi-process setup and benchmarking, please refer to 
 
 The library provides some utility functions besides the above kernels:
 
-- `deep_gemm.set_num_sms`: set the maximum SM count to use
-- `deep_gemm.get_num_sms`: get the current SM maximum count (return the device SM count if not set)
-- `deep_gemm.set_tc_util`: set an approximated tensor core utilization ratio
-- `deep_gemm.get_tc_util`: get the current tensor core utilization ratio
-- `deep_gemm.transform_sf_into_required_layout`: transform scaling factors into required layout
+- `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum SM count to use
+- `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor core utilization ratio
+- `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
+- `deep_gemm.set_mk_alignment_for_contiguous_layout` / `get_mk_alignment_for_contiguous_layout`: set/get the group-level M/K alignment for contiguous layout
+- `deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout`: get the theoretical minimum M/K alignment
+- `deep_gemm.set_ignore_compile_dims`: configure dimensions to ignore during JIT compilation
+- `deep_gemm.set_block_size_multiple_of`: constrain block sizes to be multiples of a given value
+- `deep_gemm.transform_sf_into_required_layout`: transform scaling factors into the required layout
 - `deep_gemm.get_tma_aligned_size`: get the required TMA alignment size
-- `deep_gemm.get_mk_alignment_for_contiguous_layout`: get the group-level alignment requirement for grouped contiguous layout
 - `deep_gemm.get_mn_major_tma_aligned_tensor`: get a MN-major TMA-aligned tensor
 - `deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor`: get a MN-major TMA-aligned tensor (with packing FP32 into UE8M0)
 - `deep_gemm.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor`: K-grouped GEMM packing kernel
@@ -156,17 +158,30 @@ The library provides some utility functions besides the above kernels:
 The library also provides some environment variables, which may be useful:
 
 - General
-  - `DG_JIT_DEBUG`: `0` or `1`, print more JIT debugging information, `0` by default
-- JIT cache related
-  - `DG_JIT_CACHE_DIR`: string, the cache directory to store compiled kernels, `$HOME/.deep_gemm` by default
-- NVCC/NVRTC selections
-  - `DG_JIT_USE_NVRTC`: `0` or `1`, use NVRTC instead of NVCC, faster compilation but maybe have lower performance for some cases, `0` by default
-  - `DG_JIT_NVCC_COMPILER`: string, specified NVCC compiler path; will find in `torch.utils.cpp_extension.CUDA_HOME` by default
-- Compiler options
-  - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS compiler output, `0` by default
-  - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print NVCC compilation command, `0` by default
-- Heuristic selection
+  - `DG_JIT_DEBUG`: `0` or `1`, print JIT debugging information, `0` by default
   - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
+- JIT cache
+  - `DG_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_gemm` by default
+- Compiler selection
+  - `DG_JIT_USE_NVRTC`: `0` or `1`, use NVRTC instead of NVCC (faster compilation, may have lower performance for some cases), `0` by default
+  - `DG_JIT_NVCC_COMPILER`: string, NVCC compiler path; defaults to `torch.utils.cpp_extension.CUDA_HOME`
+  - `DG_JIT_CPP_STANDARD`: integer, C++ standard version, `20` by default
+- Compiler output
+  - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print compilation commands, `0` by default
+  - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS output, `0` by default
+  - `DG_JIT_PTXAS_CHECK`: `0` or `1`, assert no local memory usage in compiled kernels, `0` by default
+  - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print kernel load time, `0` by default
+- Debug and profiling
+  - `DG_JIT_WITH_LINEINFO`: `0` or `1`, embed source line info for profiling tools, `0` by default
+  - `DG_JIT_DUMP_ASM`: `0` or `1`, dump both PTX and SASS, `0` by default
+  - `DG_JIT_DUMP_PTX`: `0` or `1`, dump PTX output, `0` by default
+  - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
+  - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero symmetric buffer before each Mega MoE call for debugging, `0` by default
+  - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
+- Build options
+  - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
+  - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
+  - `DG_JIT_USE_RUNTIME_API`: `0` or `1`, use CUDA Runtime API for kernel loading (requires CUDA runtime >= 12.8), `0` by default
 
 For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
 
