@@ -47,7 +47,7 @@ def a_fused_m_grouped_bf16_gemm_contiguous_tl_impl(a_ptr, b_ptr, d_ptr,
     # Compute
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_SIZE_K):
-        k_range = (k + tl.arange(0, BLOCK_SIZE_K)).to(tl.int64)
+        k_range = k.to(tl.int64) + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
         k_mask = k_range < K
         a_ptrs = a_ptr + rows[:, None] * K + k_range[None, :]
         b_ptrs = b_ptr + batch_id * K * N + k_range[:, None] * (1 if IS_B_K_MAJOR else N) + n_range[None, :].to(tl.int64) * (K if IS_B_K_MAJOR else 1)

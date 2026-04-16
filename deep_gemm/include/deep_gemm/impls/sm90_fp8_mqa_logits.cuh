@@ -7,36 +7,31 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/mma_sm90_desc.hpp>
 
+#include <deep_gemm/common/cute_tie.cuh>
+#include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/common/sm90_utils.cuh>
+#include <deep_gemm/common/tma_copy.cuh>
+#include <deep_gemm/common/types.cuh>
+#include <deep_gemm/mma/sm90.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/utils.cuh>
+#include <deep_gemm/ptx/wgmma.cuh>
 
 namespace deep_gemm {
-
-using namespace deep_gemm::sm90;
-
-// ReSharper disable once CppNotAllPathsReturnValue
-template <uint32_t kHeadDim>
-static constexpr int to_swizzle_cute_type() {
-    DG_STATIC_ASSERT(kHeadDim == 32 or kHeadDim == 64 or kHeadDim == 128, "Invalid swizzling");
-    if constexpr (kHeadDim == 32)
-        return static_cast<int>(cute::SM90::GMMA::LayoutType::B32);
-    if constexpr (kHeadDim == 64)
-        return static_cast<int>(cute::SM90::GMMA::LayoutType::B64);
-    if constexpr (kHeadDim == 128)
-        return static_cast<int>(cute::SM90::GMMA::LayoutType::B128);
-}
 
 template <uint32_t kNumHeads, uint32_t kHeadDim,
           bool kIsCompressedLogits,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
-          uint32_t kNumTMAThreads, uint32_t kNumMathThreads>
-__global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
+          uint32_t kNumSMs,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          typename logits_dtype_t>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
-                         const uint32_t max_seqlen_k, const uint64_t stride_logits,
+                         const uint32_t max_seqlen_k, const uint32_t stride_logits,
                          uint32_t* cu_seq_len_k_start,
                          uint32_t* cu_seq_len_k_end,
-                         float* logits,
+                         logits_dtype_t* logits,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
@@ -44,10 +39,10 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // TODO: consider TMA multicast
     // For one block, we process `[q_start:q_end, h, d] @ [kv_start:kv_end, d] -> [q_start:q_end, kv_start:kv_end]`
     // Q should be load only at once for a block
-    const auto& num_q_blocks = ceil_div(seq_len, BLOCK_Q);
+    const auto num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
 
     // Types
-    using WGMMA = typename FP8MMASelector<BLOCK_Q * kNumHeads>::type;
+    using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_Q * kNumHeads>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // Prefetch TMA descriptors
@@ -74,19 +69,19 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     DG_STATIC_ASSERT(SMEM_KV_SIZE_PER_STAGE % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
 
     // Data on shared memory
-    auto smem_q = PatternVisitor([&](const uint32_t& i) {
+    auto smem_q = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer +
             SMEM_Q_SIZE_PER_STAGE * i);
     });
-    auto smem_kv = PatternVisitor([&](const uint32_t& i) {
+    auto smem_kv = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + (
             SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SIZE_PER_STAGE * i));
     });
-    auto smem_weights = PatternVisitor([&](const uint32_t& i) {
+    auto smem_weights = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer +
             SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SIZE_PER_STAGE * kNumKVStages + SMEM_WEIGHT_SIZE_PER_STAGE * i);
     });
-    auto smem_kv_scales = PatternVisitor([&](const uint32_t& i) {
+    auto smem_kv_scales = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer +
             SMEM_Q_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SIZE_PER_STAGE * kNumKVStages +
             SMEM_WEIGHT_SIZE_PER_STAGE * kNumQStages + SMEM_KV_SCALE_SIZE_PER_STAGE * i);
@@ -94,13 +89,13 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // TMA barriers
     auto barrier_ptr = reinterpret_cast<Barrier*>(smem_kv_scales[kNumKVStages]);
-    auto full_q_barriers   = PatternVisitor([&](const uint32_t& i) { return barrier_ptr + i; });
-    auto empty_q_barriers  = PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages + i); });
-    auto full_kv_barriers  = PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + i); });
-    auto empty_kv_barriers = PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages + i); });
+    auto full_q_barriers   = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + i; });
+    auto empty_q_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages + i); });
+    auto full_kv_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + i); });
+    auto empty_kv_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_ptr + (kNumQStages * 2 + kNumKVStages + i); });
 
     // Initialize barriers
-    const bool& is_tma_load_warp = kNumMathThreads <= threadIdx.x and threadIdx.x < kNumMathThreads + 32;
+    const bool is_tma_load_warp = kNumMathThreads <= threadIdx.x and threadIdx.x < kNumMathThreads + 32;
     if (is_tma_load_warp and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumQStages; ++ i) {
@@ -123,37 +118,42 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     constexpr uint32_t kNumMathRegisters = 112;
 
     // Block scheduler
-    uint32_t block_q_idx = blockIdx.x, q_iter_idx = 0;
-    const auto& get_next_block_q_idx = [&]() -> cute::tuple<uint32_t, uint32_t> {
-        return {block_q_idx + gridDim.x, q_iter_idx + 1};
+    const auto sm_idx = blockIdx.x;
+    uint32_t block_q_idx = sm_idx, q_iter_idx = 0;
+    const auto get_next_block_q_idx = [&]() -> cute::tuple<uint32_t, uint32_t> {
+        return {block_q_idx + kNumSMs, q_iter_idx + 1};
     };
     uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
-    const auto& load_schedule = [&](const uint32_t& q_iter_offset = 0) -> cute::tuple<uint32_t, uint32_t, uint32_t, uint32_t> {
+    const auto load_schedule = [&](const uint32_t& q_iter_offset = 0) -> cute::tuple<uint32_t, uint32_t, uint32_t, uint32_t> {
         uint32_t start = cute::numeric_limits<uint32_t>::max();
         uint32_t end = cute::numeric_limits<uint32_t>::min();
 
         #pragma unroll
         for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-            const auto& q_idx = min(block_q_idx * BLOCK_Q + i, seq_len - 1);
-            seq_k_start[i] = __ldg(cu_seq_len_k_start + q_idx);
-            seq_k_end[i] = __ldg(cu_seq_len_k_end + q_idx);
+            const auto q_idx = min(block_q_idx * BLOCK_Q + i, seq_len - 1);
+            seq_k_start[i] = cu_seq_len_k_start[q_idx];
+            seq_k_end[i] = cu_seq_len_k_end[q_idx];
             start = min(start, min(seq_k_start[i], seq_len_kv));
             end = max(end, min(seq_k_end[i], seq_len_kv));
         }
+        // TMA alignment requirements for SF KV
         start = start / 4 * 4;
         return {(q_iter_idx + q_iter_offset) % kNumQStages,       // Q pipeline stage
                 ((q_iter_idx + q_iter_offset) / kNumQStages) & 1, // Q pipeline phase
-                start, ceil_div(end - start, BLOCK_KV)};          // Task info
+                start, math::ceil_div(end - start, BLOCK_KV)};          // Task info
     };
 
     // KV pipeline
     uint32_t num_total_kv_blocks = 0;
-    const auto& get_kv_pipeline = [&](const uint32_t& kv_block_idx) -> cute::tuple<uint32_t, uint32_t> {
+    const auto get_kv_pipeline = [&](const uint32_t& kv_block_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {
             (num_total_kv_blocks + kv_block_idx) % kNumKVStages,         // KV pipeline stage
             ((num_total_kv_blocks + kv_block_idx) / kNumKVStages) & 1    // KV pipeline phase
         };
     };
+
+    // Wait for primary kernel completion
+    cudaGridDependencySynchronize();
 
     if (threadIdx.x >= kNumMathThreads) {
         // TMA warp-group for loading data
@@ -165,8 +165,8 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
         // Prefetch
         const auto& issue_tma_q = [&](const uint32_t& stage_idx, const auto& block_idx) {
-            tma_copy<kHeadDim, BLOCK_Q * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, block_idx * BLOCK_Q * kNumHeads);
-            tma_copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, block_idx * BLOCK_Q);
+            tma::copy<kHeadDim, BLOCK_Q * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, block_idx * BLOCK_Q * kNumHeads);
+            tma::copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, block_idx * BLOCK_Q);
             full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
         };
         if (cute::elect_one_sync() and block_q_idx < num_q_blocks)
@@ -192,9 +192,9 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                     empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
 
                     // Issue TMA KV
-                    tma_copy<kHeadDim, BLOCK_KV, kHeadDim>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
+                    tma::copy<kHeadDim, BLOCK_KV, kHeadDim>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
                              smem_kv[kv_stage_idx], 0, kv_start + kv_block_idx * BLOCK_KV);
-                    tma_copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
+                    tma::copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
                              smem_kv_scales[kv_stage_idx], kv_start + kv_block_idx * BLOCK_KV, 0);
                     full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
                 }
@@ -212,7 +212,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         const auto& thread_idx = threadIdx.x % kNumMathThreads;
         const auto& warp_idx = __shfl_sync(0xffffffff, thread_idx / 32, 0);
         const auto& warpgroup_idx = warp_idx / 4;
-        const auto& lane_idx = get_lane_idx();
+        const auto& lane_idx = ptx::get_lane_idx();
         float accum[WGMMA::kNumAccum], weights[BLOCK_Q][kNumHeads / 4];
 
         const auto& warp_offset = warp_idx * 16;
@@ -230,7 +230,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
-                    weights[i][j] = ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
+                    weights[i][j] = ptx::ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
             }
 
             // Compute over KV blocks
@@ -242,29 +242,31 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 full_kv_barriers[kv_stage_idx]->wait(kv_phase);
 
                 // Read per-KV scales
-                float scale_kv_0 = ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_0_offset);
-                float scale_kv_1 = ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_1_offset);
+                float scale_kv_0 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_0_offset);
+                float scale_kv_1 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_1_offset);
 
                 // Issue WGMMA
                 DG_STATIC_ASSERT(BLOCK_KV == kNumMathThreads / 2, "Invalid block size");
                 DG_STATIC_ASSERT(kHeadDim % WGMMA::K == 0, "Invalid head dim");
                 #pragma unroll
                 for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                    warpgroup_fence_operand(accum[i]);
-                warpgroup_arrive();
+                    ptx::warpgroup_fence_operand(accum[i]);
+                ptx::warpgroup_arrive();
                 #pragma unroll
                 for (uint32_t k = 0; k < kHeadDim / WGMMA::K; ++ k) {
-                    auto desc_a = make_smem_desc(smem_kv[kv_stage_idx] + (warpgroup_idx * WGMMA::M) * kHeadDim + k * WGMMA::K,
-                                                 to_swizzle_cute_type<kHeadDim>(), 0, kHeadDim * 8);
-                    auto desc_b = make_smem_desc(smem_q[q_stage_idx] + k * WGMMA::K,
-                                                 to_swizzle_cute_type<kHeadDim>(), 0, kHeadDim * 8);
+                    auto desc_a = mma::sm90::make_smem_desc(
+                        smem_kv[kv_stage_idx] + (warpgroup_idx * WGMMA::M) * kHeadDim + k * WGMMA::K,
+                        mma::sm90::to_swizzle_cute_type<kHeadDim>(), 0, kHeadDim * 8);
+                    auto desc_b = mma::sm90::make_smem_desc(
+                        smem_q[q_stage_idx] + k * WGMMA::K,
+                        mma::sm90::to_swizzle_cute_type<kHeadDim>(), 0, kHeadDim * 8);
                     WGMMA::wgmma(desc_a, desc_b, accum, k);
                 }
-                warpgroup_commit_batch();
+                ptx::warpgroup_commit_batch();
                 #pragma unroll
                 for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
-                    warpgroup_fence_operand(accum[i]);
-                warpgroup_wait<0>();
+                    ptx::warpgroup_fence_operand(accum[i]);
+                ptx::warpgroup_wait<0>();
 
                 // Release KV empty
                 empty_kv_barriers[kv_stage_idx]->arrive();
@@ -278,7 +280,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 #pragma unroll
                 for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                     auto shifted_accum = accum + i * kNumAccumPerReduce;
-                    const auto& transform = [&](const uint32_t& j) {
+                    const auto transform = [&](const uint32_t& j) {
                         return fmaxf(shifted_accum[j], 0) * weights[i][(j / 4) * 2 + (j & 1)];
                     };
 
@@ -302,16 +304,15 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                     }
 
                     // Store into the global memory
-                    // NOTES: we have redundant writes here, consider more carefully
-                    const uint32_t& q_idx = block_q_idx * BLOCK_Q + i;
+                    const auto q_offset = (block_q_idx * BLOCK_Q + i) * static_cast<uint64_t>(stride_logits);
                     if constexpr (kIsCompressedLogits) {
                         if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
-                            logits[q_idx * stride_logits + kv_offset + v_0_offset - seq_k_start[i]] = v_0;
+                            logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_0);
                         if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
-                            logits[q_idx * stride_logits + kv_offset + v_1_offset - seq_k_start[i]] = v_1;
+                            logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_1);
                     } else {
-                        logits[q_idx * stride_logits + kv_offset + v_0_offset] = v_0;
-                        logits[q_idx * stride_logits + kv_offset + v_1_offset] = v_1;
+                        logits[q_offset + kv_offset + v_0_offset] = static_cast<logits_dtype_t>(v_0);
+                        logits[q_offset + kv_offset + v_1_offset] = static_cast<logits_dtype_t>(v_1);
                     }
                 }
             }

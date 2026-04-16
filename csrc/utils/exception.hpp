@@ -42,7 +42,7 @@ do { \
 #ifndef DG_NVRTC_CHECK
 #define DG_NVRTC_CHECK(cmd) \
 do { \
-    const auto& e = (cmd); \
+    const auto e = (cmd); \
     if (e != NVRTC_SUCCESS) { \
         throw DGException("NVRTC", __FILE__, __LINE__, nvrtcGetErrorString(e)); \
     } \
@@ -52,7 +52,7 @@ do { \
 #ifndef DG_CUDA_DRIVER_CHECK
 #define DG_CUDA_DRIVER_CHECK(cmd) \
 do { \
-    const auto& e = (cmd); \
+    const auto e = (cmd); \
     if (e != CUDA_SUCCESS) { \
         std::stringstream ss; \
         const char *name, *info; \
@@ -66,7 +66,7 @@ do { \
 #ifndef DG_CUDA_RUNTIME_CHECK
 #define DG_CUDA_RUNTIME_CHECK(cmd) \
 do { \
-    const auto& e = (cmd); \
+    const auto e = (cmd); \
     if (e != cudaSuccess) { \
         std::stringstream ss; \
         ss << static_cast<int>(e) << " (" << cudaGetErrorName(e) << ", " << cudaGetErrorString(e) << ")"; \
@@ -97,7 +97,7 @@ inline const char* cublasGetStatusString(cublasStatus_t status) {
 
 #define DG_CUBLASLT_CHECK(cmd) \
 do { \
-    const auto& e = (cmd); \
+    const auto e = (cmd); \
     if (e != CUBLAS_STATUS_SUCCESS) { \
         std::ostringstream ss; \
         ss << static_cast<int>(e) << " (" << cublasGetStatusString(e) << ")"; \

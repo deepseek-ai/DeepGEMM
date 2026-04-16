@@ -20,6 +20,9 @@ static int get_non_contiguous_dim(const cute::UMMA::Major& major) {
 }
 
 static int get_compiled_dim(const int& dim, const char& name, const std::string& compiled_dims) {
+    if (heuristics_runtime->get_ignore_compile_dims())
+        return 0;
+
     for (const char& c: compiled_dims) {
         if (name == c)
             return dim;
@@ -58,8 +61,19 @@ static std::string to_string(const at::ScalarType& dtype) {
     }
 }
 
+static std::string to_string(const float& v) {
+    if (std::isfinite(v)) {
+        return fmt::format(R"({:a}f)", v);
+    } else if (std::isinf(v)) {
+        return v > 0 ? "cute::numeric_limits<float>::infinity()"
+                     : "-cute::numeric_limits<float>::infinity()";
+    }
+    DG_HOST_UNREACHABLE("NaN input is not supported");
+}
+
 static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& dtype,
-                                                          const bool& allow_tf32) {
+                                                          const bool& allow_tf32,
+                                                          const bool& fp4_unpacked_smem) {
     if (allow_tf32 and dtype == torch::kFloat)
         return CU_TENSOR_MAP_DATA_TYPE_TFLOAT32;
 
@@ -68,13 +82,16 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
-        case kPackedFP4:            return CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
+#if CUDA_VERSION >= 12080
+        case kPackedFP4:            return fp4_unpacked_smem ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
+                                                             : CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
+#endif
         default: DG_HOST_UNREACHABLE("Unsupported dtype");
     }
 }
 
 static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const int& base) {
-#if CUDART_VERSION >= 12080
+#if CUDA_VERSION >= 12080
     if (base != 0) {
         DG_HOST_ASSERT(base == 32 and mode == 128);
         return CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B;
@@ -97,14 +114,20 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
                                     int smem_inner_dim, int smem_outer_dim,
                                     const int& gmem_outer_stride,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
-                                    const bool& allow_tf32 = false) {
-    const auto& elem_size = static_cast<int>(t.element_size());
+                                    const bool& allow_tf32 = false,
+                                    const bool& fp4_unpacked_smem = true) {
+    const auto elem_size = static_cast<int>(t.element_size());
     if (swizzle_mode != 0)
         smem_inner_dim = swizzle_mode / elem_size;
 
-    // Inner dim must be a multiple of 64B for .b4x16_p64
-    if (t.scalar_type() == kPackedFP4)
-        DG_HOST_ASSERT(gmem_inner_dim % 128 == 0);
+    if (t.scalar_type() == kPackedFP4) {
+        // Inner dim must be a multiple of 64B for .b4x16_p64
+        DG_HOST_ASSERT(not fp4_unpacked_smem or gmem_inner_dim % 128 == 0);
+
+        // Fix FP4 packed smem
+        if (not fp4_unpacked_smem and swizzle_mode != 0)
+            smem_inner_dim = swizzle_mode * 2;
+    }
 
     CUtensorMap tensor_map;
     const cuuint64_t gmem_dims[2] = {static_cast<cuuint64_t>(gmem_inner_dim), static_cast<cuuint64_t>(gmem_outer_dim)};
@@ -112,12 +135,13 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
     const cuuint64_t gmem_strides[1] = {static_cast<cuuint64_t>(gmem_outer_stride * elem_size), };
     const cuuint32_t elem_strides[2] = {1, 1};
     if (get_env<int>("DG_JIT_DEBUG")) {
-        printf("Making TMA desc: global memory: %d %d, shared memory: %d %d, outer stride: %d, swizzle: %d (base: %d), elem size: %d\n",
+        printf("Making TMA desc: global memory: %d %d, shared memory: %d %d, outer stride: %d, swizzle: %d (base: %d), elem size: %d, pointer: %llu\n",
                gmem_inner_dim, gmem_outer_dim, smem_inner_dim, smem_outer_dim,
-               gmem_outer_stride, swizzle_mode, swizzle_base, elem_size);
+               gmem_outer_stride, swizzle_mode, swizzle_base, elem_size,
+               reinterpret_cast<unsigned long long>(t.data_ptr()));
     }
     DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
-        &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32),
+        &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32, fp4_unpacked_smem),
         2, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
@@ -129,14 +153,20 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
                                     int smem_dim_0, int smem_dim_1, int smem_dim_2,
                                     const int& gmem_stride_0, const int& gmem_stride_1,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
-                                    const bool& allow_tf32 = false) {
-    const auto& elem_size = static_cast<int>(t.element_size());
+                                    const bool& allow_tf32 = false,
+                                    const bool& fp4_unpacked_smem = true) {
+    const auto elem_size = static_cast<int>(t.element_size());
     if (swizzle_mode != 0)
         smem_dim_0 = swizzle_mode / elem_size;
 
-    // Inner dim must be a multiple of 64B for .b4x16_p64
-    if (t.scalar_type() == kPackedFP4)
-        DG_HOST_ASSERT(gmem_dim_0 % 128 == 0);
+    if (t.scalar_type() == kPackedFP4) {
+        // Inner dim must be a multiple of 64B for .b4x16_p64
+        DG_HOST_ASSERT(not fp4_unpacked_smem or gmem_dim_0 % 128 == 0);
+
+        // Fix fp4 packed smem
+        if (not fp4_unpacked_smem and swizzle_mode != 0)
+            smem_dim_0 = swizzle_mode * 2;
+    }
 
     CUtensorMap tensor_map;
     const cuuint64_t gmem_dims[3] = {static_cast<cuuint64_t>(gmem_dim_0), static_cast<cuuint64_t>(gmem_dim_1), static_cast<cuuint64_t>(gmem_dim_2),};
@@ -149,7 +179,7 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
                gmem_stride_0, gmem_stride_1, swizzle_mode, elem_size);
     }
     DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
-        &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32),
+        &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32, fp4_unpacked_smem),
         3, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
@@ -166,8 +196,8 @@ static CUtensorMap make_tma_a_desc(const cute::UMMA::Major& major,
                                    const bool& allow_tf32 = false) {
     if (num_groups > 1)
         DG_HOST_ASSERT(major == cute::UMMA::Major::K);
-    const auto& [gmem_inner_dim, gmem_outer_dim] = get_inner_outer_dims(major, shape_k, shape_m * num_groups);
-    const auto& [smem_inner_dim, smem_outer_dim] = get_inner_outer_dims(major, block_k, block_m);
+    const auto [gmem_inner_dim, gmem_outer_dim] = get_inner_outer_dims(major, shape_k, shape_m * num_groups);
+    const auto [smem_inner_dim, smem_outer_dim] = get_inner_outer_dims(major, block_k, block_m);
     return make_tma_2d_desc(t,
                             gmem_inner_dim, gmem_outer_dim,
                             smem_inner_dim, smem_outer_dim,
@@ -184,8 +214,8 @@ static CUtensorMap make_tma_b_desc(const cute::UMMA::Major& major,
                                    const int& num_groups,
                                    const int& swizzle_mode, const int& swizzle_base = 0,
                                    const bool& allow_tf32 = false) {
-    const auto& [gmem_inner_dim, gmem_outer_dim] = get_inner_outer_dims(major, shape_k, shape_n);
-    const auto& [smem_inner_dim, smem_outer_dim] = get_inner_outer_dims(major, block_k, block_n);
+    const auto [gmem_inner_dim, gmem_outer_dim] = get_inner_outer_dims(major, shape_k, shape_n);
+    const auto [smem_inner_dim, smem_outer_dim] = get_inner_outer_dims(major, block_k, block_n);
 
     // `num_groups` is always applied into the outer dimensions
     return make_tma_2d_desc(t,

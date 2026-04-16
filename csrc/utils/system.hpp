@@ -16,7 +16,7 @@ namespace deep_gemm {
 // ReSharper disable once CppNotAllPathsReturnValue
 template <typename dtype_t>
 static dtype_t get_env(const std::string& name, const dtype_t& default_value = dtype_t()) {
-    const auto& c_str = std::getenv(name.c_str());
+    const auto c_str = std::getenv(name.c_str());
     if (c_str == nullptr)
         return default_value;
 
@@ -34,7 +34,7 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
 
 static std::tuple<int, std::string> call_external_command(std::string command) {
     command = command + " 2>&1";
-    const auto& deleter = [](FILE* f) { if (f) pclose(f); };
+    const auto deleter = [](FILE* f) { if (f) pclose(f); };
     std::unique_ptr<FILE, decltype(deleter)> pipe(popen(command.c_str(), "r"), deleter);
     DG_HOST_ASSERT(pipe != nullptr);
 
@@ -42,7 +42,10 @@ static std::tuple<int, std::string> call_external_command(std::string command) {
     std::string output;
     while (fgets(buffer.data(), buffer.size(), pipe.get()))
         output += buffer.data();
-    const auto& exit_code = WEXITSTATUS(pclose(pipe.release()));
+    const auto status = pclose(pipe.release());
+    // NOTES: if the child was killed by a signal (e.g., SIGINT from Ctrl+C),
+    // WEXITSTATUS would incorrectly return 0. Treat signal death as failure.
+    const auto exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
     return {exit_code, output};
 }
 
@@ -68,7 +71,7 @@ static std::vector<std::filesystem::path> collect_files(const std::filesystem::p
 static std::filesystem::path make_dirs(const std::filesystem::path& path) {
     // OK if existed
     std::error_code capture;
-    const bool& created = std::filesystem::create_directories(path, capture);
+    const bool created = std::filesystem::create_directories(path, capture);
     if (not (created or capture.value() == 0)) {
         DG_HOST_UNREACHABLE(fmt::format("Failed to make directory: {}, created: {}, value: {}",
                                         path.c_str(), created, capture.value()));
@@ -92,6 +95,34 @@ static std::string get_uuid() {
        << std::setw(8) << dist(gen) << "-"
        << std::setw(8) << dist(gen);
     return ss.str();
+}
+
+static void safe_remove_all(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (not std::filesystem::exists(path, ec) or ec)
+        return;
+
+    // A single file
+    if (not std::filesystem::is_directory(path, ec) or ec) {
+        std::filesystem::remove(path, ec);
+        return;
+    }
+
+    // Remove directory
+    auto it = std::filesystem::directory_iterator(path,
+        std::filesystem::directory_options::skip_permission_denied, ec);
+    for (auto end = std::filesystem::directory_iterator(); it != end and not ec;) {
+        const auto entry_path = it->path();
+
+        // Increase firstly to avoid failures
+        it.increment(ec);
+        if (ec)
+            break;
+
+        // Recursively clean
+        safe_remove_all(entry_path);
+    }
+    std::filesystem::remove(path, ec);
 }
 
 } // deep_gemm

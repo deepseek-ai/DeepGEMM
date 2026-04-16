@@ -81,21 +81,21 @@ static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     DG_HOST_ASSERT(n <= 32 and n % 8 == 0);
     DG_HOST_ASSERT(k % block_k == 0);
 
-    const auto& swizzle_cd_mode = get_swizzle_mode(block_n, sizeof(float));
-    const auto& tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
-                                               block_m, block_k,
-                                               static_cast<int>(a.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
-                                               get_swizzle_mode(block_k, a.element_size()), 0,
-                                               true);
-    const auto& tensor_map_b = make_tma_b_desc(cute::UMMA::Major::K, b, n, k,
-                                               block_n, block_k,
-                                               static_cast<int>(b.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
-                                               get_swizzle_mode(block_k, b.element_size()), 0,
-                                               true);
-    const auto& tensor_map_d = num_splits == 1 ? make_tma_cd_desc(d, m, n,
-                                                                  block_m, block_n,
-                                                                  static_cast<int>(d.stride(-2)), 1,
-                                                                  swizzle_cd_mode)
+    const auto swizzle_cd_mode = get_swizzle_mode(block_n, sizeof(float));
+    const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
+                                              block_m, block_k,
+                                              static_cast<int>(a.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
+                                              get_swizzle_mode(block_k, a.element_size()), 0,
+                                              true);
+    const auto tensor_map_b = make_tma_b_desc(cute::UMMA::Major::K, b, n, k,
+                                              block_n, block_k,
+                                              static_cast<int>(b.stride(get_non_contiguous_dim(cute::UMMA::Major::K))), 1,
+                                              get_swizzle_mode(block_k, b.element_size()), 0,
+                                              true);
+    const auto tensor_map_d = num_splits == 1 ? make_tma_cd_desc(d, m, n,
+                                                                 block_m, block_n,
+                                                                 static_cast<int>(d.stride(-2)), 1,
+                                                                 swizzle_cd_mode)
                                                : make_tma_3d_desc(d, n, m, num_splits,
                                                                   block_n, block_m, 1,
                                                                   static_cast<int>(d.stride(-2)),
@@ -138,14 +138,14 @@ static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
         .num_stages = num_stages,
         .num_math_threads = num_math_threads,
         .num_tma_threads = num_tma_threads,
-        .launch_args = LaunchArgs(num_splits * ceil_div(m, block_m), num_threads, smem_size, 1),
+        .launch_args = LaunchArgs(num_splits * ceil_div(m, block_m), num_threads, smem_size),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_d = tensor_map_d,
         .sqr_sum = sqr_sum.data_ptr<float>()
     };
-    const auto& code = SM90BF16HCPrenormGemmRuntime::generate(args);
-    const auto& runtime = compiler->build("sm90_tf32_hc_prenorm_gemm", code);
+    const auto code = SM90BF16HCPrenormGemmRuntime::generate(args);
+    const auto runtime = compiler->build("sm90_tf32_hc_prenorm_gemm", code);
     SM90BF16HCPrenormGemmRuntime::launch(runtime, args);
 }
 

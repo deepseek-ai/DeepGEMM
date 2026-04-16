@@ -99,7 +99,7 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
             deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, z)
             assert calc_diff(z, ref_z) < 1e-3
 
-            t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, z), 'fp8_gemm', suppress_kineto_output=True)
+            t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, z), 'gemm_', suppress_kineto_output=True)
             t_cublaslt = bench_kineto(lambda: deep_gemm.einsum('bhr,hdr->bhd', x, y, z, use_cublaslt=True), 'nvjet', suppress_kineto_output=True)
             print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',
                   f'{t * 1e6:4.0f} us | '
@@ -129,7 +129,7 @@ def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
             deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z)
             assert calc_diff(z, ref_z) < 1e-3
 
-            t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z), 'fp8_gemm', suppress_kineto_output=True)
+            t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z), 'gemm_', suppress_kineto_output=True)
             t_cublaslt = bench_kineto(lambda: deep_gemm.einsum('bhd,hdr->bhr', x, y, z, use_cublaslt=True), 'nvjet', suppress_kineto_output=True)
             print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',
                   f'{t * 1e6:4.0f} us | '
@@ -157,7 +157,7 @@ def test_fp8_bhd_bhr_hdr(use_ue8m0: bool = True):
             deep_gemm.fp8_einsum('bhd,bhr->hdr', x_fp8, y_fp8, z, z, recipe=(1, 1, 128))
             assert calc_diff(z, ref_z) < 1e-3
 
-            t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhd,bhr->hdr', x_fp8, y_fp8, z, z, recipe=(1, 1, 128)), 'fp8_gemm', suppress_kineto_output=True)
+            t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhd,bhr->hdr', x_fp8, y_fp8, z, z, recipe=(1, 1, 128)), 'gemm_', suppress_kineto_output=True)
             print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',
                   f'{t * 1e6:4.0f} us | '
                   f'{2 * b * h * r * d / t / 1e12:4.0f} TFLOPS | '

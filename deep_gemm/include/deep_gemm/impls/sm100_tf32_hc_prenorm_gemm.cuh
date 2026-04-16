@@ -4,20 +4,22 @@
 
 #include <cutlass/arch/barrier.h>
 
-#include <deep_gemm/common/reduction.cuh>
+#include <deep_gemm/common/cute_tie.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/common/sm90_utils.cuh>
-#include <deep_gemm/common/sm100_utils.cuh>
+#include <deep_gemm/mma/sm100.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tcgen05.cuh>
+#include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm {
 
-using namespace deep_gemm::sm100;
-
 template <uint32_t kSwizzleMode, uint32_t kSwizzleBase = 16>
-__device__ __forceinline__
+CUTLASS_DEVICE
 uint32_t get_swizzled_smem_offset(const uint32_t& offset, const uint32_t& lane_idx) {
     // Calculate the index of the bank group to be written in the atom
-    const auto& bank_group_idx = offset + lane_idx * (kSwizzleMode / kSwizzleBase);
+    const auto bank_group_idx = offset + lane_idx * (kSwizzleMode / kSwizzleBase);
 
     // Reshape the atom in another view and swizzle
     //  - original: `(BLOCK_N, kSwizzleMode / kSwizzleBase)`
@@ -37,7 +39,7 @@ template <uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kSwizzleCDMode,
           uint32_t kNumStages,
           uint32_t kNumMMAThreads, uint32_t kNumCastAndReduceThreads>
-__global__ void __launch_bounds__(kNumMMAThreads + kNumCastAndReduceThreads, 1)
+CUTLASS_GLOBAL void __launch_bounds__(kNumMMAThreads + kNumCastAndReduceThreads, 1)
 sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -58,7 +60,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
     // Utils
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
-    const auto lane_idx = get_lane_idx();
+    const auto lane_idx = ptx::get_lane_idx();
 
     // Align to 1024 bytes for swizzle-128B
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
@@ -70,7 +72,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
     DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0, "Shared memory of A/B must be aligned to 1024 bytes");
 
     // Real tensor memory size and offsets
-    constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<BLOCK_K * kNumCastStages + BLOCK_N>();
+    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<BLOCK_K * kNumCastStages + BLOCK_N>();
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0 and cute::elect_one_sync()) {
@@ -82,20 +84,20 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
     // Data on shared memory (layout as ordered below)
     // Fill D/A/B pointers
     auto smem_cd = reinterpret_cast<float*>(smem_buffer);
-    auto smem_a = PatternVisitor([&](const uint32_t& i) {
+    auto smem_a = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<nv_bfloat16*>(smem_buffer + (SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE));
     });
-    auto smem_b = PatternVisitor([&](const uint32_t& i) {
+    auto smem_b = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + (SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE));
     });
 
     // Fill barriers
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_CD_SIZE +
         kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
-    auto full_barriers           = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
-    auto full_cast_barriers      = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
-    auto empty_barriers          = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
-    auto empty_cast_barriers     = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
+    auto full_barriers           = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
+    auto full_cast_barriers      = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
+    auto empty_barriers          = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 2 + i); });
+    auto empty_cast_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages * 3 + i); });
     auto tmem_full_barrier       = barrier_start_ptr + kNumStages * 4;
 
     // Fill the tensor memory pointer
@@ -121,7 +123,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
     }
     __syncthreads();
 
-    constexpr uint32_t kNumKBlocks = constexpr_ceil_div(SHAPE_K, BLOCK_K);
+    constexpr uint32_t kNumKBlocks = math::constexpr_ceil_div(SHAPE_K, BLOCK_K);
     constexpr uint32_t kNumKBlocksPerSplit = kNumKBlocks / kNumSplits;
     constexpr uint32_t kRemainKBlocks = kNumKBlocks % kNumSplits;
     const uint32_t block_idx = __shfl_sync(0xffffffff, blockIdx.x, 0);
@@ -130,6 +132,9 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
     const uint32_t k_offset = (k_split_idx * kNumKBlocksPerSplit + cute::min(k_split_idx, kRemainKBlocks)) * BLOCK_K;
     const uint32_t m_offset = shape_m * k_split_idx;
     const uint32_t num_total_stages = kNumKBlocksPerSplit + (k_split_idx < kRemainKBlocks);
+
+    // Wait for primary kernel completion
+    cudaGridDependencySynchronize();
 
     // Dispatch warps into different roles
     if (warp_idx < kNumMMAThreads / 32) {
@@ -145,8 +150,8 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 uint32_t k_idx = k_offset + s * BLOCK_K;
 
                 // Issue TMAs
-                tma_copy<BLOCK_K, BLOCK_M, kSwizzleAMode>(&tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx);
-                tma_copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(&tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, 0);
+                tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode>(&tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx);
+                tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(&tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, 0);
 
                 // Arrive at full barriers
                 constexpr uint32_t kNumArrivalBytes = SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE;
@@ -168,7 +173,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
             const auto& runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-            auto b_desc = make_umma_desc<kMajorB, BLOCK_N, BLOCK_SWIZZLED_BK, kSwizzleBMode>(smem_b[0], 0, 0);
+            auto b_desc = mma::sm100::make_umma_desc<kMajorB, BLOCK_N, BLOCK_SWIZZLED_BK, kSwizzleBMode>(smem_b[0], 0, 0);
             const uint32_t& b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
             // Checks for MMA instructions
@@ -185,7 +190,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 const auto& stage_idx = s % kNumStages;
                 const auto& cast_stage_idx = s % kNumCastStages;
                 full_cast_barriers[cast_stage_idx]->wait((s / kNumCastStages) & 1);
-                tcgen05_after_thread_sync();
+                ptx::tcgen05_after_thread_sync();
 
                 // Issue UMMA
                 const auto& b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
@@ -194,7 +199,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                     const uint32_t& atom_idx = (k * UMMA_K) / BLOCK_SWIZZLED_BK;
                     const uint32_t& in_atom_idx = (k * UMMA_K) % BLOCK_SWIZZLED_BK;
                     const uint32_t& offset = atom_idx * BLOCK_N * BLOCK_SWIZZLED_BK;
-                    b_desc.lo = advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, float>(b_desc_base_lo, offset, in_atom_idx);
+                    b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, BLOCK_N, kSwizzleBMode, float>(b_desc_base_lo, offset, in_atom_idx);
                     umma_t::fma(BLOCK_K * cast_stage_idx + k * UMMA_K, b_desc, BLOCK_K * kNumCastStages, s > 0 or k > 0, runtime_instr_desc);
                 }
 
@@ -218,7 +223,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
         // Wait UMMA arrival
         tmem_full_barrier->wait(0);
-        tcgen05_after_thread_sync();
+        ptx::tcgen05_after_thread_sync();
 
         // Load from tensor memory into registers, and write shared memory with STSM
         DG_STATIC_ASSERT(kNumMMAThreads == 128, "Epilogue threads not enough");
@@ -239,7 +244,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 values[0], values[1], values[2], values[3]);
             cutlass::arch::fence_view_async_tmem_load();
             if (BLOCK_M == 128 or (BLOCK_M == 64 and lane_idx < 16))
-                st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+                ptx::st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
             if constexpr (BLOCK_M == 64)
                 __syncwarp();
         }
@@ -290,9 +295,9 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
             #pragma unroll
             for (uint32_t i = 0; i < kNumLoads; i += 2) {
                 auto smem_ptr = smem_base_ptr + get_swizzled_smem_offset<kSwizzleAMode>(i + lane_idx / 16, lane_idx % 16);
-                sm90::SM90_U32x4_LDSM_N::copy(uint32_values[0][i + 0], uint32_values[1][i + 0],
-                                              uint32_values[0][i + 1], uint32_values[1][i + 1],
-                                              smem_ptr);
+                ptx::SM90_U32x4_LDSM_N::copy(uint32_values[0][i + 0], uint32_values[1][i + 0],
+                                             uint32_values[0][i + 1], uint32_values[1][i + 1],
+                                             smem_ptr);
             }
 
             // Wait tensor memory empty
@@ -321,15 +326,15 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
             cutlass::arch::fence_view_async_tmem_store();
 
             // Arrive for issuing MMAs
-            tcgen05_before_thread_sync();
+            ptx::tcgen05_before_thread_sync();
             full_cast_barriers[cast_stage_idx]->arrive();
         }
 
         // Intra-warp reduction and write back
         #pragma unroll
         for (uint32_t u = 0; u < 2; ++ u) {
-            const auto& reduced_sum = warp_reduce_sum<4>(sum[u].x + sum[u].y);
-            const auto& m_idx = m_block_idx * BLOCK_M + sub_warp_idx * BLOCK_M_PER_WARP + lane_idx / 4 + u * 8;
+            const auto reduced_sum = math::warp_reduce_sum<4>(sum[u].x + sum[u].y);
+            const auto m_idx = m_block_idx * BLOCK_M + sub_warp_idx * BLOCK_M_PER_WARP + lane_idx / 4 + u * 8;
             if (lane_idx % 4 == 0 and m_idx < shape_m)
                 sqr_sum[m_offset + m_idx] = reduced_sum;
         }

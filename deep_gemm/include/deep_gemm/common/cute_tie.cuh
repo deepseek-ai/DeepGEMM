@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cute/int_tuple.hpp>
+
 namespace cute {
 
 struct ignore_t {
