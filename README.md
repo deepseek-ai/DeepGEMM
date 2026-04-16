@@ -8,6 +8,9 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## News
 
+- 2026.04.16: Mega MoE, FP8xFP4 GEMM, FP4 Indexer, PDL, faster JIT compilation and more.
+  - Performance comparison will be posted later.
+  - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) for more details.
 - 2025.09.28: DeepGEMM now supports scoring kernels (weighted ReLU MQA logits) for the lightning indexer for DeepSeek v3.2.
   - Please see [#200](https://github.com/deepseek-ai/DeepGEMM/pull/200) for more details.
 - 2025.07.20: DeepGEMM now supports both SM90/SM100, and has a full refactor with a low-CPU-overhead JIT CPP module.
@@ -18,27 +21,6 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - 2025.05.14: DeepGEMM now offers weight gradient kernels for dense and MoE backward! See [#95](https://github.com/deepseek-ai/DeepGEMM/pull/95) for details.
 - 2025.05.07: DeepGEMM now supports NVRTC with up to 10x compilation speedup! See [#94](https://github.com/deepseek-ai/DeepGEMM/pull/94) for details. Please use `DG_JIT_USE_NVRTC=1` to enable it (may have performance loss with some cases).
 - 2025.04.18: DeepGEMM now achieves up to **1550 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81), [#86](https://github.com/deepseek-ai/DeepGEMM/pull/86) and [340d988](https://github.com/deepseek-ai/DeepGEMM/commit/340d9880f4a418d943d34260d20a79f41f4c0526) for details.
-
-## Roadmap
-
-- [x] More correctness tests for grouped-contiguous layout
-- [x] Shared memory swizzling for output
-- [x] MoE scheduler with TMA multicast compatibility
-- [x] Fix TMA multicast compatibility for indivisible shapes
-- [x] Skip useless computation on M
-- [x] NVRTC as a faster compiler
-- [x] Sanitizer for testing
-- [x] Weight gradient kernels for dense models
-- [x] Weight gradient kernels for MoE models
-- [ ] Better `get_best_configs` modeling
-- [ ] CUDA PDL support
-- [ ] Larger TMA multicast size for some shapes
-- [x] MMA template refactor with CUTLASS
-- [x] Remove shape limitations on N and K
-- [x] BF16 kernels
-- [ ] Split/stream-k optimizations
-- [ ] Ampere kernels
-- [ ] Polish docs
 
 ## Quick start
 
@@ -65,11 +47,6 @@ cd DeepGEMM
 # Link some essential includes and build the CPP JIT module
 cat develop.sh
 ./develop.sh
-
-# Test all GEMM implements
-python tests/test_layout.py
-python tests/test_attention.py
-python tests/test_core.py
 ```
 
 ### Installation
@@ -134,6 +111,33 @@ out_ij = out_ij.sum()  # Scalar
 
 For more details and the paged version `fp8_paged_mqa_logits`, please refer to `tests/test_attention.py`.
 
+#### Mega MoE
+
+Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+
+```python
+# Allocate symmetric memory buffer
+buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+)
+
+# Transform weights (FP4 with UE8M0 SF) into the required layout
+transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
+
+# Copy inputs into the buffer before each call
+# You may fuse these into previous kernels
+buffer.x[:num_tokens].copy_(x_fp8)
+buffer.x_sf[:num_tokens].copy_(x_sf)
+buffer.topk_idx[:num_tokens].copy_(topk_idx)
+buffer.topk_weights[:num_tokens].copy_(topk_weights)
+
+# Run the fused mega MoE kernel
+y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
+```
+
+For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:
@@ -173,3 +177,15 @@ DeepGEMM is inspired by the [CUTLASS](https://github.com/nvidia/cutlass) project
 ## License
 
 This code repository is released under [the MIT License](LICENSE).
+
+## Citation
+
+```bibtex
+@misc{deepgemm2025,
+      title={DeepGEMM: clean and efficient BLAS kernel library on GPU}, 
+      author={Chenggang Zhao and Zhean Xu and Liang Zhao and Jiashi Li and Chenhao Xu and Anyi Xu and Shengyu Liu and Kexing Zhou and Kuai Yu},
+      year={2025},
+      publisher = {GitHub},
+      howpublished = {\url{https://github.com/deepseek-ai/DeepGEMM}},
+}
+```
