@@ -394,7 +394,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         }
 
         // Free tensor memory
-        cutlass::arch::NamedBarrier(kNumSpecializedThreads, 0).sync();
+        cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (warp_idx == 0)
             cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
     }
