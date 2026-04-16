@@ -117,6 +117,7 @@ Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (F
 
 ```python
 # Allocate symmetric memory buffer
+# NOTES: requires PyTorch >= 2.9
 buffer = deep_gemm.get_symm_buffer_for_mega_moe(
     group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
 )
