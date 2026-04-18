@@ -49,12 +49,44 @@ third_party_include_dirs = [
 
 # Release
 base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'
+version_tag_pattern = re.compile(r'^v(?P<version>\d+\.\d+\.\d+(?:\.post\d+)?)$')
+
+
+def get_public_version():
+    with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
+        version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
+    return ast.literal_eval(version_match.group(1))
+
+
+def get_exact_git_tag_version(public_version: str) -> str | None:
+    # Release builds check out the exact tag, so we can safely derive post-release
+    # versions from the tag even when __version__ still carries the base version.
+    try:
+        tags_output = subprocess.check_output(['git', 'tag', '--points-at', 'HEAD']).decode('ascii')
+    except Exception:
+        return None
+
+    matching_versions = []
+    for raw_tag in tags_output.splitlines():
+        match = version_tag_pattern.fullmatch(raw_tag.strip())
+        if not match:
+            continue
+
+        tag_version = match.group('version')
+        if tag_version == public_version or tag_version.startswith(f'{public_version}.post'):
+            matching_versions.append(tag_version)
+
+    if not matching_versions:
+        return None
+
+    return str(max((parse(version) for version in matching_versions), key=lambda value: value))
 
 
 def get_package_version():
-    with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
-        version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
-    public_version = ast.literal_eval(version_match.group(1))
+    public_version = get_public_version()
+    exact_tag_version = get_exact_git_tag_version(public_version)
+    if exact_tag_version is not None:
+        public_version = exact_tag_version
 
     revision = ''
     if DG_USE_LOCAL_VERSION:
