@@ -263,13 +263,13 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         kv_cache = torch::from_blob(
             fused_kv_cache.data_ptr(),
             {num_kv_blocks, block_kv, head_dim / 2},
-            {kv_cache_stride_bytes, head_dim / 2, 1},
+            {kv_cache_stride_bytes, fp4_with_sf_bytes, 1},
             torch::TensorOptions().dtype(kPackedFP4)
         );
         kv_cache_sf = torch::from_blob(
-            fused_kv_cache.data_ptr<uint8_t>() + block_kv * head_dim / 2,
+            fused_kv_cache.data_ptr<uint8_t>() + head_dim / 2,
             {num_kv_blocks, block_kv},
-            {kv_cache_stride_bytes / static_cast<int>(sizeof(int)), 1},
+            {kv_cache_stride_bytes / static_cast<int>(sizeof(int)), fp4_with_sf_bytes / static_cast<int>(sizeof(int))},
             torch::TensorOptions().dtype(torch::kInt32)
         );
     } else {
@@ -295,13 +295,13 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         kv_cache = torch::from_blob(
             fused_kv_cache.data_ptr(),
             {num_kv_blocks, block_kv, head_dim},
-            {kv_cache_stride_bytes, head_dim, 1},
+            {kv_cache_stride_bytes, head_dim_with_sf, 1},
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
         );
         kv_cache_sf = torch::from_blob(
-            fused_kv_cache.data_ptr<uint8_t>() + block_kv * head_dim,
+            fused_kv_cache.data_ptr<uint8_t>() + head_dim,
             {num_kv_blocks, block_kv},
-            {kv_cache_stride_bytes / static_cast<int>(sizeof(float)), 1},
+            {kv_cache_stride_bytes / static_cast<int>(sizeof(float)), head_dim_with_sf / static_cast<int>(sizeof(float))},
             torch::TensorOptions().dtype(torch::kFloat32)
         );
 

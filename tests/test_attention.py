@@ -235,10 +235,12 @@ def test_paged_mqa_logits():
         x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
         x_cast_back = x_scaled.float() * sf
 
-        x_fp8 = torch.empty((num_blocks, block_size * (head_dim + 4)), device=x.device, dtype=torch.uint8)
-        x_fp8[ :, : block_size * head_dim] = x_scaled.view(num_blocks, block_size * head_dim).view(torch.uint8)
-        x_fp8[ :, block_size * head_dim :] = sf.view(num_blocks, block_size).view(torch.uint8)
-        return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4), x_cast_back.to(x.dtype)
+        # Interleaved layout: [FP8_data (head_dim) | SF (4 bytes)] per row
+        row_stride = head_dim + 4
+        x_fp8 = torch.empty((num_blocks, block_size, num_heads, row_stride), device=x.device, dtype=torch.uint8)
+        x_fp8[:, :, :, :head_dim] = x_scaled.view(torch.uint8)
+        x_fp8[:, :, :, head_dim:] = sf.view(num_blocks, block_size, 1, 1).expand(-1, -1, 1, 4).view(torch.uint8)
+        return x_fp8, x_cast_back.to(x.dtype)
 
     def kv_cache_cast_to_fp4(x: torch.Tensor) -> torch.Tensor:
         num_blocks, block_size, num_heads, head_dim = x.shape
@@ -246,10 +248,12 @@ def test_paged_mqa_logits():
         x_scaled, sf = per_token_cast_to_fp4(x.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
         x_cast_back = cast_back_from_fp4(x_scaled, sf, gran_k=32, use_packed_ue8m0=True).view(num_blocks, block_size, 1, head_dim)
 
-        x_fp4 = torch.empty((num_blocks, block_size * (head_dim // 2 + 4)), device=x.device, dtype=torch.uint8)
-        x_fp4[ :, : block_size * head_dim // 2] = x_scaled.view(num_blocks, block_size * head_dim // 2).view(torch.uint8)
-        x_fp4[ :, block_size * head_dim // 2 :] = sf.view(num_blocks, block_size).view(torch.uint8)
-        return x_fp4.view(num_blocks, block_size, num_heads, head_dim // 2 + 4), x_cast_back.to(x.dtype)
+        # Interleaved layout: [FP4_data (head_dim//2) | SF (4 bytes)] per row
+        row_stride = head_dim // 2 + 4
+        x_fp4 = torch.empty((num_blocks, block_size, num_heads, row_stride), device=x.device, dtype=torch.uint8)
+        x_fp4[:, :, :, :head_dim // 2] = x_scaled.view(torch.uint8)
+        x_fp4[:, :, :, head_dim // 2:] = sf.view(num_blocks, block_size, 1, 1).expand(-1, -1, 1, 4).view(torch.uint8)
+        return x_fp4, x_cast_back.to(x.dtype)
 
     def enumerate_paged_mqa_logits():
         arch_major = get_arch_major()
