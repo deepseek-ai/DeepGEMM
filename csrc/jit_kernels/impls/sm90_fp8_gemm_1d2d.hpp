@@ -32,6 +32,13 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        const bool is_w4 = args.gemm_desc.is_w4;
+
+        // W4 small-m Normal: compile SHAPE_M for MMA_N selection
+        const bool should_compile_m = is_w4
+                                      and (args.gemm_desc.gemm_type == GemmType::Normal)
+                                      and (args.gemm_desc.m > 0 and args.gemm_desc.m <= 56);
+
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh>
 
@@ -48,13 +55,14 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {}
     >);
 }};
 )",
         // TODO: add CD dtype
         to_string(args.major_sfb),
-        get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
+        should_compile_m ? align(args.gemm_desc.m, 8) : get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
         args.gemm_desc.num_groups,
@@ -64,7 +72,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        get_default_epilogue_type(args.epilogue_type));
+        get_default_epilogue_type(args.epilogue_type),
+        is_w4);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -88,6 +97,9 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
     DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
+    const bool is_w4 = a.size(-1) != b.size(-1);
+    const int weight_ratio = is_w4 ? 2 : 1;
+
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
         .kernel_type = KernelType::Kernel1D2D,
@@ -97,21 +109,22 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
         .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
+        .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .is_w4 = is_w4
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
-    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k / weight_ratio);
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
                                               config.storage_config.swizzle_a_mode);
-    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k / weight_ratio,
                                               config.storage_config.load_block_n,
-                                              config.layout.block_k,
+                                              config.layout.block_k / weight_ratio,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_d = make_tma_cd_desc(d, m, static_cast<int>(d.size(-1)),
@@ -119,8 +132,11 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                config.storage_config.store_block_n,
                                                static_cast<int>(d.stride(-2)), 1,
                                                config.storage_config.swizzle_cd_mode);
-    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 config.layout.block_m, config.layout.block_k, 1, 0);
+    // W4: SFA slot carries weight scales (sfb tensor, block_n dim)
+    const auto tensor_map_sfa = is_w4 ? make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
+                                                         config.layout.block_n, config.layout.block_k, 1, 0)
+                                      : make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                         config.layout.block_m, config.layout.block_k, 1, 0);
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
@@ -131,7 +147,7 @@ static void sm90_fp8_gemm_1d2d(const torch::Tensor& a, const torch::Tensor& sfa,
                                   config.layout.get_cluster_size()),
         .epilogue_type = epilogue_type,
         .major_sfb = major_sfb,
-        .sfb = sfb.data_ptr(),
+        .sfb = is_w4 ? sfa.data_ptr() : sfb.data_ptr(),
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -155,6 +171,9 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
+    const bool is_w4 = a.size(-1) != b.size(-1);
+    const int weight_ratio = is_w4 ? 2 : 1;
+
     const auto gemm_type = use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
 
@@ -172,6 +191,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
         .with_accumulation = false,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .is_w4 = is_w4,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
         .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
@@ -180,15 +200,15 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
 
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
-    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k / weight_ratio);
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
                                               config.storage_config.swizzle_a_mode);
-    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k / weight_ratio,
                                               config.storage_config.load_block_n,
-                                              config.layout.block_k,
+                                              config.layout.block_k / weight_ratio,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_d = make_tma_cd_desc(d, m, n,
@@ -196,8 +216,11 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                                config.storage_config.store_block_n,
                                                static_cast<int>(d.stride(-2)), 1,
                                                config.storage_config.swizzle_cd_mode);
-    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 config.layout.block_m, config.layout.block_k, 1, 0);
+    // W4: SFA slot carries weight scales (sfb tensor, block_n dim, with num_groups)
+    const auto tensor_map_sfa = is_w4 ? make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
+                                                         config.layout.block_n, config.layout.block_k, num_groups, 0)
+                                      : make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                         config.layout.block_m, config.layout.block_k, 1, 0);
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
@@ -208,7 +231,7 @@ static void sm90_m_grouped_fp8_gemm_contiguous_1d2d(const torch::Tensor& a, cons
                                   config.layout.get_cluster_size()),
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
-        .sfb = sfb.data_ptr(),
+        .sfb = is_w4 ? sfa.data_ptr() : sfb.data_ptr(),
         .grouped_layout = m_indices.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -231,6 +254,9 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
+    const bool is_w4 = a.size(-1) != b.size(-1);
+    const int weight_ratio = is_w4 ? 2 : 1;
+
     const auto desc = GemmDesc {
         .gemm_type = GemmType::MGroupedMasked,
         .kernel_type = KernelType::Kernel1D2D,
@@ -241,21 +267,22 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
         .with_accumulation = false,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .is_w4 = is_w4,
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM90ArchSpec>(desc);
 
     // Requires no TMA splits
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
-    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
+    DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k / weight_ratio);
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k,
                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), num_groups,
                                               config.storage_config.swizzle_a_mode);
-    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k / weight_ratio,
                                               config.storage_config.load_block_n,
-                                              config.layout.block_k,
+                                              config.layout.block_k / weight_ratio,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_d = make_tma_cd_desc(d, m, n,
@@ -263,8 +290,11 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
                                                config.storage_config.store_block_n,
                                                static_cast<int>(d.stride(-2)), num_groups,
                                                config.storage_config.swizzle_cd_mode);
-    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 config.layout.block_m, config.layout.block_k, num_groups, 0);
+    // W4: SFA slot carries weight scales (sfb tensor, block_n dim, with num_groups)
+    const auto tensor_map_sfa = is_w4 ? make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
+                                                         config.layout.block_n, config.layout.block_k, num_groups, 0)
+                                      : make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+                                                         config.layout.block_m, config.layout.block_k, num_groups, 0);
 
     // Launch
     const SM90FP8Gemm1D2DRuntime::Args& args = {
@@ -275,7 +305,7 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
                                   config.layout.get_cluster_size()),
         .epilogue_type = std::nullopt,
         .major_sfb = major_sfb,
-        .sfb = sfb.data_ptr(),
+        .sfb = is_w4 ? sfa.data_ptr() : sfb.data_ptr(),
         .grouped_layout = masked_m.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
