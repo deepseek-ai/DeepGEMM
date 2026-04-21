@@ -199,14 +199,25 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
     DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(context_lens.is_contiguous());
 
-    // Create metadata tensor
+    // Create metadata tensor. `num_sms` here is actually the scheduler slot count
+    // (= num_clusters on SM90 next_n=4 multicast, = num_sms elsewhere); callers
+    // pre-divide.
     auto schedule_metadata = torch::empty({num_sms + 1, 2}, context_lens.options());
 
     // Dispatch implementation
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9 or arch_major == 10) {
-        DG_HOST_ASSERT(block_kv == 64 or (arch_major == 10 and block_kv == 32));
-        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d);
+        DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
+        // SM90 schedules in units of `kComputeBlockKV = 64` regardless of physical
+        // `block_kv`; pass the compute block size to the metadata kernel.
+        const int metadata_block_kv = (arch_major == 9) ? 64 : block_kv;
+        // Match the kernel-side `kNumNextNAtoms`: SM90 cluster multicast runs one
+        // q per cluster (no atomization), SM100 time-atomizes `next_n` into
+        // `next_n_atom_size` slots per atom.
+        const int num_kv_multicast = (arch_major == 9 and next_n == 4) ? 2 : 1;
+        const int next_n_atom_size = (next_n % 2 == 0) ? 2 : 1;
+        const int num_next_n_atoms = (next_n / next_n_atom_size) / num_kv_multicast;
+        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, metadata_block_kv, num_sms, is_context_lens_2d, num_next_n_atoms);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -321,9 +332,11 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     DG_HOST_ASSERT(block_table.stride(1) == 1);
     DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt);
 
-    // Check schedule metadata
+    // Check schedule metadata. SM90 next_n=4 uses a 2-CTA cluster per task, so
+    // schedule_meta carries one entry per cluster instead of per SM.
     auto [_schedule_meta_size, _meta_info_size] = get_shape<2>(schedule_meta);
-    DG_HOST_ASSERT(_schedule_meta_size == num_sms + 1 and _meta_info_size == 2);
+    const int num_kv_multicast = (device_runtime->get_arch_major() == 9 and next_n == 4) ? 2 : 1;
+    DG_HOST_ASSERT(_schedule_meta_size == num_sms / num_kv_multicast + 1 and _meta_info_size == 2);
     DG_HOST_ASSERT(schedule_meta.is_contiguous());
     DG_HOST_ASSERT(schedule_meta.scalar_type() == torch::kInt);
 

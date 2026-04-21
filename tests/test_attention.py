@@ -314,16 +314,14 @@ def test_paged_mqa_logits():
             limits = (context_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
             ref_neginf_mask = ~(positions <= limits)
 
-        # Run Kernel
-        # SM90 launches one cluster of 2 CTAs per task when next_n == 4 (multicast),
+        # SM90 next_n=4 launches one cluster of 2 CTAs per task (multicast),
         # so the metadata schedule must be sized for clusters, not SMs.
         num_kv_multicast = 2 if get_arch_major() == 9 and next_n == 4 else 1
         num_clusters = deep_gemm.get_num_sms() // num_kv_multicast
-        metadata_block_kv = 64 if get_arch_major() == 9 else block_kv
         kernel_kwargs = dict(
             q=q_in, kv_cache=kv_in, weights=weights,
             context_lens=context_lens_nextn, block_table=block_table,
-            schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(context_lens_nextn, metadata_block_kv, num_clusters),
+            schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(context_lens_nextn, block_kv, num_clusters),
             max_context_len=max_model_len, clean_logits=clean_logits, logits_dtype=logits_dtype
         )
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(**kernel_kwargs)

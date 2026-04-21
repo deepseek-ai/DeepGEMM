@@ -9,6 +9,7 @@ namespace deep_gemm::sched {
 template <uint32_t kAlignedBatchSize, uint32_t SPLIT_KV, uint32_t kNumSMs>
 CUTLASS_GLOBAL __launch_bounds__(32, 1)
 void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t next_n, const bool is_context_lens_2d,
+                                    const uint32_t num_next_n_atoms,
                                     const uint32_t* context_lens, uint32_t* schedule_metadata) {
     DG_STATIC_ASSERT(kAlignedBatchSize % 32 == 0, "Invalid aligned batch size");
     const uint32_t lane_idx = ptx::get_lane_idx();
@@ -40,7 +41,6 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
         sum = __shfl_sync(0xffffffff, x, 31);
     }
 
-    const uint32_t num_next_n_atoms = next_n / ((next_n % 2 == 0) ? 2 : 1);
     const uint32_t total = sum * num_next_n_atoms;
     const uint32_t q = total / kNumSMs, r = total % kNumSMs;
     for (uint32_t sm_idx = lane_idx; sm_idx <= kNumSMs; sm_idx += 32) {
