@@ -255,10 +255,10 @@ def test_paged_mqa_logits():
         arch_major = get_arch_major()
         for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
             for logits_dtype in (torch.float, torch.bfloat16):
-                for block_kv in ((32, 64) if arch_major == 10 else (64, )):
+                for block_kv in (32, 64):
                     for use_2d_context_lens, clean_logits in [(True, False)]:
                         for batch_size in (256, ):
-                            for next_n in (1, 2, 4, 5, 6) if arch_major == 10 else (1, 2):
+                            for next_n in (1, 2, 4, 5, 6) if arch_major == 10 else (1, 2, 4):
                                 for num_heads, head_dim in [(64, 128)]:
                                     for avg_kv in (8192, 32768):
                                         yield is_fp4, logits_dtype, block_kv, use_2d_context_lens, clean_logits, batch_size, next_n, num_heads, head_dim, avg_kv
@@ -277,7 +277,7 @@ def test_paged_mqa_logits():
 
         # Assign block tables
         num_blocks_per_query = ceil_div(context_lens, block_kv)
-        block_table = torch.empty((batch_size, num_blocks_per_query.max().item()), device='cuda', dtype=torch.int)
+        block_table = torch.zeros((batch_size, num_blocks_per_query.max().item()), device="cuda", dtype=torch.int)
         block_idx_pool = torch.randperm(num_total_blocks, device='cuda', dtype=torch.int)
         offset = 0
         for i, num_blocks in enumerate(num_blocks_per_query.tolist()):
@@ -315,10 +315,15 @@ def test_paged_mqa_logits():
             ref_neginf_mask = ~(positions <= limits)
 
         # Run Kernel
+        # SM90 launches one cluster of 2 CTAs per task when next_n == 4 (multicast),
+        # so the metadata schedule must be sized for clusters, not SMs.
+        num_kv_multicast = 2 if get_arch_major() == 9 and next_n == 4 else 1
+        num_clusters = deep_gemm.get_num_sms() // num_kv_multicast
+        metadata_block_kv = 64 if get_arch_major() == 9 else block_kv
         kernel_kwargs = dict(
             q=q_in, kv_cache=kv_in, weights=weights,
             context_lens=context_lens_nextn, block_table=block_table,
-            schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(context_lens_nextn, block_kv, deep_gemm.get_num_sms()),
+            schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(context_lens_nextn, metadata_block_kv, num_clusters),
             max_context_len=max_model_len, clean_logits=clean_logits, logits_dtype=logits_dtype
         )
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(**kernel_kwargs)

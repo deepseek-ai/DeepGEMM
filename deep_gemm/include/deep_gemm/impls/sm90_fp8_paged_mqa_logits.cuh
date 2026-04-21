@@ -25,6 +25,7 @@ template <uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumKVMulticast,
           typename logits_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
@@ -35,19 +36,23 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+    constexpr uint32_t kNextNPerCTA = kNextN / kNumKVMulticast;
+    DG_STATIC_ASSERT(kNextN % kNumKVMulticast == 0, "Invalid `kNextN` or `kNumKVMulticast`");
+
     // Types
-    using WGMMA = typename mma::sm90::FP8MMASelector<kNextN * kNumHeads>::type;
+    using WGMMA = typename mma::sm90::FP8MMASelector<kNextNPerCTA * kNumHeads>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
     const auto warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const auto warpgroup_idx = warp_idx / 4;
     const auto lane_idx = ptx::get_lane_idx();
+    constexpr uint32_t kComputeBlockKV = 64;
 
     // Prefetch TMA descriptors
     static constexpr uint32_t kNumMathWarpGroups = kNumMathThreads / 128;
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
-    DG_STATIC_ASSERT(SPLIT_KV == BLOCK_KV * kNumMathWarpGroups, "Invalid `SPLIT_KV`");
+    DG_STATIC_ASSERT(SPLIT_KV == kComputeBlockKV * kNumMathWarpGroups, "Invalid `SPLIT_KV`");
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_q);
         cute::prefetch_tma_descriptor(&tensor_map_kv);
@@ -58,14 +63,14 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
     // Shared memory configs
     static constexpr uint32_t kSwizzleAlignment = kHeadDim * 8;
-    static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = kNextN * kNumHeads * kHeadDim * sizeof(__nv_fp8_e4m3);
-    static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = kNextN * kNumHeads * sizeof(float);
+    static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = kNextNPerCTA * kNumHeads * kHeadDim * sizeof(__nv_fp8_e4m3);
+    static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = kNextNPerCTA * kNumHeads * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE = math::constexpr_align(SMEM_WEIGHT_SIZE_PER_STAGE, kSwizzleAlignment);
     static constexpr uint32_t SMEM_Q_PIPE_SIZE = kNumQStages * (SMEM_Q_SIZE_PER_STAGE + ALIGNED_SMEM_WEIGHT_SIZE_PER_STAGE) +
                                                  math::constexpr_align(kNumQStages * 8 * 2, kSwizzleAlignment);
 
-    static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = BLOCK_KV * kHeadDim * sizeof(__nv_fp8_e4m3);
-    static constexpr uint32_t SMEM_KV_SCALE_SIZE_PER_STAGE = BLOCK_KV * sizeof(float);
+    static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = kComputeBlockKV * kHeadDim * sizeof(__nv_fp8_e4m3);
+    static constexpr uint32_t SMEM_KV_SCALE_SIZE_PER_STAGE = kComputeBlockKV * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE = math::constexpr_align(SMEM_KV_SCALE_SIZE_PER_STAGE, kSwizzleAlignment);
     static constexpr uint32_t SMEM_KV_PIPE_SIZE = kNumKVStages * (SMEM_KV_SIZE_PER_STAGE + ALIGNED_SMEM_KV_SCALE_SIZE_PER_STAGE) +
                                                   math::constexpr_align(kNumKVStages * 8 * 2, kSwizzleAlignment);
@@ -132,9 +137,10 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     cudaGridDependencySynchronize();
 
     // Scheduler
-    auto scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, BLOCK_KV, kNumMathWarpGroups, 1>(
-        blockIdx.x, context_lens, schedule_meta);
-    DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
+    // NOTES: when multicasting we launch one cluster of `kNumKVMulticast` CTAs per task, so use cluster id
+    auto scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kComputeBlockKV, kNumMathWarpGroups, 1>(
+        cute::cluster_id_in_grid().x, context_lens, schedule_meta);
+    DG_STATIC_ASSERT(SPLIT_KV % kComputeBlockKV == 0, "Unaligned SPLIT_KV");
 
     // Q and KV pipeline
     const auto get_q_pipeline = [=](const uint32_t& q_iter_idx) -> cute::tuple<uint32_t, uint32_t> {
@@ -144,6 +150,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
         return {kv_iter_idx % kNumKVStages, (kv_iter_idx / kNumKVStages) & 1}; // KV pipeline stage and phase
     };
     uint32_t q_iter_idx = 0, kv_iter_idx = 0;
+    const uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
 
     if (warp_idx >= kNumMathThreads / 32) {
         // TMA warp-group for loading data
@@ -153,8 +160,8 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
         const auto issue_tma_q = [&](const uint32_t& stage_idx, const uint32_t& q_idx) {
             if (kv_group_idx == 0 and cute::elect_one_sync()) {
-                tma::copy<kHeadDim, kNextN * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, q_idx * kNextN * kNumHeads);
-                tma::copy<kNextN * kNumHeads, 1, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, q_idx * kNextN);
+                tma::copy<kHeadDim, kNextNPerCTA * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, (q_idx * kNextN + cta_rank_in_cluster * kNextNPerCTA) * kNumHeads);
+                tma::copy<kNextNPerCTA * kNumHeads, 1, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, q_idx * kNextN + cta_rank_in_cluster * kNextNPerCTA);
                 full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
             }
         };
@@ -168,8 +175,15 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
         if ((fetched_next_task = scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv)))
             issue_tma_q(0, next_q_idx), q_iter_idx = 1;
 
+        constexpr uint32_t kNumBlocksPerMMA = kComputeBlockKV / BLOCK_KV;
+        DG_STATIC_ASSERT(kComputeBlockKV % BLOCK_KV == 0, "kComputeBlockKV must be a multiple of BLOCK_KV");
+        DG_STATIC_ASSERT(kNumBlocksPerMMA <= 4, "Invalid BLOCK_KV");
+
+        using idx_storage_t = std::conditional_t<kNumBlocksPerMMA == 1, uint32_t,
+                              std::conditional_t<kNumBlocksPerMMA == 2, uint2, uint4>>;
+
         int kv_block_idx_ptr = 32;
-        uint32_t kv_block_idx_storage;
+        idx_storage_t kv_block_idx_storage;
 
         while (fetched_next_task) {
             // Prefetch next Q when current Q changes
@@ -189,10 +203,14 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             // TODO: deal with `-1`?
             if (kv_idx == 0 or kv_block_idx_ptr == 32) {
                 kv_block_idx_ptr = 0;
-                kv_block_idx_storage = (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups < num_kv ?
-                    block_table[q_idx * static_cast<uint64_t>(block_table_stride) + (kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups)] : 0);
+                const uint32_t compute_block_kv_offset = kv_idx + kv_group_idx + lane_idx * kNumMathWarpGroups;
+                const auto* kv_block_idx_global = block_table + q_idx * static_cast<uint64_t>(block_table_stride) + compute_block_kv_offset * kNumBlocksPerMMA;
+                auto* kv_block_idx_reg = reinterpret_cast<uint32_t*>(&kv_block_idx_storage);
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumBlocksPerMMA; ++ i)
+                    kv_block_idx_reg[i] = compute_block_kv_offset < num_kv ? __ldg(kv_block_idx_global + i) : 0;
             }
-            const auto kv_block_idx = __shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
+            idx_storage_t kv_block_idx = utils::shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
 
             // Wait KV consumer release
             CUTE_TIE_DECL(get_kv_pipeline(kv_iter_idx ++), kv_stage_idx, kv_phase);
@@ -200,10 +218,14 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
             // Issue TMA KV
             if (cute::elect_one_sync()) {
-                tma::copy<kHeadDim, BLOCK_KV, 0, __nv_fp8_e4m3, true>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
-                                                                      smem_kv[kv_stage_idx], 0, 0, 1, kv_block_idx);
-                tma::copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
-                                          smem_kv_scales[kv_stage_idx], 0, kv_block_idx);
+                const auto* kv_block_idx_array = reinterpret_cast<const uint32_t*>(&kv_block_idx);
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumBlocksPerMMA; ++ i) {
+                    tma::copy<kHeadDim, BLOCK_KV, 0, __nv_fp8_e4m3, true>(&tensor_map_kv, full_kv_barriers[kv_stage_idx],
+                        smem_kv[kv_stage_idx] + i * BLOCK_KV * kHeadDim, 0, 0, 1, kv_block_idx_array[i]);
+                    tma::copy<BLOCK_KV, 1, 0>(&tensor_map_kv_scales, full_kv_barriers[kv_stage_idx],
+                        smem_kv_scales[kv_stage_idx] + i * BLOCK_KV, 0, kv_block_idx_array[i]);
+                }
                 full_kv_barriers[kv_stage_idx]->arrive_and_expect_tx(SMEM_KV_SIZE_PER_STAGE + SMEM_KV_SCALE_SIZE_PER_STAGE);
             }
 
@@ -214,7 +236,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
         // Math warp-groups for WGMMA
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
-        float accum[WGMMA::kNumAccum], weights[kNextN][kNumHeads / 4];
+        float accum[WGMMA::kNumAccum], weights[kNextNPerCTA][kNumHeads / 4];
         const auto sub_warp_offset = (warp_idx % 4) * 16;
         const auto v_0_offset = lane_idx / 4 + 0;
         const auto v_1_offset = lane_idx / 4 + 8;
@@ -237,7 +259,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
 
                 // Read weights
                 #pragma unroll
-                for (uint32_t i = 0; i < kNextN; ++ i) {
+                for (uint32_t i = 0; i < kNextNPerCTA; ++ i) {
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
                         weights[i][j] = ptx::ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
@@ -249,15 +271,14 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             kv_idx = next_kv_idx;
 
             // Calculate KV offset in advance
-            auto kv_offset = q_idx * kNextN * static_cast<uint64_t>(logits_stride) + ((kv_idx + kv_group_idx) * BLOCK_KV + sub_warp_offset);
+            auto kv_offset = (q_idx * kNextN + cta_rank_in_cluster * kNextNPerCTA) * static_cast<uint64_t>(logits_stride) + ((kv_idx + kv_group_idx) * kComputeBlockKV + sub_warp_offset);
 
-            // Compute `[kNextN * kNumHeads, kHeadDim] @ [BLOCK_KV, kHeadDim] -> [kNextN, BLOCK_KV]`
+            // Compute `[kNextNPerCTA * kNumHeads, kHeadDim] @ [kComputeBlockKV, kHeadDim] -> [kNextNPerCTA, kComputeBlockKV]`
             // Wait TMA KV arrival
             CUTE_TIE_DECL(get_kv_pipeline(kv_iter_idx ++), kv_stage_idx, kv_phase);
             full_kv_barriers[kv_stage_idx]->wait(kv_phase);
 
             // Issue WGMMA
-            DG_STATIC_ASSERT(BLOCK_KV == 64, "Invalid block size");
             DG_STATIC_ASSERT(kHeadDim % WGMMA::K == 0, "Invalid head dim");
             #pragma unroll
             for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
@@ -291,10 +312,10 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
             // Reduce over the head dim and store
             static constexpr uint32_t kNumAccumPerReduce = kNumHeads / 2;
             DG_STATIC_ASSERT(WGMMA::kNumAccum % kNumAccumPerReduce == 0, "Invalid accumulation");
-            DG_STATIC_ASSERT(WGMMA::kNumAccum / kNumAccumPerReduce == kNextN, "Invalid accumulation");
+            DG_STATIC_ASSERT(WGMMA::kNumAccum / kNumAccumPerReduce == kNextNPerCTA, "Invalid accumulation");
             DG_STATIC_ASSERT(kNumHeads % 8 == 0, "Invalid head");
             #pragma unroll
-            for (uint32_t i = 0; i < kNextN; ++ i) {
+            for (uint32_t i = 0; i < kNextNPerCTA; ++ i) {
                 auto shifted_accum = accum + i * kNumAccumPerReduce;
                 const auto transform = [&](const uint32_t& j) {
                     return fmaxf(shifted_accum[j], 0) * weights[i][(j / 4) * 2 + (j & 1)];
