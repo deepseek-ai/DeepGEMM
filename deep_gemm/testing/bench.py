@@ -1,6 +1,7 @@
 import os
 import sys
 import torch
+from typing import Callable, Optional
 
 
 def bench(fn, num_warmups: int = 5, num_tests: int = 10,
@@ -78,7 +79,8 @@ class suppress_stdout_stderr:
 def bench_kineto(fn, kernel_names, num_tests: int = 30,
                  suppress_kineto_output: bool = False,
                  trace_path: str = None, flush_l2: bool = True,
-                 with_multiple_kernels: bool = False):
+                 with_multiple_kernels: bool = False,
+                 barrier: Optional[Callable] = None):
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
 
@@ -96,14 +98,21 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
-        schedule = torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
-        profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule)
+        schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule, acc_events=True)
         with profiler:
             for i in range(2):
                 for _ in range(num_tests):
                     if flush_l2:
                         torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
+                    if barrier is not None:
+                        # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
+                        # noinspection PyProtectedMember
+                        torch.cuda._sleep(int(2e7))  # ~10ms
+                        barrier()
                     fn()
+                torch.cuda.synchronize()
                 profiler.step()
 
     # Parse the profiling table
@@ -111,7 +120,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     if not with_multiple_kernels:
         for name in kernel_names:
-            assert sum([name in line for line in prof_lines]) <= 1, f'Errors of the kernel {name} in the profiling table'
+            assert sum([name in line for line in prof_lines]) <= 1, f'Errors of the kernel {name} in the profiling table {prof_lines}'
 
     # Save chrome traces
     if trace_path is not None:

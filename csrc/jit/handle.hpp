@@ -24,7 +24,7 @@ static void* get_driver_handle() {
 #define DECL_LAZY_CUDA_DRIVER_FUNCTION(name) \
 template <typename... Args> \
 static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
-    using FuncType = decltype(&name); \
+    using FuncType = decltype(&(name)); \
     static FuncType func = nullptr; \
     if (func == nullptr) { \
         func = reinterpret_cast<FuncType>(dlsym(get_driver_handle(), #name)); \
@@ -39,6 +39,9 @@ DECL_LAZY_CUDA_DRIVER_FUNCTION(cuFuncSetAttribute);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleLoad);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleUnload);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleGetFunction);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryLoadFromFile);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryUnload);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuKernelGetFunction);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLaunchKernelEx);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuTensorMapEncodeTiled);
 
@@ -65,13 +68,13 @@ static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const s
 }
 
 static void unload_library(const LibraryHandle& library) {
-    const auto& error = cudaLibraryUnload(library);
+    const auto error = cudaLibraryUnload(library);
     DG_HOST_ASSERT(error == cudaSuccess or error == cudaErrorCudartUnloading);
 }
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                   const cudaStream_t& stream, const int& smem_size,
-                                                  const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim) {
+                                                  const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl) {
     if (smem_size > 0)
         DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -80,17 +83,27 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.blockDim = block_dim;
     config.dynamicSmemBytes = smem_size;
     config.stream = stream;
-    config.numAttrs = 0;
-    config.attrs = nullptr;
 
+    // Create attributes
     // NOTES: must use `static` or the `attr` will be deconstructed
-    static LaunchAttrHandle attr;
+    static LaunchAttrHandle attrs[2];
+    config.numAttrs = 0;
+    config.attrs = attrs;
+
+    // Cluster size
     if (cluster_dim > 1) {
+        auto& attr = attrs[config.numAttrs ++];
         attr.id = cudaLaunchAttributeClusterDimension;
         attr.val.clusterDim = {static_cast<unsigned>(cluster_dim), 1, 1};
-        config.attrs = &attr;
-        config.numAttrs = 1;
     }
+
+    // Dependent kernel launch
+    if (enable_pdl) {
+        auto& attr = attrs[config.numAttrs ++];
+        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr.val.programmaticStreamSerializationAllowed = 1;
+    }
+
     return config;
 }
 
@@ -103,19 +116,46 @@ static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& 
 #else
 
 // Use CUDA driver API
-using LibraryHandle = CUmodule;
 using KernelHandle = CUfunction;
 using LaunchConfigHandle = CUlaunchConfig;
 using LaunchAttrHandle = CUlaunchAttribute;
 
+// `cuLibraryEnumerateKernels` is supported since CUDA Driver API 12.4
+#if CUDA_VERSION >= 12040
+    #define DG_JIT_USE_LIBRARY_ENUM_KERNELS
+    DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryGetKernelCount);
+    DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryEnumerateKernels);
+    using LibraryHandle = CUlibrary;
+#else
+    using LibraryHandle = CUmodule;
+#endif
+
 #define DG_CUDA_UNIFIED_CHECK DG_CUDA_DRIVER_CHECK
 
 static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const std::string& func_name,
-                               LibraryHandle *library_opt = nullptr) {
+                                LibraryHandle *library_opt = nullptr) {
     LibraryHandle library;
     KernelHandle kernel;
+
+#ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
+    DG_CUDA_DRIVER_CHECK(lazy_cuLibraryLoadFromFile(&library, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+    unsigned int num_kernels;
+    DG_CUDA_DRIVER_CHECK(lazy_cuLibraryGetKernelCount(&num_kernels, library));
+    if (num_kernels != 1) {
+        const auto dir_path = cubin_path.parent_path();
+        printf("Corrupted JIT cache directory (expected 1 kernel, found %u): %s, "
+               "please run `rm -rf %s` and restart your task.\n",
+               num_kernels, dir_path.c_str(), dir_path.c_str());
+        DG_HOST_ASSERT(false and "Corrupted JIT cache directory");
+    }
+
+    CUkernel cu_kernel;
+    DG_CUDA_DRIVER_CHECK(lazy_cuLibraryEnumerateKernels(&cu_kernel, 1, library));
+    DG_CUDA_DRIVER_CHECK(lazy_cuKernelGetFunction(&kernel, cu_kernel));
+#else
     DG_CUDA_DRIVER_CHECK(lazy_cuModuleLoad(&library, cubin_path.c_str()));
     DG_CUDA_DRIVER_CHECK(lazy_cuModuleGetFunction(&kernel, library, func_name.c_str()));
+#endif
 
     if (library_opt != nullptr)
         *library_opt = library;
@@ -123,13 +163,17 @@ static KernelHandle load_kernel(const std::filesystem::path& cubin_path, const s
 }
 
 static void unload_library(const LibraryHandle& library) {
-    const auto& error = lazy_cuModuleUnload(library);
+#ifdef DG_JIT_USE_LIBRARY_ENUM_KERNELS
+    const auto error = lazy_cuLibraryUnload(library);
+#else
+    const auto error = lazy_cuModuleUnload(library);
+#endif
     DG_HOST_ASSERT(error == CUDA_SUCCESS or error == CUDA_ERROR_DEINITIALIZED);
 }
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                  const cudaStream_t& stream, const int& smem_size,
-                                                 const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim) {
+                                                 const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl) {
     if (smem_size > 0)
         DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
 
@@ -142,19 +186,29 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.blockDimZ = block_dim.z;
     config.sharedMemBytes = smem_size;
     config.hStream = stream;
-    config.numAttrs = 0;
-    config.attrs = nullptr;
-
+    
+    // Create attributes
     // NOTES: must use `static` or the `attr` will be deconstructed
-    static LaunchAttrHandle attr;
+    static LaunchAttrHandle attrs[2];
+    config.numAttrs = 0;
+    config.attrs = attrs;
+
+    // Cluster size
     if (cluster_dim > 1) {
+        auto& attr = attrs[config.numAttrs ++];
         attr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-        attr.value.clusterDim.x = cluster_dim;
+        attr.value.clusterDim.x = static_cast<unsigned>(cluster_dim);
         attr.value.clusterDim.y = 1;
         attr.value.clusterDim.z = 1;
-        config.attrs = &attr;
-        config.numAttrs = 1;
     }
+
+    // Dependent kernel launch
+    if (enable_pdl) {
+        auto& attr = attrs[config.numAttrs ++];
+        attr.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+        attr.value.programmaticStreamSerializationAllowed = 1;
+    }
+
     return config;
 }
 

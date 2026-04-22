@@ -46,7 +46,7 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
 
 #if DG_CUBLASLT_ADVANCED_FEATURES_COMPATIBLE
-    const int& math_sms = device_runtime->get_num_sms();
+    const int math_sms = device_runtime->get_num_sms();
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, &math_sms, sizeof(math_sms)));
 #endif
 
@@ -57,10 +57,10 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
 #endif
 
     // Get cuBLASLt handle, workspace, and stream
-    const auto& handle = device_runtime->get_cublaslt_handle();
-    const auto& workspace = device_runtime->get_cublaslt_workspace();
-    const auto& workspace_bytes = workspace.nbytes();
-    const auto& stream = at::cuda::getCurrentCUDAStream();
+    const auto handle = device_runtime->get_cublaslt_handle();
+    const auto workspace = device_runtime->get_cublaslt_workspace();
+    const auto workspace_bytes = workspace.nbytes();
+    const auto stream = at::cuda::getCurrentCUDAStream();
 
     // Algorithm selection
     cublasLtMatmulPreference_t pref;
@@ -77,7 +77,7 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     DG_HOST_ASSERT(num_heuristic_results == 1 and "Unable to find any algorithm for the GEMM");
 
     // Call: D = alpha * (A @ B) + beta * C
-    const float& alpha = 1.0, beta = accumulate ? 1.0 : 0.0;
+    const float alpha = 1.0, beta = accumulate ? 1.0 : 0.0;
     DG_CUBLASLT_CHECK(cublasLtMatmul(handle,                                // Light handle
                                      desc,                                  // Operation description
                                      &alpha,                                // Alpha
@@ -99,47 +99,36 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
 }
 
 static void cublaslt_gemm(const torch::Tensor& lhs, const torch::Tensor& rhs,
-                          const std::optional<torch::Tensor>& acc,
                           const torch::Tensor& out,
                           const int& m, const int& n, const int& k,
-                          const cute::UMMA::Major& a_major, const cute::UMMA::Major& b_major) {
-    const auto& trans_a = b_major == cute::UMMA::Major::K ? CUBLAS_OP_T : CUBLAS_OP_N;
-    const auto& trans_b = a_major == cute::UMMA::Major::K ? CUBLAS_OP_N : CUBLAS_OP_T;
-
-    // Duplicate the accumulator if necessary
-    // TODO: remove this
-    if (acc.has_value()) {
-        if (acc->data_ptr() == out.data_ptr()) {
-            DG_HOST_ASSERT(acc->sizes() == out.sizes() and acc->strides() == out.strides());
-        } else {
-            out.copy_(acc.value());
-        }
-    }
+                          const cute::UMMA::Major& a_major, const cute::UMMA::Major& b_major,
+                          const bool& accumulate) {
+    const auto trans_a = b_major == cute::UMMA::Major::K ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const auto trans_b = a_major == cute::UMMA::Major::K ? CUBLAS_OP_N : CUBLAS_OP_T;
 
     // Matrix layouts
-    const auto& cuda_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
-    const auto& cuda_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
-    const auto& cuda_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
-    const auto& layout_a = b_major == cute::UMMA::Major::K ? get_cublaslt_layout(cuda_type_a, k, n, rhs.stride(0))
-                                                           : get_cublaslt_layout(cuda_type_a, n, k, rhs.stride(1));
-    const auto& layout_b = a_major == cute::UMMA::Major::K ? get_cublaslt_layout(cuda_type_b, k, m, lhs.stride(0))
-                                                           : get_cublaslt_layout(cuda_type_b, m, k, lhs.stride(1));
-    const auto& layout_d = get_cublaslt_layout(cuda_type_d, n, m, out.stride(0));
+    const auto cuda_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
+    const auto cuda_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
+    const auto cuda_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
+    const auto layout_a = b_major == cute::UMMA::Major::K ? get_cublaslt_layout(cuda_type_a, k, n, rhs.stride(0))
+                                                          : get_cublaslt_layout(cuda_type_a, n, k, rhs.stride(1));
+    const auto layout_b = a_major == cute::UMMA::Major::K ? get_cublaslt_layout(cuda_type_b, k, m, lhs.stride(0))
+                                                          : get_cublaslt_layout(cuda_type_b, m, k, lhs.stride(1));
+    const auto layout_d = get_cublaslt_layout(cuda_type_d, n, m, out.stride(0));
 
-    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, acc.has_value());
+    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, accumulate);
 }
-
 
 static void cublaslt_bhr_hdr_bhd(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
                                  const int& b, const int& h, const int& r, const int& d) {
-    const auto& m = d, n = b, k = r;
-    const auto& trans_a = CUBLAS_OP_T;
-    const auto& trans_b = CUBLAS_OP_N;
+    const auto m = d, n = b, k = r;
+    const auto trans_a = CUBLAS_OP_T;
+    const auto trans_b = CUBLAS_OP_N;
 
     // Matrix layouts
-    const auto& layout_a = get_cublaslt_layout(CUDA_R_16BF, k, m, rhs.stride(1), h, rhs.stride(0));
-    const auto& layout_b = get_cublaslt_layout(CUDA_R_16BF, k, n, lhs.stride(0), h, lhs.stride(1));
-    const auto& layout_d = get_cublaslt_layout(CUDA_R_16BF, m, n, out.stride(0), h, out.stride(1));
+    const auto layout_a = get_cublaslt_layout(CUDA_R_16BF, k, m, rhs.stride(1), h, rhs.stride(0));
+    const auto layout_b = get_cublaslt_layout(CUDA_R_16BF, k, n, lhs.stride(0), h, lhs.stride(1));
+    const auto layout_d = get_cublaslt_layout(CUDA_R_16BF, m, n, out.stride(0), h, out.stride(1));
 
     call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, false);
 }
@@ -147,14 +136,14 @@ static void cublaslt_bhr_hdr_bhd(const torch::Tensor& lhs, const torch::Tensor& 
 
 static void cublaslt_bhd_hdr_bhr(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
                                  const int& b, const int& h, const int& r, const int& d) {
-    const auto& m = r, n = b, k = d;
-    const auto& trans_a = CUBLAS_OP_N;
-    const auto& trans_b = CUBLAS_OP_N;
+    const auto m = r, n = b, k = d;
+    const auto trans_a = CUBLAS_OP_N;
+    const auto trans_b = CUBLAS_OP_N;
 
     // Matrix layouts
-    const auto& layout_a = get_cublaslt_layout(CUDA_R_16BF, m, k, rhs.stride(1), h, rhs.stride(0));
-    const auto& layout_b = get_cublaslt_layout(CUDA_R_16BF, k, n, lhs.stride(0), h, lhs.stride(1));
-    const auto& layout_d = get_cublaslt_layout(CUDA_R_16BF, m, n, out.stride(0), h, out.stride(1));
+    const auto layout_a = get_cublaslt_layout(CUDA_R_16BF, m, k, rhs.stride(1), h, rhs.stride(0));
+    const auto layout_b = get_cublaslt_layout(CUDA_R_16BF, k, n, lhs.stride(0), h, lhs.stride(1));
+    const auto layout_d = get_cublaslt_layout(CUDA_R_16BF, m, n, out.stride(0), h, out.stride(1));
 
     call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, false);
 }

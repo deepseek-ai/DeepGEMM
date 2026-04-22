@@ -24,16 +24,16 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
     DG_HOST_ASSERT(sqr_sum.is_contiguous());
 
     // Type and shape checks
-    const auto& [m, k ] = get_shape<2>(a);
-    const auto& [n, k_] = get_shape<2>(b);
+    const auto [m, k ] = get_shape<2>(a);
+    const auto [n, k_] = get_shape<2>(b);
     if (num_splits.has_value()) {
-        const auto& [num_splits_, m_, n_] = get_shape<3>(d);
-        const auto& [num_splits__, m__] = get_shape<2>(sqr_sum);
+        const auto [num_splits_, m_, n_] = get_shape<3>(d);
+        const auto [num_splits__, m__] = get_shape<2>(sqr_sum);
         DG_HOST_ASSERT(num_splits.value() == num_splits_ and num_splits.value() == num_splits__ and num_splits.value() >= 1);
         DG_HOST_ASSERT(m == m_ and m == m__ and n == n_ and k == k_);
     } else {
-        const auto& [m_, n_] = get_shape<2>(d);
-        const auto& [m__] = get_shape<1>(sqr_sum);
+        const auto [m_, n_] = get_shape<2>(d);
+        const auto [m__] = get_shape<1>(sqr_sum);
         DG_HOST_ASSERT(m == m_ and m == m__ and n == n_ and k == k_);
     }
     DG_HOST_ASSERT(n > 0 and k > 0);
@@ -47,7 +47,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         return;
 
     // Dispatch into different implements
-    const auto& arch_major = device_runtime->get_arch_major();
+    const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
         sm90_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else if (arch_major == 10) {

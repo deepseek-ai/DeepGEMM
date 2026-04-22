@@ -116,9 +116,4 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
     return sf;
 }
 
-// Value matrix layout
-static int get_mk_alignment_for_contiguous_layout() {
-    return 128;
-}
-
 } // namespace deep_gemm

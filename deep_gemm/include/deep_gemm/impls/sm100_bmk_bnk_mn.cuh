@@ -5,18 +5,19 @@
 #include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/common/sm100_utils.cuh>
+#include <deep_gemm/mma/sm100.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tcgen05.cuh>
+#include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm {
-
-using namespace deep_gemm::sm100;
 
 template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kSplitFactor,
           uint32_t kSwizzleABMode, uint32_t kSwizzleCDMode,
           uint32_t kNumStages, uint32_t kNumThreads>
-__global__ void __launch_bounds__(kNumThreads, 1)
+CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
 sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -30,7 +31,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
 
     // Utils
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
-    const auto lane_idx = get_lane_idx();
+    const auto lane_idx = ptx::get_lane_idx();
     DG_STATIC_ASSERT(BLOCK_M == LAYOUT_AD_M and BLOCK_N == 128 and BLOCK_K == 64, "Invalid block size");
     DG_STATIC_ASSERT(kSwizzleABMode == 128 and kSwizzleCDMode == 128, "Invalid swizzle mode");
 
@@ -51,24 +52,24 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
     }
 
     // Real tensor memory size and offsets
-    constexpr uint32_t kNumTmemCols = get_num_aligned_tmem_cols<BLOCK_N>();
+    constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<BLOCK_N>();
 
     // Fill D/A/B
-    auto smem_cd = PatternVisitor([&](const uint32_t& i) {
+    auto smem_cd = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + (i * SMEM_CD_SIZE_PER_STAGE));
     });
-    auto smem_a  = PatternVisitor([&](const uint32_t& i) {
+    auto smem_a  = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + (SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE));
     });
-    auto smem_b  = PatternVisitor([&](const uint32_t& i) {
+    auto smem_b  = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + (SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE));
     });
 
     // Fill barriers
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_CD_SIZE +
             kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
-    auto full_barriers     = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
-    auto empty_barriers    = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
+    auto full_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
+    auto empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumStages + i); });
     auto tmem_full_barrier = barrier_start_ptr + (kNumStages * 2);
 
     // Fill the tensor memory pointer
@@ -93,13 +94,16 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
     __syncthreads();
 
     // Block indices
-    const uint32_t num_n_blocks = ceil_div(SHAPE_N, BLOCK_N);
-    const uint32_t num_mn_blocks = num_n_blocks * ceil_div(SHAPE_M, BLOCK_M);
+    const uint32_t num_n_blocks = math::ceil_div(SHAPE_N, BLOCK_N);
+    const uint32_t num_mn_blocks = num_n_blocks * math::ceil_div(SHAPE_M, BLOCK_M);
     const uint32_t mn_block_idx = blockIdx.x % num_mn_blocks;
     const uint32_t sk_block_idx = blockIdx.x / num_mn_blocks;
     const uint32_t n_block_idx = mn_block_idx % num_n_blocks;
     const uint32_t m_block_idx = mn_block_idx / num_n_blocks;
     const uint32_t num_total_stages = cute::min(kSplitFactor, shape_s * (SHAPE_K / BLOCK_K) - sk_block_idx * kSplitFactor);
+
+    // Wait for primary kernel completion
+    cudaGridDependencySynchronize();
 
     if (warp_idx == 0) {
         // TMA load warp
@@ -115,8 +119,8 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
 
             // Issue TMAs
             if (cute::elect_one_sync()) {
-                tma_copy<BLOCK_K, BLOCK_M, kSwizzleABMode>(&tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx + s_idx * SHAPE_M);
-                tma_copy<BLOCK_K, BLOCK_N, kSwizzleABMode>(&tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx + s_idx * SHAPE_N);
+                tma::copy<BLOCK_K, BLOCK_M, kSwizzleABMode>(&tensor_map_a, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx + s_idx * SHAPE_M);
+                tma::copy<BLOCK_K, BLOCK_N, kSwizzleABMode>(&tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx + s_idx * SHAPE_N);
             }
 
             // Arrive at full barriers
@@ -134,8 +138,8 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
         auto instr_desc = cute::UMMA::make_instr_desc<cutlass::bfloat16_t, cutlass::bfloat16_t, float, UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
 
         DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-        auto a_desc = make_umma_desc<cute::UMMA::Major::K, BLOCK_M, BLOCK_K, kSwizzleABMode>(smem_a[0], 0, 0);
-        auto b_desc = make_umma_desc<cute::UMMA::Major::K, BLOCK_N, BLOCK_K, kSwizzleABMode>(smem_b[0], 0, 0);
+        auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, BLOCK_M, BLOCK_K, kSwizzleABMode>(smem_a[0], 0, 0);
+        auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, BLOCK_N, BLOCK_K, kSwizzleABMode>(smem_b[0], 0, 0);
         uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
         uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -147,14 +151,14 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
                          "Invalid MMA instruction shape");
 
         // Wait tensor memory empty barrier arrival
-        tcgen05_after_thread_sync();
+        ptx::tcgen05_after_thread_sync();
 
         // Launch MMAs
         for (uint32_t s = 0; s < num_total_stages; ++ s) {
             // Wait TMA arrival
             const auto& stage_idx = s % kNumStages;
             full_barriers[stage_idx]->wait((s / kNumStages) & 1);
-            tcgen05_after_thread_sync();
+            ptx::tcgen05_after_thread_sync();
 
             // Issue UMMA in the leader CTA
             const auto& runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
@@ -163,9 +167,11 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
             if (cute::elect_one_sync()) {
                 #pragma unroll
                 for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                    a_desc.lo = advance_umma_desc_lo<cute::UMMA::Major::K, BLOCK_M, kSwizzleABMode, cutlass::bfloat16_t>(a_desc_base_lo, 0, k * UMMA_K);
-                    b_desc.lo = advance_umma_desc_lo<cute::UMMA::Major::K, BLOCK_N, kSwizzleABMode, cutlass::bfloat16_t>(b_desc_base_lo, 0, k * UMMA_K);
-                    SM100_MMA_F16BF16_SS::fma(a_desc, b_desc, 0, s > 0 or k > 0, runtime_instr_desc);
+                    a_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, BLOCK_M, kSwizzleABMode, cutlass::bfloat16_t>(
+                        a_desc_base_lo, 0, k * UMMA_K);
+                    b_desc.lo = mma::sm100::advance_umma_desc_lo<cute::UMMA::Major::K, BLOCK_N, kSwizzleABMode, cutlass::bfloat16_t>(
+                        b_desc_base_lo, 0, k * UMMA_K);
+                    ptx::SM100_MMA_F16BF16_SS::fma(a_desc, b_desc, 0, s > 0 or k > 0, runtime_instr_desc);
                 }
             }
 
@@ -180,7 +186,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
     // i.e., no need for `tmem_ptr |= (warp_idx * 32) << 16`.
     // NOTES: we also forbid two CTAs to share the same SM and its tensor memory
     if (warp_idx == 2)
-        DG_TRAP_ONLY_DEVICE_ASSERT(ld_shared(tmem_ptr_in_smem) == 0);
+        DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
 
     // TMA checks
     constexpr uint32_t kNumBankGroupBytes = 16;
@@ -191,7 +197,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
 
     // Wait UMMA arrival
     tmem_full_barrier->wait(0);
-    tcgen05_after_thread_sync();
+    ptx::tcgen05_after_thread_sync();
 
     // Load from tensor memory into registers, and write shared memory with STSM
     DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
@@ -239,7 +245,7 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
             cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
                 values[0], values[1], values[2], values[3]);
             cutlass::arch::fence_view_async_tmem_load();
-            st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+            ptx::st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
         }
 
         // Synchronize all threads and issue TMA
@@ -251,7 +257,6 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
         }
     }
 
-    __syncthreads();
     // Deallocate tensor memory by warp 1
     // NOTES: warp 0 is doing TMA stores
     if (warp_idx == 1)

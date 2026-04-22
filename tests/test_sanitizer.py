@@ -21,7 +21,7 @@ sys.path.append('{script_dir}')
 torch.manual_seed(0)
 random.seed(0)
 
-from tests.{module_name} import {func_name}
+from {module_name} import {func_name}
 {func_name}()
 """
 
@@ -40,7 +40,7 @@ if __name__ == '__main__':
     else:
         # Get all test functions except those related to cuBLAS
         files = [f for f in os.listdir(script_dir) if f.endswith('.py')]
-        exclude_files = ['test_sanitizer.py', 'generators.py']
+        exclude_files = ['test_sanitizer.py', 'generators.py', 'test_mega_moe.py']
         funcs = [
             (module_name, name)
             for module_name in [os.path.splitext(f)[0] for f in files if f not in exclude_files]
@@ -53,6 +53,7 @@ if __name__ == '__main__':
     env['CUDA_LAUNCH_BLOCKING'] = '1'
     env['DG_JIT_PTXAS_CHECK'] = '1'
     env['DG_USE_NVIDIA_TOOLS'] = '1'
+    env['DG_USE_TEMP_CUBLASLT_WORKSPACE'] = '1'  # Avoid holding CUDA tensor that crashes during shutdown
     env['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '1'
     env['TORCH_SHOW_CPP_STACKTRACES'] = '1'
 

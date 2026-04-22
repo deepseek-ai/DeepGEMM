@@ -2,162 +2,244 @@
 
 #include <cute/arch/mma_sm100_desc.hpp>
 // Reuse some types in the JIT modules
-#include <deep_gemm/common/types.hpp>
+#include <deep_gemm/common/types.cuh>
 
 #include "common.hpp"
+#include "utils.hpp"
+#include "../../utils/exception.hpp"
 
 namespace deep_gemm {
 
 struct SM90ArchSpec {
     static constexpr int smem_capacity = 232448;
-    
-    static std::vector<int> get_block_m_candidates(const KernelType& kernel_type, const cute::UMMA::Major& major_a, const int& m) {
-        std::vector<int> candidates{64, 128, 256};
-        if ((kernel_type == KernelType::Kernel1D2D or kernel_type == KernelType::KernelNoSF) and major_a == cute::UMMA::Major::K) {
-            // NOTES: `block_m = 16/32` is smaller than MMA M size, should be careful in handling this
-            if (m <= 16) candidates.push_back(16);
-            if (m <= 32) candidates.push_back(32);
+
+    static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
+        // Block M candidates
+        std::vector<int> block_m_candidates;
+        if (desc.gemm_type == GemmType::Normal or
+            desc.gemm_type == GemmType::Batched or
+            desc.gemm_type == GemmType::KGroupedContiguous) {
+            // TODO: check 256's performance
+            block_m_candidates = {64, 128};
+            // NOTES: smaller block M can avoid TMA L2 OOB bound
+            if (desc.m <= 16) block_m_candidates.push_back(16);
+            if (desc.m <= 32) block_m_candidates.push_back(32);
+
+            // BF16 output GEMM supports 256
+            if (desc.cd_dtype != torch::kFloat)
+                block_m_candidates.push_back(256);
+        } else if (desc.gemm_type == GemmType::MGroupedContiguous or
+                   desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout) {
+            block_m_candidates = std::vector{heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
+        } else if (desc.gemm_type == GemmType::MGroupedMasked) {
+            block_m_candidates = {64, 128};
         }
-        return candidates;
-    }
 
-    static std::vector<int> get_block_n_candidates(const KernelType& kernel_type, const at::ScalarType& cd_dtype) {
-        int start = 16;
-
+        // Block N candidates
+        std::vector<int> block_n_candidates;
+        int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
+        int start = step;
         // Avoid bank conflicts for 1D1D kernel FP32 output
-        std::vector<int> candidates;
-        if (kernel_type == KernelType::Kernel1D1D and cd_dtype == torch::kFloat) {
-            candidates.push_back(16);
+        if (desc.kernel_type == KernelType::Kernel1D1D and desc.cd_dtype == torch::kFloat) {
+            DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K);
+            DG_HOST_ASSERT(desc.major_b == cute::UMMA::Major::K);
             start = 24;
+            block_n_candidates.push_back(16);
+        }
+        // Register spills
+        int end = 256;
+        if (desc.kernel_type == KernelType::Kernel1D2D)
+            end = 192;
+        if (desc.kernel_type == KernelType::Kernel1D1D)
+            end = 160;
+        // Enumerate
+        for (int i = start; i <= end; i += step)
+            block_n_candidates.push_back(i);
+
+        // Block K is always in a fixed manner
+        const int block_k = 128 / get_element_size(desc.get_mma_kind());
+
+        // Disable multicast for performance
+        const bool disable_multicast =
+            // The number of k-groups is large (a heuristic)
+            (desc.gemm_type == GemmType::KGroupedContiguous and desc.num_groups > 4) or
+            // Not supported
+            (desc.gemm_type == GemmType::Batched);
+
+        // Enumerate all candidates
+        std::vector<Layout> candidates;
+        for (int cluster_m = 1; cluster_m <= (disable_multicast ? 1 : 2); ++ cluster_m) {
+            for (int cluster_n = 1; cluster_n <= (disable_multicast ? 1 : 2); ++ cluster_n) {
+                // We only support cluster 2
+                if (cluster_m * cluster_n > 2)
+                    continue;
+
+                // SM count must be divisible
+                if (desc.num_sms % (cluster_m * cluster_n) != 0)
+                    continue;
+
+                for (int block_m: block_m_candidates) {
+                    for (int block_n: block_n_candidates) {
+                        // 1D2D kernel unroll requirement
+                        if (desc.kernel_type == KernelType::Kernel1D2D and block_n > block_k and (block_n % (block_n - block_k) != 0 and block_k % (block_n - block_k) != 0))
+                            continue;
+
+                        // Multicast legality for masked layout
+                        // TODO: add some comments about it
+                        if ((desc.gemm_type == GemmType::MGroupedMasked or desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout) and
+                            ceil_div(desc.n, block_n) % (cluster_m * cluster_n) != 0)
+                            continue;
+
+                        // The block sizes cannot be too large (for enough registers), so at least one dim less than 128
+                        if (block_m > 128 and block_n > 128)
+                            continue;
+
+                        // Calculate swizzling
+                        const auto layout = Layout{0, block_m, block_n, block_k, cluster_m, cluster_n};
+                        const auto storage_config = get_storage_config(desc, layout);
+
+                        // Make sure swizzling is large enough (32B's performance is low)
+                        if (storage_config.swizzle_a_mode % 64 != 0 or storage_config.swizzle_b_mode % 64 != 0)
+                            continue;
+                        
+                        // To hide TMA latency, the stage count should be at least 3; for small matrices, at least 4
+                        int num_stages = get_pipeline_config(desc, layout, storage_config).num_stages;
+                        if (num_stages < 3 or (block_m * block_n < 128 * 192 and num_stages < 4))
+                            continue;
+
+                        candidates.push_back(layout);
+                    }
+                }
+            }
         }
 
-        // Push the strided options
-        for (int i = start; i <= 256; i += 16)
-            candidates.push_back(i);
+        DG_HOST_ASSERT(not candidates.empty());
         return candidates;
     }
 
-    static int get_ab_load_block_m(const MulticastConfig& multicast_config, const int& block_m) {
-        return block_m;
-    }
-
-    static int get_ab_load_block_n(const MulticastConfig& multicast_config, const int& block_n) {
-        return block_n;
-    }
-
-    static int get_cd_store_block_m(const int& block_m, const bool& single_warpgroup_sync = false) {
+    static StorageConfig get_storage_config(const GemmDesc& desc, const Layout& layout) {
         constexpr int wgmma_m = 64;
-        return single_warpgroup_sync ? wgmma_m : block_m;
-    }
 
-    static int get_cd_store_block_n(const int& block_n) {
-        return block_n;
-    }
+        // Load/store block sizes (w/o consideration of swizzling atoms, w/ consideration of loop atoms)
+        // TODO: support swap AB
+        DG_HOST_ASSERT(layout.swap_ab == 0);
+        const auto load_block_m = layout.block_m;
+        const auto load_block_n = layout.block_n;
+        // 1D1D kernel will do single warp-group stores
+        const auto store_block_m = desc.kernel_type == KernelType::Kernel1D1D ? wgmma_m : layout.block_m;
+        const auto store_block_n = layout.block_n;
 
-    static bool enable_cd_swizzle(const at::ScalarType& cd_dtype) {
-        return cd_dtype != torch::kFloat;
-    }
-
-    static bool is_block_size_legal(const KernelType& kernel_type,
-                                    const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                    const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
-                                    const int& m, const int& n, const int& k,
-                                    const int& block_m, const int& block_n, const int& block_k) {
-        // SM90 FP32 output does not support `block_m == 256`
-        if (cd_dtype == at::kFloat and block_m == 256)
-            return false;
-
-        // Avoid large C/D shared memory for FP32 output
-        // Ensure `num_stages >= 4` (for 1D1D Kernel), `num_stages >= 3` (for No SF kernel)
-        if (block_n > 128 and cd_dtype == torch::kFloat) {
-            if (kernel_type == KernelType::Kernel1D1D and block_n > 152)
-                return false;
-            if (kernel_type == KernelType::KernelNoSF and block_n > 200)
-                return false;
-        }
-
-        // When B is N Major, use swizzle 128B for better performance; only affects SM90 BF16 GEMM
-        if (major_b == cute::UMMA::Major::MN and block_n >= 128 and block_n % 64 != 0)
-            return false;
-
-        // Too many scaling factors in a single block: `block_n > block_k and std::gcd(block_n, block_k) != block_n - block_k`
-        // Or too many register spills
-        if (block_n > 128 and kernel_type == KernelType::Kernel1D2D and (block_n != 144 and block_n != 160 and block_n != 192))
-            return false;
-
-        // The block sizes cannot be too large (for enough registers), so at least one dim less than 128
-        return block_m <= 128 or block_n <= 128;
-    }
-
-    static bool is_num_stages_legal(const MmaKind& mma_kind, const at::ScalarType& cd_dtype,
-                                    const int& num_stages,
-                                    const int& block_m, const int& block_n, const int& block_k) {
-        // Unrolling both stages and `num_former_iters` will cause large code size
-        if (mma_kind == MmaKind::MXFP8FP4 and block_k % block_n != 0 and block_k / std::gcd(block_n, block_k) <= 4)
-            return num_stages <= 4;
-        return true;
-    }
-
-    static std::pair<bool, bool> get_multicast_legality(const GemmType& gemm_type, const int& num_groups,
-                                                        const int& m, const int& n, const int& block_m, const int& block_n,
-                                                        const int& num_sms) {
-        // Disable multicast when the number of k-groups is large (a heuristic)
-        if (gemm_type == GemmType::KGroupedContiguous and num_groups > 4)
-            return {false, false};
-
-        if (gemm_type == GemmType::Batched)
-            return {false, false};
+        // Decide swizzling by the inner dim
+        const auto swizzle_mode_a = get_swizzle_mode(
+            desc.major_a == cute::UMMA::Major::K ? layout.block_k : load_block_m, c10::elementSize(desc.a_dtype));
+        const auto swizzle_mode_b = get_swizzle_mode(
+            desc.major_b == cute::UMMA::Major::K ? layout.block_k : load_block_n, c10::elementSize(desc.b_dtype));
+        // We only enable swizzling for non-FP32 outputs
+        const auto swizzle_mode_cd = desc.cd_dtype != torch::kFloat ?
+            get_swizzle_mode(store_block_n, c10::elementSize(desc.cd_dtype)) : 0;
 
         return {
-            is_multicast_legal(n, block_n, 2, num_sms, gemm_type == GemmType::MGroupedMasked),
-            // For masked GEMM layout, divisibility on N is also required as we must ensure the total number of blocks is even
-            is_multicast_legal(m, block_m, 2, num_sms, false)
-                and (gemm_type != GemmType::MGroupedMasked or is_multicast_legal(n, block_n, 2, num_sms, true))
+            load_block_m, load_block_n,
+            store_block_m, store_block_n,
+            swizzle_mode_a, swizzle_mode_b, swizzle_mode_cd
         };
     }
 
-    static ThreadConfig get_thread_config(const KernelType& kernel_type,
-                                          const int& block_m, const int& block_n) {
-        return ThreadConfig::sm90(128, (block_m <= 64 ? 1 : 2) * 128);
-    }
+    static PipelineConfig get_pipeline_config(const GemmDesc& desc, const Layout& layout, const StorageConfig& storage_config) {
+        constexpr int kNumMaxStages = 16;
 
-    static int get_smem_cd_size(const KernelType& kernel_type,
-                                const int& block_m, const int& block_n,
-                                const int& swizzle_cd_mode, const at::ScalarType& cd_dtype) {
+        // TODO: consider swap AB
+        // C/D for TMA stores
         // NOTES: 1024 is for TMA swizzling alignment requirement
-        return align(block_m * block_n * static_cast<int>(c10::elementSize(cd_dtype)), 1024);
+        const int smem_cd =
+            align(layout.block_m * layout.block_n * static_cast<int>(c10::elementSize(desc.cd_dtype)), 1024);
+        const int smem_barriers = kNumMaxStages * 8 * 2;
+
+        // Calculate A/B per stages
+        const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
+        const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
+
+        // Calculate SF A/B per stages
+        const int smem_sfa_per_stage = desc.kernel_type == KernelType::KernelNoSF ?
+            0 : align(layout.block_m * static_cast<int>(sizeof(float)), 128);
+        const int smem_sfb_per_stage = desc.kernel_type != KernelType::Kernel1D1D ?
+            0 : align(layout.block_n * static_cast<int>(sizeof(float)), 128);
+
+        // Extra SFB sizes for 1D2D kernels
+        const int use_uniform_sfb = layout.block_k % layout.block_n == 0 ? 1 : 2;
+        const int smem_extra_sfb = desc.kernel_type != KernelType::Kernel1D2D ?
+            0 : align<int>(ceil_div(desc.k, layout.block_k) * static_cast<int>(sizeof(float)) * use_uniform_sfb, 8);
+
+        // Extra tensormap for 1D1D kernels
+        const int smem_tensormap =
+            desc.gemm_type == GemmType::KGroupedContiguous ? 4 * static_cast<int>(sizeof(CUtensorMap)) : 0;
+
+        // Calculate stages
+        const int smem_extra = smem_cd + smem_barriers + smem_extra_sfb + smem_tensormap;
+        const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
+        const int num_stages = std::min(
+            (smem_capacity - smem_extra) / smem_per_stage,
+            kNumMaxStages);
+        return {
+            smem_extra + num_stages * smem_per_stage,
+            num_stages
+        };
     }
 
-    static std::pair<int, int> get_sf_smem_size_per_stage(const KernelType& kernel_type,
-                                                          const int& block_m, const int& block_n, const int& block_k,
-                                                          const MmaKind& mma_kind, const at::ScalarType& cd_dtype) {
-        if (mma_kind == MmaKind::BF16)
-            return {0, 0};
-
-        // NOTES: 128 is for 2D TMA alignment requirement
-        int smem_sfa_per_stage = align(block_m * static_cast<int>(sizeof(float)), 128);
-        int smem_sfb_per_stage = 0;
-        if (kernel_type == KernelType::Kernel1D1D)
-            smem_sfb_per_stage = align(block_n * 4, 128);
-        return {smem_sfa_per_stage, smem_sfb_per_stage};
+    static LaunchConfig get_launch_config(const GemmDesc& desc, const Layout& layout) {
+        const int num_tma_threads = 128;
+        const int num_math_threads = layout.block_m <= 64 ? 128 : 256;
+        return {
+            desc.num_sms,
+            layout.get_cluster_size(),
+            num_tma_threads + num_math_threads,
+            num_tma_threads, num_math_threads,
+            0, 0 // Meaningless for SM90
+        };
     }
 
-    static int get_extra_sfb_smem_size(const int& m, const int& n, const int& k,
-                                       const int& block_m, const int& block_n, const int& block_k) {
-        const auto& use_uniform_sfb = block_k % block_n == 0 ? 1 : 2;
-        return align<int>(ceil_div(k, block_k) * static_cast<int>(sizeof(float)) * use_uniform_sfb, 8);
+    static LayoutInfo get_layout_info(const GemmDesc& desc, const Layout& layout) {
+        const auto num_blocks =
+            ceil_div(desc.get_expected_m(), layout.block_m) *
+            ceil_div(desc.get_expected_n(), layout.block_n) *
+            desc.get_expected_num_groups();
+        const auto num_waves = ceil_div(num_blocks, desc.num_sms);
+        const auto num_last_blocks = num_blocks % desc.num_sms;
+        const auto last_wave_util = num_last_blocks == 0 ? desc.num_sms : num_last_blocks;
+
+        // Utils
+        const int l2_bandwidth_per_cycle = std::min(64. * desc.num_sms, 8e6 / (1.3e3)); // B/cycle
+        const int l1_bandwidth_per_cycle = 128 * desc.num_sms; // B/cycle
+        const int wgmma_m = 64;
+        const int elem_size_ab = c10::elementSize(desc.a_dtype);
+        const int elem_size_cd = c10::elementSize(desc.cd_dtype);
+        DG_HOST_ASSERT(desc.a_dtype == desc.b_dtype);
+
+        // Data movement per block
+        int64_t expected_k = desc.get_expected_k();
+        int64_t num_bytes_l2_ab = expected_k * (layout.block_m / layout.cluster_n + layout.block_n / layout.cluster_m) * elem_size_ab;
+        int64_t num_bytes_l1_ab = expected_k * (layout.block_m + layout.block_n) * elem_size_ab;
+        int64_t num_bytes_l1_tc = expected_k * (std::max(wgmma_m, layout.block_m) + layout.block_n) * elem_size_ab
+                                  + layout.block_m * layout.block_n * elem_size_cd;
+        int64_t num_bytes_l1_l2_cd = layout.block_m * layout.block_n * elem_size_cd * (desc.with_accumulation ? 2 : 1);
+
+        // HBM bandwidth and total compute (Tensor/CUDA cores) are constant across configs
+        // We only model L1/L2 cycles as they are the primary variables between configs
+        int64_t num_l2_cycles = (num_bytes_l2_ab + num_bytes_l1_l2_cd) * num_blocks / l2_bandwidth_per_cycle;
+        int64_t num_l1_cycles = (num_bytes_l1_ab + num_bytes_l1_tc + num_bytes_l1_l2_cd) * num_blocks / l1_bandwidth_per_cycle;
+        float wave_efficiency = static_cast<float>(num_blocks) / (num_waves * desc.num_sms);
+        int64_t num_cycles = std::max(num_l1_cycles, num_l2_cycles) / wave_efficiency;
+
+        // Disable multicasting if only one wave exists
+        if (layout.cluster_n * layout.cluster_m > 1 and num_waves <= 1)
+            num_cycles = std::numeric_limits<int64_t>::max();
+
+        return {num_waves, last_wave_util, num_cycles, layout};
     }
 
-    static int get_barrier_smem_size(const int& num_stages) {
-        return num_stages * 8 * 2;
-    }
-
-    static int get_tmem_ptr_smem_size() {
-        return 0;
-    }
-
-    static int get_tensormap_smem_size(const GemmType& gemm_type) {
-        return gemm_type == GemmType::KGroupedContiguous ? 4 * static_cast<int>(sizeof(CUtensorMap)) : 0;
+    // A regular comparator
+    static bool compare(const LayoutInfo& a, const LayoutInfo& b) {
+        return a.num_cycles < b.num_cycles;
     }
 };
 

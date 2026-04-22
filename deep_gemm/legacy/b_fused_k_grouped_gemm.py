@@ -50,7 +50,7 @@ def b_fused_k_grouped_bf16_gemm_contiguous_tl_impl(a_ptr, b_ptr, d_ptr,
     # Compute
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(k_start, k_end, BLOCK_SIZE_K):
-        k_range = (k + tl.arange(0, BLOCK_SIZE_K)).to(tl.int64)
+        k_range = k.to(tl.int64) + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
         rows = tl.load(k_indices_ptr + k_range).to(tl.int64)
         a_ptrs = a_ptr + m_range[:, None] + k_range[None, :] * M
         b_ptrs = b_ptr + rows[:, None] * N + n_range[None, :]

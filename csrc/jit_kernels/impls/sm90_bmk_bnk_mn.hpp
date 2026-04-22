@@ -84,9 +84,9 @@ static void sm90_bmn_bnk_mn_gemm(const torch::Tensor &a,
     // Select best number of stages
     int num_stages = 4, smem_size = 0;
     while (true) {
-        const int& smem_a_per_stage = block_m * block_k * sizeof(cutlass::bfloat16_t);
-        const int& smem_b_per_stage = block_n * block_k * sizeof(cutlass::bfloat16_t);
-        const int& smem_barrier = SM90ArchSpec::get_barrier_smem_size(num_stages);
+        const int smem_a_per_stage = block_m * block_k * sizeof(cutlass::bfloat16_t);
+        const int smem_b_per_stage = block_n * block_k * sizeof(cutlass::bfloat16_t);
+        const int smem_barrier = num_stages * 8 * 2;
 
         smem_size = 0;
         smem_size += (smem_a_per_stage + smem_b_per_stage) * num_stages;
@@ -108,8 +108,8 @@ static void sm90_bmn_bnk_mn_gemm(const torch::Tensor &a,
                num_stages, smem_size, swizzle_ab_mode);
     }
 
-    const auto& tensor_map_a = make_tma_2d_desc(a, k, s * m, block_k, block_m, k, swizzle_ab_mode);
-    const auto& tensor_map_b = make_tma_2d_desc(b, k, s * n, block_k, block_n, k, swizzle_ab_mode);
+    const auto tensor_map_a = make_tma_2d_desc(a, k, s * m, block_k, block_m, k, swizzle_ab_mode);
+    const auto tensor_map_b = make_tma_2d_desc(b, k, s * n, block_k, block_n, k, swizzle_ab_mode);
 
     const SM90BmkBnkMnRuntime::Args& args = {
         .s = s, .m = m, .n = n, .k = k,
@@ -123,8 +123,8 @@ static void sm90_bmn_bnk_mn_gemm(const torch::Tensor &a,
         .tensor_map_b = tensor_map_b,
         .d = d.data_ptr<float>()
     };
-    const auto& code = SM90BmkBnkMnRuntime::generate(args);
-    const auto& runtime = compiler->build("sm90_bmn_bnk_mn_gemm", code);
+    const auto code = SM90BmkBnkMnRuntime::generate(args);
+    const auto runtime = compiler->build("sm90_bmn_bnk_mn_gemm", code);
     SM90BmkBnkMnRuntime::launch(runtime, args);
 }
 
