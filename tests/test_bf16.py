@@ -11,7 +11,8 @@ from deep_gemm.testing import (
 from generators import (
     get_arch_major, layout_masked_to_psum, align,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
-    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
+    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
+    get_mk_alignment_for_contiguous_layout
 )
 
 
@@ -56,6 +57,10 @@ def test_m_grouped_gemm_contiguous() -> None:
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
 
+        # Select best alignment
+        alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
+        deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+
         for test_alias in (False, True):
             m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b,
                                                                               use_bf16=True, use_psum_layout=use_psum_layout)
@@ -65,8 +70,15 @@ def test_m_grouped_gemm_contiguous() -> None:
                 b = b if major_b.is_k_major() else b.mT
                 assert a[0].is_contiguous() and b[0].is_contiguous()
             getattr(deep_gemm, func_name)(a, b, d, grouped_layout, use_psum_layout=use_psum_layout)
-            diff = calc_diff(d, ref_d)
-            assert diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}'
+            if use_psum_layout:
+                for j in range(num_groups):
+                    start = 0 if j == 0 else align(grouped_layout[j - 1], get_mk_alignment_for_contiguous_layout())
+                    end = grouped_layout[j]
+                    diff = calc_diff(d[start : end], ref_d[start : end])
+                    assert diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}'
+            else:
+                diff = calc_diff(d, ref_d)
+                assert diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}'
         m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b,
                                                                           use_bf16=True, use_psum_layout=use_psum_layout)
 
@@ -91,6 +103,10 @@ def test_m_grouped_gemm_masked() -> None:
         sum_t, max_t = 0, 0
         sum_ops, sum_bytes = 0, 0
 
+        # Select best alignment
+        alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(int(expected_m_per_group * 1.2))
+        deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+
         for i in range(num_tests):
             a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k,
                                                                          use_bf16=True, use_psum_layout=use_psum_layout)
@@ -111,7 +127,7 @@ def test_m_grouped_gemm_masked() -> None:
                 if masked_m[j].item() == 0:
                     continue
                 if use_psum_layout:
-                    d_slice = d_psum[: psum_m[j]] if j == 0 else d_psum[align(psum_m[j - 1], 128): psum_m[j]]
+                    d_slice = d_psum[: psum_m[j]] if j == 0 else d_psum[align(psum_m[j - 1], get_mk_alignment_for_contiguous_layout()): psum_m[j]]
                 else:
                     d_slice = d[j, :masked_m[j].item()]
                 diff = calc_diff(d_slice, ref_d[j, :masked_m[j].item()])
@@ -137,6 +153,9 @@ def test_m_grouped_gemm_masked() -> None:
 
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
+    
+    # TODO: Support arbitrary alignment
+    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
 
     for num_groups, m, n, major_a, major_b, ks, expected_k_per_group in enumerate_k_grouped_contiguous(torch.bfloat16):
         for test_empty_groups in (False, True):

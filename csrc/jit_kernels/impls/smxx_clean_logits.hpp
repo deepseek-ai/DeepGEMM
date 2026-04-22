@@ -17,7 +17,8 @@ public:
 
         int* cu_seq_len_k_start;
         int* cu_seq_len_k_end;
-        float* logits;
+        void* logits;
+        at::ScalarType logits_dtype;
 
         int block_kv;
         int num_warps;
@@ -33,10 +34,10 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&smxx_clean_logits<
-        {}, {}, {}
+        {}, {}, {}, {}
     >);
 }};
-)", args.next_n, args.block_kv, args.num_warps);
+)", args.next_n, args.block_kv, args.num_warps, to_string(args.logits_dtype));
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -65,14 +66,15 @@ static void smxx_clean_logits(const torch::Tensor& logits,
         .stride_logits = stride_logits,
         .cu_seq_len_k_start = cu_seq_len_k_start.has_value() ? cu_seq_len_k_start.value().data_ptr<int>() : nullptr,
         .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
-        .logits = logits.data_ptr<float>(),
+        .logits = logits.data_ptr(),
+        .logits_dtype = logits.scalar_type(),
         .block_kv = block_kv,
         .num_warps = num_warps,
         .launch_args = LaunchArgs(device_runtime->get_num_sms(),
                                   num_warps * 32, smem_size)
     };
-    const auto& code = SMXXCleanLogitsRuntime::generate(args);
-    const auto& runtime = compiler->build("smxx_clean_logits", code);
+    const auto code = SMXXCleanLogitsRuntime::generate(args);
+    const auto runtime = compiler->build("smxx_clean_logits", code);
     SMXXCleanLogitsRuntime::launch(runtime, args);
 }
 

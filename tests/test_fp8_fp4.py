@@ -13,11 +13,11 @@ from deep_gemm.testing import (
 from generators import (
     KernelType, get_ue8m0_usage, layout_masked_to_psum, align,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
-    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous
+    generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
+    get_mk_alignment_for_contiguous_layout
 )
 
 
-@ignore_env('DG_JIT_PTXAS_CHECK', lambda: get_arch_major() == 9)
 def test_gemm() -> None:
     print('Testing GEMM:')
     scores = []
@@ -45,7 +45,7 @@ def test_gemm() -> None:
 
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0, quant_config=quant_config)
         t = bench_kineto(lambda: deep_gemm.fp8_fp4_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
-                         'fp8_gemm', suppress_kineto_output=True)
+                         'gemm_', suppress_kineto_output=True)
         cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True) \
                               if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
@@ -68,6 +68,10 @@ def test_m_grouped_gemm_contiguous() -> None:
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes()
 
+        # Select best alignment
+        alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
+        deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+
         for test_alias in (False, True):
             m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b,
                                                                               use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout,
@@ -79,8 +83,15 @@ def test_m_grouped_gemm_contiguous() -> None:
                 assert a[0].is_contiguous() and b[0].is_contiguous()
             getattr(deep_gemm, func_name)(a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast, use_psum_layout=use_psum_layout,
                                           recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
-            diff = calc_diff(d, ref_d)
-            assert diff < quant_config.max_diff(), f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, {diff:.5f}, alias={test_alias}'
+            if use_psum_layout:
+                for j in range(num_groups):
+                    start = 0 if j == 0 else align(grouped_layout[j - 1], get_mk_alignment_for_contiguous_layout())
+                    end = grouped_layout[j]
+                    diff = calc_diff(d[start : end], ref_d[start : end])
+                    assert diff < quant_config.max_diff(), f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, {diff:.5f}, alias={test_alias}'
+            else:
+                diff = calc_diff(d, ref_d)
+                assert diff < quant_config.max_diff(), f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, {diff:.5f}, alias={test_alias}'
         m, a, b, grouped_layout, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b,
                                                                           use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout,
                                                                           quant_config=quant_config)
@@ -90,7 +101,7 @@ def test_m_grouped_gemm_contiguous() -> None:
             deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast, use_psum_layout=use_psum_layout,
                                                            recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
 
-        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+        t = bench_kineto(test_func, 'gemm_', suppress_kineto_output=True)
         print(f' > Perf ({num_groups=}, m={m:5}, n={n:6}, k={k:5}, {kernel_opt}, layout={major_opt}, psum={use_psum_layout}): '
               f'{t * 1e6:4.0f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
@@ -112,6 +123,10 @@ def test_m_grouped_gemm_masked() -> None:
         sum_t, max_t = 0, 0
         sum_ops, sum_bytes = 0, 0
 
+        # Select best alignment
+        alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(int(expected_m_per_group * 1.2))
+        deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+
         for i in range(num_tests):
             a, b, masked_m, psum_m, d, ref_d = generate_m_grouped_masked(num_groups, max_m, expected_m_per_group, n, k,
                                                                          use_ue8m0=use_ue8m0, use_psum_layout=use_psum_layout,
@@ -124,10 +139,10 @@ def test_m_grouped_gemm_masked() -> None:
             def test_func():
                 if use_psum_layout:
                     deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(a_psum, b, d_psum, psum_m, disable_ue8m0_cast=disable_ue8m0_cast,
-                                                                   use_psum_layout=True, expected_m_for_psum_layout=expected_m_per_group,
+                                                                   use_psum_layout=True, expected_m_for_psum_layout=int(expected_m_per_group * 1.2),
                                                                    recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
                 else:
-                    deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m_per_group, disable_ue8m0_cast=disable_ue8m0_cast,
+                    deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, int(expected_m_per_group * 1.2), disable_ue8m0_cast=disable_ue8m0_cast,
                                                                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
 
             test_func()
@@ -135,7 +150,7 @@ def test_m_grouped_gemm_masked() -> None:
                 if masked_m[j].item() == 0:
                     continue
                 if use_psum_layout:
-                    d_slice = d_psum[: psum_m[j]] if j == 0 else d_psum[align(psum_m[j - 1], 128): psum_m[j]]
+                    d_slice = d_psum[: psum_m[j]] if j == 0 else d_psum[align(psum_m[j - 1], get_mk_alignment_for_contiguous_layout()): psum_m[j]]
                 else:
                     d_slice = d[j, :masked_m[j].item()]
                 diff = calc_diff(d_slice, ref_d[j, :masked_m[j].item()])
@@ -143,7 +158,7 @@ def test_m_grouped_gemm_masked() -> None:
 
             # Test performance with fixed shapes
             valid_m = masked_m.sum().item()
-            t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
+            t = bench_kineto(test_func, 'gemm_', suppress_kineto_output=True)
 
             sum_t += t
             max_t = max(max_t, t)
@@ -158,36 +173,36 @@ def test_m_grouped_gemm_masked() -> None:
     print()
 
 
-@ignore_env('DG_JIT_PTXAS_CHECK', lambda: get_arch_major() == 9)
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
 
     k_grouped_fp8_gemm_contiguous = deep_gemm.k_grouped_fp8_gemm_nt_contiguous if get_arch_major() == 9 \
                                     else deep_gemm.k_grouped_fp8_gemm_tn_contiguous
-    for num_groups, m, n, major_a, major_b, ks, expected_k_per_group in enumerate_k_grouped_contiguous(torch.float8_e4m3fn):
+    for num_groups, m, n, major_a, major_b, ks, expected_k_per_group, gran_k in enumerate_k_grouped_contiguous(torch.float8_e4m3fn):
+        recipe = (1, 1, gran_k)
         use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D)
 
         for test_empty_groups in (False, True):
             new_ks = copy.deepcopy(ks)
             if test_empty_groups and len(ks) > 1:
                 new_ks[random.randint(0, num_groups - 1)] = 0
-            k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, new_ks, use_ue8m0=use_ue8m0)
+            k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, new_ks, use_ue8m0=use_ue8m0, gran_k=gran_k)
             new_ks_tensor = torch.tensor(new_ks, dtype=torch.int, device='cuda')
-            k_grouped_fp8_gemm_contiguous(a, b, d, new_ks, new_ks_tensor, c)
+            k_grouped_fp8_gemm_contiguous(a, b, d, new_ks, new_ks_tensor, c, recipe=recipe)
 
             diff = calc_diff(d, ref_d)
             assert diff < 0.001, f'{m=}, {n=}, {k=}, {ks=}, {diff:.5f}'
 
         # Test performance
-        k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_ue8m0=use_ue8m0)
+        k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_ue8m0=use_ue8m0, gran_k=gran_k)
         ks_tensor = torch.tensor(ks, dtype=torch.int, device='cuda')
 
         # noinspection PyShadowingNames
         def test_func():
-            k_grouped_fp8_gemm_contiguous(a, b, d, ks, ks_tensor, c)
+            k_grouped_fp8_gemm_contiguous(a, b, d, ks, ks_tensor, c, recipe=recipe)
 
-        t = bench_kineto(test_func, 'fp8_gemm', suppress_kineto_output=True)
-        print(f' > Perf ({num_groups=:2}, m={m:5}, n={n:5}, k={k:5}): '
+        t = bench_kineto(test_func, 'gemm_', suppress_kineto_output=True)
+        print(f' > Perf ({num_groups=:2}, m={m:5}, n={n:5}, k={k:5}, gran_k={gran_k:3}): '
               f'{t * 1e6:4.0f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{count_bytes(a, b, c, d) / 1e9 / t:4.0f} GB/s')

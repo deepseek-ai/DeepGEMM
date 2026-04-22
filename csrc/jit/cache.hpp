@@ -17,7 +17,7 @@ public:
 
     std::shared_ptr<KernelRuntime> get(const std::filesystem::path& dir_path) {
         // Hit the runtime cache
-        if (const auto& iterator = cache.find(dir_path); iterator != cache.end())
+        if (const auto iterator = cache.find(dir_path); iterator != cache.end())
             return iterator->second;
 
         if (KernelRuntime::check_validity(dir_path))
