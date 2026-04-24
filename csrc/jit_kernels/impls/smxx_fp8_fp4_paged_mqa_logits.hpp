@@ -166,6 +166,133 @@ static void __instantiate_kernel() {{
     }
 };
 
+class SM120FP8PagedMQALogitsReferenceRuntime final: public LaunchRuntime<SM120FP8PagedMQALogitsReferenceRuntime> {
+public:
+    struct Args {
+        int batch_size;
+        int next_n;
+        int num_heads;
+        int head_dim;
+        int block_kv;
+        bool is_context_lens_2d;
+        int block_table_stride;
+        int logits_stride;
+        int tokens_per_block;
+
+        int64_t q_batch_stride;
+        int64_t q_next_stride;
+        int64_t q_head_stride;
+        int64_t kv_block_stride;
+        int64_t kv_token_stride;
+        int64_t kv_scale_block_stride;
+        int64_t weights_row_stride;
+
+        void* q;
+        void* kv_cache;
+        float* kv_cache_scales;
+        float* weights;
+        int* context_lens;
+        void* logits;
+        int* block_table;
+        at::ScalarType logits_dtype;
+
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm120_fp8_paged_mqa_logits_reference<
+        {}, {}, {},
+        {}, {},
+        {}
+    >);
+}};
+)", args.num_heads, args.head_dim, args.block_kv,
+    args.is_context_lens_2d ? "true" : "false", args.tokens_per_block,
+    to_string(args.logits_dtype));
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.batch_size,
+            args.next_n,
+            args.logits_stride,
+            args.block_table_stride,
+            args.q_batch_stride,
+            args.q_next_stride,
+            args.q_head_stride,
+            args.kv_block_stride,
+            args.kv_token_stride,
+            args.kv_scale_block_stride,
+            args.weights_row_stride,
+            args.q,
+            args.kv_cache,
+            args.kv_cache_scales,
+            args.weights,
+            args.context_lens,
+            args.logits,
+            args.block_table
+        ));
+    }
+};
+
+static void sm120_fp8_paged_mqa_logits_reference(const torch::Tensor& q,
+                                                const torch::Tensor& kv_cache,
+                                                const torch::Tensor& kv_cache_scales,
+                                                const torch::Tensor& weights,
+                                                const torch::Tensor& context_lens,
+                                                const torch::Tensor& logits,
+                                                const torch::Tensor& block_table,
+                                                const at::ScalarType& logits_dtype,
+                                                const int& batch_size, const int& next_n,
+                                                const int& num_heads, const int& head_dim,
+                                                const int& block_kv,
+                                                const bool& is_context_lens_2d,
+                                                const int& logits_stride,
+                                                const int& block_table_stride) {
+    constexpr int tokens_per_block = 128;
+    DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
+    DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
+    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
+
+    const SM120FP8PagedMQALogitsReferenceRuntime::Args args = {
+        .batch_size = batch_size,
+        .next_n = next_n,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+        .block_kv = block_kv,
+        .is_context_lens_2d = is_context_lens_2d,
+        .block_table_stride = block_table_stride,
+        .logits_stride = logits_stride,
+        .tokens_per_block = tokens_per_block,
+        .q_batch_stride = q.stride(0),
+        .q_next_stride = q.stride(1),
+        .q_head_stride = q.stride(2),
+        .kv_block_stride = kv_cache.stride(0),
+        .kv_token_stride = kv_cache.stride(1),
+        .kv_scale_block_stride = kv_cache_scales.stride(0),
+        .weights_row_stride = weights.stride(0),
+        .q = q.data_ptr(),
+        .kv_cache = kv_cache.data_ptr(),
+        .kv_cache_scales = kv_cache_scales.data_ptr<float>(),
+        .weights = weights.data_ptr<float>(),
+        .context_lens = context_lens.data_ptr<int>(),
+        .logits = logits.data_ptr(),
+        .block_table = block_table.data_ptr<int>(),
+        .logits_dtype = logits_dtype,
+        .launch_args = LaunchArgs(std::make_pair(batch_size * next_n, ceil_div(logits_stride, tokens_per_block)),
+                                  tokens_per_block)
+    };
+    const auto code = SM120FP8PagedMQALogitsReferenceRuntime::generate(args);
+    const auto runtime = compiler->build("sm120_fp8_paged_mqa_logits_reference", code);
+    SM120FP8PagedMQALogitsReferenceRuntime::launch(runtime, args);
+}
+
 static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
                                       const torch::Tensor& kv_cache,
                                       const torch::Tensor& kv_cache_scales,
