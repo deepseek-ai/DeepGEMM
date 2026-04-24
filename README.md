@@ -6,36 +6,11 @@ DeepGEMM leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlas
 
 Despite its lightweight design, DeepGEMM's performance matches or exceeds expert-tuned libraries across various matrix shapes.
 
-## Mega MoE Performance
-
-We benchmarked Mega MoE on DeepSeek-V4-Flash and DeepSeek-V4-Pro under 8-way expert parallelism (EP8), testing at various batch sizes (i.e., the number of tokens per rank) to cover different serving scenarios. All values are averaged across 8 ranks.
-
-### DeepSeek-V4-Flash
-
-DeepSeek-V4-Flash has 256 experts with top-k=6 (each token is routed to 6 experts), a hidden dimension of 4096, and an intermediate hidden dimension of 2048.
-
-| Batch Size | Time (us) | Compute (TFLOPS) | Global Memory (GB/s) | Interconnect (GB/s) | Speedup (vs legacy) |
-|:-----:|:------:|:----:|:----:|:---:|:-----:|
-| 1     | 56.5   | 5    | 1311 | 1   | 1.96x |
-| 512   | 146.5  | 1056 | 3192 | 266 | 1.73x |
-| 8192  | 1283.1 | 1928 | 998  | 499 | 1.56x |
-| 32768 | 4855.5 | 2038 | 794  | 529 | 1.62x |
-
-### DeepSeek-V4-Pro
-
-DeepSeek-V4-Pro has 384 experts with top-k=6, a hidden dimension of 7168, and an intermediate hidden dimension of 3072.
-
-| Batch Size | Time (us) | Compute (TFLOPS) | Global Memory (GB/s) | Interconnect (GB/s) | Speedup (vs legacy) |
-|:-----:|:-------:|:----:|:----:|:---:|:-----:|
-| 1     | 108.1   | 7    | 1758 | 1   | 1.61x |
-| 512   | 369.6   | 1098 | 4619 | 182 | 1.54x |
-| 8192  | 2818.5  | 2304 | 1094 | 393 | 1.50x |
-| 32768 | 10655.2 | 2438 | 692  | 417 | 1.54x |
-
 ## News
 
 - 2026.04.16: Mega MoE, FP8xFP4 GEMM, FP4 Indexer, PDL, faster JIT compilation and more.
-    - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) and [#316](https://github.com/deepseek-ai/DeepGEMM/pull/316) for more details.
+    - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) for more details.
+    - For Mega MoE benchmarks, refer to [#316](https://github.com/deepseek-ai/DeepGEMM/pull/316).
 - 2025.09.28: DeepGEMM now supports scoring kernels (weighted ReLU MQA logits) for the lightning indexer for DeepSeek v3.2.
     - Please see [#200](https://github.com/deepseek-ai/DeepGEMM/pull/200) for more details.
 - 2025.07.20: DeepGEMM now supports both SM90/SM100, and has a full refactor with a low-CPU-overhead JIT CPP module.
