@@ -5,34 +5,12 @@
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp"
+#include "../jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp"
 #endif
 
 namespace deep_gemm::hyperconnection {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-static void sm12x_tf32_hc_prenorm_gemm_reference(const torch::Tensor& a,
-                                                 const torch::Tensor& b,
-                                                 const torch::Tensor& d,
-                                                 const torch::Tensor& sqr_sum,
-                                                 const int& num_splits,
-                                                 const bool& has_split_outputs) {
-    auto a_float = a.to(torch::kFloat);
-    auto d_value = at::matmul(a_float, b.transpose(0, 1));
-    auto sqr_sum_value = (a_float * a_float).sum(-1);
-
-    if (has_split_outputs) {
-        d.zero_();
-        sqr_sum.zero_();
-        d.select(0, 0).copy_(d_value);
-        sqr_sum.select(0, 0).copy_(sqr_sum_value);
-        return;
-    }
-
-    DG_HOST_ASSERT(num_splits == 1);
-    d.copy_(d_value);
-    sqr_sum.copy_(sqr_sum_value);
-}
-
 static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
                                  const torch::Tensor& b,
                                  const torch::Tensor& d,
@@ -76,9 +54,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
     } else if (arch_major == 10) {
         sm100_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else if (arch_major == 12) {
-        sm12x_tf32_hc_prenorm_gemm_reference(a, b, d, sqr_sum,
-                                             num_splits.has_value() ? num_splits.value() : 1,
-                                             num_splits.has_value());
+        sm120_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
