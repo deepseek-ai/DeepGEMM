@@ -253,36 +253,61 @@ def test_paged_mqa_logits():
 
     def enumerate_paged_mqa_logits():
         arch_major = get_arch_major()
-        for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
-            for logits_dtype in (torch.float, torch.bfloat16):
-                for block_kv in ((32, 64) if arch_major == 10 else (64, )):
-                    for use_2d_context_lens, clean_logits in [(True, False)]:
-                        for batch_size in (256, ):
-                            for next_n in (1, 2, 4, 5, 6) if arch_major == 10 else (1, 2):
-                                for num_heads, head_dim in [(64, 128)]:
-                                    for avg_kv in (8192, 32768):
-                                        yield is_fp4, logits_dtype, block_kv, use_2d_context_lens, clean_logits, batch_size, next_n, num_heads, head_dim, avg_kv
+        for is_varlen in ((True, False) if arch_major == 10 else (False, )):
+            for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
+                for logits_dtype in (torch.float, torch.bfloat16):
+                    for block_kv in ((32, 64) if arch_major == 10 else (64, )):
+                        for use_2d_context_lens, clean_logits in [(True, False)]:
+                            for batch_size in (256, ):
+                                for next_n in ((1, ) if is_varlen else ((1, 2, 4, 5, 6) if arch_major == 10 else (1, 2))):
+                                    for max_tokens_per_batch in ((1, 4, 10) if is_varlen else (1, )):
+                                        for num_heads, head_dim in [(64, 128)]:
+                                            for avg_kv in (8192, 32768):
+                                                yield is_varlen, is_fp4, logits_dtype, block_kv, use_2d_context_lens, clean_logits, batch_size, next_n, max_tokens_per_batch, num_heads, head_dim, avg_kv
 
 
     print('Testing FP8/FP4 Paged MQA Logits:')
     max_model_len = 111 * 1024
     num_total_blocks = max_model_len * 5
 
-    for is_fp4, logits_dtype, block_kv, use_2d_context_lens, clean_logits, batch_size, next_n, num_heads, head_dim, avg_kv in enumerate_paged_mqa_logits():
+    for is_varlen, is_fp4, logits_dtype, block_kv, use_2d_context_lens, clean_logits, batch_size, next_n, max_tokens_per_batch, num_heads, head_dim, avg_kv in enumerate_paged_mqa_logits():
+        # Varlen: flatten raw_batch_size sequences with variable tokens into (batch_size, 1, ...)
+        raw_batch_size, raw_next_n = batch_size, next_n
+        if is_varlen:
+            tokens_per_seq = torch.randint(1, max_tokens_per_batch + 1, (raw_batch_size,), device='cuda', dtype=torch.int)
+            indices = torch.arange(raw_batch_size, device='cuda', dtype=torch.int).repeat_interleave(tokens_per_seq)
+            batch_size, next_n = tokens_per_seq.sum().item(), 1
+        else:
+            tokens_per_seq, indices = None, None
+
         # Generate random inputs
         q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
         kv_cache = torch.randn((num_total_blocks, block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16)
         weights = torch.randn((batch_size * next_n, num_heads), device='cuda', dtype=torch.float)
-        context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (batch_size,), device='cuda', dtype=torch.int)
+        context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (raw_batch_size,), device='cuda', dtype=torch.int)
 
-        # Assign block tables
-        num_blocks_per_query = ceil_div(context_lens, block_kv)
-        block_table = torch.empty((batch_size, num_blocks_per_query.max().item()), device='cuda', dtype=torch.int)
+        if is_varlen:
+            max_ctx_len_per_seq = context_lens + (tokens_per_seq - 1)
+        else:
+            max_ctx_len_per_seq = context_lens
+
+        # Assign block tables (per-sequence, sized by the largest ctx_len within the sequence)
+        seq_sum_lens = context_lens.sum().item()
+        num_blocks_per_query = ceil_div(max_ctx_len_per_seq, block_kv)
+        block_table = torch.empty((raw_batch_size, num_blocks_per_query.max().item()), device='cuda', dtype=torch.int)
         block_idx_pool = torch.randperm(num_total_blocks, device='cuda', dtype=torch.int)
         offset = 0
         for i, num_blocks in enumerate(num_blocks_per_query.tolist()):
             block_table[i, :num_blocks] = block_idx_pool[offset : offset + num_blocks]
             offset += num_blocks
+        if is_varlen:
+            context_lens = context_lens.repeat_interleave(tokens_per_seq)
+            offsets_within_seq = torch.cat([
+                torch.arange(n.item(), device='cuda', dtype=torch.int)
+                for n in tokens_per_seq
+            ])
+            context_lens = context_lens + offsets_within_seq
+            block_table = block_table.repeat_interleave(tokens_per_seq, dim=0)
 
         # Calculate reference logits
         ref_logits = ref_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, max_model_len, use_2d_context_lens)
@@ -304,9 +329,14 @@ def test_paged_mqa_logits():
         # Prepare masks and context lengths with NextN
         positions = torch.arange(max_model_len, device='cuda').unsqueeze(0).expand(batch_size * next_n, -1)
         if use_2d_context_lens:
-            context_lens_nextn = ((context_lens.unsqueeze(1) + 1) * torch.rand(batch_size, next_n, device='cuda')).int()
-            # Ensure last token matches actual length
-            context_lens_nextn[:, -1] = context_lens
+            if is_varlen:
+                # Varlen: context_lens is already per-token (shape [total_tokens]);
+                # just reshape to (total_tokens, 1) so each token keeps its own ctx_len.
+                context_lens_nextn = context_lens.view(-1, 1)
+            else:
+                context_lens_nextn = ((context_lens.unsqueeze(1) + 1) * torch.rand(batch_size, next_n, device='cuda')).int()
+                # Ensure last token matches actual length
+                context_lens_nextn[:, -1] = context_lens
             ref_neginf_mask = ~(positions < context_lens_nextn.view(-1, 1))
         else:
             context_lens_nextn = context_lens
@@ -318,8 +348,9 @@ def test_paged_mqa_logits():
         kernel_kwargs = dict(
             q=q_in, kv_cache=kv_in, weights=weights,
             context_lens=context_lens_nextn, block_table=block_table,
-            schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(context_lens_nextn, block_kv, deep_gemm.get_num_sms()),
-            max_context_len=max_model_len, clean_logits=clean_logits, logits_dtype=logits_dtype
+            schedule_meta=deep_gemm.get_paged_mqa_logits_metadata(context_lens_nextn, block_kv, deep_gemm.get_num_sms(), indices=indices),
+            max_context_len=max_model_len, clean_logits=clean_logits, logits_dtype=logits_dtype,
+            indices=indices,
         )
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(**kernel_kwargs)
 
@@ -342,11 +373,15 @@ def test_paged_mqa_logits():
         sum_lens = context_lens.sum().item()
         tflops_calc = 2 * sum_lens * next_n * num_heads * head_dim / 1e12
         kv_bytes_per_token = head_dim / (2 if is_fp4 else 1) + 4
-        total_bytes = count_bytes(q, weights) + sum_lens * kv_bytes_per_token + (sum_lens * next_n * logits_dtype.itemsize)
+        # KV is read once per sequence; for varlen sum_lens overcounts (per-token), so use seq_sum_lens
+        kv_sum_lens = seq_sum_lens if is_varlen else sum_lens
+        total_bytes = count_bytes(q, weights) + kv_sum_lens * kv_bytes_per_token + (sum_lens * next_n * logits_dtype.itemsize)
 
         t, clean_t = bench_kineto(lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**kernel_kwargs), ('paged_mqa_logits', 'clean_logits'))
-        print(f' > FP4={is_fp4}, BF16={logits_dtype == torch.bfloat16}, BLOCK_KV={block_kv}, BSZ={batch_size:3}, NextN={next_n:1}, H={num_heads:2}, D={head_dim:2}, L={avg_kv:6}: '
+        print(f' > FP4={is_fp4}, BF16={logits_dtype == torch.bfloat16}, BLOCK_KV={block_kv}, BSZ={raw_batch_size:3}, NextN={raw_next_n:1}, H={num_heads:2}, D={head_dim:2}, L={avg_kv:6}: '
               f'{tflops_calc / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, {total_bytes / t / 1e9:4.0f} GB/s', end='')
+        if is_varlen:
+            print(f' | Varlen, MaxTPB={max_tokens_per_batch}, NumTokens={batch_size}', end='')
         print(f' | clean: {clean_t*1e6:3.0f} us' if clean_logits else '')
     print()
 

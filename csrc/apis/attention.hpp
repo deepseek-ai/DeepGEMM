@@ -190,12 +190,13 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     return logits;
 }
 
-static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_lens, int block_kv, int num_sms) {
+static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_lens, int block_kv, int num_sms, const std::optional<torch::Tensor>& indices) {
     // NOTES: Only 2D context lens is supported for now
     DG_HOST_ASSERT(context_lens.dim() == 2);
     const bool is_context_lens_2d = true;
     const int batch_size = context_lens.size(0);
     const int next_n = context_lens.size(1);
+    const bool is_varlen = indices.has_value();
     DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(context_lens.is_contiguous());
 
@@ -204,9 +205,16 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
 
     // Dispatch implementation
     const auto arch_major = device_runtime->get_arch_major();
-    if (arch_major == 9 or arch_major == 10) {
+    if (is_varlen) {
+        const auto& indices_tensor = indices.value();
+        DG_HOST_ASSERT(arch_major == 10 and next_n == 1 and (block_kv == 64 or block_kv == 32));
+        DG_HOST_ASSERT(indices_tensor.dim() == 1 and indices_tensor.size(0) == batch_size);
+        DG_HOST_ASSERT(indices_tensor.is_contiguous());
+        DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
+        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d, true, indices_tensor.data_ptr<int>());
+    } else if (arch_major == 9 or arch_major == 10) {
         DG_HOST_ASSERT(block_kv == 64 or (arch_major == 10 and block_kv == 32));
-        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d);
+        smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d, false, nullptr);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -222,7 +230,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                               const torch::Tensor& schedule_meta,
                                               const int& max_context_len,
                                               const bool& clean_logits,
-                                              const at::ScalarType& logits_dtype) {
+                                              const at::ScalarType& logits_dtype,
+                                              const std::optional<torch::Tensor>& indices) {
     const auto [q_fp, q_sf] = q;
     const bool is_fp4 = q_sf.has_value();
 
@@ -321,6 +330,17 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     DG_HOST_ASSERT(block_table.stride(1) == 1);
     DG_HOST_ASSERT(block_table.scalar_type() == torch::kInt);
 
+    // Check indices
+    const bool is_varlen = indices.has_value();
+    const auto arch_major = device_runtime->get_arch_major();
+    const auto indices_tensor = indices.value_or(torch::Tensor());
+    if (is_varlen) {
+        DG_HOST_ASSERT(arch_major == 10 and next_n == 1);
+        DG_HOST_ASSERT(indices_tensor.dim() == 1 and indices_tensor.size(0) == batch_size);
+        DG_HOST_ASSERT(indices_tensor.is_contiguous());
+        DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
+    }
+
     // Check schedule metadata
     auto [_schedule_meta_size, _meta_info_size] = get_shape<2>(schedule_meta);
     DG_HOST_ASSERT(_schedule_meta_size == num_sms + 1 and _meta_info_size == 2);
@@ -344,15 +364,14 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     DG_HOST_ASSERT(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16);
 
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
     if (is_fp4 and arch_major == 10) {
-        sm100_fp4_paged_mqa_logits(q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, schedule_meta,
+        sm100_fp4_paged_mqa_logits(q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                    logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
-                                   aligned_max_context_len, block_table_stride, num_sms, split_kv);
+                                   is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
     } else if (not is_fp4 and (arch_major == 9 or arch_major == 10)) {
-        smxx_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, schedule_meta,
+        smxx_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                   logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
-                                  aligned_max_context_len, block_table_stride, num_sms, split_kv);
+                                  is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -386,10 +405,11 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                           const torch::Tensor& block_table,
                                           const torch::Tensor& schedule_meta,
                                           const int& max_context_len,
-                                          const bool& clean_logits) {
+                                          const bool& clean_logits,
+                                          const std::optional<torch::Tensor>& indices) {
     return fp8_fp4_paged_mqa_logits(std::make_tuple(q, std::nullopt), fused_kv_cache, weights,
                                     context_lens, block_table, schedule_meta,
-                                    max_context_len, clean_logits, torch::kFloat);
+                                    max_context_len, clean_logits, torch::kFloat, indices);
 }
 #endif
 
@@ -407,13 +427,15 @@ static void register_apis(pybind11::module_& m) {
           py::arg("max_seqlen_k") = 0,
           py::arg("logits_dtype") = torch::kFloat32);
     m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
-          py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"));
+          py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
+          py::arg("indices") = std::nullopt);
     m.def("fp8_fp4_paged_mqa_logits", &fp8_fp4_paged_mqa_logits,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
           py::arg("max_context_len"),
           py::arg("clean_logits") = false,
-          py::arg("logits_dtype") = torch::kFloat32);
+          py::arg("logits_dtype") = torch::kFloat32,
+          py::arg("indices") = std::nullopt);
     // Legacy API
     m.def("fp8_mqa_logits", &fp8_mqa_logits,
           py::arg("q"), py::arg("kv"), py::arg("weights"),
@@ -423,7 +445,8 @@ static void register_apis(pybind11::module_& m) {
     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
-          py::arg("max_context_len"), py::arg("clean_logits") = false);
+          py::arg("max_context_len"), py::arg("clean_logits") = false,
+          py::arg("indices") = std::nullopt);
 #endif
 }
 

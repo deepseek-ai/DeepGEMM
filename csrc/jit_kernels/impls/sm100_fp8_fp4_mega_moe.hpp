@@ -29,6 +29,7 @@ public:
 
         // Runtime arguments
         void* y;
+        int* cumulative_local_expert_recv_stats;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
@@ -91,6 +92,7 @@ static void __instantiate_kernel() {{
         // TODO: optimize `args` copy
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
+            args.cumulative_local_expert_recv_stats,
             args.num_tokens,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
@@ -112,6 +114,7 @@ static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& l2_acts, const torch::Tensor& l2_acts_sf,
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
+    const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
@@ -122,11 +125,12 @@ static void sm100_fp8_fp4_mega_moe(
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
+    const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
 
     // Heuristics
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden);
+        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden, num_padded_sf_pool_tokens);
 
     // Make tensormap
     constexpr int kGranK = 32;
@@ -175,6 +179,11 @@ static void sm100_fp8_fp4_mega_moe(
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0);
 
+    // Stats can be optional
+    int* cumulative_local_expert_recv_stats_ptr = nullptr;
+    if (cumulative_local_expert_recv_stats.has_value())
+        cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
     const SM100FP8FP4MegaMoERuntime::Args args = {
@@ -186,6 +195,7 @@ static void sm100_fp8_fp4_mega_moe(
         .fast_math = fast_math,
         .config = config,
         .y = y.data_ptr(),
+        .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,

@@ -21,7 +21,7 @@ namespace deep_gemm {
 
 template <uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t BLOCK_KV,
-          bool kIsContextLens2D,
+          bool kIsContextLens2D, bool kIsVarlen,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
@@ -30,11 +30,14 @@ CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
                                const uint32_t logits_stride, const uint32_t block_table_stride,
                                const uint32_t* context_lens, logits_dtype_t* logits,
-                               const uint32_t* block_table, const uint32_t* schedule_meta,
+                               const uint32_t* block_table, const uint32_t* indices,
+                               const uint32_t* schedule_meta,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+    DG_STATIC_ASSERT(not kIsVarlen, "Varlen is not supported for SM90 paged MQA logits");
+
     // Types
     using WGMMA = typename mma::sm90::FP8MMASelector<kNextN * kNumHeads>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -132,8 +135,8 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     cudaGridDependencySynchronize();
 
     // Scheduler
-    auto scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, BLOCK_KV, kNumMathWarpGroups, 1>(
-        blockIdx.x, context_lens, schedule_meta);
+    auto scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_KV, kNumMathWarpGroups, 1>(
+        blockIdx.x, batch_size, context_lens, schedule_meta, indices);
     DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
 
     // Q and KV pipeline

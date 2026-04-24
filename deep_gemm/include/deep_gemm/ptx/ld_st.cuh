@@ -164,7 +164,7 @@ CUTLASS_DEVICE uint64_t ld_acq_sys(const uint64_t* ptr) {
 }
 
 CUTLASS_DEVICE void st_relaxed_sys(const uint64_t* ptr, const uint64_t& value) {
-    asm volatile("st.L1::no_allocate.relaxed.sys.u64 [%0], %1;" :: "l"(ptr), "l"(value));
+    asm volatile("st.L1::no_allocate.relaxed.sys.global.u64 [%0], %1;" :: "l"(ptr), "l"(value));
 }
 
 /// Atomics
@@ -186,7 +186,11 @@ CUTLASS_DEVICE uint32_t atomic_add_rel(const uint32_t* ptr, const uint32_t& valu
     return ret;
 }
 
-__forceinline__ __device__ void red_add(const uint32_t* ptr, const uint32_t& value) {
+CUTLASS_DEVICE void red_add(const int* ptr, const int& value) {
+    asm volatile("red.gpu.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
+}
+
+CUTLASS_DEVICE void red_add(const uint32_t* ptr, const uint32_t& value) {
     asm volatile("red.gpu.global.add.u32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
 

@@ -401,7 +401,8 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                     // Load accumulator from TMEM
                     uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
-                    tmem_load(cute::Int<kNumHeads>{}, tmem_addr, accum);
+                    tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
+                    tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
 
                     // Release TMEM empty
                     if (i == BLOCK_Q - 1) {

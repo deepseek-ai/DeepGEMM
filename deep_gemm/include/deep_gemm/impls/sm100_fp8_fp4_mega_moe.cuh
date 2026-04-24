@@ -48,6 +48,7 @@ template <
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
+                            int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
@@ -91,7 +92,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Workspaces
     const auto workspace = layout::Workspace(
-        sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, BLOCK_M);
+        sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
     // Token and buffer layouts
     constexpr auto fp8_token_layout = layout::Data(kHidden);
@@ -170,7 +171,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t UMMA_K = 32;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
-    DG_STATIC_ASSERT(BLOCK_M % 32 == 0, "Invalid block M");
+    DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
     DG_STATIC_ASSERT(BLOCK_K == 128, "Invalid block K");
 
@@ -269,7 +270,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     auto tmem_ptr_in_smem       = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + kNumEpilogueWarps * 2);
 
     // A cluster sync is essential for 2CTA tensor memory allocation
-    cute::cluster_sync();
+    comm::cluster_sync_with_relaxed_arrive();
 
     // Initialization
     if (warp_idx == 0) {
@@ -307,7 +308,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
-    cute::cluster_sync();
+    // NOTES: Using `.relaxed` is allowed here since `fence_barrier_init` is `.release.cluster`,
+    // and `barrier.cluster.wait.aligned` is by default `.acquire`
+    comm::cluster_sync_with_relaxed_arrive();
 
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
@@ -599,7 +602,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
-        // Clean workspace for the next usage
+        // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -623,19 +626,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Wait read count ready
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-                // Clean expert token count
-                if (thread_idx == 0)
+                // Clean expert token count, and add cumulative results
+                DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
+                if (warp_idx == 0) {
                     *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                } else if (warp_idx == 1) {
+                    if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
+                        ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
+                    __syncwarp();
+                }
 
                 // Clean per-rank token count
                 for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
                     *workspace.get_expert_recv_count_ptr(j, i) = 0;
+                __syncwarp();
 
                 // Clean L1 and L2 arrival stuffs
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
                     *workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + j) = 0;
                     *workspace.get_l2_arrival_mask_ptr(expert_pool_block_offset + j) = 0;
                 }
+                __syncwarp();
             }
         }
 
@@ -672,23 +683,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                 const auto expected = scheduler.template get_valid_m<false>();
                 while (ptx::ld_acq(ptr) != expected);
+            } else {
+                // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2x L1 blocks' arrival
+                // NOTES: Originally we wait blocks on-demand to overlap L1 calculation
+                // with L2, but this optimization is negative when `num_experts_per_wave`
+                // guarantees L1's completion when L2 starts. So we remove it.
+                // In the future, if `num_experts_per_wave` is not large enough
+                // due to small `num_experts_per_rank`, we may need to add it back or add a switch
+                DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
+                const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
+                // NOTES: Equivalent to `(1ull << (2 * num_k_blocks)) - 1`, but split into two shifts
+                // to avoid undefined behavior when `num_k_blocks == 32`
+                const uint64_t expected = ((1ull << num_k_blocks) << num_k_blocks) - 1;
+                while (ptx::ld_acq_gpu(ptr) != expected);
             }
 
-            uint64_t cached_l2_arrival_mask = 0;
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
-                // Wait current K block arrival
-                if (block_phase == sched::BlockPhase::Linear2) {
-                    // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2 L1 blocks' arrival
-                    DG_STATIC_ASSERT(BLOCK_K == BLOCK_N, "Invalid block sizes");
-                    const uint64_t needed = 3ull << (k_block_idx * 2);
-                    if ((cached_l2_arrival_mask & needed) != needed) {
-                        const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                        do {
-                            cached_l2_arrival_mask = ptx::ld_acq_gpu(ptr);
-                        } while ((cached_l2_arrival_mask & needed) != needed);
-                    }
-                }
-
                 // Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
@@ -953,8 +963,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Load weights from global into register cache per 32 tokens
                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        DG_STATIC_ASSERT(WG_BLOCK_M % 32 == 0, "Invalid block size");
-                        if ((j * ATOM_M) % 32 == 0) {
+                        if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
                             stored_cached_weight = *l1_topk_weights_buffer
                                 .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
                                 .get_base_ptr<float>();
@@ -1060,19 +1069,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Only one warp per pair writes (both hold the same SF after cross-warp reduce)
                         // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)
                         if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
-                            // TODO: I believe the expression can be optimized
-                            const uint32_t token_idx_in_expert = m_block_idx * BLOCK_M
-                                + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2;
                             const uint32_t k_idx = n_block_idx * 2 + warp_idx_in_wg / 2;
                             const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
                             const uint32_t mn_stride = kNumPaddedSFPoolTokens * sizeof(uint32_t);
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
                             // NOTES: consecutive tokens (t, t + 1) are in the same 32-group, so `sf_idx` differs by 4
+                            // NOTES: originally there was:
+                            //   - `const uint32_t token_idx_in_expert = m_block_idx * BLOCK_M + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2
+                            //   - `scheduler.get_current_pool_block_offset() * SF_BLOCK_M + transform_sf_token_idx(token_idx_in_expert)`
+                            // We find out that
+                            //   1. `m_block_idx * BLOCK_M` mod `BLOCK_M` is 0, and `epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2` is always < `BLOCK_M`, so we can put `m_block_idx * BLOCK_M` outside
+                            //   2. `lane_idx * 2` controls the lowest 3 bit of `token_idx_in_expert`, and `transform_sf_token_idx` is a bitwise-independent transformation if the input is less than `BLOCK_M`, so we can put `lane_idx * 2` outside
+                            // This reduce the number of computation instructions.
+                            const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                            __builtin_assume(token_base_idx < BLOCK_M);
                             const auto sf_pool_token_idx = scheduler.get_current_pool_block_offset() * SF_BLOCK_M
-                                + transform_sf_token_idx(token_idx_in_expert);
-                            sf_base_ptr[k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx] =
+                                + m_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
+                            const auto sf_addr = k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
+                            sf_base_ptr[sf_addr] =
                                 (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23);
-                            sf_base_ptr[k_uint_idx * mn_stride + (sf_pool_token_idx + 4) * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx] =
+                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] =
                                 (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23);
                         }
                         __syncwarp();

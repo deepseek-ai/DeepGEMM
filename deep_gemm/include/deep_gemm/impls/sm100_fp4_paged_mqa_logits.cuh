@@ -20,7 +20,7 @@ namespace deep_gemm {
 
 template <uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t BLOCK_KV,
-          bool kIsContextLens2D,
+          bool kIsContextLens2D, bool kIsVarlen,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
@@ -30,7 +30,8 @@ CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
 void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
                                 const uint32_t logits_stride, const uint32_t block_table_stride,
                                 const uint32_t* context_lens, logits_dtype_t* logits,
-                                const uint32_t* block_table, const uint32_t* schedule_meta,
+                                const uint32_t* block_table, const uint32_t* indices,
+                                const uint32_t* schedule_meta,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -54,10 +55,10 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
         cute::prefetch_tma_descriptor(&tensor_map_sf_kv);
     }
 
-    // Next-N atom configs
-    static constexpr uint32_t kNextNAtom = (kNextN % 2 == 0) ? 2 : 1;
-    static constexpr uint32_t kNumNextNAtoms = kNextN / kNextNAtom;
-    static constexpr bool kSingleAtom = (kNumNextNAtoms == 1);
+    // For non-varlen odd kNextN >= 3, pad to even using TMA OOB zero-fill.
+    static constexpr bool kPadOddN = (not kIsVarlen) and (kNextN % 2 == 1) and (kNextN >= 3);
+    static constexpr uint32_t kNextNAtom = (kIsVarlen or kNextN >= 2) ? 2 : 1;
+    static constexpr uint32_t kNumNextNAtoms = math::constexpr_ceil_div(kNextN, kNextNAtom);
 
     // UMMA configs
     static constexpr uint32_t kNumTmemStages = 3;
@@ -157,7 +158,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
 
     // Scheduler
     constexpr uint32_t kNumBlocksPerSplit = SPLIT_KV / BLOCK_KV;
-    using Scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, BLOCK_KV, kNumBlocksPerSplit, kNumNextNAtoms>;
+    using Scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_KV, kNumBlocksPerSplit, kNumNextNAtoms>;
     DG_STATIC_ASSERT(SPLIT_KV == BLOCK_KV * kNumBlocksPerSplit, "Invalid `SPLIT_KV`");
 
     // Make Q, KV and TMEM pipeline
@@ -182,7 +183,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
         if (cute::elect_one_sync()) {
-            auto scheduler = Scheduler(sm_idx, context_lens, schedule_meta);
+            auto scheduler = Scheduler(sm_idx, batch_size, context_lens, schedule_meta, indices);
 
             // Persistently schedule over blocks
             // Initialize outside valid range to indicate no previous task
@@ -196,11 +197,12 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
                     empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
 
                     // Issue TMA Q
+                    const auto q_token_idx = Scheduler::atom_to_token_idx(q_atom_idx);
                     cute::SM90_TMA_LOAD_2D::copy(&tensor_map_q, reinterpret_cast<uint64_t*>(full_q_barriers[q_stage_idx]),
                                                  static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-                                                 smem_q[q_stage_idx], 0, q_atom_idx * kNextNAtom * kNumHeads);
-                    tma::copy<kNextNAtom * kNumHeads, 1, 0>(&tensor_map_sf_q, full_q_barriers[q_stage_idx], smem_sf_q[q_stage_idx], 0, q_atom_idx * kNextNAtom);
-                    tma::copy<kNumHeads, kNextNAtom, 0>(&tensor_map_weights, full_q_barriers[q_stage_idx], smem_weights[q_stage_idx], 0, q_atom_idx * kNextNAtom);
+                                                 smem_q[q_stage_idx], 0, q_token_idx * kNumHeads);
+                    tma::copy<kNextNAtom * kNumHeads, 1, 0>(&tensor_map_sf_q, full_q_barriers[q_stage_idx], smem_sf_q[q_stage_idx], 0, q_token_idx);
+                    tma::copy<kNumHeads, kNextNAtom, 0>(&tensor_map_weights, full_q_barriers[q_stage_idx], smem_weights[q_stage_idx], 0, q_token_idx);
                     full_q_barriers[q_stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + kRealNumSFQAtom * sizeof(int) + SMEM_WEIGHT_SIZE_PER_STAGE);
                 }
                 last_q_atom_idx = q_atom_idx;
@@ -210,7 +212,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
     } else if (warp_idx == kSpecWarpStart + 1) {
         // TMA warp for loading KV cache
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
-        auto scheduler = Scheduler(sm_idx, context_lens, schedule_meta);
+        auto scheduler = Scheduler(sm_idx, batch_size, context_lens, schedule_meta, indices);
 
         // Persistently schedule over blocks
         uint32_t kv_block_idx_ptr = 32, kv_block_idx_storage;
@@ -225,10 +227,11 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
             // Coalesced load of block table
             if (kv_block_idx_ptr == 32) {
                 kv_block_idx_ptr = 0;
-                const auto block_table_offset = (q_atom_idx / kNumNextNAtoms) * static_cast<uint64_t>(block_table_stride);
+                const auto block_table_offset = Scheduler::atom_to_block_table_row(q_atom_idx) * static_cast<uint64_t>(block_table_stride);
                 kv_block_idx_storage = (kv_idx + lane_idx < num_kv)
                     ? block_table[block_table_offset + kv_idx + lane_idx] : 0;
             }
+            __syncwarp();
 
             // Broadcast KV block indices 
             int kv_block_idx[kNumBlocksPerSplit];
@@ -240,7 +243,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
 
             // Wait KV consumer release
             CUTE_TIE_DECL(advance_kv_pipeline(), kv_stage_idx, kv_phase);
-            
+
             // Issue TMA KV
             if (cute::elect_one_sync()) {
                 empty_kv_barriers[kv_stage_idx]->wait(kv_phase ^ 1);
@@ -260,7 +263,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
     } else if (warp_idx == kSpecWarpStart + 2) {
         // UMMA warp
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
-        auto scheduler = Scheduler(sm_idx, context_lens, schedule_meta);
+        auto scheduler = Scheduler(sm_idx, batch_size, context_lens, schedule_meta, indices);
         DG_TRAP_ONLY_DEVICE_ASSERT(ptx::ld_shared(tmem_ptr_in_smem) == 0);
 
         // UTCCP transposer
@@ -371,7 +374,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
     } else if (warp_idx < kSpecWarpStart) {
         // Math warpgroups for reduce
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
-        auto scheduler = Scheduler(sm_idx, context_lens, schedule_meta);
+        auto scheduler = Scheduler(sm_idx, batch_size, context_lens, schedule_meta, indices);
 
         const auto math_warpgroup_idx = warpgroup_idx;
         const auto math_thread_idx = warp_idx * 32 + lane_idx;
@@ -400,6 +403,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
         // Persistently schedule over blocks
         uint32_t last_q_atom_idx = batch_size * kNumNextNAtoms;
         uint32_t q_atom_idx, kv_idx, _;
+        bool is_paired_atom = false;
         while (scheduler.fetch_next_task(q_atom_idx, kv_idx, _)) {
             if (q_atom_idx != last_q_atom_idx) {
                 CUTE_TIE_DECL(advance_q_pipeline(), q_stage_idx, q_phase);
@@ -423,11 +427,16 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
                         weights[i][j + 3] = raw.w;
                     }
                 }
+
+                // Check if this atom pairs two tokens from the same sequence
+                if constexpr (kIsVarlen) {
+                    is_paired_atom = (scheduler.get_atom_advance(q_atom_idx, batch_size) == 2);
+                }
             }
             last_q_atom_idx = q_atom_idx;
 
             // Calculate KV offset in advance
-            auto kv_offset = q_atom_idx * kNextNAtom * static_cast<uint64_t>(logits_stride) + kv_idx * BLOCK_KV + math_thread_idx;
+            auto kv_offset = Scheduler::atom_to_token_idx(q_atom_idx) * static_cast<uint64_t>(logits_stride) + kv_idx * BLOCK_KV + math_thread_idx;
 
             // Advance pipeline by `kNumMathWarpGroups` steps
             // Wait UMMA arrival
@@ -436,53 +445,58 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
             ptx::tcgen05_after_thread_sync();
 
             // Reduce over the head dim and store
-            #pragma unroll
-            for (uint32_t i = 0; i < kNextNAtom; ++ i) {
-                // Load accumulator from TMEM
-                uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
-                tmem_load(cute::Int<kNumHeads>{}, tmem_addr, accum);
+            const auto reduce_and_store = [&](auto num_iters_c) {
+                constexpr uint32_t kNumIters = decltype(num_iters_c)::value;
+
+                // Only loop over valid iterations
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumIters; ++ i) {
+                    // Load accumulator from TMEM
+                    uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
+                    tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
+                    tmem_load(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
+
+                    // Accumulate weighted ReLU in parallel
+                    auto sum_0 = make_float2(0, 0);
+                    auto sum_1 = make_float2(0, 0);
+
+                    const auto transform = [&](const uint32_t& j, const float2& sum) {
+                        auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));
+                        auto b = make_float2(weights[i][j], weights[i][j + 1]);
+                        return __ffma2_rn(a, b, sum);
+                    };
+
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumHeads; j += 4) {
+                        sum_0 = transform(j, sum_0);
+                        sum_1 = transform(j + 2, sum_1);
+                    }
+
+                    auto sum = __fadd2_rn(sum_0, sum_1);
+                    auto result = static_cast<logits_dtype_t>(sum.x + sum.y);
+
+                    // Store into the global memory
+                    logits[kv_offset + i * static_cast<uint64_t>(logits_stride)] = result;
+                    __syncwarp();
+                }
 
                 // Release TMEM empty
-                if (i == kNextNAtom - 1) {
-                    ptx::tcgen05_before_thread_sync();
-                    empty_tmem_barriers[tmem_stage_idx]->arrive();
-                }
+                ptx::tcgen05_before_thread_sync();
+                empty_tmem_barriers[tmem_stage_idx]->arrive();
+            };
 
-                // Accumulate weighted ReLU in parallel
-                auto sum_0 = make_float2(0, 0);
-                auto sum_1 = make_float2(0, 0);
-
-                const auto transform = [&](const uint32_t& j, const float2& sum) {
-                    auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));
-                    auto b = make_float2(weights[i][j], weights[i][j + 1]);
-                    return __ffma2_rn(a, b, sum);
-                };
-
-                #pragma unroll
-                for (uint32_t j = 0; j < kNumHeads; j += 4) {
-                    sum_0 = transform(j, sum_0);
-                    sum_1 = transform(j + 2, sum_1);
-                }
-
-                auto sum = __fadd2_rn(sum_0, sum_1);
-                auto result = static_cast<logits_dtype_t>(sum.x + sum.y);
-
-                // Store into the global memory
-                const auto dst_offset = kv_offset + i * static_cast<uint64_t>(logits_stride);
-                if constexpr(sizeof(logits_dtype_t) == 2) {
-                    // Pack two adjacent bf16 lanes into uint32 for wider store
-                    uint16_t my_bits = *reinterpret_cast<const uint16_t*>(&result);
-                    uint16_t neighbor_bits = __shfl_down_sync(0xffffffff, my_bits, 1);
-                    uint32_t packed;
-                    asm volatile("mov.b32 %0, {%1, %2};" : "=r"(packed) : "h"(my_bits), "h"(neighbor_bits));
-                    if (lane_idx % 2 == 0)
-                        *reinterpret_cast<uint32_t*>(logits + dst_offset) = packed;
-                } else {
-                    logits[dst_offset] = result;
-                }
-                // this sync warp prevent the next load tmem from reordering
-                // nvcc may reorder it to overlap with the current tmem load, lead to large register usage
-                __syncwarp();
+            if constexpr (kIsVarlen) {
+                if (is_paired_atom)
+                    reduce_and_store(cute::Int<kNextNAtom>{});
+                else
+                    reduce_and_store(cute::Int<1>{});
+            } else if constexpr (kPadOddN) {
+                if (q_atom_idx % kNumNextNAtoms == kNumNextNAtoms - 1)
+                    reduce_and_store(cute::Int<1>{});
+                else
+                    reduce_and_store(cute::Int<kNextNAtom>{});
+            } else {
+                reduce_and_store(cute::Int<kNextNAtom>{});
             }
         }
 
