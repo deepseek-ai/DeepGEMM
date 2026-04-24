@@ -111,6 +111,11 @@ out_ij = out_ij.sum()  # Scalar
 
 For more details and the paged version `fp8_paged_mqa_logits`, please refer to `tests/test_attention.py`.
 
+#### W4Afp8
+- W4AFP8 (INT4-bit weight, FP8 activation) GEMM kernel for Hopper (SM90). Supports Normal GEMM, M-Grouped Contiguous GEMM, and M-Grouped Masked GEMM.
+
+- Algorithm compatible with https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8, but uses a custom weight layout (see `convert_fp8_to_int4` in `tests/generators.py`).
+
 #### Mega MoE
 
 Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:

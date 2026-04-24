@@ -17,6 +17,47 @@ CUTLASS_HOST_DEVICE longlong4_t make_longlong4_t(
 }
 #endif
 
+/// W4AFP8 helpers: permute_col, fast_int4_to_fp8_convert
+template <uint32_t COL_BYTES, uint32_t NV>
+CUTLASS_DEVICE auto permute_col(const uint32_t sRow, const uint32_t sCol) {
+    constexpr uint32_t strd = 128 / std::min(uint32_t(128), COL_BYTES);
+    const uint32_t pCol = (sCol / NV) ^ (sRow % 8 / strd);
+    return pCol * NV;
+}
+
+CUTLASS_DEVICE void fast_int4_to_fp8_convert(uint32_t outputs[2], uint32_t input) {
+    constexpr uint32_t neg0 = 0xcaccced0;
+    constexpr uint32_t neg1 = 0xb8c0c4c8;
+    constexpr uint32_t pos0 = 0x44403800;
+    constexpr uint32_t pos1 = 0x4e4c4a48;
+
+    constexpr uint32_t immLut = (0xf0 & 0xcc) | 0xaa;
+    uint32_t sign;
+    asm volatile(
+        "{\n"
+        "  lop3.b32 %0, %1, %2, %3, %4;\n"
+        "}\n"
+        : "=r"(sign)
+        : "r"(input), "n"(0x88888888), "n"(0x64206420), "n"(immLut));
+    sign = sign >> 1;
+
+    uint32_t lut_idx = input & 0x77777777;
+
+    #pragma unroll
+    for (int i = 0; i < 2; ++i, lut_idx >>= 16, sign >>= 16)
+    {
+        asm volatile(
+            "{\n"
+            "  .reg .b32 pos, neg                    ;\n"
+            "  prmt .b32 neg, %3, %4, %1             ;\n"
+            "  prmt .b32 pos, %5, %6, %1             ;\n"
+            "  prmt .b32 %0, pos, neg, %2            ;\n"
+            "}\n"
+            : "=r"(outputs[i])
+            : "r"(lut_idx), "r"(sign), "r"(neg0), "r"(neg1), "r"(pos0),"r"(pos1));
+    }
+}
+
 /// LD/ST matrix
 // TODO: remove `struct`
 struct SM90_U32x2_LDSM_N {
@@ -39,12 +80,18 @@ struct SM90_U32x4_LDSM_N {
 
 template <typename dtype_t>
 struct SM90_U32x2_STSM_N {
+    template<bool kIsW4 = false>
     CUTLASS_DEVICE static void
     copy(dtype_t src_0, dtype_t src_1, void* smem_dst) {
         DG_STATIC_ASSERT(sizeof(dtype_t) == sizeof(uint32_t), "Invalid dtype");
         const uint32_t src[2] = {*reinterpret_cast<uint32_t*>(&src_0), *reinterpret_cast<uint32_t*>(&src_1)};
-        asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16 [%0], {%1, %2};\n"
-                     :: "l"(__cvta_generic_to_shared(smem_dst)), "r"(src[0]), "r"(src[1]));
+        if constexpr (kIsW4) {
+            asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16.trans [%0], {%1, %2};\n"
+                         :: "l"(__cvta_generic_to_shared(smem_dst)), "r"(src[0]), "r"(src[1]));
+        } else {
+            asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16 [%0], {%1, %2};\n"
+                         :: "l"(__cvta_generic_to_shared(smem_dst)), "r"(src[0]), "r"(src[1]));
+        }
     }
 };
 
