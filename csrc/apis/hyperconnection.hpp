@@ -5,6 +5,7 @@
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp"
+#include "../jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp"
 #endif
 
 namespace deep_gemm::hyperconnection {
@@ -52,6 +53,8 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         sm90_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else if (arch_major == 10) {
         sm100_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
+    } else if (arch_major == 12) {
+        sm120_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
