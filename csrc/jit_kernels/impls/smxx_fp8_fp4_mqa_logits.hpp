@@ -46,7 +46,33 @@ public:
         DG_HOST_ASSERT(128 % args.num_heads == 0);
         const auto arch = device_runtime->get_arch(true);
 
-        return fmt::format(R"(
+        if (arch == "90") {
+            return fmt::format(R"(
+#include <deep_gemm/impls/sm{}_fp8_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm{}_fp8_mqa_logits<
+        {}, {},
+        {},
+        {}, {},
+        {}, {}, {},
+        {},
+        {}, {},
+        {}
+    >);
+}};
+)", arch, arch,
+    args.num_heads, args.head_dim,
+    args.is_compressed_logits,
+    args.block_q, args.block_kv,
+    args.num_q_stages, args.num_kv_stages, 3,
+    args.launch_args.grid_dim.first,
+    args.num_specialized_threads, args.num_math_threads,
+    to_string(args.logits_dtype));
+        } else {
+            return fmt::format(R"(
 #include <deep_gemm/impls/sm{}_fp8_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -70,6 +96,7 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first,
     args.num_specialized_threads, args.num_math_threads,
     to_string(args.logits_dtype));
+        }
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -97,7 +124,8 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                 const int& block_q, const int& block_kv) {
     constexpr int num_specialized_threads = 128;
     constexpr int num_q_stages = 3, num_kv_stages = 3;
-    const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
+    const int num_math_threads = get_env("DG_OVERLAP_3WG", 0) ? 384 :
+                                 (device_runtime->get_arch_major() == 10 ? 256 : 512);
 
     // Use compressed logits format when max_seqlen_k is specified
     const bool is_compressed_logits = (max_seqlen_k > 0);
@@ -117,6 +145,9 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                                      num_heads, block_q, num_heads, 0);
 
     // Calculate shared memory size
+    const bool is_ws = (device_runtime->get_arch_major() == 9);
+    constexpr int num_epi_stages = 3;
+    constexpr int num_epi_threads = 128;
     int smem_size = 0;
     const int smem_q_size_per_stage = block_q * num_heads * head_dim * static_cast<int>(q.element_size());
     const int smem_weight_size_per_stage = block_q * num_heads * static_cast<int>(weights.element_size());
@@ -126,7 +157,12 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     smem_size += num_kv_stages * smem_kv_size_per_stage;
     smem_size += num_q_stages * smem_weight_size_per_stage;
     smem_size += num_kv_stages * kv_scale_size_per_stage;
-    smem_size += (num_q_stages * 2 + num_kv_stages * 2 + (num_math_threads / 128) * 2) * 8;
+    if (is_ws) {
+        smem_size += num_epi_stages * block_kv * (block_q * 4 + 1) * static_cast<int>(weights.element_size());
+        smem_size += (num_q_stages * 2 + num_kv_stages * 2 + num_epi_stages * 2) * 8;
+    } else {
+        smem_size += (num_q_stages * 2 + num_kv_stages * 2 + (num_math_threads / 128) * 2) * 8;
+    }
     smem_size += 4;
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
@@ -154,7 +190,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
         .num_specialized_threads = num_specialized_threads,
         .num_math_threads = num_math_threads,
         .launch_args = LaunchArgs(device_runtime->get_num_sms(),
-                                  num_specialized_threads + num_math_threads,
+                                  num_specialized_threads + num_math_threads + (is_ws ? num_epi_threads : 0),
                                   smem_size)
     };
     const auto code = SMXXFP8MQALogitsRuntime::generate(args);
