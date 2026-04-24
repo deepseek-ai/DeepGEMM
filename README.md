@@ -1,10 +1,32 @@
 # DeepGEMM
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GitHub stars](https://img.shields.io/github/stars/deepseek-ai/DeepGEMM)](https://github.com/deepseek-ai/DeepGEMM/stargazers)
+[![GitHub last commit](https://img.shields.io/github/last-commit/deepseek-ai/DeepGEMM)](https://github.com/deepseek-ai/DeepGEMM/commits/main)
+
 DeepGEMM is a unified, high-performance tensor core kernel library that brings together the key computation primitives of modern large language models — GEMMs (FP8, FP4, BF16), fused MoE with overlapped communication (Mega MoE), MQA scoring for the lightning indexer, HyperConnection (HC), and more — into a single, cohesive CUDA codebase. All kernels are compiled at runtime via a lightweight Just-In-Time (JIT) module, requiring no CUDA compilation during installation.
 
 DeepGEMM leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), but avoids heavy reliance on their templates or algebras. The library is designed for simplicity, with only a limited number of core kernel functions, making it a clean and accessible resource for learning NVIDIA GPU kernel optimization techniques.
 
 Despite its lightweight design, DeepGEMM's performance matches or exceeds expert-tuned libraries across various matrix shapes.
+
+## Table of Contents
+
+- [News](#news)
+- [Quick Start](#quick-start)
+  - [Requirements](#requirements)
+  - [Development](#development)
+  - [Installation](#installation)
+- [Interfaces](#interfaces)
+  - [Normal Dense GEMMs](#normal-dense-gemms-non-grouped)
+  - [Grouped GEMMs (Contiguous)](#grouped-gemms-contiguous-layout)
+  - [Grouped GEMMs (Masked)](#grouped-gemms-masked-layout)
+  - [V3.2 MQA Kernels](#v32-mqa-kernels-for-the-indexer)
+  - [Mega MoE](#mega-moe)
+  - [Utilities](#utilities)
+- [Acknowledgement](#acknowledgement)
+- [License](#license)
+- [Citation](#citation)
 
 ## News
 
