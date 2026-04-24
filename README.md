@@ -35,7 +35,7 @@ DeepSeek-V4-Pro has 384 experts with top-k=6, a hidden dimension of 7168, and an
 ## News
 
 - 2026.04.16: Mega MoE, FP8xFP4 GEMM, FP4 Indexer, PDL, faster JIT compilation and more.
-    - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) and [#313](https://github.com/deepseek-ai/DeepGEMM/pull/313) for more details.
+    - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) and [#316](https://github.com/deepseek-ai/DeepGEMM/pull/316) for more details.
 - 2025.09.28: DeepGEMM now supports scoring kernels (weighted ReLU MQA logits) for the lightning indexer for DeepSeek v3.2.
     - Please see [#200](https://github.com/deepseek-ai/DeepGEMM/pull/200) for more details.
 - 2025.07.20: DeepGEMM now supports both SM90/SM100, and has a full refactor with a low-CPU-overhead JIT CPP module.
