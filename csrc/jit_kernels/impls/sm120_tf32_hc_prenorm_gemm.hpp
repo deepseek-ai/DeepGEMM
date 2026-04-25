@@ -81,6 +81,7 @@ static void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     // Only support small N for now
     DG_HOST_ASSERT(n <= 32 and n % 8 == 0);
     DG_HOST_ASSERT(k % block_k == 0);
+    DG_HOST_ASSERT(num_splits >= 1 and num_splits <= k / block_k);
 
     const auto swizzle_cd_mode = get_swizzle_mode(block_n, sizeof(float));
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,

@@ -2,6 +2,7 @@ import torch
 
 import deep_gemm
 from deep_gemm.testing import calc_diff, get_arch_major, test_filter as _test_filter
+from deep_gemm.utils.math import ceil_div, per_block_cast_to_fp8, per_token_cast_to_fp8
 
 
 def _cast_kv_cache_to_fp8(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -56,7 +57,7 @@ def _paged_mqa_reference(
 def test_sm120_hc_prenorm_gemm_kernel_path() -> None:
     torch.manual_seed(0)
 
-    m, n, k = 5, 8, 64
+    m, n, k = 5, 8, 256
     a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     b = torch.randn((n, k), dtype=torch.float32, device="cuda")
     for num_splits in (None, 3):
@@ -126,3 +127,105 @@ def test_sm120_fp8_paged_mqa_logits_reference_path() -> None:
         diff = calc_diff(logits.float()[valid_mask], expected[valid_mask])
         threshold = 1e-6 if logits_dtype == torch.float32 else 2e-6
         assert diff < threshold, f"{logits_dtype=}, {diff=}"
+
+
+@_test_filter(lambda: get_arch_major() >= 12)
+def test_sm120_fp8_paged_mqa_logits_varlen_reference_path() -> None:
+    torch.manual_seed(2)
+
+    raw_batch_size, num_heads, head_dim = 3, 32, 32
+    block_kv = 32
+    max_context_len = 80
+    num_blocks = 8
+    tokens_per_seq = torch.tensor([1, 2, 1], device="cuda", dtype=torch.int32)
+    indices = torch.arange(raw_batch_size, device="cuda", dtype=torch.int32)
+    indices = indices.repeat_interleave(tokens_per_seq)
+    batch_size = int(tokens_per_seq.sum().item())
+    next_n = 1
+
+    base_context_lens = torch.tensor([11, 19, 7], device="cuda", dtype=torch.int32)
+    offsets = torch.cat([
+        torch.arange(int(token_count.item()), device="cuda", dtype=torch.int32)
+        for token_count in tokens_per_seq
+    ])
+    context_lens = (base_context_lens.repeat_interleave(tokens_per_seq) + offsets).view(-1, 1)
+
+    q = torch.randn(
+        (batch_size, next_n, num_heads, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    q_simulated = q_fp8.float()
+    kv_cache = torch.randn((num_blocks, block_kv, 1, head_dim), device="cuda", dtype=torch.bfloat16)
+    fused_kv_cache, kv_simulated = _cast_kv_cache_to_fp8(kv_cache)
+    weights = torch.randn((batch_size * next_n, num_heads), device="cuda", dtype=torch.float32)
+
+    base_block_table = torch.tensor(
+        [
+            [0, 1, 2],
+            [3, 4, 5],
+            [6, 7, 0],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_table = base_block_table.repeat_interleave(tokens_per_seq, dim=0)
+
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens,
+        block_kv,
+        deep_gemm.get_num_sms(),
+        indices=indices,
+    )
+    expected = _paged_mqa_reference(
+        q_simulated,
+        kv_simulated,
+        weights,
+        context_lens,
+        block_table,
+        max_context_len,
+    )
+    logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+        q=(q_fp8, None),
+        kv_cache=fused_kv_cache,
+        weights=weights,
+        context_lens=context_lens,
+        block_table=block_table,
+        schedule_meta=schedule_meta,
+        max_context_len=max_context_len,
+        clean_logits=False,
+        logits_dtype=torch.float32,
+        indices=indices,
+    )
+
+    valid_mask = torch.arange(max_context_len, device="cuda").unsqueeze(0) < context_lens
+    diff = calc_diff(logits.float()[valid_mask], expected[valid_mask])
+    assert diff < 1e-6, f"{diff=}"
+
+
+@_test_filter(lambda: get_arch_major() >= 12)
+def test_sm120_fp8_einsum_reference_path() -> None:
+    torch.manual_seed(3)
+
+    batch_size, num_heads, rank, output_dim = 3, 4, 256, 128
+    x = torch.randn((batch_size, num_heads, rank), device="cuda", dtype=torch.bfloat16)
+    y = torch.randn((num_heads, output_dim, rank), device="cuda", dtype=torch.bfloat16)
+    expected = torch.einsum("bhr,hdr->bhd", x, y)
+
+    x_fp8, x_sf = per_token_cast_to_fp8(x.view(-1, rank), use_ue8m0=False)
+    x_in = x_fp8.view(batch_size, num_heads, rank), x_sf.view(batch_size, num_heads, ceil_div(rank, 128))
+    y_fp8 = torch.empty_like(y, dtype=torch.float8_e4m3fn)
+    y_sf = torch.empty(
+        (num_heads, ceil_div(output_dim, 128), ceil_div(rank, 128)),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    for head_idx in range(num_heads):
+        y_fp8[head_idx], y_sf[head_idx] = per_block_cast_to_fp8(y[head_idx], use_ue8m0=False)
+
+    actual = torch.empty((batch_size, num_heads, output_dim), device="cuda", dtype=torch.bfloat16)
+    deep_gemm.fp8_einsum("bhr,hdr->bhd", x_in, (y_fp8, y_sf), actual)
+
+    diff = calc_diff(actual, expected)
+    assert diff < 1e-3, f"{diff=}"
