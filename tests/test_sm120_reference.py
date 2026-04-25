@@ -201,7 +201,10 @@ def test_sm120_fp8_paged_mqa_logits_v4_shape_reference_path() -> None:
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
-@pytest.mark.parametrize("token_groups, cache_q", ((1, False), (2, False), (4, False), (8, False), (4, True)))
+@pytest.mark.parametrize(
+    "token_groups, cache_q",
+    ((1, False), (2, False), (4, False), (8, False), (2, True), (4, True), (8, True)),
+)
 def test_sm120_fp8_paged_mqa_logits_tiled_path(monkeypatch, token_groups: int, cache_q: bool) -> None:
     torch.manual_seed(5)
     monkeypatch.setenv("DG_SM120_PAGED_MQA_TILED", "1")

@@ -154,79 +154,157 @@ void sm120_fp8_paged_mqa_logits_mma_tiled(
         cute::SM120_16x8x32_TN<Element, Element, Accumulator>{});
     auto thread_mma = tiled_mma.get_slice(lane_idx);
 
-    if constexpr (kCacheQ and kTokenGroups == 4) {
-        auto score_tile0 = cute::make_tensor(
-            cute::make_smem_ptr(shared_scores + warp_idx * kHeadsPerWarp * kTokensPerCta),
-            cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kTokensPerTile>{}),
-            cute::make_stride(cute::Int<kTokensPerCta>{}, cute::Int<1>{}));
-        auto score_tile1 = cute::make_tensor(
-            cute::make_smem_ptr(shared_scores + warp_idx * kHeadsPerWarp * kTokensPerCta + kTokensPerTile),
-            cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kTokensPerTile>{}),
-            cute::make_stride(cute::Int<kTokensPerCta>{}, cute::Int<1>{}));
-        auto score_tile2 = cute::make_tensor(
-            cute::make_smem_ptr(shared_scores + warp_idx * kHeadsPerWarp * kTokensPerCta + 2 * kTokensPerTile),
-            cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kTokensPerTile>{}),
-            cute::make_stride(cute::Int<kTokensPerCta>{}, cute::Int<1>{}));
-        auto score_tile3 = cute::make_tensor(
-            cute::make_smem_ptr(shared_scores + warp_idx * kHeadsPerWarp * kTokensPerCta + 3 * kTokensPerTile),
-            cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kTokensPerTile>{}),
-            cute::make_stride(cute::Int<kTokensPerCta>{}, cute::Int<1>{}));
+    if constexpr (kCacheQ and (kTokenGroups == 2 or kTokenGroups == 4 or kTokenGroups == 8)) {
+        auto make_score_tile = [&](auto token_group) {
+            constexpr uint32_t kGroup = decltype(token_group)::value;
+            return cute::make_tensor(
+                cute::make_smem_ptr(
+                    shared_scores +
+                    warp_idx * kHeadsPerWarp * kTokensPerCta +
+                    kGroup * kTokensPerTile),
+                cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kTokensPerTile>{}),
+                cute::make_stride(cute::Int<kTokensPerCta>{}, cute::Int<1>{}));
+        };
+
+        auto score_tile0 = make_score_tile(cute::Int<0>{});
+        auto score_tile1 = make_score_tile(cute::Int<1>{});
         auto tCgC0 = thread_mma.partition_C(score_tile0);
         auto tCgC1 = thread_mma.partition_C(score_tile1);
-        auto tCgC2 = thread_mma.partition_C(score_tile2);
-        auto tCgC3 = thread_mma.partition_C(score_tile3);
         auto tCrC0 = thread_mma.make_fragment_C(tCgC0);
         auto tCrC1 = thread_mma.make_fragment_C(tCgC1);
-        auto tCrC2 = thread_mma.make_fragment_C(tCgC2);
-        auto tCrC3 = thread_mma.make_fragment_C(tCgC3);
         cute::clear(tCrC0);
         cute::clear(tCrC1);
-        cute::clear(tCrC2);
-        cute::clear(tCrC3);
 
-        #pragma unroll
-        for (uint32_t dim_idx = 0; dim_idx < kHeadDim; dim_idx += kMmaK) {
-            const auto q_tile = reinterpret_cast<const uint8_t*>(
-                q_base + (warp_idx * kHeadsPerWarp) * q_head_stride + dim_idx);
-            auto q_tensor = cute::make_tensor(
-                cute::make_gmem_ptr(q_tile),
-                cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kMmaK>{}),
-                cute::make_stride(q_head_stride, cute::Int<1>{}));
-            auto tAgA = thread_mma.partition_A(q_tensor);
-            auto tArA = thread_mma.partition_fragment_A(q_tensor);
-            cute::copy(tAgA, tArA);
+        auto accumulate_group = [&](const uint32_t dim_idx, const auto& tArA, auto token_group, auto& tCrC) {
+            constexpr uint32_t kGroup = decltype(token_group)::value;
+            const auto group_token_start = token_tile_start + kGroup * kTokensPerTile;
+            if (group_token_start >= context_len or group_token_start >= logits_stride)
+                return;
 
-            auto accumulate_group = [&](auto token_group, auto& tCrC) {
-                constexpr uint32_t kGroup = decltype(token_group)::value;
-                const auto group_token_start = token_tile_start + kGroup * kTokensPerTile;
-                if (group_token_start >= context_len or group_token_start >= logits_stride)
-                    return;
+            const auto logical_block_idx = group_token_start / BLOCK_KV;
+            const auto token_in_block = group_token_start - logical_block_idx * BLOCK_KV;
+            const auto kv_block_idx = block_table[
+                batch_idx * static_cast<uint64_t>(block_table_stride) + logical_block_idx];
+            const auto kv_base = kv_cache + kv_block_idx * kv_block_stride + token_in_block * kv_token_stride;
+            const auto kv_tile = reinterpret_cast<const uint8_t*>(kv_base + dim_idx);
+            auto kv_tensor = cute::make_tensor(
+                cute::make_gmem_ptr(kv_tile),
+                cute::make_shape(cute::Int<kTokensPerTile>{}, cute::Int<kMmaK>{}),
+                cute::make_stride(kv_token_stride, cute::Int<1>{}));
+            auto tBgB = thread_mma.partition_B(kv_tensor);
+            auto tBrB = thread_mma.partition_fragment_B(kv_tensor);
+            cute::copy(tBgB, tBrB);
+            cute::gemm(tiled_mma, tArA, tBrB, tCrC);
+        };
 
-                const auto logical_block_idx = group_token_start / BLOCK_KV;
-                const auto token_in_block = group_token_start - logical_block_idx * BLOCK_KV;
-                const auto kv_block_idx = block_table[
-                    batch_idx * static_cast<uint64_t>(block_table_stride) + logical_block_idx];
-                const auto kv_base = kv_cache + kv_block_idx * kv_block_stride + token_in_block * kv_token_stride;
-                const auto kv_tile = reinterpret_cast<const uint8_t*>(kv_base + dim_idx);
-                auto kv_tensor = cute::make_tensor(
-                    cute::make_gmem_ptr(kv_tile),
-                    cute::make_shape(cute::Int<kTokensPerTile>{}, cute::Int<kMmaK>{}),
-                    cute::make_stride(kv_token_stride, cute::Int<1>{}));
-                auto tBgB = thread_mma.partition_B(kv_tensor);
-                auto tBrB = thread_mma.partition_fragment_B(kv_tensor);
-                cute::copy(tBgB, tBrB);
-                cute::gemm(tiled_mma, tArA, tBrB, tCrC);
-            };
-            accumulate_group(cute::Int<0>{}, tCrC0);
-            accumulate_group(cute::Int<1>{}, tCrC1);
-            accumulate_group(cute::Int<2>{}, tCrC2);
-            accumulate_group(cute::Int<3>{}, tCrC3);
+        if constexpr (kTokenGroups == 2) {
+            #pragma unroll
+            for (uint32_t dim_idx = 0; dim_idx < kHeadDim; dim_idx += kMmaK) {
+                const auto q_tile = reinterpret_cast<const uint8_t*>(
+                    q_base + (warp_idx * kHeadsPerWarp) * q_head_stride + dim_idx);
+                auto q_tensor = cute::make_tensor(
+                    cute::make_gmem_ptr(q_tile),
+                    cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kMmaK>{}),
+                    cute::make_stride(q_head_stride, cute::Int<1>{}));
+                auto tAgA = thread_mma.partition_A(q_tensor);
+                auto tArA = thread_mma.partition_fragment_A(q_tensor);
+                cute::copy(tAgA, tArA);
+
+                accumulate_group(dim_idx, tArA, cute::Int<0>{}, tCrC0);
+                accumulate_group(dim_idx, tArA, cute::Int<1>{}, tCrC1);
+            }
+
+            cute::copy(tCrC0, tCgC0);
+            cute::copy(tCrC1, tCgC1);
+        } else if constexpr (kTokenGroups == 4) {
+            auto score_tile2 = make_score_tile(cute::Int<2>{});
+            auto score_tile3 = make_score_tile(cute::Int<3>{});
+            auto tCgC2 = thread_mma.partition_C(score_tile2);
+            auto tCgC3 = thread_mma.partition_C(score_tile3);
+            auto tCrC2 = thread_mma.make_fragment_C(tCgC2);
+            auto tCrC3 = thread_mma.make_fragment_C(tCgC3);
+            cute::clear(tCrC2);
+            cute::clear(tCrC3);
+
+            #pragma unroll
+            for (uint32_t dim_idx = 0; dim_idx < kHeadDim; dim_idx += kMmaK) {
+                const auto q_tile = reinterpret_cast<const uint8_t*>(
+                    q_base + (warp_idx * kHeadsPerWarp) * q_head_stride + dim_idx);
+                auto q_tensor = cute::make_tensor(
+                    cute::make_gmem_ptr(q_tile),
+                    cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kMmaK>{}),
+                    cute::make_stride(q_head_stride, cute::Int<1>{}));
+                auto tAgA = thread_mma.partition_A(q_tensor);
+                auto tArA = thread_mma.partition_fragment_A(q_tensor);
+                cute::copy(tAgA, tArA);
+
+                accumulate_group(dim_idx, tArA, cute::Int<0>{}, tCrC0);
+                accumulate_group(dim_idx, tArA, cute::Int<1>{}, tCrC1);
+                accumulate_group(dim_idx, tArA, cute::Int<2>{}, tCrC2);
+                accumulate_group(dim_idx, tArA, cute::Int<3>{}, tCrC3);
+            }
+
+            cute::copy(tCrC0, tCgC0);
+            cute::copy(tCrC1, tCgC1);
+            cute::copy(tCrC2, tCgC2);
+            cute::copy(tCrC3, tCgC3);
+        } else {
+            auto score_tile2 = make_score_tile(cute::Int<2>{});
+            auto score_tile3 = make_score_tile(cute::Int<3>{});
+            auto score_tile4 = make_score_tile(cute::Int<4>{});
+            auto score_tile5 = make_score_tile(cute::Int<5>{});
+            auto score_tile6 = make_score_tile(cute::Int<6>{});
+            auto score_tile7 = make_score_tile(cute::Int<7>{});
+            auto tCgC2 = thread_mma.partition_C(score_tile2);
+            auto tCgC3 = thread_mma.partition_C(score_tile3);
+            auto tCgC4 = thread_mma.partition_C(score_tile4);
+            auto tCgC5 = thread_mma.partition_C(score_tile5);
+            auto tCgC6 = thread_mma.partition_C(score_tile6);
+            auto tCgC7 = thread_mma.partition_C(score_tile7);
+            auto tCrC2 = thread_mma.make_fragment_C(tCgC2);
+            auto tCrC3 = thread_mma.make_fragment_C(tCgC3);
+            auto tCrC4 = thread_mma.make_fragment_C(tCgC4);
+            auto tCrC5 = thread_mma.make_fragment_C(tCgC5);
+            auto tCrC6 = thread_mma.make_fragment_C(tCgC6);
+            auto tCrC7 = thread_mma.make_fragment_C(tCgC7);
+            cute::clear(tCrC2);
+            cute::clear(tCrC3);
+            cute::clear(tCrC4);
+            cute::clear(tCrC5);
+            cute::clear(tCrC6);
+            cute::clear(tCrC7);
+
+            #pragma unroll
+            for (uint32_t dim_idx = 0; dim_idx < kHeadDim; dim_idx += kMmaK) {
+                const auto q_tile = reinterpret_cast<const uint8_t*>(
+                    q_base + (warp_idx * kHeadsPerWarp) * q_head_stride + dim_idx);
+                auto q_tensor = cute::make_tensor(
+                    cute::make_gmem_ptr(q_tile),
+                    cute::make_shape(cute::Int<kHeadsPerWarp>{}, cute::Int<kMmaK>{}),
+                    cute::make_stride(q_head_stride, cute::Int<1>{}));
+                auto tAgA = thread_mma.partition_A(q_tensor);
+                auto tArA = thread_mma.partition_fragment_A(q_tensor);
+                cute::copy(tAgA, tArA);
+
+                accumulate_group(dim_idx, tArA, cute::Int<0>{}, tCrC0);
+                accumulate_group(dim_idx, tArA, cute::Int<1>{}, tCrC1);
+                accumulate_group(dim_idx, tArA, cute::Int<2>{}, tCrC2);
+                accumulate_group(dim_idx, tArA, cute::Int<3>{}, tCrC3);
+                accumulate_group(dim_idx, tArA, cute::Int<4>{}, tCrC4);
+                accumulate_group(dim_idx, tArA, cute::Int<5>{}, tCrC5);
+                accumulate_group(dim_idx, tArA, cute::Int<6>{}, tCrC6);
+                accumulate_group(dim_idx, tArA, cute::Int<7>{}, tCrC7);
+            }
+
+            cute::copy(tCrC0, tCgC0);
+            cute::copy(tCrC1, tCgC1);
+            cute::copy(tCrC2, tCgC2);
+            cute::copy(tCrC3, tCgC3);
+            cute::copy(tCrC4, tCgC4);
+            cute::copy(tCrC5, tCgC5);
+            cute::copy(tCrC6, tCgC6);
+            cute::copy(tCrC7, tCgC7);
         }
-
-        cute::copy(tCrC0, tCgC0);
-        cute::copy(tCrC1, tCgC1);
-        cute::copy(tCrC2, tCgC2);
-        cute::copy(tCrC3, tCgC3);
     } else {
         #pragma unroll
         for (uint32_t token_group = 0; token_group < kTokenGroups; ++token_group) {

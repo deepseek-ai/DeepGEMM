@@ -343,7 +343,7 @@ static void sm120_fp8_paged_mqa_logits_reference(const torch::Tensor& q,
     };
     const bool use_tiled = get_env<int>("DG_SM120_PAGED_MQA_TILED", 0) != 0;
     if (use_tiled and num_heads == 64 and head_dim == 128 and block_kv == 64 and logits_dtype == torch::kFloat32) {
-        const int token_groups = get_env<int>("DG_SM120_PAGED_MQA_TILED_GROUPS", 4);
+        const int token_groups = get_env<int>("DG_SM120_PAGED_MQA_TILED_GROUPS", 8);
         DG_HOST_ASSERT(token_groups == 1 or token_groups == 2 or token_groups == 4 or token_groups == 8);
         constexpr int tiled_token_tile = 8;
         constexpr int tiled_num_threads = 128;
@@ -351,11 +351,11 @@ static void sm120_fp8_paged_mqa_logits_reference(const torch::Tensor& q,
         const int tiled_smem_size = 64 * tokens_per_tiled_cta * sizeof(float);
         auto tiled_args = args;
         tiled_args.token_groups = token_groups;
-        const bool should_cache_q_by_default = token_groups == 4;
+        const bool should_cache_q_by_default = token_groups != 1;
         tiled_args.cache_q = get_env<int>(
             "DG_SM120_PAGED_MQA_TILED_CACHE_Q",
             should_cache_q_by_default ? 1 : 0) != 0;
-        DG_HOST_ASSERT(not tiled_args.cache_q or token_groups == 4);
+        DG_HOST_ASSERT(not tiled_args.cache_q or token_groups == 2 or token_groups == 4 or token_groups == 8);
         tiled_args.launch_args = LaunchArgs(
             std::make_pair(batch_size * next_n, ceil_div(logits_stride, tokens_per_tiled_cta)),
             tiled_num_threads,
