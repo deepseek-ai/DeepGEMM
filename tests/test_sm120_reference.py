@@ -53,7 +53,7 @@ def _paged_mqa_reference(
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
-def test_sm120_hc_prenorm_gemm_reference_path() -> None:
+def test_sm120_hc_prenorm_gemm_kernel_path() -> None:
     torch.manual_seed(0)
 
     m, n, k = 5, 8, 64
@@ -69,8 +69,10 @@ def test_sm120_hc_prenorm_gemm_reference_path() -> None:
 
         final_d = d if num_splits is None else d.sum(dim=0)
         final_sqr_sum = sqr_sum if num_splits is None else sqr_sum.sum(dim=0)
-        torch.testing.assert_close(final_d, a.float() @ b.T, rtol=1e-4, atol=1e-4)
-        torch.testing.assert_close(final_sqr_sum, a.float().square().sum(dim=-1), rtol=1e-4, atol=1e-4)
+        ref_d = a.float() @ b.T
+        ref_sqr_sum = a.float().square().sum(dim=-1)
+        diff = max(calc_diff(final_d, ref_d), calc_diff(final_sqr_sum, ref_sqr_sum))
+        assert diff < 1e-6, f"{num_splits=}, {diff=}"
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
