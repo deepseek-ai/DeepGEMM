@@ -276,3 +276,26 @@ def test_sm120_fp8_einsum_reference_path() -> None:
 
     diff = calc_diff(actual, expected)
     assert diff < 1e-3, f"{diff=}"
+
+
+@_test_filter(lambda: get_arch_major() >= 12)
+def test_sm120_fp8_einsum_v4_shape_reference_path() -> None:
+    torch.manual_seed(5)
+
+    batch_size, num_heads, rank, output_dim = 5, 64, 128, 128
+    x = torch.randn((batch_size, num_heads, rank), device="cuda", dtype=torch.bfloat16)
+    y = torch.randn((num_heads, output_dim, rank), device="cuda", dtype=torch.bfloat16)
+    expected = torch.einsum("bhr,hdr->bhd", x, y)
+
+    x_fp8, x_sf = per_token_cast_to_fp8(x.view(-1, rank), use_ue8m0=False)
+    x_in = x_fp8.view(batch_size, num_heads, rank), x_sf.view(batch_size, num_heads, 1)
+    y_fp8 = torch.empty_like(y, dtype=torch.float8_e4m3fn)
+    y_sf = torch.empty((num_heads, 1, 1), device="cuda", dtype=torch.float32)
+    for head_idx in range(num_heads):
+        y_fp8[head_idx], y_sf[head_idx] = per_block_cast_to_fp8(y[head_idx], use_ue8m0=False)
+
+    actual = torch.empty((batch_size, num_heads, output_dim), device="cuda", dtype=torch.bfloat16)
+    deep_gemm.fp8_einsum("bhr,hdr->bhd", x_in, (y_fp8, y_sf), actual)
+
+    diff = calc_diff(actual, expected)
+    assert diff < 1e-3, f"{diff=}"
