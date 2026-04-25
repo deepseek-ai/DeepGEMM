@@ -14,6 +14,7 @@
 #include "../jit_kernels/impls/sm100_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_fp8_einsum.hpp"
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 #endif
 
@@ -186,6 +187,13 @@ static void fp8_einsum(const std::string& expr,
     // Some hardcoded Einstein sum kernels
     const auto arch_major = device_runtime->get_arch_major();
     if (expr == "bhr,hdr->bhd") {
+        if (arch_major == 12) {
+            DG_HOST_ASSERT(not c.has_value());
+            DG_HOST_ASSERT(recipe == std::make_tuple(1, 128, 128));
+            sm120_fp8_bhr_hdr_bhd_reference(a.first, a.second, b.first, b.second, d);
+            return;
+        }
+
         // Permute dims to satisfy the order of (batch_size, m, n, k)
         // (batch_size, m, n, k): (h, b, d, r)
         const auto perm_a = a.first.permute({1, 0, 2});
