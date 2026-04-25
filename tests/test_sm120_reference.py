@@ -77,6 +77,28 @@ def test_sm120_hc_prenorm_gemm_kernel_path() -> None:
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
+def test_sm120_hc_prenorm_gemm_larger_tiles() -> None:
+    torch.manual_seed(6)
+
+    for m, n, k, num_splits in (
+        (70, 16, 512, 2),
+        (70, 32, 512, 4),
+        (129, 32, 1024, 4),
+    ):
+        a = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+        b = torch.randn((n, k), dtype=torch.float32, device="cuda")
+        d = torch.empty((num_splits, m, n), dtype=torch.float32, device="cuda")
+        sqr_sum = torch.empty((num_splits, m), dtype=torch.float32, device="cuda")
+
+        deep_gemm.tf32_hc_prenorm_gemm(a, b, d, sqr_sum, num_splits=num_splits)
+
+        ref_d = a.float() @ b.T
+        ref_sqr_sum = a.float().square().sum(dim=-1)
+        diff = max(calc_diff(d.sum(dim=0), ref_d), calc_diff(sqr_sum.sum(dim=0), ref_sqr_sum))
+        assert diff < 1e-6, f"{m=}, {n=}, {k=}, {num_splits=}, {diff=}"
+
+
+@_test_filter(lambda: get_arch_major() >= 12)
 def test_sm120_fp8_paged_mqa_logits_reference_path() -> None:
     torch.manual_seed(1)
 
