@@ -8,6 +8,26 @@
 
 namespace deep_gemm {
 
+template <uint32_t kHeadDim>
+CUTLASS_DEVICE float sm120_fp8_dot_scaled(
+    const __nv_fp8_e4m3* q,
+    const __nv_fp8_e4m3* kv,
+    const float kv_scale) {
+    float score = 0.0f;
+    #pragma unroll
+    for (uint32_t dim_idx = 0; dim_idx < kHeadDim; dim_idx += 4) {
+        const auto q_values = static_cast<float4>(
+            *reinterpret_cast<const __nv_fp8x4_e4m3*>(q + dim_idx));
+        const auto kv_values = static_cast<float4>(
+            *reinterpret_cast<const __nv_fp8x4_e4m3*>(kv + dim_idx));
+        score = fmaf(q_values.x, kv_values.x * kv_scale, score);
+        score = fmaf(q_values.y, kv_values.y * kv_scale, score);
+        score = fmaf(q_values.z, kv_values.z * kv_scale, score);
+        score = fmaf(q_values.w, kv_values.w * kv_scale, score);
+    }
+    return score;
+}
+
 template <uint32_t kNumHeads, uint32_t kHeadDim, uint32_t BLOCK_KV,
           bool kIsContextLens2D, uint32_t kTokensPerBlock,
           typename logits_dtype_t>
@@ -59,13 +79,7 @@ void sm120_fp8_paged_mqa_logits_reference(
     #pragma unroll
     for (uint32_t head_idx = 0; head_idx < kNumHeads; ++head_idx) {
         const auto q_head = q_base + head_idx * q_head_stride;
-        float score = 0.0f;
-        #pragma unroll
-        for (uint32_t dim_idx = 0; dim_idx < kHeadDim; ++dim_idx) {
-            const auto q_value = static_cast<float>(q_head[dim_idx]);
-            const auto kv_value = static_cast<float>(kv_base[dim_idx]) * kv_scale;
-            score = fmaf(q_value, kv_value, score);
-        }
+        const auto score = sm120_fp8_dot_scaled<kHeadDim>(q_head, kv_base, kv_scale);
         total += fmaxf(score, 0.0f) * weight_base[head_idx];
     }
 
