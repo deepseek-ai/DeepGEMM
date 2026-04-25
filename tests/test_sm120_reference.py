@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 import deep_gemm
 from deep_gemm.testing import calc_diff, get_arch_major, test_filter as _test_filter
@@ -194,7 +195,60 @@ def test_sm120_fp8_paged_mqa_logits_v4_shape_reference_path() -> None:
         logits_dtype=torch.float32,
     )
 
-    diff = calc_diff(logits.float(), expected)
+    valid_mask = torch.arange(max_context_len, device="cuda").unsqueeze(0) < context_lens
+    diff = calc_diff(logits.float()[valid_mask], expected[valid_mask])
+    assert diff < 1e-6, f"{diff=}"
+
+
+@_test_filter(lambda: get_arch_major() >= 12)
+@pytest.mark.parametrize("token_groups, cache_q", ((1, False), (2, False), (4, False), (8, False), (4, True)))
+def test_sm120_fp8_paged_mqa_logits_tiled_path(monkeypatch, token_groups: int, cache_q: bool) -> None:
+    torch.manual_seed(5)
+    monkeypatch.setenv("DG_SM120_PAGED_MQA_TILED", "1")
+    monkeypatch.setenv("DG_SM120_PAGED_MQA_TILED_GROUPS", str(token_groups))
+    monkeypatch.setenv("DG_SM120_PAGED_MQA_TILED_CACHE_Q", "1" if cache_q else "0")
+
+    batch_size, next_n, num_heads, head_dim = 2, 1, 64, 128
+    block_kv = 64
+    max_context_len = 73
+    num_blocks = 4
+
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    q_simulated = q_fp8.float()
+    kv_cache = torch.randn((num_blocks, block_kv, 1, head_dim), device="cuda", dtype=torch.bfloat16)
+    fused_kv_cache, kv_simulated = _cast_kv_cache_to_fp8(kv_cache)
+    weights = torch.randn((batch_size * next_n, num_heads), device="cuda", dtype=torch.float32)
+    context_lens = torch.tensor([[max_context_len], [37]], device="cuda", dtype=torch.int32)
+    block_table = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int32)
+
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens,
+        block_kv,
+        deep_gemm.get_num_sms(),
+    )
+    expected = _paged_mqa_reference(
+        q_simulated,
+        kv_simulated,
+        weights,
+        context_lens,
+        block_table,
+        max_context_len,
+    )
+    logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+        q=(q_fp8, None),
+        kv_cache=fused_kv_cache,
+        weights=weights,
+        context_lens=context_lens,
+        block_table=block_table,
+        schedule_meta=schedule_meta,
+        max_context_len=max_context_len,
+        clean_logits=False,
+        logits_dtype=torch.float32,
+    )
+
+    valid_mask = torch.arange(max_context_len, device="cuda").unsqueeze(0) < context_lens
+    diff = calc_diff(logits.float()[valid_mask], expected[valid_mask])
     assert diff < 1e-6, f"{diff=}"
 
 

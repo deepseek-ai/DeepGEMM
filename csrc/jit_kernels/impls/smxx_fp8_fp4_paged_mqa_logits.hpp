@@ -178,6 +178,8 @@ public:
         int block_table_stride;
         int logits_stride;
         int tokens_per_block;
+        int token_groups;
+        bool cache_q;
 
         int64_t q_batch_stride;
         int64_t q_next_stride;
@@ -241,6 +243,55 @@ static void __instantiate_kernel() {{
     }
 };
 
+class SM120FP8PagedMQALogitsTiledRuntime final: public LaunchRuntime<SM120FP8PagedMQALogitsTiledRuntime> {
+public:
+    using Args = SM120FP8PagedMQALogitsReferenceRuntime::Args;
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm120_fp8_paged_mqa_logits_mma_tiled<
+        {},
+        {},
+        {},
+        {},
+        {}
+    >);
+}};
+)", args.block_kv, args.is_context_lens_2d ? "true" : "false",
+    args.token_groups,
+    args.cache_q ? "true" : "false",
+    to_string(args.logits_dtype));
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.batch_size,
+            args.next_n,
+            args.logits_stride,
+            args.block_table_stride,
+            args.q_batch_stride,
+            args.q_next_stride,
+            args.q_head_stride,
+            args.kv_block_stride,
+            args.kv_token_stride,
+            args.kv_scale_block_stride,
+            args.weights_row_stride,
+            args.q,
+            args.kv_cache,
+            args.kv_cache_scales,
+            args.weights,
+            args.context_lens,
+            args.logits,
+            args.block_table
+        ));
+    }
+};
+
 static void sm120_fp8_paged_mqa_logits_reference(const torch::Tensor& q,
                                                 const torch::Tensor& kv_cache,
                                                 const torch::Tensor& kv_cache_scales,
@@ -270,6 +321,8 @@ static void sm120_fp8_paged_mqa_logits_reference(const torch::Tensor& q,
         .block_table_stride = block_table_stride,
         .logits_stride = logits_stride,
         .tokens_per_block = tokens_per_block,
+        .token_groups = 1,
+        .cache_q = false,
         .q_batch_stride = q.stride(0),
         .q_next_stride = q.stride(1),
         .q_head_stride = q.stride(2),
@@ -288,6 +341,31 @@ static void sm120_fp8_paged_mqa_logits_reference(const torch::Tensor& q,
         .launch_args = LaunchArgs(std::make_pair(batch_size * next_n, ceil_div(logits_stride, tokens_per_block)),
                                   tokens_per_block)
     };
+    const bool use_tiled = get_env<int>("DG_SM120_PAGED_MQA_TILED", 0) != 0;
+    if (use_tiled and num_heads == 64 and head_dim == 128 and block_kv == 64 and logits_dtype == torch::kFloat32) {
+        const int token_groups = get_env<int>("DG_SM120_PAGED_MQA_TILED_GROUPS", 4);
+        DG_HOST_ASSERT(token_groups == 1 or token_groups == 2 or token_groups == 4 or token_groups == 8);
+        constexpr int tiled_token_tile = 8;
+        constexpr int tiled_num_threads = 128;
+        const int tokens_per_tiled_cta = tiled_token_tile * token_groups;
+        const int tiled_smem_size = 64 * tokens_per_tiled_cta * sizeof(float);
+        auto tiled_args = args;
+        tiled_args.token_groups = token_groups;
+        const bool should_cache_q_by_default = token_groups == 4;
+        tiled_args.cache_q = get_env<int>(
+            "DG_SM120_PAGED_MQA_TILED_CACHE_Q",
+            should_cache_q_by_default ? 1 : 0) != 0;
+        DG_HOST_ASSERT(not tiled_args.cache_q or token_groups == 4);
+        tiled_args.launch_args = LaunchArgs(
+            std::make_pair(batch_size * next_n, ceil_div(logits_stride, tokens_per_tiled_cta)),
+            tiled_num_threads,
+            tiled_smem_size);
+        const auto code = SM120FP8PagedMQALogitsTiledRuntime::generate(tiled_args);
+        const auto runtime = compiler->build("sm120_fp8_paged_mqa_logits_mma_tiled", code);
+        SM120FP8PagedMQALogitsTiledRuntime::launch(runtime, tiled_args);
+        return;
+    }
+
     const auto code = SM120FP8PagedMQALogitsReferenceRuntime::generate(args);
     const auto runtime = compiler->build("sm120_fp8_paged_mqa_logits_reference", code);
     SM120FP8PagedMQALogitsReferenceRuntime::launch(runtime, args);
