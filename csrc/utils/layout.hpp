@@ -67,7 +67,7 @@ get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& 
     if (arch_major == 9) {
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
-    } else if (arch_major == 10) {
+    } else if (arch_major == 10 or arch_major == 12) {
         DG_HOST_ASSERT(sfb_dtype == torch::kFloat or sfb_dtype == torch::kInt);
         return sfb_dtype == torch::kFloat ?
             std::make_tuple(1, 128, 128):   // Legacy format

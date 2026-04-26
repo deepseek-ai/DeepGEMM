@@ -8,6 +8,7 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #endif 
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
@@ -95,6 +96,9 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         }
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
+                                major_a, major_b, compiled_dims);
+    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+        sm120_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
