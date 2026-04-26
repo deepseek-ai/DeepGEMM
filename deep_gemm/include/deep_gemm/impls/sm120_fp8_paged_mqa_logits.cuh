@@ -35,7 +35,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim, uint32_t BLOCK_KV,
           bool kIsContextLens2D, uint32_t kTokensPerBlock,
           typename logits_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kTokensPerBlock, 1)
-void sm120_fp8_paged_mqa_logits_reference(
+void sm120_fp8_paged_mqa_logits_scalar(
     const uint32_t batch_size,
     const uint32_t next_n,
     const uint32_t logits_stride,

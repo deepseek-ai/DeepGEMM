@@ -73,7 +73,7 @@ CUTLASS_DEVICE float sm120_fp8_einsum_dot_fp8x4(
 }
 
 template <typename output_t, uint32_t kOutputTileD>
-CUTLASS_GLOBAL void sm120_fp8_bhr_hdr_bhd_reference(
+CUTLASS_GLOBAL void sm120_fp8_bhr_hdr_bhd_scalar(
     const uint32_t shape_b,
     const uint32_t shape_h,
     const uint32_t shape_d,

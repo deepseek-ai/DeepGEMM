@@ -69,7 +69,7 @@ static void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
                                        const int& m, const int& n, const int& k,
                                        const int& num_splits) {
 
-    // SM120 fallback uses the same small-N tile shape as the SM90 path.
+    // SM120 HC currently uses the same small-N tile shape as the SM90 path.
     constexpr int block_m = 64;
     constexpr int block_k = 64;
     constexpr int num_math_threads = 128;

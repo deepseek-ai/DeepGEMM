@@ -100,7 +100,7 @@ def test_sm120_hc_prenorm_gemm_larger_tiles() -> None:
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
-def test_sm120_fp8_paged_mqa_logits_reference_path() -> None:
+def test_sm120_fp8_paged_mqa_logits_scalar_path() -> None:
     torch.manual_seed(1)
 
     batch_size, next_n, num_heads, head_dim = 2, 2, 32, 32
@@ -153,7 +153,7 @@ def test_sm120_fp8_paged_mqa_logits_reference_path() -> None:
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
-def test_sm120_fp8_paged_mqa_logits_v4_shape_reference_path() -> None:
+def test_sm120_fp8_paged_mqa_logits_v4_shape_scalar_path() -> None:
     torch.manual_seed(4)
 
     batch_size, next_n, num_heads, head_dim = 1, 1, 64, 128
@@ -256,7 +256,7 @@ def test_sm120_fp8_paged_mqa_logits_tiled_path(monkeypatch, token_groups: int, c
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
-def test_sm120_fp8_paged_mqa_logits_varlen_reference_path() -> None:
+def test_sm120_fp8_paged_mqa_logits_varlen_scalar_path() -> None:
     torch.manual_seed(2)
 
     raw_batch_size, num_heads, head_dim = 3, 32, 32
@@ -331,7 +331,7 @@ def test_sm120_fp8_paged_mqa_logits_varlen_reference_path() -> None:
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
-def test_sm120_fp8_einsum_reference_path() -> None:
+def test_sm120_fp8_einsum_scalar_path() -> None:
     torch.manual_seed(3)
 
     batch_size, num_heads, rank, output_dim = 3, 4, 256, 128
@@ -358,7 +358,7 @@ def test_sm120_fp8_einsum_reference_path() -> None:
 
 
 @_test_filter(lambda: get_arch_major() >= 12)
-def test_sm120_fp8_einsum_v4_shape_reference_path() -> None:
+def test_sm120_fp8_einsum_v4_shape_scalar_path() -> None:
     torch.manual_seed(5)
 
     batch_size, num_heads, rank, output_dim = 5, 64, 128, 128

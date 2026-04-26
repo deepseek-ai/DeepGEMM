@@ -166,7 +166,7 @@ static void __instantiate_kernel() {{
     }
 };
 
-class SM120FP8PagedMQALogitsReferenceRuntime final: public LaunchRuntime<SM120FP8PagedMQALogitsReferenceRuntime> {
+class SM120FP8PagedMQALogitsScalarRuntime final: public LaunchRuntime<SM120FP8PagedMQALogitsScalarRuntime> {
 public:
     struct Args {
         int batch_size;
@@ -208,7 +208,7 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm120_fp8_paged_mqa_logits_reference<
+    auto ptr = reinterpret_cast<void*>(&sm120_fp8_paged_mqa_logits_scalar<
         {}, {}, {},
         {}, {},
         {}
@@ -245,7 +245,7 @@ static void __instantiate_kernel() {{
 
 class SM120FP8PagedMQALogitsTiledRuntime final: public LaunchRuntime<SM120FP8PagedMQALogitsTiledRuntime> {
 public:
-    using Args = SM120FP8PagedMQALogitsReferenceRuntime::Args;
+    using Args = SM120FP8PagedMQALogitsScalarRuntime::Args;
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
@@ -311,7 +311,7 @@ static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
     DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
     DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
 
-    const SM120FP8PagedMQALogitsReferenceRuntime::Args args = {
+    const SM120FP8PagedMQALogitsScalarRuntime::Args args = {
         .batch_size = batch_size,
         .next_n = next_n,
         .num_heads = num_heads,
@@ -366,9 +366,9 @@ static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
         return;
     }
 
-    const auto code = SM120FP8PagedMQALogitsReferenceRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp8_paged_mqa_logits_reference", code);
-    SM120FP8PagedMQALogitsReferenceRuntime::launch(runtime, args);
+    const auto code = SM120FP8PagedMQALogitsScalarRuntime::generate(args);
+    const auto runtime = compiler->build("sm120_fp8_paged_mqa_logits_scalar", code);
+    SM120FP8PagedMQALogitsScalarRuntime::launch(runtime, args);
 }
 
 static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,

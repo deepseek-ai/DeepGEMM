@@ -190,7 +190,7 @@ static void fp8_einsum(const std::string& expr,
         if (arch_major == 12) {
             DG_HOST_ASSERT(not c.has_value());
             DG_HOST_ASSERT(recipe == std::make_tuple(1, 128, 128));
-            sm120_fp8_bhr_hdr_bhd_reference(a.first, a.second, b.first, b.second, d);
+            sm120_fp8_bhr_hdr_bhd_scalar(a.first, a.second, b.first, b.second, d);
             return;
         }
 

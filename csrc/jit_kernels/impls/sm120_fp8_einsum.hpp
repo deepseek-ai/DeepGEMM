@@ -7,7 +7,7 @@
 
 namespace deep_gemm {
 
-class SM120FP8BhrHdrBhdReferenceRuntime final: public LaunchRuntime<SM120FP8BhrHdrBhdReferenceRuntime> {
+class SM120FP8BhrHdrBhdScalarRuntime final: public LaunchRuntime<SM120FP8BhrHdrBhdScalarRuntime> {
 public:
     struct Args {
         int shape_b;
@@ -49,7 +49,7 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm120_fp8_bhr_hdr_bhd_reference<
+    auto ptr = reinterpret_cast<void*>(&sm120_fp8_bhr_hdr_bhd_scalar<
         {}, {}
     >);
 }};
@@ -86,7 +86,7 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm120_fp8_bhr_hdr_bhd_reference(const torch::Tensor& a,
+static void sm120_fp8_bhr_hdr_bhd_scalar(const torch::Tensor& a,
                                             const torch::Tensor& sfa,
                                             const torch::Tensor& b,
                                             const torch::Tensor& sfb,
@@ -113,7 +113,7 @@ static void sm120_fp8_bhr_hdr_bhd_reference(const torch::Tensor& a,
 
     const int num_d_tiles = ceil_div(shape_d, output_tile_d);
     const int grid_dim = shape_b * shape_h * num_d_tiles;
-    const SM120FP8BhrHdrBhdReferenceRuntime::Args args = {
+    const SM120FP8BhrHdrBhdScalarRuntime::Args args = {
         .shape_b = shape_b,
         .shape_h = shape_h,
         .shape_d = shape_d,
@@ -141,9 +141,9 @@ static void sm120_fp8_bhr_hdr_bhd_reference(const torch::Tensor& a,
         .output_dtype = d.scalar_type(),
         .launch_args = LaunchArgs(grid_dim, output_tile_d)
     };
-    const auto code = SM120FP8BhrHdrBhdReferenceRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp8_bhr_hdr_bhd_reference", code);
-    SM120FP8BhrHdrBhdReferenceRuntime::launch(runtime, args);
+    const auto code = SM120FP8BhrHdrBhdScalarRuntime::generate(args);
+    const auto runtime = compiler->build("sm120_fp8_bhr_hdr_bhd_scalar", code);
+    SM120FP8BhrHdrBhdScalarRuntime::launch(runtime, args);
 }
 
 } // namespace deep_gemm
