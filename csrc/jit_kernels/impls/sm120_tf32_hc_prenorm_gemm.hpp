@@ -69,7 +69,7 @@ static void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
                                        const int& m, const int& n, const int& k,
                                        const int& num_splits) {
 
-    // Note: may need to change these later
+    // SM120 fallback uses the same small-N tile shape as the SM90 path.
     constexpr int block_m = 64;
     constexpr int block_k = 64;
     constexpr int num_math_threads = 128;
@@ -131,7 +131,7 @@ static void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
 
     smem_size = device_runtime->get_prop()->sharedMemPerBlockOptin;
 
-    const SM120BF16HCPrenormGemmRuntime::Args& args = {
+    const SM120BF16HCPrenormGemmRuntime::Args args = {
         .m = m, .n = n, .k = k,
         .block_m = block_m, .block_n = block_n, .block_k = block_k,
         .num_splits = num_splits,

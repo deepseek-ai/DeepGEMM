@@ -369,9 +369,9 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                    logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                    is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
     } else if (not is_fp4 and arch_major == 12) {
-        sm120_fp8_paged_mqa_logits_reference(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table,
-                                             logits_dtype, batch_size, next_n, num_heads, head_dim, block_kv,
-                                             is_context_lens_2d, aligned_max_context_len, block_table_stride);
+        sm120_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table,
+                                   logits_dtype, batch_size, next_n, num_heads, head_dim, block_kv,
+                                   is_context_lens_2d, aligned_max_context_len, block_table_stride);
     } else if (not is_fp4 and (arch_major == 9 or arch_major == 10)) {
         smxx_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                   logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,

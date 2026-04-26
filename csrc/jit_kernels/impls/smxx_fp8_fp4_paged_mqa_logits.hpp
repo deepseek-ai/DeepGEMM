@@ -292,20 +292,20 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void sm120_fp8_paged_mqa_logits_reference(const torch::Tensor& q,
-                                                const torch::Tensor& kv_cache,
-                                                const torch::Tensor& kv_cache_scales,
-                                                const torch::Tensor& weights,
-                                                const torch::Tensor& context_lens,
-                                                const torch::Tensor& logits,
-                                                const torch::Tensor& block_table,
-                                                const at::ScalarType& logits_dtype,
-                                                const int& batch_size, const int& next_n,
-                                                const int& num_heads, const int& head_dim,
-                                                const int& block_kv,
-                                                const bool& is_context_lens_2d,
-                                                const int& logits_stride,
-                                                const int& block_table_stride) {
+static void sm120_fp8_paged_mqa_logits(const torch::Tensor& q,
+                                       const torch::Tensor& kv_cache,
+                                       const torch::Tensor& kv_cache_scales,
+                                       const torch::Tensor& weights,
+                                       const torch::Tensor& context_lens,
+                                       const torch::Tensor& logits,
+                                       const torch::Tensor& block_table,
+                                       const at::ScalarType& logits_dtype,
+                                       const int& batch_size, const int& next_n,
+                                       const int& num_heads, const int& head_dim,
+                                       const int& block_kv,
+                                       const bool& is_context_lens_2d,
+                                       const int& logits_stride,
+                                       const int& block_table_stride) {
     constexpr int tokens_per_block = 128;
     DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
     DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
