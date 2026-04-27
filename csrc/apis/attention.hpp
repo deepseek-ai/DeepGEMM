@@ -392,6 +392,75 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
                               clean_logits, max_seqlen_k, torch::kFloat);
 }
 
+static torch::Tensor fp8_mqa_logits_2cta(const torch::Tensor& q,
+                                         const std::tuple<torch::Tensor, torch::Tensor>& kv,
+                                         const torch::Tensor& weights,
+                                         const torch::Tensor& cu_seq_len_k_start_and_end,
+                                         const bool& clean_logits,
+                                         const int& max_seqlen_k) {
+    const auto [kv_fp, kv_sf] = kv;
+
+    int seq_len, num_heads, head_dim;
+    std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q);
+    DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
+    DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
+    DG_HOST_ASSERT(q.is_contiguous());
+    DG_HOST_ASSERT(q.scalar_type() == torch::kFloat8_e4m3fn);
+
+    int seq_len_kv, head_dim_;
+    std::tie(seq_len_kv, head_dim_) = get_shape<2>(kv_fp);
+    DG_HOST_ASSERT(head_dim == head_dim_);
+    DG_HOST_ASSERT(kv_fp.is_contiguous());
+    DG_HOST_ASSERT(kv_fp.scalar_type() == torch::kFloat8_e4m3fn);
+
+    auto [_seq_len_kv] = get_shape<1>(kv_sf);
+    DG_HOST_ASSERT(seq_len_kv == _seq_len_kv);
+    DG_HOST_ASSERT(kv_sf.is_contiguous());
+    DG_HOST_ASSERT(kv_sf.scalar_type() == torch::kFloat);
+
+    auto [_seq_len, _num_heads] = get_shape<2>(weights);
+    DG_HOST_ASSERT(seq_len == _seq_len and num_heads == _num_heads);
+    DG_HOST_ASSERT(weights.stride(1) == 1);
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat16);
+
+    DG_HOST_ASSERT(cu_seq_len_k_start_and_end.is_contiguous());
+    DG_HOST_ASSERT(cu_seq_len_k_start_and_end.scalar_type() == torch::kInt);
+
+    constexpr int block_qh = 128;
+    constexpr int block_kv = 256;
+    const int block_q = block_qh / num_heads;
+    const int block_q_2cta = block_q * 2;
+    DG_HOST_ASSERT(block_qh % num_heads == 0);
+
+    // Logits are always float for the 2cta kernel
+    const bool is_compressed = (max_seqlen_k > 0);
+    const int stride_logits = is_compressed ? align(max_seqlen_k, block_kv)
+                                            : align(seq_len_kv + block_kv, 8);
+    const int aligned_seq_len = align(seq_len, block_q_2cta);
+    auto logits_storage = torch::empty({aligned_seq_len, stride_logits},
+                                       q.options().dtype(torch::kFloat));
+    auto logits = is_compressed
+        ? logits_storage.index({torch::indexing::Slice(0, seq_len),
+                                torch::indexing::Slice(0, max_seqlen_k)})
+        : logits_storage.index({torch::indexing::Slice(0, seq_len),
+                                torch::indexing::Slice(0, seq_len_kv)});
+
+    DG_HOST_ASSERT(not (is_compressed and clean_logits));
+    DG_HOST_ASSERT(cu_seq_len_k_start_and_end.size(0) == aligned_seq_len * 2);
+
+    sm100_fp8_mqa_logits_2cta(q, kv_fp, kv_sf, weights, cu_seq_len_k_start_and_end, logits_storage,
+                               seq_len, seq_len_kv, max_seqlen_k, stride_logits,
+                               num_heads, head_dim, block_q, block_kv);
+
+    if (clean_logits) {
+        auto chunks = cu_seq_len_k_start_and_end.view({-1, 2}).chunk(2, 1);
+        auto start = chunks[0].squeeze(1).contiguous();
+        auto end = chunks[1].squeeze(1).contiguous();
+        smxx_clean_logits(logits, start, end, 1, seq_len, seq_len_kv, stride_logits);
+    }
+    return logits;
+}
+
 static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                           const torch::Tensor& fused_kv_cache,
                                           const torch::Tensor& weights,
@@ -427,6 +496,11 @@ static void register_apis(pybind11::module_& m) {
           py::arg("max_context_len"),
           py::arg("clean_logits") = false,
           py::arg("logits_dtype") = torch::kFloat32);
+    m.def("fp8_mqa_logits_2cta", &fp8_mqa_logits_2cta,
+          py::arg("q"), py::arg("kv"), py::arg("weights"),
+          py::arg("cu_seq_len_k_start_and_end"),
+          py::arg("clean_logits") = true,
+          py::arg("max_seqlen_k") = 0);
     // Legacy API
     m.def("fp8_mqa_logits", &fp8_mqa_logits,
           py::arg("q"), py::arg("kv"), py::arg("weights"),
