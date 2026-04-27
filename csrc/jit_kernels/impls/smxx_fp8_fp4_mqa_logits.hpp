@@ -162,6 +162,154 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     SMXXFP8MQALogitsRuntime::launch(runtime, args);
 }
 
+class SM100FP8MQALogits2CTARuntime final: public LaunchRuntime<SM100FP8MQALogits2CTARuntime> {
+public:
+    struct Args {
+        int seq_len;
+        int seq_len_kv;
+        int max_seqlen_k;
+        int stride_logits;
+        int num_heads, head_dim;
+        bool is_compressed_logits;
+
+        int num_q_stages;
+        int num_kv_stages;
+        int block_q;
+        int block_kv;
+
+        uint32_t* cu_seq_len_k_start_and_end;
+        float* logits;
+
+        CUtensorMap tensor_map_q;
+        CUtensorMap tensor_map_kv;
+        CUtensorMap tensor_map_kv_scales;
+        CUtensorMap tensor_map_weights;
+
+        int num_specialized_threads;
+        int num_math_threads;
+
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        DG_HOST_ASSERT(128 % args.num_heads == 0);
+
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm100_fp8_mqa_logits_2cta.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_fp8_mqa_logits_2cta<
+        {}, {},
+        {},
+        {}, {},
+        {}, {},
+        {}, {}
+    >);
+}};
+)",
+        args.num_heads, args.head_dim,
+        args.is_compressed_logits,
+        args.block_q, args.block_kv,
+        args.num_q_stages, args.num_kv_stages,
+        args.num_specialized_threads, args.num_math_threads);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.seq_len, args.seq_len_kv,
+            args.max_seqlen_k, static_cast<uint64_t>(args.stride_logits),
+            args.cu_seq_len_k_start_and_end,
+            args.logits,
+            args.tensor_map_q, args.tensor_map_kv,
+            args.tensor_map_kv_scales, args.tensor_map_weights
+        ));
+    }
+};
+
+static void sm100_fp8_mqa_logits_2cta(const torch::Tensor& q,
+                                      const torch::Tensor& kv, const torch::Tensor& kv_scales,
+                                      const torch::Tensor& weights,
+                                      const torch::Tensor& cu_seq_len_k_start_and_end,
+                                      const torch::Tensor& logits,
+                                      const int& seq_len, const int& seq_len_kv,
+                                      const int& max_seqlen_k, const int& stride_logits,
+                                      const int& num_heads, const int& head_dim,
+                                      const int& block_q, const int& block_kv) {
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+
+    constexpr int num_specialized_threads = 128;
+    constexpr int num_q_stages = 3, num_kv_stages = 3;
+    constexpr int num_math_threads = 256;
+    const bool is_compressed_logits = (max_seqlen_k > 0);
+
+    // Q: [seq_len * num_heads, head_dim], box [block_q * num_heads, head_dim]
+    const auto tensor_map_q = make_tma_2d_desc(q, head_dim, seq_len * num_heads,
+                                               head_dim, block_q * num_heads, head_dim, head_dim);
+    // KV: [seq_len_kv, head_dim], box [block_kv/2, head_dim] per CTA
+    const auto tensor_map_kv = make_tma_2d_desc(kv, head_dim, seq_len_kv,
+                                                head_dim, block_kv / 2, head_dim, head_dim);
+    // KV scales: [seq_len_kv], box [block_kv/2] per CTA
+    const auto tensor_map_kv_scales = make_tma_2d_desc(kv_scales,
+                                                       get_tma_aligned_size(seq_len_kv, static_cast<int>(kv_scales.element_size())),
+                                                       1, block_kv / 2, 1, 0, 0);
+    // Weights: [seq_len, num_heads], box [block_q, num_heads] per CTA
+    const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, seq_len,
+                                                     num_heads, block_q, num_heads, 0);
+
+    // Shared memory layout (per CTA):
+    //   smem_q[num_q_stages]      + smem_weights[num_q_stages]     (BLOCK_Q_2CTA weights)
+    //   smem_kv[num_kv_stages]    + smem_kv_scales[num_kv_stages]  (BLOCK_KV/2 per CTA)
+    //   smem_kv_offsets[num_q_stages]  + barriers + tmem_ptr
+    const int block_q_2cta = block_q * 2;
+    const int smem_q_per_stage     = block_q * num_heads * head_dim;         // FP8 = 1 byte
+    const int smem_weight_per_stage = block_q_2cta * num_heads * 2;          // half = 2 bytes
+    const int smem_kv_per_stage     = (block_kv / 2) * head_dim;             // FP8 = 1 byte
+    const int smem_kv_scale_raw     = (block_kv / 2) * static_cast<int>(kv_scales.element_size());
+    const int smem_kv_scale_per_stage = (smem_kv_scale_raw + 511) / 512 * 512; // align to 512
+    const int smem_kv_offset_per_stage = block_q_2cta * 8;                   // uint2 = 8 bytes
+    const int num_umma_stages       = 512 / (block_q_2cta * num_heads);
+    const int num_barriers          = num_q_stages * 2 + num_kv_stages * 2 + num_umma_stages * 2;
+
+    int smem_size = 0;
+    smem_size += num_q_stages * smem_q_per_stage;
+    smem_size += num_q_stages * smem_weight_per_stage;
+    smem_size += num_kv_stages * smem_kv_per_stage;
+    smem_size += num_kv_stages * smem_kv_scale_per_stage;
+    smem_size += num_q_stages * smem_kv_offset_per_stage;
+    smem_size += num_barriers * 8;  // ClusterTransactionBarrier = 8 bytes
+    smem_size += 4;                 // tmem_ptr_in_smem
+    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+
+    const SM100FP8MQALogits2CTARuntime::Args args = {
+        .seq_len = seq_len,
+        .seq_len_kv = seq_len_kv,
+        .max_seqlen_k = max_seqlen_k,
+        .stride_logits = stride_logits,
+        .num_heads = num_heads, .head_dim = head_dim,
+        .is_compressed_logits = is_compressed_logits,
+        .num_q_stages = num_q_stages,
+        .num_kv_stages = num_kv_stages,
+        .block_q = block_q,
+        .block_kv = block_kv,
+        .cu_seq_len_k_start_and_end = reinterpret_cast<uint32_t*>(cu_seq_len_k_start_and_end.data_ptr<int>()),
+        .logits = logits.data_ptr<float>(),
+        .tensor_map_q = tensor_map_q,
+        .tensor_map_kv = tensor_map_kv,
+        .tensor_map_kv_scales = tensor_map_kv_scales,
+        .tensor_map_weights = tensor_map_weights,
+        .num_specialized_threads = num_specialized_threads,
+        .num_math_threads = num_math_threads,
+        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
+                                  num_specialized_threads + num_math_threads,
+                                  smem_size, 2 /* cluster_dim */)
+    };
+    const auto code = SM100FP8MQALogits2CTARuntime::generate(args);
+    const auto runtime = compiler->build("sm100_fp8_mqa_logits_2cta", code);
+    SM100FP8MQALogits2CTARuntime::launch(runtime, args);
+}
+
 class SM100FP4MQALogitsRuntime final: public LaunchRuntime<SM100FP4MQALogitsRuntime> {
 public:
     struct Args {

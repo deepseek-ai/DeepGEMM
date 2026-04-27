@@ -193,6 +193,100 @@ def test_mqa_logits():
     print()
 
 
+def test_mqa_logits_2cta():
+    if get_arch_major() != 10:
+        print('Skipping FP8 MQA Logits 2CTA (SM100 only)')
+        return
+
+    # block sizes (fixed in kernel)
+    block_qh = 128
+    block_kv = 256
+
+    def enumerate_mqa_logits_2cta():
+        for seq_len in (2048, 4096):
+            for seq_len_kv in (4096, 8192):
+                for num_heads, head_dim in [(64, 128)]:
+                    for disable_cp in (False, True):
+                        yield seq_len, seq_len_kv, num_heads, head_dim, disable_cp
+
+    def generate_ks_ke(seq_len, seq_len_kv, disable_cp):
+        if disable_cp:
+            ks = torch.zeros(seq_len, dtype=torch.int, device='cuda')
+            ke = torch.arange(seq_len, dtype=torch.int, device='cuda') + (seq_len_kv - seq_len)
+            return ks, ke
+        assert seq_len_kv % seq_len == 0 and seq_len % 2 == 0
+        chunk_size = seq_len // 2
+        cp_size = seq_len_kv // seq_len
+        cp_id = cp_size // 3
+        ks = torch.zeros(seq_len, dtype=torch.int, device='cuda')
+        ke = torch.zeros(seq_len, dtype=torch.int, device='cuda')
+        for i in range(chunk_size):
+            ke[i] = cp_id * chunk_size + i
+            ke[i + chunk_size] = (cp_size * 2 - 1 - cp_id) * chunk_size + i
+        return ks, ke
+
+    def pack_cu_seqlen(ks, ke, block_q_2cta):
+        seq_len = ks.shape[0]
+        num_q_blocks = ceil_div(seq_len, block_q_2cta)
+        padded_len = num_q_blocks * block_q_2cta
+        pad_len = padded_len - seq_len
+        ks_pad = torch.cat([ks, torch.zeros(pad_len, dtype=torch.int, device='cuda')])
+        ke_pad = torch.cat([ke, torch.zeros(pad_len, dtype=torch.int, device='cuda')])
+        # interleave: [start0, end0, start1, end1, ...]
+        return torch.stack([ks_pad, ke_pad], dim=1).contiguous().view(-1)
+
+    print('Testing FP8 MQA Logits 2CTA:')
+    for seq_len, seq_len_kv, num_heads, head_dim, disable_cp in enumerate_mqa_logits_2cta():
+        block_q = block_qh // num_heads
+        block_q_2cta = block_q * 2
+
+        q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+        kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
+        weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float16) * 0.1
+        ks, ke = generate_ks_ke(seq_len, seq_len_kv, disable_cp)
+
+        ref_logits, ref_cost = ref_fp8_mqa_logits(q, kv, weights, ks, ke)
+
+        # Quantize to FP8
+        q_in = q.to(torch.float8_e4m3fn), None
+        q_simulated = q_in[0].to(torch.bfloat16)
+        kv_in = per_custom_dims_cast_to_fp8(kv, (0, ), False)
+        kv_simulated = (kv_in[0].float() * kv_in[1].unsqueeze(1)).to(torch.bfloat16)
+
+        simulated_logits, _ = ref_fp8_mqa_logits(q_simulated, kv_simulated, weights, ks, ke)
+
+        cu_seqlen = pack_cu_seqlen(ks, ke, block_q_2cta)
+        kernel_kwargs = dict(
+            q=q_in[0], kv=(kv_in[0], kv_in[1]),
+            weights=weights,
+            cu_seq_len_k_start_and_end=cu_seqlen,
+            clean_logits=True,
+            max_seqlen_k=0,
+        )
+        logits = deep_gemm.fp8_mqa_logits_2cta(**kernel_kwargs)
+
+        ref_neginf_mask = (ref_logits == float('-inf'))
+        neginf_mask = (logits == float('-inf'))
+        assert torch.equal(neginf_mask, ref_neginf_mask), "Mask mismatch"
+
+        ref_logits_m = ref_logits.masked_fill(ref_neginf_mask, 0)
+        simulated_logits_m = simulated_logits.masked_fill(ref_neginf_mask, 0)
+        logits_m = logits.masked_fill(ref_neginf_mask, 0)
+        diff = calc_diff(logits_m, ref_logits_m)
+        simulated_diff = calc_diff(logits_m, simulated_logits_m)
+        assert diff < 1e-3, f"Diff: {diff}"
+        assert simulated_diff < 5e-6, f"Simulated Diff: {simulated_diff}"
+
+        tflops = 2 * ref_cost * num_heads * head_dim / 1e12
+        t, clean_t = bench_kineto(lambda: deep_gemm.fp8_mqa_logits_2cta(**kernel_kwargs), ('mqa_logits_2cta', 'clean_logits'))
+        clean_bytes = (seq_len * seq_len_kv - ref_cost) * 4 + count_bytes(ks, ke)
+        print(f' > S={seq_len:4}, SKV={seq_len_kv:6}, H={num_heads:3}, D={head_dim:3}, CP={0 if disable_cp else 1}: '
+              f'{tflops / t:4.0f} TFLOPS, {t * 1e6:4.0f} us, '
+              f'{(count_bytes(q_in, kv_in, weights, ks, ke) + ref_cost * 4) / t / 1e9:4.0f} GB/s'
+              f' | clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s')
+    print()
+
+
 def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
                          weights: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor,
                          max_model_len: int, use_2d_context_lens: bool):
@@ -363,3 +457,4 @@ if __name__ == '__main__':
     test_gemm_skip_head_mid()
     test_mqa_logits()
     test_paged_mqa_logits()
+    test_mqa_logits_2cta()
