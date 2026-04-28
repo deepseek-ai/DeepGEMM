@@ -25,3 +25,5 @@ deep_gemm/*.so
 
 docs_internal/
 benchmarks/
+ncu_reports/
+internal/

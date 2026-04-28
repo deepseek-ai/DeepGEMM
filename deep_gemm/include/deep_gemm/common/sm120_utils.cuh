@@ -5,59 +5,166 @@
 #include <cuda/std/cstdint>
 #include <cuda_bf16.h>
 
+#include <cute/swizzle.hpp>
 #include <deep_gemm/ptx/ld_st.cuh>
 
 namespace deep_gemm::sm120 {
 
-// B128 XOR swizzle: col_byte ^ ((row & 7) << 4)
-__device__ __forceinline__ int swizzle_b128(int row, int col_byte) {
-    return col_byte ^ ((row & 7) << 4);
+// ============================================================================
+// Swizzle: uses CuTe Swizzle<B,M,S> for position-independent swizzle math.
+// ============================================================================
+// TMA writes with hardware swizzle (B128, B64, B32). The XOR pattern uses
+// physical SMEM address bits. With 128B-aligned base (guaranteed by __align__(1024)),
+// the swizzle becomes position-independent.
+//
+// CuTe mapping: Swizzle<BBits, 4, 3> where BBits = log2(swizzle_bytes / 16).
+//   B128: Swizzle<3,4,3>  B64: Swizzle<2,4,3>  B32: Swizzle<1,4,3>
+//
+// SwizzleContext pre-computes the row-dependent XOR bits once per row,
+// then only XOR + ADD per ldmatrix call (saves 2 instrs per K-step).
+
+template <int swizzle_bytes>
+using CuTeSwizzle = cute::Swizzle<__builtin_ctz(swizzle_bytes) - 4, 4, 3>;
+
+template <int swizzle_bytes>
+struct SwizzleContext {
+    int row_base_addr;
+    int row_xor_bits;
+
+    __device__ __forceinline__ void init(int row, int row_stride) {
+        row_base_addr = row * row_stride;
+        row_xor_bits = CuTeSwizzle<swizzle_bytes>::apply(row_base_addr) ^ row_base_addr;
+    }
+
+    __device__ __forceinline__ void* addr(char* smem_tile, int col_byte) const {
+        return smem_tile + row_base_addr + (col_byte ^ row_xor_bits);
+    }
+};
+
+template <int swizzle_bytes>
+__device__ __forceinline__ int swizzle(int row, int col_byte, int row_stride) {
+    int flat = row * row_stride + col_byte;
+    return CuTeSwizzle<swizzle_bytes>::apply(flat) - row * row_stride;
 }
 
-// ldmatrix A operand address (16x32 FP8 → ldmatrix.x4.b16)
-// Maps 32 threads to 4 matrix fragments covering 16 rows × 32 cols
+// ============================================================================
+// ldmatrix wrappers
+// ============================================================================
+
+__device__ __forceinline__ void ldmatrix_x4(
+    uint32_t& d0, uint32_t& d1, uint32_t& d2, uint32_t& d3, void* smem) {
+    asm volatile ("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+         : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+         : "l"(__cvta_generic_to_shared(smem))
+         : "memory");
+}
+
+__device__ __forceinline__ void ldmatrix_x2(
+    uint32_t& d0, uint32_t& d1, void* smem) {
+    asm volatile ("ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
+         : "=r"(d0), "=r"(d1)
+         : "l"(__cvta_generic_to_shared(smem))
+         : "memory");
+}
+
+// ============================================================================
+// Fragment loaders: pre-computed swizzle variants (fast path)
+// ============================================================================
+
+// Load A fragment using pre-computed SwizzleContext
+// ctx must be initialized with the A row for this lane: (lane&7) + ((lane>>3)&1)*8 + m_tile*16
+template <int swizzle_bytes>
+__device__ __forceinline__ void load_a_fragment(
+    uint32_t (&frag)[4], char* smem_a,
+    const SwizzleContext<swizzle_bytes>& ctx, int lane, int k_step, int mma_k
+) {
+    int col = (lane >> 4) * 16 + k_step * mma_k;
+    void* addr = ctx.addr(smem_a, col);
+    ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], addr);
+}
+
+// Load B fragment pair (2 N-tiles) using pre-computed SwizzleContext
+// ctx must be initialized with the B row for this lane: (lane&7) + ((lane>>3)&1)*8 + np*16
+template <int swizzle_bytes>
+__device__ __forceinline__ void load_b_fragment_x4(
+    uint32_t (&frag)[4], char* smem_b,
+    const SwizzleContext<swizzle_bytes>& ctx, int lane, int k_step, int mma_k
+) {
+    int col = (lane >> 4) * 16 + k_step * mma_k;
+    void* addr = ctx.addr(smem_b, col);
+    ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], addr);
+}
+
+// Load single B N-tile via ldmatrix.x2 — no MOV overhead for fragment rearrangement
+// ctx must be initialized with: row = (lane&7) + n_tile*8, stride = BLOCK_K
+template <int swizzle_bytes>
+__device__ __forceinline__ void load_b_fragment_x2(
+    uint32_t (&frag)[2], char* smem_b,
+    const SwizzleContext<swizzle_bytes>& ctx, int lane, int k_step, int mma_k
+) {
+    int col = ((lane >> 3) & 1) * 16 + k_step * mma_k;
+    void* addr = ctx.addr(smem_b, col);
+    ldmatrix_x2(frag[0], frag[1], addr);
+}
+
+// ============================================================================
+// Fragment loaders: legacy (full address computation each call)
+// ============================================================================
+
+template <int swizzle_bytes>
 __device__ __forceinline__ void* ldmatrix_a_addr(
-    char* smem_tile, int lane, int m_tile, int k_step,
-    int row_stride, int mma_k
+    char* smem_tile, int lane, int m_tile, int k_step, int row_stride, int mma_k
 ) {
     int row = (lane & 7) + ((lane >> 3) & 1) * 8 + m_tile * 16;
     int col = (lane >> 4) * 16 + k_step * mma_k;
-    int col_swizzled = swizzle_b128(row, col);
+    int col_swizzled = swizzle<swizzle_bytes>(row, col, row_stride);
     return smem_tile + row * row_stride + col_swizzled;
 }
 
-// ldmatrix B operand address (8x32 FP8 → ldmatrix.x2.b16)
-// Maps 16 active threads to 2 matrix fragments covering 8 rows × 32 cols
+template <int swizzle_bytes>
 __device__ __forceinline__ void* ldmatrix_b_addr(
-    char* smem_tile, int lane, int n_tile, int k_step,
-    int row_stride, int mma_k
+    char* smem_tile, int lane, int n_tile, int k_step, int row_stride, int mma_k
 ) {
     int row = (lane & 7) + n_tile * 8;
     int col = ((lane >> 3) & 1) * 16 + k_step * mma_k;
-    int col_swizzled = swizzle_b128(row, col);
+    int col_swizzled = swizzle<swizzle_bytes>(row, col, row_stride);
     return smem_tile + row * row_stride + col_swizzled;
 }
 
-// Load A fragment via ldmatrix.x4
+template <int swizzle_bytes = 128>
 __device__ __forceinline__ void load_a_fragment(
     uint32_t (&frag)[4], char* smem_a, int lane, int m_tile, int k_step,
     int row_stride, int mma_k
 ) {
-    void* addr = ldmatrix_a_addr(smem_a, lane, m_tile, k_step, row_stride, mma_k);
-    ptx::SM90_U32x4_LDSM_N::copy(frag[0], frag[1], frag[2], frag[3], addr);
+    void* addr = ldmatrix_a_addr<swizzle_bytes>(smem_a, lane, m_tile, k_step, row_stride, mma_k);
+    ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], addr);
 }
 
-// Load B fragment via ldmatrix.x2
+template <int swizzle_bytes = 128>
 __device__ __forceinline__ void load_b_fragment(
     uint32_t (&frag)[2], char* smem_b, int lane, int n_tile, int k_step,
     int row_stride, int mma_k
 ) {
-    void* addr = ldmatrix_b_addr(smem_b, lane, n_tile, k_step, row_stride, mma_k);
-    ptx::SM90_U32x2_LDSM_N::copy(frag[0], frag[1], addr);
+    void* addr = ldmatrix_b_addr<swizzle_bytes>(smem_b, lane, n_tile, k_step, row_stride, mma_k);
+    ldmatrix_x2(frag[0], frag[1], addr);
 }
 
-// Load UE8M0 scale factor from SMEM (packed 4 per int32)
-// Returns the packed int32 containing 4 UE8M0 bytes for the thread's group
+template <int swizzle_bytes = 128>
+__device__ __forceinline__ void load_b_fragment_x4(
+    uint32_t (&frag)[4], char* smem_b, int lane, int n_tile_pair, int k_step,
+    int row_stride, int mma_k
+) {
+    int row = (lane & 7) + ((lane >> 3) & 1) * 8 + n_tile_pair * 16;
+    int col = (lane >> 4) * 16 + k_step * mma_k;
+    int col_swizzled = swizzle<swizzle_bytes>(row, col, row_stride);
+    void* addr = smem_b + row * row_stride + col_swizzled;
+    ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], addr);
+}
+
+// ============================================================================
+// Scale factor loading
+// ============================================================================
+
 __device__ __forceinline__ uint32_t load_sf(const char* smem_sf, int idx) {
     return *reinterpret_cast<const uint32_t*>(smem_sf + idx * sizeof(int32_t));
 }
