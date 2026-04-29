@@ -14,6 +14,8 @@
 #include "../jit_kernels/impls/sm100_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 #endif
 
@@ -74,6 +76,8 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
         cublaslt_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 9) {
         sm90_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
+    } else if (arch_major == 12) {
+        sm120_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
         sm100_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else {
@@ -97,6 +101,8 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
         cublaslt_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 9) {
         sm90_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
+    } else if (arch_major == 12) {
+        sm120_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
         sm100_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else {
@@ -168,7 +174,9 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
 
     // Dispatch implementation
     const auto arch_major = device_runtime->get_arch_major();
-    if (arch_major == 10) {
+    if (arch_major == 12) {
+        sm120_fp8_fp4_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+    } else if (arch_major == 10) {
         sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
     } else {
         const auto major_sfb = get_major_type_ab(sfb);

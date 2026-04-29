@@ -29,9 +29,18 @@ struct SM120ArchSpec {
             block_n_candidates.push_back(i);
         }
 
+        // MN-major B: scalar loads read from SMEM using flat swizzled addresses.
+        // TMA with swizzle splits SMEM into atoms of (swizzle_mode / elem_size) elements.
+        // When BLOCK_N exceeds the atom size, the SMEM layout becomes segmented (multi-atom),
+        // and the simple flat-address scalar load formula no longer works.
+        // Constrain BLOCK_N to fit in a single swizzle atom to keep scalar loads simple.
+        const int mn_major_b_max_n = (desc.major_b == cute::UMMA::Major::MN)
+            ? get_swizzle_mode(256, 1) / static_cast<int>(c10::elementSize(desc.b_dtype))
+            : 256;
+
         std::vector<Layout> candidates;
         for (int block_n : block_n_candidates) {
-            if (block_n > 128)
+            if (block_n > 128 or block_n > mn_major_b_max_n)
                 continue;
 
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
@@ -61,9 +70,12 @@ struct SM120ArchSpec {
 
         // FP4 packed: 0.5 bytes/elem → swizzle based on block_k/2 bytes per row
         const auto smem_k_bytes_a = get_smem_bytes_per_k(desc.a_dtype, layout.block_k);
-        const auto smem_k_bytes_b = get_smem_bytes_per_k(desc.b_dtype, layout.block_k);
         const auto swizzle_mode_a = get_swizzle_mode(smem_k_bytes_a, 1);
-        const auto swizzle_mode_b = get_swizzle_mode(smem_k_bytes_b, 1);
+        // B swizzle: row stride depends on major — K-major rows span K, MN-major rows span N
+        const auto smem_row_bytes_b = (desc.major_b == cute::UMMA::Major::K)
+            ? get_smem_bytes_per_k(desc.b_dtype, layout.block_k)
+            : layout.block_n * static_cast<int>(c10::elementSize(desc.b_dtype));
+        const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
         const auto swizzle_mode_cd = (c10::elementSize(desc.cd_dtype) <= 2) ? 128 : 0;
 
@@ -76,7 +88,8 @@ struct SM120ArchSpec {
 
     static int get_smem_d_size(const GemmDesc& desc, const Layout& layout) {
         const int cd_size = c10::elementSize(desc.cd_dtype);
-        if (cd_size <= 2)
+        const int swizzle_cd = 128;
+        if (cd_size <= 2 and layout.block_n * cd_size >= swizzle_cd)
             return align(layout.block_m * layout.block_n * cd_size, 128);
         return 0;
     }
@@ -141,8 +154,8 @@ struct SM120ArchSpec {
         const double a_reuse = static_cast<double>(layout.block_n) / 8.0;
         double mma_efficiency = 0.69 + 0.07 * std::min(1.0, (a_reuse - 8.0) / 8.0);
 
-        constexpr double fp8_peak_flops_per_ns = 762000.0;
-        double block_ns = flops_per_block / (fp8_peak_flops_per_ns * mma_efficiency);
+        const double peak_flops_per_ns = (desc.a_dtype == at::kBFloat16) ? 380000.0 : 762000.0;
+        double block_ns = flops_per_block / (peak_flops_per_ns * mma_efficiency);
 
         float wave_efficiency = static_cast<float>(num_blocks) / (num_waves * desc.num_sms);
         int64_t num_cycles = static_cast<int64_t>(block_ns * num_blocks / wave_efficiency);
