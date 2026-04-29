@@ -327,7 +327,9 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                              const std::tuple<int, int, int>& recipe,
                                              const std::string& compiled_dims) {
     // Must be 1D1D kernel
-    DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 128));
+    DG_HOST_ASSERT(std::get<0>(recipe) == 1 and std::get<1>(recipe) == 1);
+    const int gran_k = std::get<2>(recipe);
+    DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
 
     // Shape checks
     const auto [num_groups, m, n] = get_shape<3>(d);
@@ -362,6 +364,10 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     if (arch_major == 9) {
         sm90_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks, ks_tensor, tensor_map_buffer,
                                      cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
+    } else if (arch_major == 12) {
+        sm120_k_grouped_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks, ks_tensor, tensor_map_buffer,
+                                           gran_k, gran_k,
+                                           cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

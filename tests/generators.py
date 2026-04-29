@@ -186,8 +186,8 @@ def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
 
 def enumerate_k_grouped_contiguous(dtype: torch.dtype):
     gran_k_list = (128, ) if get_arch_major() == 9 else (32, 128)
-    # Only K-major is supported for SM90 FP8
-    major_a, major_b = (MajorTypeAB.KMajor, MajorTypeAB.KMajor) if get_arch_major() == 9 and dtype == torch.float8_e4m3fn \
+    # K-major for SM90 and SM120 FP8
+    major_a, major_b = (MajorTypeAB.KMajor, MajorTypeAB.KMajor) if get_arch_major() in (9, 12) and dtype == torch.float8_e4m3fn \
                        else (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
     # Must with FP32 accumulation and 1D1D kernels
     for num_groups, m, n, expected_k_per_group in (( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64

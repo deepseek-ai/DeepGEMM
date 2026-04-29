@@ -176,7 +176,7 @@ def test_m_grouped_gemm_masked() -> None:
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
 
-    k_grouped_fp8_gemm_contiguous = deep_gemm.k_grouped_fp8_gemm_nt_contiguous if get_arch_major() == 9 \
+    k_grouped_fp8_gemm_contiguous = deep_gemm.k_grouped_fp8_gemm_nt_contiguous if get_arch_major() in (9, 12) \
                                     else deep_gemm.k_grouped_fp8_gemm_tn_contiguous
     for num_groups, m, n, major_a, major_b, ks, expected_k_per_group, gran_k in enumerate_k_grouped_contiguous(torch.float8_e4m3fn):
         recipe = (1, 1, gran_k)

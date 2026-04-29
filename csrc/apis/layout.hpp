@@ -102,12 +102,19 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     if (sf.scalar_type() == torch::kFloat and arch_major == 9)
         return get_mn_major_tma_aligned_tensor(sf);
 
-    // FP32 on SM100
-    if (sf.scalar_type() == torch::kFloat and arch_major == 10)
-        return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, ks_tensor, ks, gran_k);
+    // FP32 on SM100/SM120 → packed UE8M0 [packed_sf_k, mn]
+    // Packing function expects [sf_k, mn]; K-major callers may pass [mn, sf_k]
+    if (sf.scalar_type() == torch::kFloat and (arch_major == 10 or arch_major == 12)) {
+        const auto sf_c = sf.is_contiguous() ? sf : sf.contiguous();
+        int ref_sf_k = 0;
+        for (const auto k: ks)
+            ref_sf_k += ceil_div(k, gran_k);
+        auto sf_input = (sf_c.size(0) == ref_sf_k) ? sf_c : sf_c.t().contiguous();
+        return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf_input, ks_tensor, ks, gran_k);
+    }
 
-    // INT on SM100
-    if (sf.scalar_type() == torch::kInt and arch_major == 10)
+    // INT on SM100/SM120
+    if (sf.scalar_type() == torch::kInt and (arch_major == 10 or arch_major == 12))
         DG_HOST_UNREACHABLE("Unimplemented");
 
     DG_HOST_UNREACHABLE("Unknown cases");

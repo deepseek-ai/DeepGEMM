@@ -180,4 +180,91 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
 }
 
+static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                               const torch::Tensor& b, const torch::Tensor& sfb,
+                                               const std::optional<torch::Tensor>& c,
+                                               const torch::Tensor& d,
+                                               const int& m, const int& n,
+                                               const std::vector<int>& ks, const torch::Tensor& ks_tensor,
+                                               const torch::Tensor& tensor_map_buffer,
+                                               const int& gran_k_a, const int& gran_k_b,
+                                               const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                               const std::string& compiled_dims) {
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(c.has_value());
+
+    const bool is_fp4 = (a.scalar_type() == kPackedFP4);
+    const auto num_groups = static_cast<int>(ks.size());
+    int first_k = 0, sum_k = 0, sum_sf_k = 0, max_k = 0;
+    for (int i = 0; i < num_groups; ++i) {
+        if (first_k == 0 and ks[i] != 0)
+            first_k = ks[i];
+        sum_k += ks[i];
+        sum_sf_k += ceil_div(ks[i], gran_k_a * 4);
+        max_k = std::max(max_k, ks[i]);
+        DG_HOST_ASSERT(ks[i] % 128 == 0);
+    }
+
+    const auto desc = GemmDesc {
+        .gemm_type = GemmType::KGroupedContiguous,
+        .kernel_type = KernelType::Kernel1D1D,
+        .m = m, .n = n, .k = sum_k, .num_groups = num_groups,
+        .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
+        .cd_dtype = d.scalar_type(),
+        .major_a = major_a, .major_b = major_b,
+        .with_accumulation = c.has_value(),
+        .num_sms = device_runtime->get_num_sms(),
+        .tc_util = device_runtime->get_tc_util(),
+        .compiled_dims = compiled_dims,
+        .expected_m = m, .expected_n = n, .expected_k = max_k, .expected_num_groups = num_groups
+    };
+    const auto config = get_best_config<SM120ArchSpec>(desc);
+
+    const auto cd = c.value_or(d);
+    const bool fp4_unpacked = !is_fp4;
+    const int outer_stride_k = is_fp4 ? (first_k / 2) : first_k;
+    const auto tensor_map_a = make_tma_a_desc(major_a, a, m, first_k,
+                                              config.storage_config.load_block_m,
+                                              config.layout.block_k, outer_stride_k, 1,
+                                              config.storage_config.swizzle_a_mode, 0, false, fp4_unpacked);
+    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, first_k,
+                                              config.storage_config.load_block_n,
+                                              config.layout.block_k, outer_stride_k, 1,
+                                              config.storage_config.swizzle_b_mode, 0, false, fp4_unpacked);
+    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, sum_sf_k * gran_k_a * 4,
+                                                 config.layout.block_m, gran_k_a, 1, 0);
+    const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, sum_sf_k * gran_k_b * 4,
+                                                 config.layout.block_n, gran_k_b, 1, 0);
+    const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                                config.layout.block_m, config.layout.block_n,
+                                                n, num_groups,
+                                                config.storage_config.swizzle_cd_mode);
+
+    const SM120FP8FP4Gemm1D1DRuntime::Args args = {
+        .gemm_desc = desc,
+        .gemm_config = config,
+        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
+                                  config.pipeline_config.smem_size,
+                                  1),
+        .epilogue_type = std::nullopt,
+        .gran_k_a = gran_k_a,
+        .gran_k_b = gran_k_b,
+        .is_fp4 = is_fp4,
+        .gmem_d = d.data_ptr(),
+        .gmem_c = cd.data_ptr(),
+        .gmem_a_ptr = a.data_ptr(),
+        .gmem_b_ptr = b.data_ptr(),
+        .grouped_layout = ks_tensor.data_ptr(),
+        .tensor_map_buffer = tensor_map_buffer.data_ptr(),
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_sfa = tensor_map_sfa,
+        .tensor_map_sfb = tensor_map_sfb,
+        .tensor_map_cd = tensor_map_cd,
+    };
+    const auto code = SM120FP8FP4Gemm1D1DRuntime::generate(args);
+    const auto runtime = compiler->build("sm120_k_grouped_fp8_fp4_gemm_1d1d", code);
+    SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+}
+
 } // namespace deep_gemm

@@ -115,16 +115,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     const uint32_t lane_idx = threadIdx.x % 32;
 
-    // SMEM layout
+    // SMEM layout: pipeline data first (1024-aligned for B128 swizzle),
+    // tensor map descriptors at the end (K-grouped only)
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
-    auto smem_tm_a = reinterpret_cast<cute::TmaDescriptor*>(smem_buffer);
-    auto smem_tm_b = smem_tm_a + 1;
-    auto gmem_tm_a = tensor_map_buffer + blockIdx.x * 2;
-    auto gmem_tm_b = gmem_tm_a + 1;
-    auto smem_d_base = reinterpret_cast<cd_dtype_t*>(smem_buffer + SMEM_TM);
+    auto smem_d_base = reinterpret_cast<cd_dtype_t*>(smem_buffer);
 
-    constexpr uint32_t PIPE_BASE = SMEM_TM + SMEM_D;
+    constexpr uint32_t PIPE_BASE = SMEM_D;
     auto smem_a = utils::PatternVisitor([&](const uint32_t& s) {
         return reinterpret_cast<char*>(smem_buffer + PIPE_BASE + s * SMEM_A);
     });
@@ -145,6 +142,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     auto empty_barriers = utils::PatternVisitor([&](const uint32_t& s) {
         return reinterpret_cast<Barrier*>(smem_buffer + BAR_BASE + (kNumStages + s) * sizeof(Barrier));
     });
+
+    // Tensor map descriptors at the end of SMEM (K-grouped only)
+    constexpr uint32_t TM_BASE = BAR_BASE + 2 * kNumStages * sizeof(Barrier);
+    auto smem_tm_a = reinterpret_cast<cute::TmaDescriptor*>(smem_buffer + TM_BASE);
+    auto smem_tm_b = smem_tm_a + 1;
+    auto gmem_tm_a = tensor_map_buffer + blockIdx.x * 2;
+    auto gmem_tm_b = gmem_tm_a + 1;
 
     // Prefetch TMA descriptors
     if (warp_idx == 0 and cute::elect_one_sync()) {
@@ -175,7 +179,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs, 128u>(
+    static constexpr uint32_t kSFKAlignment = kGranKA * 4;
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs, kSFKAlignment>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
@@ -191,7 +196,40 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         uint32_t tma_iter_idx = 0;
 
         if (is_tma_leader) {
+            uint32_t last_group_idx = kNumGroups;
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+                    if (last_group_idx != scheduler.current_group_idx) {
+                        last_group_idx = scheduler.current_group_idx;
+
+                        const auto a_base = reinterpret_cast<const char*>(gmem_a_ptr);
+                        const auto b_base = reinterpret_cast<const char*>(gmem_b_ptr);
+                        const uint64_t a_offset = kIsFP4
+                            ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
+                            : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
+                        const uint64_t b_offset = kIsFP4
+                            ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
+                            : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
+
+                        ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
+                        ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
+
+                        const uint64_t new_stride = kIsFP4
+                            ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
+                            : static_cast<uint64_t>(scheduler.current_shape_k);
+                        ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
+                            smem_tm_a, scheduler.current_shape_k, new_stride);
+                        ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
+                            smem_tm_b, scheduler.current_shape_k, new_stride);
+
+                        *gmem_tm_a = *smem_tm_a;
+                        *gmem_tm_b = *smem_tm_b;
+                        ptx::tensor_map_release_gpu();
+                        ptx::tensor_map_acquire_gpu(gmem_tm_a);
+                        ptx::tensor_map_acquire_gpu(gmem_tm_b);
+                    }
+                }
+
                 const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
                 const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
                 const uint32_t m_idx = scheduler.template get_global_idx<false>(shape_m, BLOCK_M, m_block_idx);
@@ -239,6 +277,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
                 // Wait for TMA data
                 CUTE_TIE_DECL(get_pipeline(iter_idx++), stage, phase);
+
                 full_barriers[stage]->wait(phase);
 
                 // Pre-compute swizzle contexts (row stride = kSMEMKBytes for packed FP4)
@@ -389,6 +428,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             // ======== EPILOGUE ========
             const uint32_t m_base = scheduler.template get_global_idx<true>(shape_m, BLOCK_M, m_block_idx);
             const uint32_t n_base = n_block_idx * BLOCK_N;
+            const uint32_t total_shape_m = (kGemmType == GemmType::KGroupedContiguous)
+                ? shape_m * kNumGroups : shape_m;
 
             auto read_cd = [&](const cd_dtype_t& x) -> float {
                 if constexpr (cute::is_same_v<cd_dtype_t, float>) return x;
@@ -415,11 +456,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
                             const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
                                 n_base + nt * MMA_N) + thread_id * 2;
-                            if (gr0 < shape_m and gc + 1 < shape_n) {
+                            if (gr0 < total_shape_m and gc + 1 < shape_n) {
                                 const auto ci = static_cast<int64_t>(gr0) * shape_n + gc;
                                 v0 += read_cd(gmem_c[ci]); v1 += read_cd(gmem_c[ci + 1]);
                             }
-                            if (gr1 < shape_m and gc + 1 < shape_n) {
+                            if (gr1 < total_shape_m and gc + 1 < shape_n) {
                                 const auto ci = static_cast<int64_t>(gr1) * shape_n + gc;
                                 v2 += read_cd(gmem_c[ci]); v3 += read_cd(gmem_c[ci + 1]);
                             }
@@ -469,13 +510,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
-                        if (row0 < shape_m and col + 1 < shape_n) {
+                        if (row0 < total_shape_m and col + 1 < shape_n) {
                             auto idx = static_cast<int64_t>(row0) * shape_n + col;
                             float v0 = accum[ai + 0], v1 = accum[ai + 1];
                             if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
                             store_pair(&gmem_d[idx], v0, v1);
                         }
-                        if (row1 < shape_m and col + 1 < shape_n) {
+                        if (row1 < total_shape_m and col + 1 < shape_n) {
                             auto idx = static_cast<int64_t>(row1) * shape_n + col;
                             float v2 = accum[ai + 2], v3 = accum[ai + 3];
                             if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); v3 += read_cd(gmem_c[idx + 1]); }
