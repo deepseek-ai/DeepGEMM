@@ -12,6 +12,7 @@
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm100_bmk_bnk_mn.hpp"
+#include "../jit_kernels/impls/sm120_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm120_bf16_gemm.hpp"
@@ -53,6 +54,8 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
         sm90_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
+    } else if (arch_major == 12) {
+        sm120_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
     } else if (arch_major == 10) {
         sm100_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
     } else {
@@ -201,21 +204,36 @@ static void fp8_einsum(const std::string& expr,
         const auto perm_d = d.permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk");
-    } else if (expr == "bhd,hdr->bhr" and arch_major == 10) {
+    } else if (expr == "bhd,hdr->bhr") {
         // (batch_size, m, n, k): (h, b, r, d)
         const auto perm_a = a.first.permute({1, 0, 2});
         const auto perm_sfa = a.second.permute({1, 0, 2});
-        const auto perm_b = b.first.permute({0, 2, 1});
-        const auto perm_sfb = b.second.permute({0, 2, 1});
+        auto perm_b = b.first.permute({0, 2, 1});
+        auto perm_sfb = b.second.permute({0, 2, 1});
+        // SM120: B is MN-major after permute. Kernel has scalar-load MN-major path
+        // (kBKMajor=false) but it's 3x slower than K-major ldmatrix due to 8 individual
+        // ld.shared.u8 per fragment. .contiguous() is faster for typical einsum sizes.
+        if (arch_major == 12) {
+            perm_b = perm_b.contiguous();
+        }
         const auto perm_d = d.permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk");
-    } else if (expr == "bhd,bhr->hdr" and arch_major == 10) {
+    } else if (expr == "bhd,bhr->hdr") {
         // (batch_size, m, n, k): (h, d, r, b)
-        const auto perm_a = a.first.permute({1, 2, 0});
-        const auto perm_sfa = a.second.permute({1, 2, 0});
-        const auto perm_b = b.first.permute({1, 2, 0});
-        const auto perm_sfb = b.second.permute({1, 2, 0});
+        auto perm_a = a.first.permute({1, 2, 0});
+        auto perm_sfa = a.second.permute({1, 2, 0});
+        auto perm_b = b.first.permute({1, 2, 0});
+        auto perm_sfb = b.second.permute({1, 2, 0});
+        // SM120: both A and B are MN-major after permute. .contiguous() to K-major is
+        // needed because (1) kernel scalar-load MN-major path is 3x slower than ldmatrix,
+        // and (2) MN-major A is not supported (would need ldmatrix.trans for A operand).
+        // SF-data alignment is preserved: .contiguous() copies FP8 bytes without changing
+        // logical element values, and SF transform reads from the permuted SF view independently.
+        if (arch_major == 12) {
+            perm_a = perm_a.contiguous();
+            perm_b = perm_b.contiguous();
+        }
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn");
     } else {
         DG_HOST_UNREACHABLE(fmt::format("Unsupported einsum expression: {}", expr));

@@ -25,7 +25,8 @@ public:
 
         int gran_k_a, gran_k_b;
         bool is_fp4;
-        int stride_d;
+        int stride_cd_m;
+        int stride_cd_batch;
 
         void* gmem_d;
         void* gmem_c;
@@ -60,6 +61,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -78,7 +80,8 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type),
-        args.is_fp4 ? "true" : "false");
+        args.is_fp4 ? "true" : "false",
+        (args.gemm_desc.major_b == cute::UMMA::Major::K) ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -88,7 +91,7 @@ static void __instantiate_kernel() {{
             args.grouped_layout,
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.stride_d,
+            args.stride_cd_m, args.stride_cd_batch,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
             args.tensor_map_cd));
@@ -167,7 +170,8 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .stride_d = d_stride,
+        .stride_cd_m = d_stride,
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,
@@ -255,7 +259,8 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .stride_d = n,
+        .stride_cd_m = n,
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = cd.data_ptr(),
         .gmem_a_ptr = a.data_ptr(),
@@ -340,7 +345,8 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .stride_d = n,
+        .stride_cd_m = n,
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -416,7 +422,8 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .stride_d = n,
+        .stride_cd_m = n,
+        .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -442,6 +449,9 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                               const int& gran_k_a, const int& gran_k_b,
                               const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                               const std::string& compiled_dims) {
+    // SM120 FP8 BMM currently requires K-major operands. MN-major B has a verified
+    // scalar-load kernel path (kBKMajor=false) but is 3x slower than K-major ldmatrix.
+    // Callers use .contiguous() to ensure K-major layout.
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
@@ -489,7 +499,8 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .stride_d = n,
+        .stride_cd_m = static_cast<int>(d.stride(1)),
+        .stride_cd_batch = static_cast<int>(d.stride(0)),
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,
