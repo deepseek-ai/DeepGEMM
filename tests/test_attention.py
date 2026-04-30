@@ -108,7 +108,7 @@ def test_mqa_logits():
         return ks, ke
 
     def enumerate_mqa_logits():
-        for is_fp4 in ((True, False) if get_arch_major() == 10 else (False, )):
+        for is_fp4 in ((True, False) if get_arch_major() >= 9 else (False, )):
             for logits_dtype in (torch.float, torch.bfloat16):
                 for compressed_logits, clean_logits in [(False, True), (True, False)]:
                     for seq_len in (2048, 4096):
