@@ -29,12 +29,8 @@ struct SM120ArchSpec {
             block_n_candidates.push_back(i);
         }
 
-        // MN-major B: ldmatrix.trans.x2 loads from SMEM using per-row swizzled addresses.
-        // Constrain BLOCK_N to fit in a single swizzle atom so that each K-row's
-        // N-contiguous data is within one atom (no multi-atom segmentation).
-        const int mn_major_b_max_n = (desc.major_b == cute::UMMA::Major::MN)
-            ? get_swizzle_mode(256, 1) / static_cast<int>(c10::elementSize(desc.b_dtype))
-            : 256;
+        // MN-major B: ldmatrix.trans.x2 handles multi-atom SMEM correctly
+        const int mn_major_b_max_n = 128;
 
         std::vector<Layout> candidates;
         for (int block_n : block_n_candidates) {

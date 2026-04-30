@@ -283,15 +283,21 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         for (uint32_t nt = 0; nt < kNTiles; ++nt)
                             sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
                     } else {
-                        DG_STATIC_ASSERT(kSwizzleBMode == 0 or BLOCK_N * 2 <= kSwizzleBMode,
-                                         "MN-major B requires BLOCK_N within single swizzle atom");
+                        static constexpr uint32_t kBAtomElems = kSwizzleBMode > 0 ? kSwizzleBMode / 2 : BLOCK_N;
+                        static constexpr uint32_t kBNumAtoms = (BLOCK_N + kBAtomElems - 1) / kBAtomElems;
+                        static constexpr uint32_t kNTilesPerAtom = kBAtomElems / MMA_N;
                         const int b_k_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8 + ks * MMA_K;
-                        sm120::SwizzleContext<kSwizzleBMode> b_mn_ctx;
-                        b_mn_ctx.init(b_k_row, kSMEMNBytes);
                         #pragma unroll
-                        for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                            void* addr = b_mn_ctx.addr(smem_b[stage], nt * MMA_N * 2);
-                            sm120::ldmatrix_x2_trans(b_tile[buf][nt][0], b_tile[buf][nt][1], addr);
+                        for (uint32_t atom = 0; atom < kBNumAtoms; ++atom) {
+                            sm120::SwizzleContext<kSwizzleBMode> b_mn_ctx;
+                            b_mn_ctx.init(b_k_row, kSwizzleBMode > 0 ? kSwizzleBMode : kSMEMNBytes);
+                            char* atom_base = smem_b[stage] + atom * BLOCK_K * kSwizzleBMode;
+                            #pragma unroll
+                            for (uint32_t nt_in = 0; nt_in < kNTilesPerAtom; ++nt_in) {
+                                const uint32_t nt = atom * kNTilesPerAtom + nt_in;
+                                void* addr = b_mn_ctx.addr(atom_base, nt_in * MMA_N * 2);
+                                sm120::ldmatrix_x2_trans(b_tile[buf][nt][0], b_tile[buf][nt][1], addr);
+                            }
                         }
                     }
                     #pragma unroll
