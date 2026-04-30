@@ -283,29 +283,15 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         for (uint32_t nt = 0; nt < kNTiles; ++nt)
                             sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
                     } else {
-                        // MN-major SMEM B[BLOCK_K, BLOCK_N]: rows=K, cols=N(bf16).
-                        // BLOCK_N must fit in one swizzle atom (heuristic enforces this) so that
-                        // TMA produces a simple [BLOCK_K, BLOCK_N] layout without multi-atom segmentation.
                         DG_STATIC_ASSERT(kSwizzleBMode == 0 or BLOCK_N * 2 <= kSwizzleBMode,
                                          "MN-major B requires BLOCK_N within single swizzle atom");
-                        // MMA m16n8k16 B fragment (.col): b0={B[k0,n], B[k0+1,n]}, b1={B[k0+8,n], B[k0+9,n]}
-                        const uint32_t k_base = (lane_idx % 4) * 2 + ks * MMA_K;
-                        const uint32_t n_lane = lane_idx / 4;
-                        auto load_bf16_mn = [&](uint32_t k, uint32_t n) -> uint16_t {
-                            uint32_t flat = k * kSMEMNBytes + n * 2;
-                            if constexpr (kSwizzleBMode > 0)
-                                flat = sm120::CuTeSwizzle<kSwizzleBMode>::apply(flat);
-                            return *reinterpret_cast<const uint16_t*>(smem_b[stage] + flat);
-                        };
+                        const int b_k_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8 + ks * MMA_K;
+                        sm120::SwizzleContext<kSwizzleBMode> b_mn_ctx;
+                        b_mn_ctx.init(b_k_row, kSMEMNBytes);
                         #pragma unroll
                         for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                            const uint32_t n = n_lane + nt * MMA_N;
-                            uint16_t v0 = load_bf16_mn(k_base, n);
-                            uint16_t v1 = load_bf16_mn(k_base + 1, n);
-                            uint16_t v2 = load_bf16_mn(k_base + 8, n);
-                            uint16_t v3 = load_bf16_mn(k_base + 9, n);
-                            b_tile[buf][nt][0] = static_cast<uint32_t>(v0) | (static_cast<uint32_t>(v1) << 16);
-                            b_tile[buf][nt][1] = static_cast<uint32_t>(v2) | (static_cast<uint32_t>(v3) << 16);
+                            void* addr = b_mn_ctx.addr(smem_b[stage], nt * MMA_N * 2);
+                            sm120::ldmatrix_x2_trans(b_tile[buf][nt][0], b_tile[buf][nt][1], addr);
                         }
                     }
                     #pragma unroll

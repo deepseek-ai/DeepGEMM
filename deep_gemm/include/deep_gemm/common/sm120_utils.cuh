@@ -67,8 +67,36 @@ __device__ __forceinline__ void ldmatrix_x2(
          : "memory");
 }
 
+__device__ __forceinline__ void ldmatrix_x2_trans(
+    uint32_t& d0, uint32_t& d1, void* smem) {
+    asm volatile ("ldmatrix.sync.aligned.x2.m8n8.trans.shared.b16 {%0, %1}, [%2];\n"
+         : "=r"(d0), "=r"(d1)
+         : "l"(__cvta_generic_to_shared(smem))
+         : "memory");
+}
+
 // ============================================================================
 // Fragment loaders: pre-computed swizzle variants (fast path)
+// ============================================================================
+
+// Load B fragment from MN-major SMEM B[BLOCK_K, BLOCK_N] via ldmatrix.trans.x2
+// MN-major: rows=K, cols=N(bf16 contiguous). .trans reads columns (N-contiguous).
+// Each thread provides the address of a K-row at the N-tile start.
+// Threads 0-7: K-rows [k_base..k_base+7], threads 8-15: K-rows [k_base+8..k_base+15].
+template <int swizzle_bytes>
+__device__ __forceinline__ void load_b_fragment_trans_x2(
+    uint32_t (&frag)[2], char* smem_b,
+    int lane, int k_step, int mma_k, int n_tile, int row_stride_bytes
+) {
+    const int k_row = (lane & 7) + ((lane >> 3) & 1) * 8 + k_step * mma_k;
+    const int n_col_byte = n_tile * 8 * 2;
+    int flat = k_row * row_stride_bytes + n_col_byte;
+    if constexpr (swizzle_bytes > 0)
+        flat = CuTeSwizzle<swizzle_bytes>::apply(flat);
+    void* addr = smem_b + flat;
+    ldmatrix_x2_trans(frag[0], frag[1], addr);
+}
+
 // ============================================================================
 
 // Load A fragment using pre-computed SwizzleContext

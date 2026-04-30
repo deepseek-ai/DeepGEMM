@@ -29,11 +29,9 @@ struct SM120ArchSpec {
             block_n_candidates.push_back(i);
         }
 
-        // MN-major B: scalar loads read from SMEM using flat swizzled addresses.
-        // TMA with swizzle splits SMEM into atoms of (swizzle_mode / elem_size) elements.
-        // When BLOCK_N exceeds the atom size, the SMEM layout becomes segmented (multi-atom),
-        // and the simple flat-address scalar load formula no longer works.
-        // Constrain BLOCK_N to fit in a single swizzle atom to keep scalar loads simple.
+        // MN-major B: ldmatrix.trans.x2 loads from SMEM using per-row swizzled addresses.
+        // Constrain BLOCK_N to fit in a single swizzle atom so that each K-row's
+        // N-contiguous data is within one atom (no multi-atom segmentation).
         const int mn_major_b_max_n = (desc.major_b == cute::UMMA::Major::MN)
             ? get_swizzle_mode(256, 1) / static_cast<int>(c10::elementSize(desc.b_dtype))
             : 256;
