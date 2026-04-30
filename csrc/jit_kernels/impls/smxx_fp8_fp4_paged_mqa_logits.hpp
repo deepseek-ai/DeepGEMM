@@ -4,6 +4,7 @@
 #include "../../jit/device_runtime.hpp"
 #include "../../jit/kernel_runtime.hpp"
 #include "../heuristics/sm90.hpp"
+#include "../heuristics/sm120.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -61,7 +62,7 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
                                            const bool& is_context_lens_2d,
                                            const int& num_next_n_atoms,
                                            const bool& is_varlen, const int* indices_ptr) {
-    constexpr int split_kv = 256;
+    const int split_kv = (device_runtime->get_arch_major() == 12) ? 128 : 256;
     constexpr int num_threads = 32;
     const int aligned_batch_size = align(batch_size, 32);
     DG_HOST_ASSERT(split_kv % block_kv == 0);
@@ -225,10 +226,20 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
                                       const int& split_kv) {
     const int num_specialized_threads = 128;
     const int arch_major = device_runtime->get_arch_major();
-    const int mma_m = (arch_major == 10 ? 128 : 64);
-    const int num_math_warp_groups = split_kv / mma_m;
-    const int num_math_threads = num_math_warp_groups * 128;
-    const int num_q_stages = 3, num_kv_stages = (arch_major == 10 ? 4 : 3);
+    int mma_m, num_math_threads, num_q_stages, num_kv_stages, num_math_warp_groups;
+    if (arch_major == 12) {
+        mma_m = 64;
+        num_math_warp_groups = split_kv / mma_m;
+        num_math_threads = num_math_warp_groups * 4 * 32;
+        num_q_stages = 2;
+        num_kv_stages = 3;
+    } else {
+        mma_m = (arch_major == 10 ? 128 : 64);
+        num_math_warp_groups = split_kv / mma_m;
+        num_math_threads = num_math_warp_groups * 128;
+        num_q_stages = 3;
+        num_kv_stages = (arch_major == 10 ? 4 : 3);
+    }
     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
 
     // Construct TMAs
@@ -277,6 +288,19 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
         smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size + smem_umma_barriers + smem_tmem_ptr;
         DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
         DG_HOST_ASSERT(next_n == 1 or next_n == 2 or next_n == 4);
+    } else if (arch_major == 12) {
+        // SM120a: per-group KV SMEM (like SM90), not flat split_kv layout
+        const int swizzle_alignment = head_dim * 8;
+        const int smem_q_size_per_stage = next_n_per_cta * num_heads * head_dim * static_cast<int>(q.element_size());
+        const int aligned_smem_weight_size_per_stage = align(next_n_per_cta * num_heads * static_cast<int>(weights.element_size()), swizzle_alignment);
+        const int smem_q_pipe_size = num_q_stages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage) + align(num_q_stages * 8 * 2, swizzle_alignment);
+
+        const int smem_kv_size_per_stage = block_kv * head_dim * static_cast<int>(kv_cache.element_size());
+        const int aligned_smem_kv_scale_size_per_stage = align(block_kv * static_cast<int>(kv_cache_scales.element_size()), swizzle_alignment);
+        const int smem_kv_pipe_size = num_kv_stages * (smem_kv_size_per_stage + aligned_smem_kv_scale_size_per_stage) + align(num_kv_stages * 8 * 2, swizzle_alignment);
+
+        smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size + 4;
+        DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
     } else {
         const int smem_q_size_per_stage = next_n_per_cta * num_heads * head_dim * static_cast<int>(q.element_size());
         const int smem_kv_size_per_stage = split_kv * head_dim * static_cast<int>(kv_cache.element_size());
@@ -287,8 +311,8 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
         const int smem_umma_barriers = num_math_warp_groups * 2 * 8;
         const int smem_tmem_ptr = 4;
 
-        smem_size = num_q_stages * (smem_q_size_per_stage + smem_weight_size_per_stage) + 
-                    num_kv_stages * (smem_kv_size_per_stage + smem_kv_scale_size_per_stage) + 
+        smem_size = num_q_stages * (smem_q_size_per_stage + smem_weight_size_per_stage) +
+                    num_kv_stages * (smem_kv_size_per_stage + smem_kv_scale_size_per_stage) +
                     smem_barriers + smem_umma_barriers + smem_tmem_ptr;
         DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
     }

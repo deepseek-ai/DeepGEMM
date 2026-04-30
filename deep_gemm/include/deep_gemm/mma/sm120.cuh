@@ -6,9 +6,25 @@
 
 namespace deep_gemm::mma::sm120 {
 
-// Block-scaled FP8 MMA: m16n8k32
+// FP8 MMA: m16n8k32
 static constexpr int FP8_MMA_M = 16, FP8_MMA_N = 8, FP8_MMA_K = 32;
 static constexpr int FP8_MMA_ACCUM = 4;
+
+// Non-block-scaled FP8 MMA — for kernels that apply scaling separately (e.g. MQA logits)
+__device__ __forceinline__ void fp8_mma(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+        "{%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1])
+    );
+}
+
+// Block-scaled FP8 MMA: m16n8k32
 
 __device__ __forceinline__ uint8_t extract_sf_byte(uint32_t packed, uint32_t byte_idx) {
     return static_cast<uint8_t>((packed >> (byte_idx * 8)) & 0xFF);

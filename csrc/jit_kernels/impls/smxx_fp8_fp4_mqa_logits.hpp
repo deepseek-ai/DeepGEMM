@@ -5,6 +5,7 @@
 #include "../../jit/kernel_runtime.hpp"
 #include "../heuristics/sm90.hpp"
 #include "../heuristics/sm100.hpp"
+#include "../heuristics/sm120.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -41,8 +42,6 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        // TODO: optimize performance by tuning args
-        // Block sizes are fixed in this kernel
         DG_HOST_ASSERT(128 % args.num_heads == 0);
         const auto arch = device_runtime->get_arch(true);
 
@@ -96,8 +95,10 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                 const int& num_heads, const int& head_dim,
                                 const int& block_q, const int& block_kv) {
     constexpr int num_specialized_threads = 128;
-    constexpr int num_q_stages = 3, num_kv_stages = 3;
-    const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
+    const int arch_major = device_runtime->get_arch_major();
+    const int num_q_stages = (arch_major == 12 ? 2 : 3);
+    const int num_kv_stages = 3;
+    const int num_math_threads = (arch_major == 12 ? 256 : (arch_major == 10 ? 256 : 512));
 
     // Use compressed logits format when max_seqlen_k is specified
     const bool is_compressed_logits = (max_seqlen_k > 0);
@@ -126,10 +127,14 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     smem_size += num_kv_stages * smem_kv_size_per_stage;
     smem_size += num_q_stages * smem_weight_size_per_stage;
     smem_size += num_kv_stages * kv_scale_size_per_stage;
-    smem_size += (num_q_stages * 2 + num_kv_stages * 2 + (num_math_threads / 128) * 2) * 8;
+    smem_size += (num_q_stages * 2 + num_kv_stages * 2) * 8;
     smem_size += 4;
-    DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    if (arch_major == 12) {
+        DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
+    } else {
+        DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
+        DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    }
 
     // Launch
     const SMXXFP8MQALogitsRuntime::Args args = {

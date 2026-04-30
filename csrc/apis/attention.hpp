@@ -154,7 +154,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
 
     // Allocate output
     constexpr int block_qh = 128;
-    constexpr int block_kv = 256;
+    const int block_kv = (device_runtime->get_arch_major() == 12) ? 128 : 256;
     const int block_q = block_qh / num_heads;
     DG_HOST_ASSERT(block_qh % num_heads == 0);
 
@@ -177,7 +177,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     if (is_fp4 and arch_major == 10) {
         sm100_fp4_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                              seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
-    } else if (not is_fp4 and (arch_major == 9 or arch_major == 10)) {
+    } else if (not is_fp4 and (arch_major == 9 or arch_major == 10 or arch_major == 12)) {
         smxx_fp8_mqa_logits(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                             seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
     } else {
@@ -217,7 +217,7 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
         smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv,
                                        num_sms, is_context_lens_2d, /*num_next_n_atoms=*/1,
                                        /*is_varlen=*/true, indices_tensor.data_ptr<int>());
-    } else if (arch_major == 9 or arch_major == 10) {
+    } else if (arch_major == 9 or arch_major == 10 or arch_major == 12) {
         DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
         // SM90 schedules in units of `kComputeBlockKV = 64` regardless of physical
         // `block_kv`; pass the compute block size to the metadata kernel.
@@ -226,8 +226,9 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
         //   kNextNAtom = (kIsVarlen or kNextN >= 2) ? 2 : 1
         //   kNumNextNAtoms = ceil_div(kNextN, kNextNAtom)
         // SM90 cluster multicast hard-codes kNumNextNAtoms = 1 (one q per cluster).
+        // SM120 also uses kNumNextNAtoms = 1 (no next_n atomization).
         int num_next_n_atoms;
-        if (arch_major == 9) {
+        if (arch_major == 9 or arch_major == 12) {
             num_next_n_atoms = 1;
         } else {
             const int next_n_atom = (next_n >= 2) ? 2 : 1;
@@ -380,7 +381,8 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     DG_HOST_ASSERT(context_lens.scalar_type() == torch::kInt);
 
     // Allocate output
-    constexpr int split_kv = 256;
+    // SM120a: 2 groups × 64 KV rows = 128; SM90/100: 256
+    const int split_kv = (arch_major == 12) ? 128 : 256;
     const auto aligned_max_context_len = align(max_context_len, split_kv);
     auto logits = torch::empty({batch_size * next_n, aligned_max_context_len}, q_fp.options().dtype(logits_dtype));
     logits = logits.slice(-1, 0, max_context_len);
@@ -391,7 +393,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         sm100_fp4_paged_mqa_logits(q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                    logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                    is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
-    } else if (not is_fp4 and (arch_major == 9 or arch_major == 10)) {
+    } else if (not is_fp4 and (arch_major == 9 or arch_major == 10 or arch_major == 12)) {
         smxx_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                   logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                   is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
