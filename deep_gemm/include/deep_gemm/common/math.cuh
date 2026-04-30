@@ -62,6 +62,14 @@ CUTLASS_DEVICE float2 fma2(const float2& a, const float2& b, const float2& c) {
 #endif
 }
 
+CUTLASS_DEVICE float2 mul2(const float2& a, const float2& b) {
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
+    return __fmul2_rn(a, b);
+#else
+    return make_float2(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y));
+#endif
+}
+
 CUTLASS_HOST_DEVICE float fast_rcp(const float& x) {
     float ret;
     asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(ret) : "f"(x));
@@ -91,7 +99,7 @@ template <bool kUseUE8M0 = true>
 CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv) {
     DG_STATIC_ASSERT(kUseUE8M0, "Must use UE8M0");
     const float2 finfo_factor = {1.0 / 448.0, 1.0 / 448.0};
-    const auto scaled = __fmul2_rn(amax, finfo_factor);
+    const auto scaled = mul2(amax, finfo_factor);
     const auto exp_x = fast_log2_ceil(scaled.x);
     const auto exp_y = fast_log2_ceil(scaled.y);
     sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
