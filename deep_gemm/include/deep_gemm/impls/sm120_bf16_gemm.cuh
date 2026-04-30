@@ -76,16 +76,19 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kMMARegisters = 232;
 
     // SMEM D buffer for TMA store epilogue
+    // Require BLOCK_N to be a multiple of the TMA store atom (kSwizzleCDMode / sizeof(cd_dtype_t))
+    // to avoid partial sub-tile writes corrupting adjacent N-tiles in global memory
     static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
-        and BLOCK_N * sizeof(cd_dtype_t) >= kSwizzleCDMode;
+        and BLOCK_N * sizeof(cd_dtype_t) >= kSwizzleCDMode
+        and (BLOCK_N * sizeof(cd_dtype_t)) % kSwizzleCDMode == 0;
     static constexpr uint32_t SMEM_D = kUseTMAStoreEpilogue
-        ? math::constexpr_align(static_cast<uint32_t>(BLOCK_M * BLOCK_N * sizeof(cd_dtype_t)), 128u)
+        ? static_cast<uint32_t>((BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode) * kSwizzleCDMode * BLOCK_M)
         : 0u;
     static constexpr uint32_t kSwizzleCDShift = kSwizzleCDMode > 0 ? (7 - __builtin_ctz(kSwizzleCDMode)) : 0;
     static constexpr uint32_t kSwizzleCDMask = kSwizzleCDMode > 0 ? (kSwizzleCDMode / 16 - 1) : 0;
     static constexpr uint32_t kTMAStoreInnerDim = kSwizzleCDMode / sizeof(cd_dtype_t);
     static constexpr uint32_t kNumTMAStores = kUseTMAStoreEpilogue
-        ? (BLOCK_N * sizeof(cd_dtype_t) + kSwizzleCDMode - 1) / kSwizzleCDMode : 0;
+        ? BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode : 0;
 
     static constexpr uint32_t SMEM_TM = (kGemmType == GemmType::KGroupedContiguous ? sizeof(cute::TmaDescriptor) * 2 : 0);
     static constexpr uint32_t kSMEMKBytes = BLOCK_K * 2;

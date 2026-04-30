@@ -74,7 +74,11 @@ class QuantConfig:
             return [None]
         quant_config_list = [QuantConfig()]
         if get_arch_major() == 10:
+            # SM100: FP8_A x FP4_B via UMMA mixed precision
             quant_config_list.append(QuantConfig((128, 32, False, True)))
+        elif get_arch_major() == 12:
+            # SM120: FP4_A x FP4_B via mxf4nvf4 (FP8xFP4 mix needs mxf8f6f4, future work)
+            quant_config_list.append(QuantConfig((32, 32, True, True)))
         return quant_config_list
 
 
@@ -368,7 +372,8 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
 
 
 def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks: List[int],
-                                  use_ue8m0: bool = False, use_bf16: bool = False, gran_k = 128):
+                                  use_ue8m0: bool = False, use_bf16: bool = False, gran_k = 128,
+                                  is_fp4: bool = False):
     assert get_mk_alignment_for_contiguous_layout() % gran_k == 0
     k = sum(ks)
 
@@ -388,22 +393,43 @@ def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: Majo
         assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
         return k, a, b, c, d, ref_d
 
+    assert (major_a, major_b) == (MajorTypeAB.KMajor, MajorTypeAB.KMajor)
+
+    if is_fp4:
+        # Cast each group separately to K-major FP4, then concatenate
+        a_parts, sfa_parts = [], []
+        b_parts, sfb_parts = [], []
+        prefix = 0
+        for K in ks:
+            # a[prefix:prefix+K] is [K, M] MN-major → transpose to [M, K] then cast
+            a_grp = a[prefix:prefix+K].T.contiguous()  # [M, K]
+            b_grp = b[prefix:prefix+K].T.contiguous()  # [N, K]
+            a_fp4_g, sfa_g = per_token_cast_to_fp4(a_grp, use_ue8m0=use_ue8m0, gran_k=gran_k)
+            b_fp4_g, sfb_g = per_token_cast_to_fp4(b_grp, use_ue8m0=use_ue8m0, gran_k=gran_k)
+            a_parts.append(a_fp4_g.flatten())   # [M * K/2] packed
+            sfa_parts.append(sfa_g)             # [M, K/gran_k]
+            b_parts.append(b_fp4_g.flatten())   # [N * K/2] packed
+            sfb_parts.append(sfb_g)             # [N, K/gran_k]
+            prefix += K
+        a_fp4 = torch.cat(a_parts)              # 1D packed, groups concatenated
+        b_fp4 = torch.cat(b_parts)
+        sfa = torch.cat(sfa_parts, dim=1)       # [M, sum_sf_k] concatenated along K
+        sfb = torch.cat(sfb_parts, dim=1)       # [N, sum_sf_k]
+        return k, (a_fp4, sfa), (b_fp4, sfb), c, d, ref_d
+
     a_fp8 = per_channel_cast_to_fp8(a, use_ue8m0=use_ue8m0, gran_k=gran_k)
     b_fp8 = per_channel_cast_to_fp8(b, use_ue8m0=use_ue8m0, gran_k=gran_k)
 
     # Transpose for K Major A/B
-    if (major_a, major_b) == (MajorTypeAB.KMajor, MajorTypeAB.KMajor):
-        a, sfa = a_fp8
-        b, sfb = b_fp8
-        new_a = torch.empty((sum(ks) * m, ), dtype=a.dtype, device=a.device)
-        new_b = torch.empty((sum(ks) * n, ), dtype=b.dtype, device=b.device)
-        prefix = 0
-        for K in ks:
-            new_a[prefix * m : (prefix + K) * m] = a[prefix : prefix + K, ].T.flatten()
-            new_b[prefix * n : (prefix + K) * n] = b[prefix : prefix + K, ].T.flatten()
-            prefix += K
-        a_fp8, b_fp8 = (new_a, sfa.T), (new_b, sfb.T)
-    else:
-        assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
+    a_data, sfa = a_fp8
+    b_data, sfb = b_fp8
+    new_a = torch.empty((sum(ks) * m, ), dtype=a_data.dtype, device=a_data.device)
+    new_b = torch.empty((sum(ks) * n, ), dtype=b_data.dtype, device=b_data.device)
+    prefix = 0
+    for K in ks:
+        new_a[prefix * m : (prefix + K) * m] = a_data[prefix : prefix + K, ].T.flatten()
+        new_b[prefix * n : (prefix + K) * n] = b_data[prefix : prefix + K, ].T.flatten()
+        prefix += K
+    a_fp8, b_fp8 = (new_a, sfa.T), (new_b, sfb.T)
 
     return k, a_fp8, b_fp8, c, d, ref_d

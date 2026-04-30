@@ -1,4 +1,4 @@
-"""SM120a K-Grouped Contiguous FP8 GEMM correctness and performance tests."""
+"""SM120a K-Grouped Contiguous FP8/FP4 GEMM correctness and performance tests."""
 
 import sys
 import os
@@ -18,29 +18,33 @@ from generators import (
 def test_correctness():
     assert get_arch_major() == 12, f"Expected SM120a, got arch_major={get_arch_major()}"
     print("=" * 60)
-    print("SM120a K-Grouped Contiguous FP8 GEMM — Correctness")
+    print("SM120a K-Grouped Contiguous FP8/FP4 GEMM — Correctness")
     print("=" * 60)
 
     major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
     use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D)
 
     configs = [
-        # (num_groups, m, n, expected_k, gran_k, label)
-        ( 4, 4096, 7168, 2048, 128, " 4g  4096x7168  gk=128"),
-        ( 8, 4096, 7168, 2048, 128, " 8g  4096x7168  gk=128"),
-        (16, 4096, 7168, 2048, 128, "16g  4096x7168  gk=128"),
-        ( 4, 7168, 2048, 2048, 128, " 4g  7168x2048  gk=128"),
-        ( 4, 4096, 7168, 2048,  32, " 4g  4096x7168  gk=32"),
-        ( 8, 4096, 7168, 2048,  32, " 8g  4096x7168  gk=32"),
+        # (num_groups, m, n, expected_k, gran_k, is_fp4, label)
+        ( 4, 4096, 7168, 2048, 128, False, "FP8  4g  4096x7168  gk=128"),
+        ( 8, 4096, 7168, 2048, 128, False, "FP8  8g  4096x7168  gk=128"),
+        (16, 4096, 7168, 2048, 128, False, "FP8 16g  4096x7168  gk=128"),
+        ( 4, 7168, 2048, 2048, 128, False, "FP8  4g  7168x2048  gk=128"),
+        ( 4, 4096, 7168, 2048,  32, False, "FP8  4g  4096x7168  gk=32"),
+        ( 8, 4096, 7168, 2048,  32, False, "FP8  8g  4096x7168  gk=32"),
+        ( 4, 4096, 7168, 2048,  32, True,  "FP4  4g  4096x7168  gk=32"),
+        ( 8, 4096, 7168, 2048,  32, True,  "FP4  8g  4096x7168  gk=32"),
+        ( 4, 4096, 7168, 2048, 128, True,  "FP4  4g  4096x7168  gk=128"),
+        ( 4, 7168, 2048, 2048, 128, True,  "FP4  4g  7168x2048  gk=128"),
     ]
 
     num_total = 0
     num_passed = 0
 
-    for num_groups, m, n, expected_k, gran_k, label in configs:
+    for num_groups, m, n, expected_k, gran_k, is_fp4, label in configs:
         set_mk_alignment_for_contiguous_layout(gran_k)
         reset_seed()
-        random.seed(num_groups * 1000 + gran_k)
+        random.seed(num_groups * 1000 + gran_k + (100 if is_fp4 else 0))
         ks = [align(int(expected_k * random.uniform(0.7, 1.3)), 128) for _ in range(num_groups)]
         recipe = (1, 1, gran_k)
 
@@ -48,14 +52,15 @@ def test_correctness():
         try:
             k, a, b, c, d, ref_d = generate_k_grouped_contiguous(
                 num_groups, m, n, major_a, major_b, ks,
-                use_ue8m0=use_ue8m0, gran_k=gran_k
+                use_ue8m0=use_ue8m0, gran_k=gran_k, is_fp4=is_fp4
             )
             ks_tensor = torch.tensor(ks, dtype=torch.int32, device='cuda')
 
             deep_gemm.k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks, ks_tensor, c, recipe=recipe)
 
             diff = calc_diff(d, ref_d)
-            passed = diff < 0.01
+            threshold = 0.02 if is_fp4 else 0.01
+            passed = diff < threshold
             if passed:
                 num_passed += 1
             status = "PASS" if passed else "FAIL"
@@ -63,7 +68,7 @@ def test_correctness():
         except Exception as e:
             print(f"  {label} — ERROR: {e}")
 
-    # Test with zero-K groups (edge case)
+    # Test with zero-K groups (edge case, FP8 only)
     num_total += 1
     try:
         gran_k = 128

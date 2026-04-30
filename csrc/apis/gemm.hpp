@@ -340,13 +340,14 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     const int gran_k = std::get<2>(recipe);
     DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
 
-    // Shape checks
+    // Shape checks (K-grouped data is 1D flattened; FP4 has 2x packing)
     const auto [num_groups, m, n] = get_shape<3>(d);
-    const auto sum_mk = a.first.numel();
-    const auto sum_nk = b.first.numel();
+    const auto arch_major = device_runtime->get_arch_major();
     const int sum_k = std::accumulate(ks.begin(), ks.end(), 0);
-    DG_HOST_ASSERT(sum_mk == static_cast<int64_t>(sum_k) * m);
-    DG_HOST_ASSERT(sum_nk == static_cast<int64_t>(sum_k) * n);
+    const bool is_fp4 = (a.first.scalar_type() == kPackedFP4);
+    const int pack = is_fp4 ? 2 : 1;
+    DG_HOST_ASSERT(a.first.numel() * pack == static_cast<int64_t>(sum_k) * m);
+    DG_HOST_ASSERT(b.first.numel() * pack == static_cast<int64_t>(sum_k) * n);
 
     // Contiguity checks
     DG_HOST_ASSERT(a.first.is_contiguous());
@@ -369,7 +370,6 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                                 a.first.options().dtype(torch::kByte));
 
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
         sm90_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks, ks_tensor, tensor_map_buffer,
                                      cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
@@ -584,6 +584,9 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
     } else if (arch_major == 10) {
         sm100_bf16_k_grouped_gemm(a, b, c, d, m, n, ks, ks_tensor,
+                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
+    } else if (arch_major == 12) {
+        sm120_bf16_k_grouped_gemm(a, b, c, d, m, n, ks, ks_tensor,
                                   cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");

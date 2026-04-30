@@ -89,8 +89,9 @@ struct SM120ArchSpec {
     static int get_smem_d_size(const GemmDesc& desc, const Layout& layout) {
         const int cd_size = c10::elementSize(desc.cd_dtype);
         const int swizzle_cd = 128;
-        if (cd_size <= 2 and layout.block_n * cd_size >= swizzle_cd)
-            return align(layout.block_m * layout.block_n * cd_size, 128);
+        if (cd_size <= 2 and layout.block_n * cd_size >= swizzle_cd
+            and (layout.block_n * cd_size) % swizzle_cd == 0)
+            return (layout.block_n * cd_size / swizzle_cd) * swizzle_cd * layout.block_m;
         return 0;
     }
 

@@ -49,10 +49,12 @@ public:
         if (arch_major != 10 and arch_major != 12)
             return kLegacyMKAlignmentForContiguousLayout;
 
+        // SM120 always uses BLOCK_M=128 (sm120.hpp), alignment must match
         int block_m = arch_major == 12 ? 128 : 240;
+        int min_block_m = arch_major == 12 ? 128 : 32;
         int mma_step = 16;
         if (expected_m.has_value()) {
-            for (; block_m > 32 and block_m - mma_step >= expected_m.value(); block_m -= mma_step);
+            for (; block_m > min_block_m and block_m - mma_step >= expected_m.value(); block_m -= mma_step);
         }
         return block_m;
     }
