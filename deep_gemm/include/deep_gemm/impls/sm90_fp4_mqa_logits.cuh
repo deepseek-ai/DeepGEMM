@@ -55,57 +55,32 @@ CUTLASS_DEVICE void dequant_fp4_block_to_fp8(
         const uint32_t row,                      // row index within the tile
         const uint32_t lane_idx,
         const uint32_t head_dim) {
-    // Each thread handles 4 FP4 elements (2 packed bytes) per iteration.
-    // We stride across head_dim in steps of warp_size * 4 = 128 elements.
-    // head_dim is always 128 here.
-    // UE8M0 storage: the Python code packs 8 uint8 scale factors into one int32.
-    // sf_src[0] >> ((col/32 % 8) * 8) & 0xFF gives the UE8M0 byte for block covering col.
+    const uint32_t base = lane_idx * 4;
+    const uint8_t sf_byte = (sf_src[0] >> ((base >> 5) * 8)) & 0xFF;
+    const float sf_float = __int_as_float(static_cast<uint32_t>(sf_byte) << 23);
 
-    static constexpr uint32_t kGranK = 32; // MX block size
+    const uint8_t p0 = fp4_src[base >> 1];
+    const uint8_t p1 = fp4_src[(base >> 1) + 1];
 
-    // Each lane handles 4 elements starting at lane_idx*4
-    #pragma unroll
-    for (uint32_t base = lane_idx * 4; base < head_dim; base += 128) {
-        // Determine which 32-element MX block this belongs to
-        const uint32_t block_idx = base / kGranK;          // which 32-element block (0..3 for head_dim=128)
-        // sf_src is packed as int32: 8 uint8 scales per int32
-        const uint32_t sf_int32_idx = block_idx / 8;       // which int32
-        const uint32_t sf_byte_pos  = block_idx % 8;       // which byte within int32
-        const uint8_t sf_byte = (sf_src[sf_int32_idx] >> (sf_byte_pos * 8)) & 0xFF;
-        // UE8M0: exponent field only; value = 2^(sf_byte - 127)
-        // For dequant: fp32_val = fp4_val * 2^(sf_byte - 127)
-        // We construct the scale as a float by mapping UE8M0 exponent to IEEE float exponent bits.
-        // float bits = (sf_byte) << 23  (UE8M0 exponent maps directly to IEEE float biased exponent)
-        // __int_as_float is the CUDA-safe way to do float bit-reinterpretation
-        const float sf_float = __int_as_float((uint32_t)sf_byte << 23);
-
-        // Load 2 packed bytes (4 FP4 values)
-        const uint8_t p0 = fp4_src[(base + 0) / 2];   // base+0, base+1
-        const uint8_t p1 = fp4_src[(base + 2) / 2];   // base+2, base+3
-
-        // Extract FP4 E2M1 nibbles and convert to float
-        // E2M1: sign=bit3, exponent=bits[2:1], mantissa=bit0
-        // Value table (positive): 0=0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
-        // Negative: same magnitudes with sign flip
-        auto fp4_nibble_to_float = [](uint8_t nibble) -> float {
-            static const float lut[16] = {
-                0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-               -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-            };
-            return lut[nibble & 0xF];
+    auto fp4_nibble_to_float = [](uint8_t nibble) -> float {
+        static const float lut[16] = {
+            0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+           -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
         };
+        return lut[nibble & 0xF];
+    };
 
-        float v0 = fp4_nibble_to_float(p0 & 0xF)  * sf_float;
-        float v1 = fp4_nibble_to_float(p0 >> 4)   * sf_float;
-        float v2 = fp4_nibble_to_float(p1 & 0xF)  * sf_float;
-        float v3 = fp4_nibble_to_float(p1 >> 4)   * sf_float;
+    const float v0 = fp4_nibble_to_float(p0 & 0xF) * sf_float;
+    const float v1 = fp4_nibble_to_float(p0 >> 4)  * sf_float;
+    const float v2 = fp4_nibble_to_float(p1 & 0xF) * sf_float;
+    const float v3 = fp4_nibble_to_float(p1 >> 4)  * sf_float;
 
-        // Saturate-cast to FP8 E4M3 (max 448.0) and write with B128 swizzle
-        *swizzled_fp8_ptr(fp8_tile, row, base + 0, head_dim) = static_cast<__nv_fp8_e4m3>(v0);
-        *swizzled_fp8_ptr(fp8_tile, row, base + 1, head_dim) = static_cast<__nv_fp8_e4m3>(v1);
-        *swizzled_fp8_ptr(fp8_tile, row, base + 2, head_dim) = static_cast<__nv_fp8_e4m3>(v2);
-        *swizzled_fp8_ptr(fp8_tile, row, base + 3, head_dim) = static_cast<__nv_fp8_e4m3>(v3);
-    }
+    // lane_idx*4 never crosses a 16-byte swizzle group, so calculate the
+    // B128-swizzled base address once and store four contiguous FP8 values.
+    const uint32_t swizzled_col = (((base >> 4) ^ (row & 7)) << 4) + (base & 15);
+    __nv_fp8_e4m3* out = fp8_tile + row * head_dim + swizzled_col;
+    const __nv_fp8x4_e4m3 packed(make_float4(v0, v1, v2, v3));
+    ptx::st_shared(reinterpret_cast<const uint32_t*>(out), packed.__x);
 }
 
 // SM90 FP4 MQA Logits kernel.
