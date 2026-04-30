@@ -25,6 +25,7 @@ public:
 
         int gran_k_a, gran_k_b;
         bool is_fp4;
+        int stride_d;
 
         void* gmem_d;
         void* gmem_c;
@@ -87,6 +88,7 @@ static void __instantiate_kernel() {{
             args.grouped_layout,
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
+            args.stride_d,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
             args.tensor_map_cd));
@@ -148,9 +150,11 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                                  config.layout.block_m, gran_k_a, 1, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                  config.layout.block_n, gran_k_b, 1, 0);
-    const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
+    const int d_n = static_cast<int>(d.size(-1));
+    const int d_stride = static_cast<int>(d.stride(-2));
+    const auto tensor_map_cd = make_tma_cd_desc(d, m, d_n,
                                                 config.layout.block_m, config.layout.block_n,
-                                                n, 1,
+                                                d_stride, 1,
                                                 config.storage_config.swizzle_cd_mode);
 
     const SM120FP8FP4Gemm1D1DRuntime::Args args = {
@@ -163,6 +167,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .stride_d = d_stride,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,
@@ -250,6 +255,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .stride_d = n,
         .gmem_d = d.data_ptr(),
         .gmem_c = cd.data_ptr(),
         .gmem_a_ptr = a.data_ptr(),
@@ -334,6 +340,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .stride_d = n,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -409,6 +416,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .stride_d = n,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -481,6 +489,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .stride_d = n,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,

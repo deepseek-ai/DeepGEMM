@@ -45,6 +45,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              int* grouped_layout,
                              cute::TmaDescriptor* tensor_map_buffer,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                             uint32_t stride_d,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
@@ -457,11 +458,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             };
 
             constexpr bool kIsBatchedEpilogue = (kGemmType == GemmType::Batched);
-            // Batched D is [M, batch, N] physical layout: stride_m = kNumGroups * shape_n
+            // Batched D is [M, batch, N] physical layout: stride_m = kNumGroups * stride_d
             const int64_t cd_m_stride = kIsBatchedEpilogue
-                ? static_cast<int64_t>(kNumGroups) * shape_n : static_cast<int64_t>(shape_n);
+                ? static_cast<int64_t>(kNumGroups) * stride_d : static_cast<int64_t>(stride_d);
             const int64_t cd_batch_offset = kIsBatchedEpilogue
-                ? static_cast<int64_t>(scheduler.current_group_idx) * shape_n : 0;
+                ? static_cast<int64_t>(scheduler.current_group_idx) * stride_d : 0;
 
             if constexpr (kUseTMAStoreEpilogue) {
                 if (math_warp_idx == 0 and lane_idx == 0)
@@ -483,11 +484,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
                             const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
                                 n_base + nt * MMA_N) + thread_id * 2;
-                            if (gr0 < total_shape_m and gc + 1 < shape_n) {
+                            if (gr0 < total_shape_m and gc + 1 < stride_d) {
                                 const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
                                 v0 += read_cd(gmem_c[ci]); v1 += read_cd(gmem_c[ci + 1]);
                             }
-                            if (gr1 < total_shape_m and gc + 1 < shape_n) {
+                            if (gr1 < total_shape_m and gc + 1 < stride_d) {
                                 const auto ci = cd_batch_offset + static_cast<int64_t>(gr1) * cd_m_stride + gc;
                                 v2 += read_cd(gmem_c[ci]); v3 += read_cd(gmem_c[ci + 1]);
                             }
@@ -517,19 +518,21 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     #pragma unroll
                     for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
                         auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * BLOCK_M;
+                        const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
+                            n_base + ts * kTMAStoreInnerDim);
                         if constexpr (kIsBatchedEpilogue) {
                             if constexpr (kWithAccumulation)
                                 cute::SM90_TMA_REDUCE_ADD_3D::copy(
                                     &tensor_map_cd, smem_src,
-                                    n_base + ts * kTMAStoreInnerDim, m_base, batch_store_idx);
+                                    n_store, m_base, batch_store_idx);
                             else
                                 cute::SM90_TMA_STORE_3D::copy(
                                     &tensor_map_cd, smem_src,
-                                    n_base + ts * kTMAStoreInnerDim, m_base, batch_store_idx);
+                                    n_store, m_base, batch_store_idx);
                         } else {
                             cute::SM90_TMA_STORE_2D::copy(
                                 &tensor_map_cd, smem_src,
-                                n_base + ts * kTMAStoreInnerDim, m_base);
+                                n_store, m_base);
                         }
                     }
                     cute::tma_store_arrive();
@@ -554,13 +557,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
-                        if (row0 < total_shape_m and col + 1 < shape_n) {
+                        if (row0 < total_shape_m and col + 1 < stride_d) {
                             auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
                             float v0 = accum[ai + 0], v1 = accum[ai + 1];
                             if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
                             store_pair(&gmem_d[idx], v0, v1);
                         }
-                        if (row1 < total_shape_m and col + 1 < shape_n) {
+                        if (row1 < total_shape_m and col + 1 < stride_d) {
                             auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
                             float v2 = accum[ai + 2], v3 = accum[ai + 3];
                             if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); v3 += read_cd(gmem_c[idx + 1]); }

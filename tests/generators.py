@@ -160,6 +160,7 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     quant_config_list = QuantConfig.get_list_from_dtype(dtype)
     m_group_list = [(4, 8192), (8, 4096)]
     n_k_list = [(6144, 7168), (7168, 3072), (4096, 4096), (4096, 2048)]
+    allow_b_mn = get_arch_major() != 9 or dtype != torch.float8_e4m3fn
     for kernel_type in get_kernel_types(dtype):
         for quant_config in quant_config_list:
             if len(quant_config_list) > 1:
@@ -168,7 +169,7 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
                 reset_seed()
                 for num_groups, expected_m_per_group in m_group_list:
                     for n, k in n_k_list:
-                        for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
+                        for major_a, major_b in get_major_ab(False, allow_b_mn):
                                 yield kernel_type, quant_config, num_groups, expected_m_per_group, n, k, major_a, major_b, use_psum_layout
 
 

@@ -203,7 +203,10 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 constexpr bool kAGroupOffset = (kGemmType == GemmType::MGroupedMasked);
                 const uint32_t m_idx = scheduler.template get_global_idx<kAGroupOffset>(shape_m, BLOCK_M, m_block_idx);
                 constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous);
-                const uint32_t n_idx = scheduler.template get_global_idx<kBGroupOffset>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
+                // For K-major B: group offset on outer=N. For MN-major B: group offset on outer=K.
+                const uint32_t n_idx = scheduler.template get_global_idx<kBGroupOffset and kBKMajor>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
+                const uint32_t k_group_offset = (kBGroupOffset and not kBKMajor) ?
+                    scheduler.template get_global_idx<true>(shape_k, 0, 0, m_block_idx) : 0;
                 const auto tma_a_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_a : &tensor_map_a_base);
                 const auto tma_b_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_b : &tensor_map_b_base);
 
@@ -219,10 +222,9 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     if constexpr (kBKMajor) {
                         tma::copy<kSMEMKBytes, BLOCK_N, kSwizzleBMode, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
                     } else {
-                        // MN-major: inner=N(elements), outer=K. Use bf16 dtype so multi-atom loop increments in elements.
                         tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(
                             tma_b_desc, full_barriers[s], reinterpret_cast<cutlass::bfloat16_t*>(smem_b[s]),
-                            n_idx, k_idx, 1, batch_idx);
+                            n_idx, k_group_offset + k_idx, 1, batch_idx);
                     }
                     full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
                 }
