@@ -105,6 +105,20 @@ def transform_weights_for_mega_moe(
     return l1_weights, l2_weights
 
 
+def transform_weights_for_mega_moe_sm90(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """SM90 (Hopper) variant of `transform_weights_for_mega_moe`.
+
+    SM90 has no TMEM / UTCCP path, so the SF tensors are consumed directly by
+    WGMMA promote and don't need the 4x32 transpose. Only L1's gate/up
+    interleave is preserved.
+    """
+    l1_interleaved = _interleave_l1_weights(l1_weights)
+    return l1_interleaved, l2_weights
+
+
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -145,4 +159,36 @@ def mega_moe_pre_dispatch(x: torch.Tensor,
         x, topk_idx, topk_weights,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
         num_tokens, group_size, use_fp4_acts,
+    )
+
+
+def fp8_mega_moe(y: torch.Tensor,
+                 l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                 l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                 sym_buffer: SymmBuffer,
+                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                 recipe: Tuple[int, int, int] = (1, 128, 128),
+                 activation: str = 'swiglu',
+                 activation_clamp: Optional[float] = None,
+                 fast_math: bool = True):
+    """SM90 (Hopper) MegaMoE entry point.
+
+    Expects FP8 e4m3 weights and per-128 channel float scale factors. The
+    kernel itself is currently a skeleton; calling it on a real device will
+    trigger a device-side assertion until the SM90 implementation lands.
+    """
+    (l1_weights_data, l1_weights_sf) = l1_weights
+    (l2_weights_data, l2_weights_sf) = l2_weights
+    _C.fp8_mega_moe(
+        y,
+        l1_weights_data, l1_weights_sf,
+        l2_weights_data, l2_weights_sf,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
     )

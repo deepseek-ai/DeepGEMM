@@ -59,6 +59,13 @@ public:
             flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
         if (get_env("DG_JIT_WITH_LINEINFO", 0))
             flags += " -Xcompiler -rdynamic -lineinfo";
+        // NOTES: `--device-debug` (-G) emits full device DWARF so that cuda-gdb
+        // can resolve `__device__` global variables / line numbers in JIT
+        // kernels. It DISABLES device-side optimization and will tank perf, so
+        // it is gated behind an explicit env var. Enable when you need to
+        // inspect debug-only globals such as `dg_dbg_prod_iter` after a hang.
+        if (get_env("DG_JIT_WITH_DEVICE_DEBUG", 0))
+            flags += " --device-debug";
     }
 
     virtual ~Compiler() = default;
