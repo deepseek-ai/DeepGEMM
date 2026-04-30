@@ -207,13 +207,13 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
     const auto arch_major = device_runtime->get_arch_major();
     if (is_varlen) {
         const auto& indices_tensor = indices.value();
-        DG_HOST_ASSERT(arch_major == 10 and next_n == 1 and (block_kv == 64 or block_kv == 32));
+        DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and next_n == 1 and (block_kv == 64 or block_kv == 32));
         DG_HOST_ASSERT(indices_tensor.dim() == 1 and indices_tensor.size(0) == batch_size);
         DG_HOST_ASSERT(indices_tensor.is_contiguous());
         DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
         smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d, true, indices_tensor.data_ptr<int>());
-    } else if (arch_major == 9 or arch_major == 10) {
-        DG_HOST_ASSERT(block_kv == 64 or (arch_major == 10 and block_kv == 32));
+    } else if (arch_major == 9 or arch_major == 10 or arch_major == 12) {
+        DG_HOST_ASSERT(block_kv == 64 or ((arch_major == 10 or arch_major == 12) and block_kv == 32));
         smxx_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d, false, nullptr);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -335,7 +335,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     const auto arch_major = device_runtime->get_arch_major();
     const auto indices_tensor = indices.value_or(torch::Tensor());
     if (is_varlen) {
-        DG_HOST_ASSERT(arch_major == 10 and next_n == 1);
+        DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and next_n == 1);
         DG_HOST_ASSERT(indices_tensor.dim() == 1 and indices_tensor.size(0) == batch_size);
         DG_HOST_ASSERT(indices_tensor.is_contiguous());
         DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
@@ -368,6 +368,10 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         sm100_fp4_paged_mqa_logits(q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                    logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                    is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
+    } else if (not is_fp4 and arch_major == 12) {
+        sm120_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table,
+                                   logits_dtype, batch_size, next_n, num_heads, head_dim, block_kv,
+                                   is_context_lens_2d, aligned_max_context_len, block_table_stride);
     } else if (not is_fp4 and (arch_major == 9 or arch_major == 10)) {
         smxx_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                   logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,

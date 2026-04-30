@@ -202,10 +202,11 @@ public:
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
+        const auto arch_flag = fmt::format("-gencode=arch=compute_{},code=sm_{}", arch, arch);
+        flags = fmt::format("{} -I{} {} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, library_include_path.c_str(), arch_flag);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
