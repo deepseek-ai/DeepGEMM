@@ -71,6 +71,7 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     const int smem_size = (3 * aligned_batch_size + 1) * static_cast<int>(sizeof(int));
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
 
     // Launch
     const SMXXPagedMQALogitsMetadataRuntime::Args& args = {

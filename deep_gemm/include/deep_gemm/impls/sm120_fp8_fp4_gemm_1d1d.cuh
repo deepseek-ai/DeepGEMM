@@ -39,7 +39,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           typename cd_dtype_t,
           typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
           bool kIsFP4 = false,
-          bool kBKMajor = true>
+          bool kBKMajor = true,
+          bool kKGroupedConstantStride = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
@@ -209,23 +210,35 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                         const auto a_base = reinterpret_cast<const char*>(gmem_a_ptr);
                         const auto b_base = reinterpret_cast<const char*>(gmem_b_ptr);
-                        const uint64_t a_offset = kIsFP4
-                            ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
-                            : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
-                        const uint64_t b_offset = kIsFP4
-                            ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
-                            : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
 
-                        ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
-                        ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
-
-                        const uint64_t new_stride = kIsFP4
-                            ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
-                            : static_cast<uint64_t>(scheduler.current_shape_k);
-                        ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
-                            smem_tm_a, scheduler.current_shape_k, new_stride);
-                        ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
-                            smem_tm_b, scheduler.current_shape_k, new_stride);
+                        if constexpr (kKGroupedConstantStride) {
+                            // TN path: [M, sum_k] layout with constant stride=sum_k.
+                            // Groups are at column offsets; only replace addr + dim.
+                            const uint64_t k_byte_offset = kIsFP4
+                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + k_byte_offset);
+                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + k_byte_offset);
+                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
+                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
+                        } else {
+                            // NT path: per-group [M, k_i] blocks concatenated. Replace addr + dim + stride.
+                            const uint64_t a_offset = kIsFP4
+                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
+                            const uint64_t b_offset = kIsFP4
+                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
+                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
+                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
+                            const uint64_t new_stride = kIsFP4
+                                ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
+                                : static_cast<uint64_t>(scheduler.current_shape_k);
+                            ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
+                                smem_tm_a, scheduler.current_shape_k, new_stride);
+                            ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
+                                smem_tm_b, scheduler.current_shape_k, new_stride);
+                        }
 
                         *gmem_tm_a = *smem_tm_a;
                         *gmem_tm_b = *smem_tm_b;

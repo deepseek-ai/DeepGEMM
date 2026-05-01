@@ -253,9 +253,9 @@ def test_paged_mqa_logits():
 
     def enumerate_paged_mqa_logits():
         arch_major = get_arch_major()
-        # Varlen is SM100-only (SM90 kernel statically rejects it). SM90 supports
+        # Varlen is SM100/SM120-only (SM90 kernel statically rejects it). SM90 supports
         # block_kv ∈ {32, 64} (NV PR #314) and adds next_n=4 via cluster multicast.
-        for is_varlen in ((True, False) if arch_major == 10 else (False, )):
+        for is_varlen in ((True, False) if arch_major in (10, 12) else (False, )):
             for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
                 for logits_dtype in (torch.float, torch.bfloat16):
                     for block_kv in (32, 64):

@@ -191,21 +191,28 @@ def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
 
 def enumerate_k_grouped_contiguous(dtype: torch.dtype):
     gran_k_list = (128, ) if get_arch_major() == 9 else (32, 128)
-    # K-major for SM90 and SM120 FP8
-    major_a, major_b = (MajorTypeAB.KMajor, MajorTypeAB.KMajor) if get_arch_major() in (9, 12) and dtype == torch.float8_e4m3fn \
-                       else (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
+    arch = get_arch_major()
+    # SM90: K-major only; SM100: MN-major only; SM120 FP8: both NT and TN
+    if arch == 9 and dtype == torch.float8_e4m3fn:
+        major_pairs = [(MajorTypeAB.KMajor, MajorTypeAB.KMajor)]
+    elif arch == 12 and dtype == torch.float8_e4m3fn:
+        major_pairs = [(MajorTypeAB.KMajor, MajorTypeAB.KMajor), (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)]
+    else:
+        major_pairs = [(MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)]
     # Must with FP32 accumulation and 1D1D kernels
-    for num_groups, m, n, expected_k_per_group in (( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
-                                                   ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
-                                                   (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
-        if dtype == torch.bfloat16:
-            ks = [align(int(expected_k_per_group * random.uniform(0.7, 1.3)), get_mk_alignment_for_contiguous_layout()) for _ in range(num_groups)]
-            yield num_groups, m, n, major_a, major_b, ks, expected_k_per_group
-        else:
-            for gran_k in gran_k_list:
-                set_mk_alignment_for_contiguous_layout(gran_k)
-                ks = [align(int(expected_k_per_group * random.uniform(0.7, 1.3)), gran_k) for _ in range(num_groups)]
-                yield num_groups, m, n, major_a, major_b, ks, expected_k_per_group, gran_k
+    for major_a, major_b in major_pairs:
+        for num_groups, m, n, expected_k_per_group in (( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
+                                                       ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
+                                                       (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
+            if dtype == torch.bfloat16:
+                ks = [align(int(expected_k_per_group * random.uniform(0.7, 1.3)), get_mk_alignment_for_contiguous_layout()) for _ in range(num_groups)]
+                yield num_groups, m, n, major_a, major_b, ks, expected_k_per_group
+            else:
+                for gran_k in gran_k_list:
+                    set_mk_alignment_for_contiguous_layout(gran_k)
+                    k_align = max(gran_k, 128) if arch == 12 else gran_k
+                    ks = [align(int(expected_k_per_group * random.uniform(0.7, 1.3)), k_align) for _ in range(num_groups)]
+                    yield num_groups, m, n, major_a, major_b, ks, expected_k_per_group, gran_k
 
 
 def enumerate_sf_layout():
@@ -393,6 +400,14 @@ def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: Majo
     if use_bf16:
         assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
         return k, a, b, c, d, ref_d
+
+    if (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor):
+        # TN layout: data stays [sum_k, M/N], cast to FP8 in MN-major
+        # SF from per_channel_cast is [sum_k/gran_k, M] — transpose to [M, sum_k/gran_k]
+        # so transform_k_grouped_sf_into_required_layout gets the right shape
+        a_data, sfa = per_channel_cast_to_fp8(a, use_ue8m0=use_ue8m0, gran_k=gran_k)
+        b_data, sfb = per_channel_cast_to_fp8(b, use_ue8m0=use_ue8m0, gran_k=gran_k)
+        return k, (a_data, sfa.T), (b_data, sfb.T), c, d, ref_d
 
     assert (major_a, major_b) == (MajorTypeAB.KMajor, MajorTypeAB.KMajor)
 

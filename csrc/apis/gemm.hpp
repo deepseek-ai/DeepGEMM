@@ -322,6 +322,18 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
     if (arch_major == 10) {
         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks, ks_tensor, gran_k,
                                       cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
+    } else if (arch_major == 12) {
+        // SM120: single transpose [sum_k, M/N] → [M/N, sum_k] with constant stride=sum_k.
+        // Kernel uses kKGroupedConstantStride: per-group only replaces addr+dim, not stride.
+        const auto a_k = a.first.t().contiguous();
+        const auto b_k = b.first.t().contiguous();
+        const auto num_sms = device_runtime->get_num_sms();
+        const auto tensor_map_buffer = torch::empty({num_sms * 4 * static_cast<int>(sizeof(CUtensorMap))},
+                                                    a.first.options().dtype(torch::kByte));
+        sm120_k_grouped_fp8_fp4_gemm_1d1d(a_k, sfa, b_k, sfb, c, d, m, n, ks, ks_tensor, tensor_map_buffer,
+                                           gran_k, gran_k,
+                                           cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims,
+                                           true, sum_k);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

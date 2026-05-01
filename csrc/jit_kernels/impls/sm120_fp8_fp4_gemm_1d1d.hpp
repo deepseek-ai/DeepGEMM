@@ -25,6 +25,7 @@ public:
 
         int gran_k_a, gran_k_b;
         bool is_fp4;
+        bool k_grouped_constant_stride;
         int stride_cd_m;
         int stride_cd_batch;
 
@@ -62,6 +63,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -81,7 +83,8 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type),
         args.is_fp4 ? "true" : "false",
-        (args.gemm_desc.major_b == cute::UMMA::Major::K) ? "true" : "false");
+        (args.gemm_desc.major_b == cute::UMMA::Major::K) ? "true" : "false",
+        args.k_grouped_constant_stride ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -170,6 +173,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .k_grouped_constant_stride = false,
         .stride_cd_m = d_stride,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
@@ -198,7 +202,9 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
                                                const torch::Tensor& tensor_map_buffer,
                                                const int& gran_k_a, const int& gran_k_b,
                                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                               const std::string& compiled_dims) {
+                                               const std::string& compiled_dims,
+                                               const bool k_grouped_constant_stride = false,
+                                               const int outer_stride_k_override = 0) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
     DG_HOST_ASSERT(c.has_value());
 
@@ -231,7 +237,8 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
 
     const auto cd = c.value_or(d);
     const bool fp4_unpacked = !is_fp4;
-    const int outer_stride_k = is_fp4 ? (first_k / 2) : first_k;
+    const int effective_stride = (outer_stride_k_override > 0) ? outer_stride_k_override : first_k;
+    const int outer_stride_k = is_fp4 ? (effective_stride / 2) : effective_stride;
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, first_k,
                                               config.storage_config.load_block_m,
                                               config.layout.block_k, outer_stride_k, 1,
@@ -259,6 +266,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .k_grouped_constant_stride = k_grouped_constant_stride,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
@@ -345,6 +353,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .k_grouped_constant_stride = false,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
@@ -422,6 +431,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .k_grouped_constant_stride = false,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
@@ -499,6 +509,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .k_grouped_constant_stride = false,
         .stride_cd_m = static_cast<int>(d.stride(1)),
         .stride_cd_batch = static_cast<int>(d.stride(0)),
         .gmem_d = d.data_ptr(),

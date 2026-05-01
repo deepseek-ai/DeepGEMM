@@ -163,14 +163,16 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
         if (kv_group_idx >= kNumGroups)
             return;
 
+        using Scheduler = decltype(scheduler);
         const auto issue_tma_q = [&](const uint32_t& stage_idx, const uint32_t& q_idx) {
             if (kv_group_idx == 0 and cute::elect_one_sync()) {
+                const auto q_token_idx = Scheduler::atom_to_token_idx(q_idx);
                 tma::copy<kHeadDim, kNextNAtom * kNumHeads, kHeadDim>(
                     &tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx],
-                    0, q_idx * kNextNAtom * kNumHeads);
+                    0, q_token_idx * kNumHeads);
                 tma::copy<kNextNAtom * kNumHeads, 1, 0>(
                     &tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx],
-                    0, q_idx * kNextNAtom);
+                    0, q_token_idx);
                 full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
             }
         };
@@ -186,7 +188,12 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
         uint32_t kv_block_idx_storage;
 
         while (fetched_next_task) {
-            bool prefetch_q = (q_idx != next_q_idx and scheduler.exist_q_atom_idx(next_q_idx + 1));
+            const auto next_advance = scheduler.get_atom_advance(next_q_idx, batch_size);
+            bool prefetch_q = (q_idx != next_q_idx and scheduler.exist_q_atom_idx(next_q_idx + next_advance));
+
+            if (q_idx != next_q_idx)
+                kv_block_idx_ptr = 32;
+
             q_idx = next_q_idx;
             kv_idx = next_kv_idx;
             num_kv = next_num_kv;
@@ -194,11 +201,11 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
             if (prefetch_q) {
                 CUTE_TIE_DECL(get_q_pipeline(q_iter_idx ++), q_stage_idx, q_phase);
                 empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
-                issue_tma_q(q_stage_idx, q_idx + 1);
+                issue_tma_q(q_stage_idx, q_idx + next_advance);
             }
 
             // Read KV block index via block table
-            if (kv_idx == 0 or kv_block_idx_ptr == 32) {
+            if (kv_block_idx_ptr == 32) {
                 kv_block_idx_ptr = 0;
                 kv_block_idx_storage = (kv_idx + kv_group_idx + lane_idx * kNumGroups < num_kv ?
                     block_table[scheduler.atom_to_block_table_row(q_idx) * static_cast<uint64_t>(block_table_stride) +
@@ -232,9 +239,11 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
         // Pre-compute A row for this warp's M-tile position within the group
         const uint32_t a_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8;
 
+        using Scheduler = decltype(scheduler);
         uint32_t q_idx = batch_size, kv_idx;
         uint32_t next_q_idx, next_kv_idx, next_num_kv;
         uint32_t q_stage_idx, q_phase;
+        bool is_paired_atom = false;
 
         while (scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv)) {
             // Q changes
@@ -244,6 +253,10 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
                 CUTE_TIE(get_q_pipeline(q_iter_idx ++), q_stage_idx, q_phase);
                 full_q_barriers[q_stage_idx]->wait(q_phase);
+
+                if constexpr (kIsVarlen) {
+                    is_paired_atom = (scheduler.get_atom_advance(next_q_idx, batch_size) == 2);
+                }
             }
 
             q_idx = next_q_idx;
@@ -265,53 +278,64 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
             a_ctx.init(a_row + warp_in_group * MMA_M, kSMEMKBytes);
 
             // Process each Q token in the atom
-            #pragma unroll
-            for (uint32_t qi = 0; qi < kNextNAtom; ++ qi) {
-                float partial_0 = 0.0f, partial_1 = 0.0f;
-
+            const auto compute_and_store = [&](auto kNumQTokens) {
                 #pragma unroll
-                for (uint32_t nt = 0; nt < kNTilesPerQ; ++ nt) {
-                    const uint32_t n_tile = qi * kNTilesPerQ + nt;
-                    float d[4] = {0, 0, 0, 0};
-
-                    sm120::SwizzleContext<kSwizzleMode> b_ctx;
-                    b_ctx.init((lane_idx & 7) + n_tile * MMA_N, kSMEMKBytes);
+                for (uint32_t qi = 0; qi < decltype(kNumQTokens)::value; ++ qi) {
+                    float partial_0 = 0.0f, partial_1 = 0.0f;
 
                     #pragma unroll
-                    for (uint32_t k = 0; k < kKSteps; ++ k) {
-                        uint32_t a_frag[4];
-                        sm120::load_a_fragment<kSwizzleMode>(
-                            a_frag, reinterpret_cast<char*>(smem_kv[kv_stage_idx]),
-                            a_ctx, lane_idx, k, MMA_K);
+                    for (uint32_t nt = 0; nt < kNTilesPerQ; ++ nt) {
+                        const uint32_t n_tile = qi * kNTilesPerQ + nt;
+                        float d[4] = {0, 0, 0, 0};
 
-                        uint32_t b_frag[2];
-                        sm120::load_b_fragment_x2<kSwizzleMode>(
-                            b_frag, reinterpret_cast<char*>(smem_q[q_stage_idx]),
-                            b_ctx, lane_idx, k, MMA_K);
+                        sm120::SwizzleContext<kSwizzleMode> b_ctx;
+                        b_ctx.init((lane_idx & 7) + n_tile * MMA_N, kSMEMKBytes);
 
-                        fp8_mma(d, a_frag, b_frag);
+                        #pragma unroll
+                        for (uint32_t k = 0; k < kKSteps; ++ k) {
+                            uint32_t a_frag[4];
+                            sm120::load_a_fragment<kSwizzleMode>(
+                                a_frag, reinterpret_cast<char*>(smem_kv[kv_stage_idx]),
+                                a_ctx, lane_idx, k, MMA_K);
+
+                            uint32_t b_frag[2];
+                            sm120::load_b_fragment_x2<kSwizzleMode>(
+                                b_frag, reinterpret_cast<char*>(smem_q[q_stage_idx]),
+                                b_ctx, lane_idx, k, MMA_K);
+
+                            fp8_mma(d, a_frag, b_frag);
+                        }
+
+                        // Weighted ReLU accumulation
+                        const uint32_t h0 = nt * MMA_N + t * 2;
+                        const float w0 = ptx::ld_shared(smem_weights[q_stage_idx] + qi * kNumHeads + h0);
+                        const float w1 = ptx::ld_shared(smem_weights[q_stage_idx] + qi * kNumHeads + h0 + 1);
+                        partial_0 += fmaxf(d[0], 0.0f) * w0 + fmaxf(d[1], 0.0f) * w1;
+                        partial_1 += fmaxf(d[2], 0.0f) * w0 + fmaxf(d[3], 0.0f) * w1;
                     }
 
-                    // Weighted ReLU accumulation
-                    const uint32_t h0 = nt * MMA_N + t * 2;
-                    const float w0 = ptx::ld_shared(smem_weights[q_stage_idx] + qi * kNumHeads + h0);
-                    const float w1 = ptx::ld_shared(smem_weights[q_stage_idx] + qi * kNumHeads + h0 + 1);
-                    partial_0 += fmaxf(d[0], 0.0f) * w0 + fmaxf(d[1], 0.0f) * w1;
-                    partial_1 += fmaxf(d[2], 0.0f) * w0 + fmaxf(d[3], 0.0f) * w1;
+                    float v_0 = partial_0 * scale_kv_0;
+                    float v_1 = partial_1 * scale_kv_1;
+
+                    #pragma unroll
+                    for (uint32_t j = 0; j < 2; ++ j) {
+                        const auto offset = static_cast<int>(1u << j);
+                        v_0 += __shfl_xor_sync(0xffffffffu, v_0, offset);
+                        v_1 += __shfl_xor_sync(0xffffffffu, v_1, offset);
+                    }
+
+                    logits[kv_offset + qi * static_cast<uint64_t>(logits_stride) + g] = static_cast<logits_dtype_t>(v_0);
+                    logits[kv_offset + qi * static_cast<uint64_t>(logits_stride) + g + 8] = static_cast<logits_dtype_t>(v_1);
                 }
+            };
 
-                float v_0 = partial_0 * scale_kv_0;
-                float v_1 = partial_1 * scale_kv_1;
-
-                #pragma unroll
-                for (uint32_t j = 0; j < 2; ++ j) {
-                    const auto offset = static_cast<int>(1u << j);
-                    v_0 += __shfl_xor_sync(0xffffffffu, v_0, offset);
-                    v_1 += __shfl_xor_sync(0xffffffffu, v_1, offset);
-                }
-
-                logits[kv_offset + qi * static_cast<uint64_t>(logits_stride) + g] = static_cast<logits_dtype_t>(v_0);
-                logits[kv_offset + qi * static_cast<uint64_t>(logits_stride) + g + 8] = static_cast<logits_dtype_t>(v_1);
+            if constexpr (kIsVarlen) {
+                if (is_paired_atom)
+                    compute_and_store(cute::Int<kNextNAtom>{});
+                else
+                    compute_and_store(cute::Int<1>{});
+            } else {
+                compute_and_store(cute::Int<kNextNAtom>{});
             }
 
             empty_kv_barriers[kv_stage_idx]->arrive();

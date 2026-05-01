@@ -102,15 +102,8 @@ def test_correctness():
 
 def test_performance():
     assert get_arch_major() == 12
-    print("=" * 60)
-    print("SM120a K-Grouped Contiguous FP8 GEMM — Performance")
-    print("=" * 60)
-
     major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
     use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D)
-    gran_k = 128
-    set_mk_alignment_for_contiguous_layout(gran_k)
-    recipe = (1, 1, gran_k)
 
     bench_configs = [
         # (num_groups, m, n, expected_k, label)
@@ -120,31 +113,43 @@ def test_performance():
         ( 4, 7168, 2048, 8192, "EP64  4g (alt)"),
     ]
 
-    print(f"{'Config':>20s} | {'sum_K':>8s} | {'Time (us)':>10s} | {'TFLOPS':>8s}")
-    print("-" * 56)
+    for is_fp4, dtype_label in [(False, "FP8"), (True, "FP4")]:
+        print("=" * 60)
+        print(f"SM120a K-Grouped Contiguous {dtype_label} GEMM — Performance")
+        print("=" * 60)
 
-    for num_groups, m, n, expected_k, label in bench_configs:
-        reset_seed()
-        random.seed(num_groups * 100 + expected_k)
-        ks = [align(int(expected_k * random.uniform(0.7, 1.3)), 128) for _ in range(num_groups)]
-        sum_k = sum(ks)
+        for gran_k in (128,) if not is_fp4 else (32, 128):
+            set_mk_alignment_for_contiguous_layout(gran_k)
+            recipe = (1, 1, gran_k)
 
-        try:
-            k, a, b, c, d, ref_d = generate_k_grouped_contiguous(
-                num_groups, m, n, major_a, major_b, ks,
-                use_ue8m0=use_ue8m0, gran_k=gran_k
-            )
-            ks_tensor = torch.tensor(ks, dtype=torch.int32, device='cuda')
+            print(f"\ngran_k={gran_k}:")
+            print(f"{'Config':>20s} | {'sum_K':>8s} | {'Time (us)':>10s} | {'TFLOPS':>8s}")
+            print("-" * 56)
 
-            t = bench_kineto(
-                lambda: deep_gemm.k_grouped_fp8_gemm_nt_contiguous(
-                    a, b, d, ks, ks_tensor, c, recipe=recipe),
-                'gemm_', suppress_kineto_output=True
-            )
-            tflops = 2.0 * m * n * sum_k / t / 1e12
-            print(f"{label:>20s} | {sum_k:8d} | {t * 1e6:10.1f} | {tflops:8.1f}")
-        except Exception as e:
-            print(f"{label:>20s} | ERROR: {e}")
+            for num_groups, m, n, expected_k, label in bench_configs:
+                reset_seed()
+                random.seed(num_groups * 100 + expected_k + (500 if is_fp4 else 0))
+                k_align = max(gran_k, 128)
+                ks = [align(int(expected_k * random.uniform(0.7, 1.3)), k_align) for _ in range(num_groups)]
+                sum_k = sum(ks)
+
+                try:
+                    k, a, b, c, d, ref_d = generate_k_grouped_contiguous(
+                        num_groups, m, n, major_a, major_b, ks,
+                        use_ue8m0=use_ue8m0, gran_k=gran_k, is_fp4=is_fp4
+                    )
+                    ks_tensor = torch.tensor(ks, dtype=torch.int32, device='cuda')
+
+                    t = bench_kineto(
+                        lambda a=a, b=b, d=d, ks=ks, ks_tensor=ks_tensor, c=c, recipe=recipe:
+                            deep_gemm.k_grouped_fp8_gemm_nt_contiguous(
+                                a, b, d, ks, ks_tensor, c, recipe=recipe),
+                        'gemm_', suppress_kineto_output=True
+                    )
+                    tflops = 2.0 * m * n * sum_k / t / 1e12
+                    print(f"{label:>20s} | {sum_k:8d} | {t * 1e6:10.1f} | {tflops:8.1f}")
+                except Exception as e:
+                    print(f"{label:>20s} | ERROR: {e}")
 
 
 if __name__ == '__main__':
