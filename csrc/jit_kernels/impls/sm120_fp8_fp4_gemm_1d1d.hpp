@@ -216,13 +216,16 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
     DG_HOST_ASSERT(c.has_value());
 
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
     const auto num_groups = static_cast<int>(ks.size());
-    int first_k = 0, sum_k = 0, sum_sf_k = 0, max_k = 0;
+    int first_k = 0, sum_k = 0, max_k = 0;
+    int sum_sf_k_a = 0, sum_sf_k_b = 0;
     for (int i = 0; i < num_groups; ++i) {
         if (first_k == 0 and ks[i] != 0)
             first_k = ks[i];
         sum_k += ks[i];
-        sum_sf_k += ceil_div(ks[i], gran_k_a * 4);
+        sum_sf_k_a += ceil_div(ks[i], gran_k_a * 4);
+        sum_sf_k_b += ceil_div(ks[i], gran_k_b * 4);
         max_k = std::max(max_k, ks[i]);
         DG_HOST_ASSERT(ks[i] % 128 == 0);
     }
@@ -245,18 +248,20 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
     const auto cd = c.value_or(d);
     const bool fp4_unpacked = !is_fp4;
     const int effective_stride = (outer_stride_k_override > 0) ? outer_stride_k_override : first_k;
-    const int outer_stride_k = is_fp4 ? (effective_stride / 2) : effective_stride;
+    const int outer_stride_k_a = is_fp4 ? (effective_stride / 2) : effective_stride;
+    const int outer_stride_k_b = (is_fp4 || b_is_fp4) ? (effective_stride / 2) : effective_stride;
     const auto tensor_map_a = make_tma_a_desc(major_a, a, m, first_k,
                                               config.storage_config.load_block_m,
-                                              config.layout.block_k, outer_stride_k, 1,
+                                              config.layout.block_k, outer_stride_k_a, 1,
                                               config.storage_config.swizzle_a_mode, 0, false, fp4_unpacked);
     const auto tensor_map_b = make_tma_b_desc(major_b, b, n, first_k,
                                               config.storage_config.load_block_n,
-                                              config.layout.block_k, outer_stride_k, 1,
-                                              config.storage_config.swizzle_b_mode, 0, false, fp4_unpacked);
-    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, sum_sf_k * gran_k_a * 4,
+                                              config.layout.block_k, outer_stride_k_b, 1,
+                                              config.storage_config.swizzle_b_mode, 0, false,
+                                              b_is_fp4 ? true : fp4_unpacked);
+    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, sum_sf_k_a * gran_k_a * 4,
                                                  config.layout.block_m, gran_k_a, 1, 0);
-    const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, sum_sf_k * gran_k_b * 4,
+    const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, sum_sf_k_b * gran_k_b * 4,
                                                  config.layout.block_n, gran_k_b, 1, 0);
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
                                                 config.layout.block_m, config.layout.block_n,
@@ -273,7 +278,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .b_is_fp4 = false,
+        .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = k_grouped_constant_stride,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
@@ -313,6 +318,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         DG_HOST_ASSERT(use_psum_layout);
 
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
 
     const auto desc = GemmDesc {
         .gemm_type = gemm_type,
@@ -341,7 +347,8 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                               config.storage_config.load_block_n,
                                               config.layout.block_k,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
-                                              config.storage_config.swizzle_b_mode, 0, false, fp4_unpacked);
+                                              config.storage_config.swizzle_b_mode, 0, false,
+                                              b_is_fp4 ? true : fp4_unpacked);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, gran_k_a, 1, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
@@ -361,7 +368,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .b_is_fp4 = false,
+        .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
@@ -394,6 +401,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
 
     const auto desc = GemmDesc {
         .gemm_type = GemmType::MGroupedMasked,
@@ -420,7 +428,8 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
                                               config.storage_config.load_block_n,
                                               config.layout.block_k,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
-                                              config.storage_config.swizzle_b_mode, 0, false, fp4_unpacked);
+                                              config.storage_config.swizzle_b_mode, 0, false,
+                                              b_is_fp4 ? true : fp4_unpacked);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, gran_k_a, num_groups, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
@@ -440,7 +449,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .b_is_fp4 = false,
+        .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
@@ -475,6 +484,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
 
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Batched,
@@ -499,7 +509,8 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto tensor_map_b = make_tma_3d_desc(b, k, n, batch_size,
                                                config.layout.block_k, config.storage_config.load_block_n, 1,
                                                b.stride(1), b.stride(0),
-                                               config.storage_config.swizzle_b_mode, 0, false, fp4_unpacked);
+                                               config.storage_config.swizzle_b_mode, 0, false,
+                                               b_is_fp4 ? true : fp4_unpacked);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, gran_k_a, batch_size, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
@@ -519,7 +530,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
-        .b_is_fp4 = false,
+        .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = static_cast<int>(d.stride(1)),
         .stride_cd_batch = static_cast<int>(d.stride(0)),
