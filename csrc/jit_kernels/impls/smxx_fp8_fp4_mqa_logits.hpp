@@ -330,4 +330,156 @@ static void sm100_fp4_mqa_logits(const torch::Tensor& q, const torch::Tensor& sf
     SM100FP4MQALogitsRuntime::launch(runtime, args);
 }
 
+class SM120FP4MQALogitsRuntime final: public LaunchRuntime<SM120FP4MQALogitsRuntime> {
+public:
+    struct Args {
+        int seq_len;
+        int seq_len_kv;
+        int max_seqlen_k;
+        int stride_logits;
+        int num_heads, head_dim;
+        bool is_compressed_logits;
+
+        int num_q_stages;
+        int num_kv_stages;
+        int block_q;
+        int block_kv;
+
+        int* cu_seq_len_k_start;
+        int* cu_seq_len_k_end;
+        void* logits;
+
+        CUtensorMap tensor_map_q;
+        CUtensorMap tensor_map_sf_q;
+        CUtensorMap tensor_map_kv;
+        CUtensorMap tensor_map_sf_kv;
+        CUtensorMap tensor_map_weights;
+        at::ScalarType logits_dtype;
+
+        int num_tma_threads;
+        int num_math_threads;
+
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        DG_HOST_ASSERT(128 % args.num_heads == 0);
+
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm120_fp4_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm120_fp4_mqa_logits<
+        {}, {},
+        {},
+        {}, {},
+        {}, {},
+        {},
+        {}, {},
+        {}
+    >);
+}};
+)", args.num_heads, args.head_dim,
+    args.is_compressed_logits,
+    args.block_q, args.block_kv,
+    args.num_q_stages, args.num_kv_stages,
+    args.launch_args.grid_dim.first,
+    args.num_tma_threads, args.num_math_threads,
+    to_string(args.logits_dtype));
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.seq_len, args.seq_len_kv,
+            args.max_seqlen_k, args.stride_logits,
+            args.cu_seq_len_k_start, args.cu_seq_len_k_end,
+            args.logits,
+            args.tensor_map_q, args.tensor_map_sf_q,
+            args.tensor_map_kv, args.tensor_map_sf_kv,
+            args.tensor_map_weights
+        ));
+    }
+};
+
+static void sm120_fp4_mqa_logits(const torch::Tensor& q, const torch::Tensor& sf_q,
+                                 const torch::Tensor& kv, const torch::Tensor& sf_kv,
+                                 const torch::Tensor& weights,
+                                 const torch::Tensor& cu_seq_len_k_start,
+                                 const torch::Tensor& cu_seq_len_k_end,
+                                 const torch::Tensor& logits,
+                                 const at::ScalarType& logits_dtype,
+                                 const int& seq_len, const int& seq_len_kv,
+                                 const int& max_seqlen_k, const int& stride_logits,
+                                 const int& num_heads, const int& head_dim,
+                                 const int& block_q, const int& block_kv) {
+    constexpr int num_tma_threads = 128;
+    constexpr int num_math_threads = 256;
+    constexpr int num_q_stages = 2, num_kv_stages = 5;
+
+    const bool is_compressed_logits = (max_seqlen_k > 0);
+
+    DG_HOST_ASSERT(head_dim == 128);
+    const auto tensor_map_q = make_tma_2d_desc(q, head_dim, seq_len * num_heads,
+                                               head_dim, block_q * num_heads,
+                                               static_cast<int>(q.stride(1)),
+                                               head_dim / 2, 0, false, false);
+    const auto tensor_map_sf_q = make_tma_2d_desc(sf_q, num_heads, seq_len,
+                                                  num_heads, block_q,
+                                                  static_cast<int>(sf_q.stride(0)), 0);
+    const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, seq_len,
+                                                     num_heads, block_q,
+                                                     static_cast<int>(weights.stride(0)), 0);
+    const auto tensor_map_kv = make_tma_2d_desc(kv, head_dim, seq_len_kv,
+                                                head_dim, block_kv,
+                                                static_cast<int>(kv.stride(0)),
+                                                head_dim / 2, 0, false, false);
+    const auto tensor_map_sf_kv = make_tma_2d_desc(sf_kv,
+                                                   get_tma_aligned_size(seq_len_kv, static_cast<int>(sf_kv.element_size())), 1,
+                                                   block_kv, 1, 0, 0);
+
+    const int smem_q_size_per_stage = block_q * num_heads * head_dim / 2;
+    const int smem_sf_q_size_per_stage = block_q * num_heads * sizeof(int);
+    const int smem_kv_size_per_stage = block_kv * head_dim / 2;
+    const int smem_sf_kv_size_per_stage = block_kv * sizeof(int);
+    const int smem_weight_size_per_stage = block_q * num_heads * sizeof(float);
+
+    const int smem_barriers = (num_q_stages + num_kv_stages) * 2 * 8;
+    const int smem_size = num_q_stages * (smem_q_size_per_stage + smem_sf_q_size_per_stage + smem_weight_size_per_stage) +
+                          num_kv_stages * (smem_kv_size_per_stage + smem_sf_kv_size_per_stage) +
+                          smem_barriers;
+    DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
+
+    const SM120FP4MQALogitsRuntime::Args args = {
+        .seq_len = seq_len,
+        .seq_len_kv = seq_len_kv,
+        .max_seqlen_k = max_seqlen_k,
+        .stride_logits = stride_logits,
+        .num_heads = num_heads, .head_dim = head_dim,
+        .is_compressed_logits = is_compressed_logits,
+        .num_q_stages = num_q_stages,
+        .num_kv_stages = num_kv_stages,
+        .block_q = block_q,
+        .block_kv = block_kv,
+        .cu_seq_len_k_start = cu_seq_len_k_start.data_ptr<int>(),
+        .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
+        .logits = logits.data_ptr(),
+        .tensor_map_q = tensor_map_q,
+        .tensor_map_sf_q = tensor_map_sf_q,
+        .tensor_map_kv = tensor_map_kv,
+        .tensor_map_sf_kv = tensor_map_sf_kv,
+        .tensor_map_weights = tensor_map_weights,
+        .logits_dtype = logits_dtype,
+        .num_tma_threads = num_tma_threads,
+        .num_math_threads = num_math_threads,
+        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
+                                  num_tma_threads + num_math_threads,
+                                  smem_size)
+    };
+    const auto code = SM120FP4MQALogitsRuntime::generate(args);
+    const auto runtime = compiler->build("sm120_fp4_mqa_logits", code);
+    SM120FP4MQALogitsRuntime::launch(runtime, args);
+}
+
 } // namespace deep_gemm

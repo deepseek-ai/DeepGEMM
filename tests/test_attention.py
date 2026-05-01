@@ -108,7 +108,7 @@ def test_mqa_logits():
         return ks, ke
 
     def enumerate_mqa_logits():
-        for is_fp4 in ((True, False) if get_arch_major() == 10 else (False, )):
+        for is_fp4 in ((True, False) if get_arch_major() in (10, 12) else (False, )):
             for logits_dtype in (torch.float, torch.bfloat16):
                 for compressed_logits, clean_logits in [(False, True), (True, False)]:
                     for seq_len in (2048, 4096):
@@ -256,7 +256,7 @@ def test_paged_mqa_logits():
         # Varlen is SM100/SM120-only (SM90 kernel statically rejects it). SM90 supports
         # block_kv ∈ {32, 64} (NV PR #314) and adds next_n=4 via cluster multicast.
         for is_varlen in ((True, False) if arch_major in (10, 12) else (False, )):
-            for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
+            for is_fp4 in ((True, False) if arch_major in (10, 12) else (False, )):
                 for logits_dtype in (torch.float, torch.bfloat16):
                     for block_kv in (32, 64):
                         for use_2d_context_lens, clean_logits in [(True, False)]:
@@ -269,10 +269,13 @@ def test_paged_mqa_logits():
 
 
     print('Testing FP8/FP4 Paged MQA Logits:')
-    max_model_len = 111 * 1024
-    num_total_blocks = max_model_len * 5
 
     for is_varlen, is_fp4, logits_dtype, block_kv, use_2d_context_lens, clean_logits, batch_size, next_n, max_tokens_per_batch, num_heads, head_dim, avg_kv in enumerate_paged_mqa_logits():
+        # FP4 per_token_cast_to_fp4 uses bucketize (int64), needs ~8x kv_cache memory.
+        # Use smaller num_total_blocks to avoid OOM.
+        max_model_len = 111 * 1024
+        min_blocks_needed = batch_size * (int(1.3 * avg_kv) + max_tokens_per_batch) // block_kv + 256
+        num_total_blocks = max(min_blocks_needed, max_model_len) * (1 if is_fp4 else 5)
         # Varlen: flatten raw_batch_size sequences with variable tokens into (batch_size, 1, ...)
         raw_batch_size, raw_next_n = batch_size, next_n
         if is_varlen:
