@@ -435,19 +435,24 @@ void sm90_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 CUTE_TIE_DECL(get_kv_pipeline(kv_block_idx), kv_stage_idx, kv_phase);
                 full_kv_barriers[kv_stage_idx]->wait(kv_phase);
 
-                // Dequantize FP4 KV -> FP8 KV
-                // KV is [BLOCK_KV, kHeadDim/2] in packed FP4.
-                // SF KV is [BLOCK_KV, 1] int32 (one int32 per KV token, 4 UE8M0 bytes for 4 blocks of 32).
+                // Dequantize only the KV rows consumed by this warpgroup.
+                // Each WGMMA warpgroup owns a contiguous WGMMA::M-row slice of
+                // the KV tile, so it only needs to synchronize with itself
+                // before issuing WGMMA on that slice.
                 {
-                    for (uint32_t row = thread_idx / 32; row < BLOCK_KV; row += kNumMathThreads / 32) {
+                    const uint32_t wg_thread_idx = thread_idx % 128;
+                    const uint32_t wg_warp_idx = wg_thread_idx / 32;
+                    const uint32_t row_end = (warpgroup_idx + 1) * WGMMA::M;
+                    for (uint32_t row = warpgroup_idx * WGMMA::M + wg_warp_idx; row < row_end; row += 4) {
                         const uint8_t* fp4_row_ptr = smem_fp4_kv[kv_stage_idx] + row * (kHeadDim / 2);
                         const uint32_t* sf_row_ptr = smem_sf_kv[kv_stage_idx] + row;
                         // Pass tile base + row index so the function can apply B128 swizzle
                         dequant_fp4_block_to_fp8(fp4_row_ptr, sf_row_ptr, smem_fp8_kv[kv_stage_idx], row, lane_idx, kHeadDim);
                     }
                 }
-                // Barrier id 1: synchronize all kNumMathThreads after KV dequant
-                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 1);
+                // Barrier ids 1..kNumMathThreads/128: one local barrier per
+                // WGMMA warpgroup after its KV slice is ready.
+                cutlass::arch::NamedBarrier::sync(128, warpgroup_idx + 1);
 
                 // Per-KV scales: the fp8 representation already has the scale embedded
                 // (FP4 * UE8M0_scale -> FP8). For the reduce step we need a per-KV
