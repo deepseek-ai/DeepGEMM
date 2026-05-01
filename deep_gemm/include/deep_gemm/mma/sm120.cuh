@@ -51,6 +51,25 @@ __device__ __forceinline__ void fp8_mma_block_scaled(
     );
 }
 
+// Mixed FP8_A × FP4_B block-scaled MMA: m16n8k32, scale_vec::1X
+// Uses mxf8f6f4 with e4m3 A and e2m1 B. Same K=32 as pure FP8.
+// B operand must be unpacked (1 byte/elem) and shifted << 2 before calling.
+__device__ __forceinline__ void fp8_fp4_mixed_mma_block_scaled(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2],
+    uint8_t sfa, uint8_t sfb
+) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e2m1.f32.ue8m0 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, "
+        "{%10}, {%11, %12}, {%13}, {%14, %15};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "r"(static_cast<uint32_t>(sfa)), "n"(static_cast<uint16_t>(0)), "n"(static_cast<uint16_t>(0)),
+          "r"(static_cast<uint32_t>(sfb)), "n"(static_cast<uint16_t>(0)), "n"(static_cast<uint16_t>(0))
+    );
+}
+
 // FP4 Block-Scaled MMA: m16n8k64
 static constexpr int FP4_MMA_M = 16, FP4_MMA_N = 8, FP4_MMA_K = 64;
 static constexpr int FP4_MMA_ACCUM = 4;

@@ -39,6 +39,7 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           typename cd_dtype_t,
           typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
           bool kIsFP4 = false,
+          bool kBIsFP4 = false,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -64,6 +65,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
                      "Only float or bfloat16 output supported");
+    DG_STATIC_ASSERT(!(kIsFP4 && kBIsFP4), "Use kIsFP4 for symmetric FP4x4, not kBIsFP4");
+    DG_STATIC_ASSERT(!kBIsFP4 || kBKMajor, "Mixed FP8xFP4 requires K-major B");
     DG_STATIC_ASSERT(kNumTMAThreads > 0, "SM120a always uses warp-specialized pipeline");
     DG_STATIC_ASSERT(kNumMathThreads % 32 == 0, "Invalid math threads");
     DG_STATIC_ASSERT(BLOCK_M % MMA_M == 0 and BLOCK_N % MMA_N == 0 and BLOCK_K % MMA_K == 0, "Invalid block dims");
@@ -106,7 +109,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t SMEM_SFB = math::constexpr_align(static_cast<uint32_t>(BLOCK_N * sizeof(int32_t)), 128u);
     static constexpr uint32_t TMA_SFA_BYTES = BLOCK_M * sizeof(int32_t);
     static constexpr uint32_t TMA_SFB_BYTES = BLOCK_N * sizeof(int32_t);
-    static constexpr uint32_t SMEM_TMA_BYTES = SMEM_A + SMEM_B + TMA_SFA_BYTES + TMA_SFB_BYTES;
+    // TMA mbarrier reports GMEM bytes. For .b4x16_p64 (kBIsFP4): GMEM = SMEM/2 (packed).
+    // For packed FP4 (kIsFP4): SMEM already uses packed size, so SMEM_B = GMEM bytes.
+    static constexpr uint32_t TMA_B_BYTES = kBIsFP4 ? (SMEM_B / 2) : SMEM_B;
+    static constexpr uint32_t SMEM_TMA_BYTES = SMEM_A + TMA_B_BYTES + TMA_SFA_BYTES + TMA_SFB_BYTES;
     // ldmatrix K stride in bytes: FP4 packed = MMA_K/2, FP8 = MMA_K. Both = 32 bytes.
     static constexpr uint32_t kLdmK = kIsFP4 ? (MMA_K / 2) : MMA_K;
     // tma::copy swizzle for split computation: FP4 packed with B64 has 64 byte rows = full BLOCK_K,
@@ -212,32 +218,35 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const auto b_base = reinterpret_cast<const char*>(gmem_b_ptr);
 
                         if constexpr (kKGroupedConstantStride) {
-                            // TN path: [M, sum_k] layout with constant stride=sum_k.
-                            // Groups are at column offsets; only replace addr + dim.
-                            const uint64_t k_byte_offset = kIsFP4
+                            const uint64_t a_k_byte_offset = kIsFP4
                                 ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
                                 : (static_cast<uint64_t>(scheduler.current_k_cumsum));
-                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + k_byte_offset);
-                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + k_byte_offset);
+                            const uint64_t b_k_byte_offset = (kIsFP4 || kBIsFP4)
+                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_k_byte_offset);
+                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_k_byte_offset);
                             ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
                             ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
                         } else {
-                            // NT path: per-group [M, k_i] blocks concatenated. Replace addr + dim + stride.
                             const uint64_t a_offset = kIsFP4
                                 ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
                                 : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
-                            const uint64_t b_offset = kIsFP4
+                            const uint64_t b_offset = (kIsFP4 || kBIsFP4)
                                 ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
                                 : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
-                            const uint64_t new_stride = kIsFP4
+                            const uint64_t a_new_stride = kIsFP4
+                                ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
+                                : static_cast<uint64_t>(scheduler.current_shape_k);
+                            const uint64_t b_new_stride = (kIsFP4 || kBIsFP4)
                                 ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
                                 : static_cast<uint64_t>(scheduler.current_shape_k);
                             ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
-                                smem_tm_a, scheduler.current_shape_k, new_stride);
+                                smem_tm_a, scheduler.current_shape_k, a_new_stride);
                             ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
-                                smem_tm_b, scheduler.current_shape_k, new_stride);
+                                smem_tm_b, scheduler.current_shape_k, b_new_stride);
                         }
 
                         *gmem_tm_a = *smem_tm_a;
@@ -382,8 +391,15 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 auto load_kstep = [&](int buf, uint32_t ks) {
                     if constexpr (kBKMajor) {
                         #pragma unroll
-                        for (uint32_t nt = 0; nt < kNTiles; ++nt)
-                            sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
+                        for (uint32_t nt = 0; nt < kNTiles; ++nt) {
+                            if constexpr (kBIsFP4) {
+                                sm120::load_b_fragment_b4x16_p64(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
+                                b_tile[buf][nt][0] <<= 2;
+                                b_tile[buf][nt][1] <<= 2;
+                            } else {
+                                sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
+                            }
+                        }
                     } else {
                         // MN-major B: scalar loads from [BLOCK_K, BLOCK_N] SMEM (N contiguous)
                         // B fragment: b[0] = pack(B[tid*4+0..3, gid]), b[1] = pack(B[tid*4+16..19, gid])
@@ -474,6 +490,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_bytes[buf][nt];
                             if constexpr (kIsFP4)
                                 sm120_mma::fp4_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                            else if constexpr (kBIsFP4)
+                                sm120_mma::fp8_fp4_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
                             else
                                 sm120_mma::fp8_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
                         }

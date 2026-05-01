@@ -356,10 +356,10 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto arch_major = device_runtime->get_arch_major();
     const int sum_k = std::accumulate(ks.begin(), ks.end(), 0);
-    const bool is_fp4 = (a.first.scalar_type() == kPackedFP4);
-    const int pack = is_fp4 ? 2 : 1;
-    DG_HOST_ASSERT(a.first.numel() * pack == static_cast<int64_t>(sum_k) * m);
-    DG_HOST_ASSERT(b.first.numel() * pack == static_cast<int64_t>(sum_k) * n);
+    const int pack_a = (a.first.scalar_type() == kPackedFP4) ? 2 : 1;
+    const int pack_b = (b.first.scalar_type() == kPackedFP4) ? 2 : 1;
+    DG_HOST_ASSERT(a.first.numel() * pack_a == static_cast<int64_t>(sum_k) * m);
+    DG_HOST_ASSERT(b.first.numel() * pack_b == static_cast<int64_t>(sum_k) * n);
 
     // Contiguity checks
     DG_HOST_ASSERT(a.first.is_contiguous());

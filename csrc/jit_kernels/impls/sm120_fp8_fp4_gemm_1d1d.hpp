@@ -25,6 +25,7 @@ public:
 
         int gran_k_a, gran_k_b;
         bool is_fp4;
+        bool b_is_fp4;
         bool k_grouped_constant_stride;
         int stride_cd_m;
         int stride_cd_batch;
@@ -64,6 +65,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -83,6 +85,7 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type),
         args.is_fp4 ? "true" : "false",
+        args.b_is_fp4 ? "true" : "false",
         (args.gemm_desc.major_b == cute::UMMA::Major::K) ? "true" : "false",
         args.k_grouped_constant_stride ? "true" : "false");
     }
@@ -114,6 +117,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
 
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
@@ -147,11 +151,13 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                               config.layout.block_k,
                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
                                               config.storage_config.swizzle_a_mode, 0, false, fp4_unpacked);
+    // Mixed FP8xFP4: B uses 16U4_ALIGN16B (fp4_unpacked_smem=true) for .b4x16_p64 padded format
     const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
                                               config.storage_config.load_block_n,
                                               config.layout.block_k,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
-                                              config.storage_config.swizzle_b_mode, 0, false, fp4_unpacked);
+                                              config.storage_config.swizzle_b_mode, 0, false,
+                                              b_is_fp4 ? true : fp4_unpacked);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, gran_k_a, 1, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
@@ -173,6 +179,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = d_stride,
         .stride_cd_batch = 0,
@@ -266,6 +273,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .b_is_fp4 = false,
         .k_grouped_constant_stride = k_grouped_constant_stride,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
@@ -353,6 +361,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .b_is_fp4 = false,
         .k_grouped_constant_stride = false,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
@@ -431,6 +440,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .b_is_fp4 = false,
         .k_grouped_constant_stride = false,
         .stride_cd_m = n,
         .stride_cd_batch = 0,
@@ -509,6 +519,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
+        .b_is_fp4 = false,
         .k_grouped_constant_stride = false,
         .stride_cd_m = static_cast<int>(d.stride(1)),
         .stride_cd_batch = static_cast<int>(d.stride(0)),

@@ -62,12 +62,12 @@ struct SM120ArchSpec {
         const auto load_block_m = layout.block_m;
         const auto load_block_n = layout.block_n;
 
-        // FP4 packed: 0.5 bytes/elem → swizzle based on block_k/2 bytes per row
         const auto smem_k_bytes_a = get_smem_bytes_per_k(desc.a_dtype, layout.block_k);
         const auto swizzle_mode_a = get_swizzle_mode(smem_k_bytes_a, 1);
-        // B swizzle: row stride depends on major — K-major rows span K, MN-major rows span N
+        // Mixed FP8xFP4: B uses .b4x16_p64 padded SMEM (row stride = block_k, same as FP8)
+        const bool b_padded_fp4 = (desc.a_dtype != kPackedFP4 && desc.b_dtype == kPackedFP4);
         const auto smem_row_bytes_b = (desc.major_b == cute::UMMA::Major::K)
-            ? get_smem_bytes_per_k(desc.b_dtype, layout.block_k)
+            ? (b_padded_fp4 ? layout.block_k : get_smem_bytes_per_k(desc.b_dtype, layout.block_k))
             : layout.block_n * static_cast<int>(c10::elementSize(desc.b_dtype));
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
@@ -94,7 +94,9 @@ struct SM120ArchSpec {
 
         const int smem_barriers = kNumMaxStages * 8 * 2;
         const int smem_a_per_stage = storage_config.load_block_m * get_smem_bytes_per_k(desc.a_dtype, layout.block_k);
-        const int smem_b_per_stage = storage_config.load_block_n * get_smem_bytes_per_k(desc.b_dtype, layout.block_k);
+        const bool b_padded_fp4 = (desc.a_dtype != kPackedFP4 && desc.b_dtype == kPackedFP4);
+        const int smem_b_per_stage = storage_config.load_block_n *
+            (b_padded_fp4 ? layout.block_k : get_smem_bytes_per_k(desc.b_dtype, layout.block_k));
 
         int smem_sfa_per_stage = 0;
         int smem_sfb_per_stage = 0;

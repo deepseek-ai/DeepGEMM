@@ -77,8 +77,8 @@ class QuantConfig:
             # SM100: FP8_A x FP4_B via UMMA mixed precision
             quant_config_list.append(QuantConfig((128, 32, False, True)))
         elif get_arch_major() == 12:
-            # SM120: FP4_A x FP4_B via mxf4nvf4 (FP8xFP4 mix needs mxf8f6f4, future work)
             quant_config_list.append(QuantConfig((32, 32, True, True)))
+            quant_config_list.append(QuantConfig((128, 32, False, True)))
         return quant_config_list
 
 
