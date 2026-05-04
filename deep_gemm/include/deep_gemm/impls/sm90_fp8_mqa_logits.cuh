@@ -23,7 +23,6 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           bool kIsCompressedLogits,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
-          uint32_t kNumEpiStages,
           uint32_t kNumSMs,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           typename logits_dtype_t>
@@ -47,11 +46,10 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     static constexpr uint32_t kBlockQPerBank = BLOCK_Q / 2;
     static constexpr uint32_t kNumEpiThreads = 128;
     static constexpr uint32_t kNumAccumPerReduce = kNumHeads / 2;
+    static constexpr uint32_t kNumEpiStages = kNumKVStages;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
-    DG_STATIC_ASSERT(kNumEpiStages >= 2, "Need double-buffer for epi pipeline");
-    DG_STATIC_ASSERT(kNumEpiStages >= kNumKVStages, "Epi stages must cover KV pipeline depth");
     DG_STATIC_ASSERT(kHeadDim % WGMMA_HALF::K == 0, "Invalid head dim");
     DG_STATIC_ASSERT(WGMMA_HALF::kNumAccum % kNumAccumPerReduce == 0, "Invalid accumulation");
     DG_STATIC_ASSERT(WGMMA_HALF::kNumAccum / kNumAccumPerReduce == kBlockQPerBank, "Invalid accumulation");

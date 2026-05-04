@@ -46,33 +46,7 @@ public:
         DG_HOST_ASSERT(128 % args.num_heads == 0);
         const auto arch = device_runtime->get_arch(true);
 
-        if (arch == "90") {
-            return fmt::format(R"(
-#include <deep_gemm/impls/sm{}_fp8_mqa_logits.cuh>
-
-using namespace deep_gemm;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm{}_fp8_mqa_logits<
-        {}, {},
-        {},
-        {}, {},
-        {}, {}, {},
-        {},
-        {}, {},
-        {}
-    >);
-}};
-)", arch, arch,
-    args.num_heads, args.head_dim,
-    args.is_compressed_logits,
-    args.block_q, args.block_kv,
-    args.num_q_stages, args.num_kv_stages, 3,
-    args.launch_args.grid_dim.first,
-    args.num_specialized_threads, args.num_math_threads,
-    to_string(args.logits_dtype));
-        } else {
-            return fmt::format(R"(
+        return fmt::format(R"(
 #include <deep_gemm/impls/sm{}_fp8_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -96,7 +70,6 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first,
     args.num_specialized_threads, args.num_math_threads,
     to_string(args.logits_dtype));
-        }
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
