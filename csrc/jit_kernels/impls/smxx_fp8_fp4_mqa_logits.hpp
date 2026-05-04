@@ -117,7 +117,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                                      num_heads, block_q, num_heads, 0);
 
     // Calculate shared memory size
-    const bool is_ws = (device_runtime->get_arch_major() == 9);
+    const bool has_epi_wg = (device_runtime->get_arch_major() == 9);
     constexpr int num_epi_stages = 3;
     constexpr int num_epi_threads = 128;
     int smem_size = 0;
@@ -129,7 +129,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     smem_size += num_kv_stages * smem_kv_size_per_stage;
     smem_size += num_q_stages * smem_weight_size_per_stage;
     smem_size += num_kv_stages * kv_scale_size_per_stage;
-    if (is_ws) {
+    if (has_epi_wg) {
         smem_size += num_epi_stages * block_kv * (block_q * 4 + 1) * static_cast<int>(weights.element_size());
         smem_size += (num_q_stages * 2 + num_kv_stages * 2 + num_epi_stages * 2) * 8;
     } else {
@@ -162,7 +162,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
         .num_specialized_threads = num_specialized_threads,
         .num_math_threads = num_math_threads,
         .launch_args = LaunchArgs(device_runtime->get_num_sms(),
-                                  num_specialized_threads + num_math_threads + (is_ws ? num_epi_threads : 0),
+                                  num_specialized_threads + num_math_threads + (has_epi_wg ? num_epi_threads : 0),
                                   smem_size)
     };
     const auto code = SMXXFP8MQALogitsRuntime::generate(args);
