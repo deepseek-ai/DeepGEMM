@@ -1,5 +1,8 @@
 #pragma once
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-attributes"
+
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
@@ -36,6 +39,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
     using namespace mma::sm120;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -341,6 +345,12 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
             empty_kv_barriers[kv_stage_idx]->arrive();
         }
     }
+#else
+    if (blockIdx.x == 0 and threadIdx.x == 0)
+        DG_DEVICE_ASSERT(false and "This kernel only supports sm_120a");
+#endif
 }
 
 } // namespace deep_gemm
+
+#pragma clang diagnostic pop

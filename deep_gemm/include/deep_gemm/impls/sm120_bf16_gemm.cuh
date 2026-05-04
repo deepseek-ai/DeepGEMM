@@ -405,19 +405,21 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     #pragma unroll
                     for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
                         auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * BLOCK_M;
+                        const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
+                            n_base + ts * kTMAStoreInnerDim);
                         if constexpr (kIsBatchedEpilogue) {
                             if constexpr (kWithAccumulation)
                                 cute::SM90_TMA_REDUCE_ADD_3D::copy(
                                     &tensor_map_cd, smem_src,
-                                    n_base + ts * kTMAStoreInnerDim, m_base, batch_store_idx);
+                                    n_store, m_base, batch_store_idx);
                             else
                                 cute::SM90_TMA_STORE_3D::copy(
                                     &tensor_map_cd, smem_src,
-                                    n_base + ts * kTMAStoreInnerDim, m_base, batch_store_idx);
+                                    n_store, m_base, batch_store_idx);
                         } else {
                             cute::SM90_TMA_STORE_2D::copy(
                                 &tensor_map_cd, smem_src,
-                                n_base + ts * kTMAStoreInnerDim, m_base);
+                                n_store, m_base);
                         }
                     }
                     cute::tma_store_arrive();

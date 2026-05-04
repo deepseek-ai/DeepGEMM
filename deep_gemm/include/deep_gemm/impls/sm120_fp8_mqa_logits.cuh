@@ -1,5 +1,8 @@
 #pragma once
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-attributes"
+
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
@@ -35,6 +38,7 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
     // Warp-specialized mma.sync m16n8k32 FP8 (no block_scale).
     // 8 math warps (256 threads) + 4 TMA warps (128 threads) = 384 total.
     // Each math warp: 1 M-tile (16 KV rows) × all N-tiles, in-warp 2-shfl reduction.
@@ -298,6 +302,12 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             CUTE_TIE(get_next_block_q_idx(), block_q_idx, q_iter_idx);
         }
     }
+#else
+    if (blockIdx.x == 0 and threadIdx.x == 0)
+        DG_DEVICE_ASSERT(false and "This kernel only supports sm_120a");
+#endif
 }
 
 } // namespace deep_gemm
+
+#pragma clang diagnostic pop
