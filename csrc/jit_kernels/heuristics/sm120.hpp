@@ -58,6 +58,27 @@ struct SM120ArchSpec {
         return (dtype == kPackedFP4) ? (block_k / 2) : (block_k * static_cast<int>(c10::elementSize(dtype)));
     }
 
+    static int get_smem_d_size_for_swizzle(const GemmDesc& desc, const Layout& layout, int swizzle_cd, int store_m) {
+        const int cd_size = c10::elementSize(desc.cd_dtype);
+        if (swizzle_cd > 0 and cd_size <= 2
+            and layout.block_n * cd_size >= swizzle_cd
+            and (layout.block_n * cd_size) % swizzle_cd == 0)
+            return (layout.block_n * cd_size / swizzle_cd) * swizzle_cd * store_m;
+        return 0;
+    }
+
+    static int get_smem_per_stage(const GemmDesc& desc, const Layout& layout) {
+        const bool b_padded_fp4 = (desc.a_dtype != kPackedFP4 && desc.b_dtype == kPackedFP4);
+        const int smem_a = layout.block_m * get_smem_bytes_per_k(desc.a_dtype, layout.block_k);
+        const int smem_b = layout.block_n *
+            (b_padded_fp4 ? layout.block_k : get_smem_bytes_per_k(desc.b_dtype, layout.block_k));
+        const int smem_sfa = (desc.kernel_type == KernelType::Kernel1D1D)
+            ? align(layout.block_m * static_cast<int>(sizeof(int32_t)), 128) : 0;
+        const int smem_sfb = (desc.kernel_type == KernelType::Kernel1D1D)
+            ? align(layout.block_n * static_cast<int>(sizeof(int32_t)), 128) : 0;
+        return smem_a + smem_b + smem_sfa + smem_sfb;
+    }
+
     static StorageConfig get_storage_config(const GemmDesc& desc, const Layout& layout) {
         const auto load_block_m = layout.block_m;
         const auto load_block_n = layout.block_n;
@@ -73,20 +94,33 @@ struct SM120ArchSpec {
 
         const auto swizzle_mode_cd = (c10::elementSize(desc.cd_dtype) <= 2) ? 128 : 0;
 
+        // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
+        // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
+        constexpr int kNumMaxStages = 16;
+        const int smem_barriers = kNumMaxStages * 8 * 2;
+        const int per_stage = get_smem_per_stage(desc, layout);
+        const int smem_d_full = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, layout.block_m);
+        const int stages_full = std::min((smem_capacity - smem_barriers - smem_d_full) / per_stage, kNumMaxStages);
+
+        int store_m = layout.block_m;
+        constexpr int kSubTileM = 64;
+        if (swizzle_mode_cd > 0 and layout.block_m > kSubTileM) {
+            const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, kSubTileM);
+            const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
+            if (stages_sub > stages_full)
+                store_m = kSubTileM;
+        }
+
         return {
             load_block_m, load_block_n,
-            0, 0,
+            store_m, 0,
             swizzle_mode_a, swizzle_mode_b, swizzle_mode_cd
         };
     }
 
     static int get_smem_d_size(const GemmDesc& desc, const Layout& layout) {
-        const int cd_size = c10::elementSize(desc.cd_dtype);
-        const int swizzle_cd = 128;
-        if (cd_size <= 2 and layout.block_n * cd_size >= swizzle_cd
-            and (layout.block_n * cd_size) % swizzle_cd == 0)
-            return (layout.block_n * cd_size / swizzle_cd) * swizzle_cd * layout.block_m;
-        return 0;
+        const auto storage = get_storage_config(desc, layout);
+        return get_smem_d_size_for_swizzle(desc, layout, storage.swizzle_cd_mode, storage.store_block_m);
     }
 
     static PipelineConfig get_pipeline_config(const GemmDesc& desc, const Layout& layout, const StorageConfig& storage_config) {
@@ -108,7 +142,8 @@ struct SM120ArchSpec {
         const int smem_tensormap =
             desc.gemm_type == GemmType::KGroupedContiguous ? 2 * static_cast<int>(sizeof(CUtensorMap)) : 0;
 
-        const int smem_d = get_smem_d_size(desc, layout);
+        const int smem_d = get_smem_d_size_for_swizzle(desc, layout, storage_config.swizzle_cd_mode,
+                                                       storage_config.store_block_m);
 
         const int smem_extra = smem_barriers + smem_tensormap + smem_d;
         const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;

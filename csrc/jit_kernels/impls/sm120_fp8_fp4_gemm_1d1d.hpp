@@ -66,6 +66,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -87,7 +88,8 @@ static void __instantiate_kernel() {{
         args.is_fp4 ? "true" : "false",
         args.b_is_fp4 ? "true" : "false",
         (args.gemm_desc.major_b == cute::UMMA::Major::K) ? "true" : "false",
-        args.k_grouped_constant_stride ? "true" : "false");
+        args.k_grouped_constant_stride ? "true" : "false",
+        args.gemm_config.storage_config.store_block_m);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -164,8 +166,10 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                                  config.layout.block_n, gran_k_b, 1, 0);
     const int d_n = static_cast<int>(d.size(-1));
     const int d_stride = static_cast<int>(d.stride(-2));
+    const int cd_store_m = config.storage_config.store_block_m > 0
+        ? config.storage_config.store_block_m : config.layout.block_m;
     const auto tensor_map_cd = make_tma_cd_desc(d, m, d_n,
-                                                config.layout.block_m, config.layout.block_n,
+                                                cd_store_m, config.layout.block_n,
                                                 d_stride, 1,
                                                 config.storage_config.swizzle_cd_mode);
 
@@ -263,8 +267,10 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
                                                  config.layout.block_m, gran_k_a, 1, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, sum_sf_k_b * gran_k_b * 4,
                                                  config.layout.block_n, gran_k_b, 1, 0);
+    const int cd_store_m = config.storage_config.store_block_m > 0
+        ? config.storage_config.store_block_m : config.layout.block_m;
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
-                                                config.layout.block_m, config.layout.block_n,
+                                                cd_store_m, config.layout.block_n,
                                                 n, num_groups,
                                                 config.storage_config.swizzle_cd_mode);
 
@@ -353,8 +359,10 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                                  config.layout.block_m, gran_k_a, 1, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                  config.layout.block_n, gran_k_b, num_groups, 0);
+    const int cd_store_m = config.storage_config.store_block_m > 0
+        ? config.storage_config.store_block_m : config.layout.block_m;
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
-                                                config.layout.block_m, config.layout.block_n,
+                                                cd_store_m, config.layout.block_n,
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
@@ -434,8 +442,10 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
                                                  config.layout.block_m, gran_k_a, num_groups, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                  config.layout.block_n, gran_k_b, num_groups, 0);
+    const int cd_store_m = config.storage_config.store_block_m > 0
+        ? config.storage_config.store_block_m : config.layout.block_m;
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
-                                                config.layout.block_m, config.layout.block_n,
+                                                cd_store_m, config.layout.block_n,
                                                 static_cast<int>(d.stride(-2)), num_groups,
                                                 config.storage_config.swizzle_cd_mode);
 
@@ -515,8 +525,10 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                                                  config.layout.block_m, gran_k_a, batch_size, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                  config.layout.block_n, gran_k_b, batch_size, 0);
+    const int cd_store_m = config.storage_config.store_block_m > 0
+        ? config.storage_config.store_block_m : config.layout.block_m;
     const auto tensor_map_cd = make_tma_3d_desc(d, n, m, batch_size,
-                                                config.layout.block_n, config.layout.block_m, 1,
+                                                config.layout.block_n, cd_store_m, 1,
                                                 d.stride(1), d.stride(0),
                                                 config.storage_config.swizzle_cd_mode);
 

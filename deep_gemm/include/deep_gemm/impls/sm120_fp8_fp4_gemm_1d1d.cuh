@@ -41,7 +41,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kIsFP4 = false,
           bool kBIsFP4 = false,
           bool kBKMajor = true,
-          bool kKGroupedConstantStride = false>
+          bool kKGroupedConstantStride = false,
+          uint32_t kEpiSubM = BLOCK_M>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
@@ -86,12 +87,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kTMARegisters = 40;
     static constexpr uint32_t kMMARegisters = 232;
 
-    // SMEM D buffer for TMA store epilogue
+    // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
     static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
         and BLOCK_N * sizeof(cd_dtype_t) >= kSwizzleCDMode
         and (BLOCK_N * sizeof(cd_dtype_t)) % kSwizzleCDMode == 0;
+    static constexpr uint32_t kNumEpiMSubs = kUseTMAStoreEpilogue ? (BLOCK_M / kEpiSubM) : 0;
     static constexpr uint32_t SMEM_D = kUseTMAStoreEpilogue
-        ? static_cast<uint32_t>((BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode) * kSwizzleCDMode * BLOCK_M)
+        ? static_cast<uint32_t>((BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode) * kSwizzleCDMode * kEpiSubM)
         : 0u;
     static constexpr uint32_t kSwizzleCDShift = kSwizzleCDMode > 0 ? (7 - __builtin_ctz(kSwizzleCDMode)) : 0;
     static constexpr uint32_t kSwizzleCDMask = kSwizzleCDMode > 0 ? (kSwizzleCDMode / 16 - 1) : 0;
@@ -337,12 +339,22 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     int a_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8 + (m_tile_base + mt) * 16;
                     a_ctx[mt].init(a_row, kSMEMKBytes);
                 }
-                [[maybe_unused]] sm120::SwizzleContext<kSwizzleBMode> b_ctx[kBKMajor ? kNTiles : 1];
+                static constexpr bool kUseBLoadX4 = kBKMajor and not kBIsFP4 and (kNTiles >= 2);
+                static constexpr uint32_t kBCtxCount = kBKMajor ? (kUseBLoadX4 ? kNTiles / 2 : kNTiles) : 1;
+                [[maybe_unused]] sm120::SwizzleContext<kSwizzleBMode> b_ctx[kBCtxCount];
                 if constexpr (kBKMajor) {
-                    #pragma unroll
-                    for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                        int b_row = (lane_idx & 7) + nt * 8;
-                        b_ctx[nt].init(b_row, kSMEMKBytes);
+                    if constexpr (kUseBLoadX4) {
+                        #pragma unroll
+                        for (uint32_t np = 0; np < kNTiles / 2; ++np) {
+                            int b_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8 + np * 16;
+                            b_ctx[np].init(b_row, kSMEMKBytes);
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t nt = 0; nt < kNTiles; ++nt) {
+                            int b_row = (lane_idx & 7) + nt * 8;
+                            b_ctx[nt].init(b_row, kSMEMKBytes);
+                        }
                     }
                 }
 
@@ -351,7 +363,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                 // Ping-pong fragment buffers for K-step double-buffer
                 uint32_t a_frag[2][kMTilesPerWarp][4];
-                uint32_t b_tile[2][kNTiles][2];
+                // B fragment: x4 loads keep pairs contiguous to avoid MOV rearrangement.
+                // x4 output: [0]=N0_Klo, [1]=N1_Klo, [2]=N0_Khi, [3]=N1_Khi
+                // MMA reads: N-tile 0 = {[0],[2]}, N-tile 1 = {[1],[3]}
+                [[maybe_unused]] uint32_t b_x4[2][kUseBLoadX4 ? kNTiles / 2 : 1][4];
+                [[maybe_unused]] uint32_t b_tile[2][kUseBLoadX4 ? 1 : kNTiles][2];
 
                 // SF type: FP4 scale_vec::2X uses uint16_t (2 SF bytes per MMA step),
                 // FP8 uses uint8_t (1 SF byte per MMA step).
@@ -390,13 +406,21 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                 auto load_kstep = [&](int buf, uint32_t ks) {
                     if constexpr (kBKMajor) {
-                        #pragma unroll
-                        for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                            if constexpr (kBIsFP4) {
+                        if constexpr (kUseBLoadX4) {
+                            #pragma unroll
+                            for (uint32_t np = 0; np < kNTiles / 2; ++np) {
+                                sm120::load_b_fragment_x4(b_x4[buf][np], smem_b[stage], b_ctx[np], lane_idx, ks, kLdmK);
+                            }
+                        } else if constexpr (kBIsFP4) {
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTiles; ++nt) {
                                 sm120::load_b_fragment_b4x16_p64(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
                                 b_tile[buf][nt][0] <<= 2;
                                 b_tile[buf][nt][1] <<= 2;
-                            } else {
+                            }
+                        } else {
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTiles; ++nt) {
                                 sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
                             }
                         }
@@ -484,16 +508,32 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     #pragma unroll
                     for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
                         const sf_t sfa = (kGranKA >= BLOCK_K) ? sfa_hoisted[mt] : sfa_bytes[buf][mt];
-                        #pragma unroll
-                        for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                            float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTiles + nt) * MMA_ACCUM]);
-                            const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_bytes[buf][nt];
-                            if constexpr (kIsFP4)
-                                sm120_mma::fp4_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
-                            else if constexpr (kBIsFP4)
-                                sm120_mma::fp8_fp4_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
-                            else
-                                sm120_mma::fp8_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                        if constexpr (kUseBLoadX4) {
+                            #pragma unroll
+                            for (uint32_t np = 0; np < kNTiles / 2; ++np) {
+                                const auto& x4 = b_x4[buf][np];
+                                const sf_t sfb0 = (kGranKB >= BLOCK_K) ? sfb_hoisted[np * 2] : sfb_bytes[buf][np * 2];
+                                const sf_t sfb1 = (kGranKB >= BLOCK_K) ? sfb_hoisted[np * 2 + 1] : sfb_bytes[buf][np * 2 + 1];
+                                float (&d0)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTiles + np * 2) * MMA_ACCUM]);
+                                float (&d1)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTiles + np * 2 + 1) * MMA_ACCUM]);
+                                if constexpr (kIsFP4) {
+                                    sm120_mma::fp4_mma_block_scaled(d0, a_frag[buf][mt], x4[0], x4[2], sfa, sfb0);
+                                    sm120_mma::fp4_mma_block_scaled(d1, a_frag[buf][mt], x4[1], x4[3], sfa, sfb1);
+                                } else {
+                                    sm120_mma::fp8_mma_block_scaled(d0, a_frag[buf][mt], x4[0], x4[2], sfa, sfb0);
+                                    sm120_mma::fp8_mma_block_scaled(d1, a_frag[buf][mt], x4[1], x4[3], sfa, sfb1);
+                                }
+                            }
+                        } else {
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTiles; ++nt) {
+                                float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTiles + nt) * MMA_ACCUM]);
+                                const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_bytes[buf][nt];
+                                if constexpr (kBIsFP4)
+                                    sm120_mma::fp8_fp4_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                                else
+                                    sm120_mma::fp8_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                            }
                         }
                     }
                 };
@@ -535,78 +575,87 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 ? static_cast<int64_t>(scheduler.current_group_idx) * stride_cd_batch : 0;
 
             if constexpr (kUseTMAStoreEpilogue) {
-                if (math_warp_idx == 0 and lane_idx == 0)
-                    cute::tma_store_wait<0>();
-                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
-
                 #pragma unroll
-                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                for (uint32_t ms = 0; ms < kNumEpiMSubs; ++ms) {
+                    const uint32_t epi_m_start = ms * kEpiSubM;
+
+                    if (math_warp_idx == 0 and lane_idx == 0)
+                        cute::tma_store_wait<0>();
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
                     #pragma unroll
-                    for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                        const uint32_t ai = (mt * kNTiles + nt) * MMA_ACCUM;
+                    for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
                         const uint32_t local_row0 = (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t local_row1 = local_row0 + 8;
-                        const uint32_t local_col  = nt * MMA_N + thread_id * 2;
-                        float v0 = accum[ai + 0], v1 = accum[ai + 1];
-                        float v2 = accum[ai + 2], v3 = accum[ai + 3];
+                        if (local_row0 >= epi_m_start and local_row0 < epi_m_start + kEpiSubM) {
+                            const uint32_t sub_row0 = local_row0 - epi_m_start;
+                            const uint32_t sub_row1 = sub_row0 + 8;
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTiles; ++nt) {
+                                const uint32_t ai = (mt * kNTiles + nt) * MMA_ACCUM;
+                                const uint32_t local_col = nt * MMA_N + thread_id * 2;
+                                float v0 = accum[ai + 0], v1 = accum[ai + 1];
+                                float v2 = accum[ai + 2], v3 = accum[ai + 3];
 
-                        if constexpr (kWithAccumulation) {
-                            const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
-                            const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
-                                n_base + nt * MMA_N) + thread_id * 2;
-                            if (gr0 < total_shape_m and gc + 1 < shape_n) {
-                                const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
-                                v0 += read_cd(gmem_c[ci]); v1 += read_cd(gmem_c[ci + 1]);
-                            }
-                            if (gr1 < total_shape_m and gc + 1 < shape_n) {
-                                const auto ci = cd_batch_offset + static_cast<int64_t>(gr1) * cd_m_stride + gc;
-                                v2 += read_cd(gmem_c[ci]); v3 += read_cd(gmem_c[ci + 1]);
+                                if constexpr (kWithAccumulation) {
+                                    const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
+                                    const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
+                                        n_base + nt * MMA_N) + thread_id * 2;
+                                    if (gr0 < total_shape_m and gc + 1 < shape_n) {
+                                        const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
+                                        v0 += read_cd(gmem_c[ci]); v1 += read_cd(gmem_c[ci + 1]);
+                                    }
+                                    if (gr1 < total_shape_m and gc + 1 < shape_n) {
+                                        const auto ci = cd_batch_offset + static_cast<int64_t>(gr1) * cd_m_stride + gc;
+                                        v2 += read_cd(gmem_c[ci]); v3 += read_cd(gmem_c[ci + 1]);
+                                    }
+                                }
+
+                                const uint32_t sub_tile = local_col / kTMAStoreInnerDim;
+                                const uint32_t col_in_sub = local_col % kTMAStoreInnerDim;
+                                const uint32_t col_byte_in_sub = col_in_sub * sizeof(cd_dtype_t);
+                                const uint32_t sw0 = col_byte_in_sub ^ (((sub_row0 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                const uint32_t sw1 = col_byte_in_sub ^ (((sub_row1 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                                cd_dtype_t p0[2] = {cd_dtype_t(v0), cd_dtype_t(v1)};
+                                cd_dtype_t p1[2] = {cd_dtype_t(v2), cd_dtype_t(v3)};
+                                auto* smem_d_bytes = reinterpret_cast<char*>(smem_d_base);
+                                const uint32_t sub_base = sub_tile * kSwizzleCDMode * kEpiSubM;
+                                *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
+                                    *reinterpret_cast<const uint32_t*>(p0);
+                                *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
+                                    *reinterpret_cast<const uint32_t*>(p1);
                             }
                         }
-
-                        const uint32_t sub_tile = local_col / kTMAStoreInnerDim;
-                        const uint32_t col_in_sub = local_col % kTMAStoreInnerDim;
-                        const uint32_t col_byte_in_sub = col_in_sub * sizeof(cd_dtype_t);
-                        const uint32_t sw0 = col_byte_in_sub ^ (((local_row0 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
-                        const uint32_t sw1 = col_byte_in_sub ^ (((local_row1 >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
-                        cd_dtype_t p0[2] = {cd_dtype_t(v0), cd_dtype_t(v1)};
-                        cd_dtype_t p1[2] = {cd_dtype_t(v2), cd_dtype_t(v3)};
-                        auto* smem_d_bytes = reinterpret_cast<char*>(smem_d_base);
-                        const uint32_t sub_base = sub_tile * kSwizzleCDMode * BLOCK_M;
-                        *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + local_row0 * kSwizzleCDMode + sw0) =
-                            *reinterpret_cast<const uint32_t*>(p0);
-                        *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + local_row1 * kSwizzleCDMode + sw1) =
-                            *reinterpret_cast<const uint32_t*>(p1);
                     }
-                }
 
-                cute::tma_store_fence();
-                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+                    cute::tma_store_fence();
+                    cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
 
-                if (math_warp_idx == 0 and lane_idx == 0) {
-                    const uint32_t batch_store_idx = kIsBatchedEpilogue ? scheduler.current_group_idx : 0;
-                    #pragma unroll
-                    for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
-                        auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * BLOCK_M;
-                        const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
-                            n_base + ts * kTMAStoreInnerDim);
-                        if constexpr (kIsBatchedEpilogue) {
-                            if constexpr (kWithAccumulation)
-                                cute::SM90_TMA_REDUCE_ADD_3D::copy(
+                    if (math_warp_idx == 0 and lane_idx == 0) {
+                        const uint32_t batch_store_idx = kIsBatchedEpilogue ? scheduler.current_group_idx : 0;
+                        #pragma unroll
+                        for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
+                            auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * kEpiSubM;
+                            const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
+                                n_base + ts * kTMAStoreInnerDim);
+                            if constexpr (kIsBatchedEpilogue) {
+                                if constexpr (kWithAccumulation)
+                                    cute::SM90_TMA_REDUCE_ADD_3D::copy(
+                                        &tensor_map_cd, smem_src,
+                                        n_store, m_base + epi_m_start, batch_store_idx);
+                                else
+                                    cute::SM90_TMA_STORE_3D::copy(
+                                        &tensor_map_cd, smem_src,
+                                        n_store, m_base + epi_m_start, batch_store_idx);
+                            } else {
+                                cute::SM90_TMA_STORE_2D::copy(
                                     &tensor_map_cd, smem_src,
-                                    n_store, m_base, batch_store_idx);
-                            else
-                                cute::SM90_TMA_STORE_3D::copy(
-                                    &tensor_map_cd, smem_src,
-                                    n_store, m_base, batch_store_idx);
-                        } else {
-                            cute::SM90_TMA_STORE_2D::copy(
-                                &tensor_map_cd, smem_src,
-                                n_store, m_base);
+                                    n_store, m_base + epi_m_start);
+                            }
                         }
+                        cute::tma_store_arrive();
                     }
-                    cute::tma_store_arrive();
-                }
+                } // ms loop
             } else {
                 auto store_pair = [&](cd_dtype_t* ptr, float a, float b) {
                     if constexpr (cute::is_same_v<cd_dtype_t, float>) {

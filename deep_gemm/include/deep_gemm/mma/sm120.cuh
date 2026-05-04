@@ -36,7 +36,7 @@ __device__ __forceinline__ uint16_t extract_sf_pair(uint32_t packed, uint32_t fi
 }
 
 __device__ __forceinline__ void fp8_mma_block_scaled(
-    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2],
+    float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
     uint8_t sfa, uint8_t sfb
 ) {
     asm volatile(
@@ -45,10 +45,17 @@ __device__ __forceinline__ void fp8_mma_block_scaled(
         "{%10}, {%11, %12}, {%13}, {%14, %15};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1]),
+          "r"(b0), "r"(b1),
           "r"(static_cast<uint32_t>(sfa)), "n"(static_cast<uint16_t>(0)), "n"(static_cast<uint16_t>(0)),
           "r"(static_cast<uint32_t>(sfb)), "n"(static_cast<uint16_t>(0)), "n"(static_cast<uint16_t>(0))
     );
+}
+
+__device__ __forceinline__ void fp8_mma_block_scaled(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2],
+    uint8_t sfa, uint8_t sfb
+) {
+    fp8_mma_block_scaled(d, a, b[0], b[1], sfa, sfb);
 }
 
 // Mixed FP8_A × FP4_B block-scaled MMA: m16n8k32, scale_vec::1X
@@ -75,7 +82,7 @@ static constexpr int FP4_MMA_M = 16, FP4_MMA_N = 8, FP4_MMA_K = 64;
 static constexpr int FP4_MMA_ACCUM = 4;
 
 __device__ __forceinline__ void fp4_mma_block_scaled(
-    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2],
+    float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1,
     uint16_t sfa, uint16_t sfb
 ) {
     asm volatile(
@@ -84,10 +91,17 @@ __device__ __forceinline__ void fp4_mma_block_scaled(
         "{%10}, {%11, %12}, {%13}, {%14, %15};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1]),
+          "r"(b0), "r"(b1),
           "r"(static_cast<uint32_t>(sfa)), "n"(static_cast<uint16_t>(0)), "n"(static_cast<uint16_t>(0)),
           "r"(static_cast<uint32_t>(sfb)), "n"(static_cast<uint16_t>(0)), "n"(static_cast<uint16_t>(0))
     );
+}
+
+__device__ __forceinline__ void fp4_mma_block_scaled(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2],
+    uint16_t sfa, uint16_t sfb
+) {
+    fp4_mma_block_scaled(d, a, b[0], b[1], sfa, sfb);
 }
 
 // BF16 MMA: m16n8k16
