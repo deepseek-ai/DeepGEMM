@@ -414,37 +414,37 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 for (uint32_t i = 0; i < WGMMA_HALF::kNumAccum; ++ i)
                     ptx::warpgroup_fence_operand(accum_A[i]);
 
-                // Partial reduce bank A → STS to epi_buf
+                // Partial reduce → STS to epi_buf
                 float* epi_buf = smem_epi[epi_stage_idx];
-
-                #define DO_PARTIAL_REDUCE(ACCUM, Q_BASE, Q_COUNT)                                   \
-                    _Pragma("unroll")                                                                \
-                    for (uint32_t i = 0; i < Q_COUNT; ++ i) {                                      \
-                        auto shifted_accum = ACCUM + i * kNumAccumPerReduce;                        \
-                        const auto transform = [&](const uint32_t& j) {                            \
-                            return fmaxf(shifted_accum[j], 0) *                                    \
-                                   weights[(Q_BASE) + i][(j / 4) * 2 + (j & 1)];                  \
-                        };                                                                          \
-                        float sum[4] = {transform(0), transform(1),                                \
-                                        transform(2), transform(3)};                               \
-                        _Pragma("unroll")                                                           \
-                        for (uint32_t j = 1; j < kNumHeads / 8; ++ j) {                            \
-                            _Pragma("unroll")                                                       \
-                            for (uint32_t kk = 0; kk < 4; kk ++)                                  \
-                                sum[kk] += transform(j * 4 + kk);                                 \
-                        }                                                                           \
-                        float v_0 = (sum[0] + sum[1]) * scale_kv_0;                                \
-                        float v_1 = (sum[2] + sum[3]) * scale_kv_1;                                \
-                        const uint32_t kv_col_0 = warp_offset + v_0_offset;                        \
-                        const uint32_t kv_col_1 = warp_offset + v_1_offset;                        \
-                        const uint32_t shfl_lane = lane_idx % 4;                                   \
-                        ptx::st_shared(epi_buf + kv_col_0 * kEpiStride                             \
-                                       + ((Q_BASE) + i) * 4 + shfl_lane, v_0);                    \
-                        ptx::st_shared(epi_buf + kv_col_1 * kEpiStride                             \
-                                       + ((Q_BASE) + i) * 4 + shfl_lane, v_1);                    \
+                const auto partial_reduce = [&](float* accum, const uint32_t q_base) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kBlockQPerBank; ++ i) {
+                        auto shifted_accum = accum + i * kNumAccumPerReduce;
+                        const auto transform = [&](const uint32_t& j) {
+                            return fmaxf(shifted_accum[j], 0) *
+                                   weights[q_base + i][(j / 4) * 2 + (j & 1)];
+                        };
+                        float sum[4] = {transform(0), transform(1),
+                                        transform(2), transform(3)};
+                        #pragma unroll
+                        for (uint32_t j = 1; j < kNumHeads / 8; ++ j) {
+                            #pragma unroll
+                            for (uint32_t kk = 0; kk < 4; kk ++)
+                                sum[kk] += transform(j * 4 + kk);
+                        }
+                        float v_0 = (sum[0] + sum[1]) * scale_kv_0;
+                        float v_1 = (sum[2] + sum[3]) * scale_kv_1;
+                        const uint32_t kv_col_0 = warp_offset + v_0_offset;
+                        const uint32_t kv_col_1 = warp_offset + v_1_offset;
+                        const uint32_t shfl_lane = lane_idx % 4;
+                        ptx::st_shared(epi_buf + kv_col_0 * kEpiStride
+                                       + (q_base + i) * 4 + shfl_lane, v_0);
+                        ptx::st_shared(epi_buf + kv_col_1 * kEpiStride
+                                       + (q_base + i) * 4 + shfl_lane, v_1);
                     }
+                };
 
-                DO_PARTIAL_REDUCE(accum_A, 0, kBlockQPerBank)
+                partial_reduce(accum_A, 0);
 
                 // Drain bank B — must complete before releasing KV SMEM
                 ptx::warpgroup_wait<0>();
@@ -455,10 +455,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 // Release KV empty — both banks fully drained
                 empty_kv_barriers[kv_stage_idx]->arrive();
 
-                // Partial reduce bank B → STS to epi_buf
-                DO_PARTIAL_REDUCE(accum_B, kBlockQPerBank, kBlockQPerBank)
-
-                #undef DO_PARTIAL_REDUCE
+                partial_reduce(accum_B, kBlockQPerBank);
 
                 // Fence STS visibility + signal Epi
                 cutlass::arch::fence_view_async_shared();
