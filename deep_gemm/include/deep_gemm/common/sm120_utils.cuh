@@ -133,6 +133,24 @@ __device__ __forceinline__ void load_b_fragment_x4(
     ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], addr);
 }
 
+// Load B fragment for one N-tile covering 2 K-steps via ldmatrix.x4.
+// 4 thread groups (8 lanes each) load 4 consecutive 16-byte K-groups:
+//   group 0 (lanes 0-7):   K bytes [base, base+16)
+//   group 1 (lanes 8-15):  K bytes [base+16, base+32)
+//   group 2 (lanes 16-23): K bytes [base+32, base+48)
+//   group 3 (lanes 24-31): K bytes [base+48, base+64)
+// Output: {r0,r1} = K-step 0 B operand (consecutive regs), {r2,r3} = K-step 1.
+// ctx must be initialized with: row = (lane&7) + nt*8, stride = kSMEMKBytes
+template <int swizzle_bytes>
+__device__ __forceinline__ void load_b_per_ntile_x4(
+    uint32_t (&frag)[4], char* smem_b,
+    const SwizzleContext<swizzle_bytes>& ctx, int lane, int ks_pair_base, int ldm_k
+) {
+    int col = (lane >> 3) * 16 + ks_pair_base * ldm_k;
+    void* addr = ctx.addr(smem_b, col);
+    ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], addr);
+}
+
 // Load single B N-tile via ldmatrix.x2 — no MOV overhead for fragment rearrangement
 // ctx must be initialized with: row = (lane&7) + n_tile*8, stride = BLOCK_K
 template <int swizzle_bytes>
