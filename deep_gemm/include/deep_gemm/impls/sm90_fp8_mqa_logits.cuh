@@ -224,7 +224,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
         const uint32_t epi_tid = threadIdx.x - kEpiStart;
         const uint32_t kv_col_lo = epi_tid;
-        const uint32_t kv_col_hi = epi_tid + 128;
+        const uint32_t kv_col_hi = epi_tid + kNumEpiThreads;
 
         uint32_t block_q_idx = sm_idx, q_iter_idx = 0;
         uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
@@ -346,7 +346,6 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 ((num_total_kv_blocks + kv_block_idx) / kNumEpiStages) & 1
             };
         };
-
 
         while (block_q_idx < num_q_blocks) {
             CUTE_TIE_DECL(load_schedule(), q_stage_idx, q_phase, kv_start, num_kv_blocks);

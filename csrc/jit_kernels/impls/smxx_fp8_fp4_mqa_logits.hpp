@@ -118,7 +118,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
 
     // Calculate shared memory size
     const bool has_epi_wg = (device_runtime->get_arch_major() == 9);
-    constexpr int num_epi_stages = 3;
+    constexpr int num_epi_stages = num_kv_stages;
     constexpr int num_epi_threads = 128;
     int smem_size = 0;
     const int smem_q_size_per_stage = block_q * num_heads * head_dim * static_cast<int>(q.element_size());
