@@ -124,8 +124,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                 const int& block_q, const int& block_kv) {
     constexpr int num_specialized_threads = 128;
     constexpr int num_q_stages = 3, num_kv_stages = 3;
-    const int num_math_threads = get_env("DG_OVERLAP_3WG", 0) ? 384 :
-                                 (device_runtime->get_arch_major() == 10 ? 256 : 512);
+    const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
 
     // Use compressed logits format when max_seqlen_k is specified
     const bool is_compressed_logits = (max_seqlen_k > 0);

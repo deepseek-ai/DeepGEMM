@@ -27,7 +27,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumSMs,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           typename logits_dtype_t>
-CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads + 128, 1)
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads + 128 /* kNumEpiThreads */, 1)
 void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                          const uint32_t max_seqlen_k, const uint32_t stride_logits,
                          uint32_t* cu_seq_len_k_start,
@@ -37,10 +37,12 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+    // TODO: consider TMA multicast
+    // For one block, we process `[q_start:q_end, h, d] @ [kv_start:kv_end, d] -> [q_start:q_end, kv_start:kv_end]`
+    // Q should be load only at once for a block
     const auto num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
 
     // Types — N=64 split for wait<1> overlap
-    using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_Q * kNumHeads>::type;
     using WGMMA_HALF = typename mma::sm90::FP8MMASelector<BLOCK_Q * kNumHeads / 2>::type;
     static constexpr uint32_t kBlockQPerBank = BLOCK_Q / 2;
     static constexpr uint32_t kNumEpiThreads = 128;
@@ -54,6 +56,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     DG_STATIC_ASSERT(WGMMA_HALF::kNumAccum % kNumAccumPerReduce == 0, "Invalid accumulation");
     DG_STATIC_ASSERT(WGMMA_HALF::kNumAccum / kNumAccumPerReduce == kBlockQPerBank, "Invalid accumulation");
     DG_STATIC_ASSERT(kNumHeads % 8 == 0, "Invalid head");
+    DG_STATIC_ASSERT(BLOCK_KV == kNumEpiThreads * 2, "Invalid `BLOCK_KV`");
 
     // Thread layout: TC[0..511] + Epi[512..639] + TMA[640..767]
     static constexpr uint32_t kEpiStart = kNumMathThreads;
@@ -69,6 +72,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     __syncwarp();
 
     // Shared memory configs
+    // NOTES: weight may be unaligned
     static constexpr uint32_t kSwizzleAlignment = kHeadDim * 8;
     static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * kHeadDim * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * sizeof(float);
@@ -132,9 +136,14 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             full_epi_barriers[i]->init(kNumMathThreads);
             empty_epi_barriers[i]->init(kNumEpiThreads);
         }
+        // Make initialized barrier visible in async proxy
         cutlass::arch::fence_barrier_init();
     }
     __syncthreads();
+
+    // Register reconfigurations
+    constexpr uint32_t kNumTMARegisters = 32;
+    constexpr uint32_t kNumMathRegisters = 104;
 
     // Block scheduler (shared by TC and Epi, computed independently)
     const auto sm_idx = blockIdx.x;
@@ -142,11 +151,9 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
-    // ═══════════════════════════════════════════════════════════════════
-    // TMA WG: threadIdx.x in [kTMAStart..kTMAStart+127]
-    // ═══════════════════════════════════════════════════════════════════
     if (threadIdx.x >= kTMAStart) {
-        cutlass::arch::warpgroup_reg_dealloc<32>();
+        // TMA warp-group for loading data
+        cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
         if (not is_tma_load_warp)
             return;
 
@@ -214,11 +221,9 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             }
         }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Epi WG: threadIdx.x in [kEpiStart..kEpiStart+127]
-    // ═══════════════════════════════════════════════════════════════════
     } else if (threadIdx.x >= kEpiStart) {
-        cutlass::arch::warpgroup_reg_dealloc<32>();
+        // Epilogue warp-group for post-processing
+        cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
         const uint32_t epi_tid = threadIdx.x - kEpiStart;
         const uint32_t kv_col_lo = epi_tid;
         const uint32_t kv_col_hi = epi_tid + 128;
@@ -293,11 +298,11 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             CUTE_TIE(get_next_block_q_idx(), block_q_idx, q_iter_idx);
         }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // TC WGs (4 warpgroups): threadIdx.x in [0..511]
-    // ═══════════════════════════════════════════════════════════════════
     } else {
-        cutlass::arch::warpgroup_reg_alloc<104>();
+        // Math warp-groups for WGMMA
+        cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
+
+        // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
         const auto& thread_idx = threadIdx.x % kNumMathThreads;
         const auto& warp_idx = __shfl_sync(0xffffffff, thread_idx / 32, 0);
         const auto& warpgroup_idx = warp_idx / 4;
@@ -396,7 +401,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 }
                 ptx::warpgroup_commit_batch();
 
-                // Wait epi-empty (producer acquire — skip on first kv-block)
+                // NOTES: skip epi-empty wait on first KV block (barrier is pre-consumed at init)
                 CUTE_TIE_DECL(get_epi_pipeline(kv_block_idx), epi_stage_idx, epi_phase);
                 if ((num_total_kv_blocks | kv_block_idx) != 0)
                     empty_epi_barriers[epi_stage_idx]->wait(epi_phase ^ 1);
