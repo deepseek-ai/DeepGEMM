@@ -183,8 +183,10 @@ struct SM120ArchSpec {
 
         // Empirical warp-spec MMA efficiency model.
         // A reuse = BN/8 (each A fragment reused across N-tiles).
+        // Cooperative layout: larger BN reduces epilogue overhead (fewer tiles) and
+        // increases compute per K-block (better TMA latency amortization).
         const double a_reuse = static_cast<double>(layout.block_n) / 8.0;
-        double mma_efficiency = 0.69 + 0.07 * std::min(1.0, (a_reuse - 8.0) / 8.0);
+        double mma_efficiency = 0.69 + 0.12 * std::min(1.0, (a_reuse - 4.0) / 12.0);
 
         const double peak_flops_per_ns = (desc.a_dtype == at::kBFloat16) ? 380000.0 : 762000.0;
         double block_ns = flops_per_block / (peak_flops_per_ns * mma_efficiency);
