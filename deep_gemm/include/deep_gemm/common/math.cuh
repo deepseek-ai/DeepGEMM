@@ -98,6 +98,54 @@ CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
 }
 
+// E2M1 (FP4) variant: divisor is finfo_max=6 instead of 448. Same UE8M0
+// SF protocol; only the per-element clipping range and dtype differ.
+// 1/6 = 0x3E2AAAAB exactly in FP32 RN.
+template <bool kUseUE8M0 = true>
+CUTLASS_DEVICE void get_e2m1_sf_and_sf_inv(const float2& amax, float2& sf, float2& sf_inv) {
+    DG_STATIC_ASSERT(kUseUE8M0, "Must use UE8M0");
+    const float2 finfo_factor = {1.0f / 6.0f, 1.0f / 6.0f};
+    const auto scaled = __fmul2_rn(amax, finfo_factor);
+    const auto exp_x = fast_log2_ceil(scaled.x);
+    const auto exp_y = fast_log2_ceil(scaled.y);
+    sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
+    sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
+}
+
+// Pack two FP32 values into one FP4 (E2M1) byte: lower nibble = a, upper = b.
+// Matches PTX `cvt.rn.satfinite.e2m1x2.f32 d, b, a` (b → upper, a → lower).
+CUTLASS_DEVICE uint32_t cvt_pack_f32_to_e2m1x2(const float& a, const float& b) {
+    uint32_t out;
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+        "cvt.u32.u8 %0, byte0;\n"
+        "}"
+        : "=r"(out) : "f"(a), "f"(b));
+    return out;
+}
+
+// Pack four FP32 values into one uint16 (FP4 nibbles, 4 elements / 2 bytes).
+// Layout: bits[0:4]=a, [4:8]=b, [8:12]=c, [12:16]=d. Compatible with
+// `cvt.rn.satfinite.e2m1x2.f32` whose output is "low nibble = first arg".
+CUTLASS_DEVICE uint32_t cvt_pack_f32x4_to_e2m1x4(
+        const float& a, const float& b, const float& c, const float& d) {
+    uint32_t out;
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0;\n"
+        ".reg .b8 byte1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+        ".reg .b16 hword;\n"
+        "mov.b16 hword, {byte0, byte1};\n"
+        "cvt.u32.u16 %0, hword;\n"
+        "}"
+        : "=r"(out) : "f"(a), "f"(b), "f"(c), "f"(d));
+    return out;
+}
+
 /// Reduction
 CUTLASS_DEVICE uint32_t warp_inclusive_sum(uint32_t value, const uint32_t& lane_idx) {
     #pragma unroll

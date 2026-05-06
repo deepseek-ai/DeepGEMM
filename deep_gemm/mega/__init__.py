@@ -202,3 +202,20 @@ def bf16_mega_moe(y: torch.Tensor,
         fast_math,
         sym_buffer.num_ring_tokens
     )
+
+
+def mega_moe_pre_dispatch(x: torch.Tensor,
+                          topk_idx: torch.Tensor,
+                          topk_weights: torch.Tensor,
+                          buf_x: torch.Tensor,
+                          buf_x_sf: torch.Tensor,
+                          buf_topk_idx: torch.Tensor,
+                          buf_topk_weights: torch.Tensor,
+                          num_tokens: int,
+                          group_size: int = 32,
+                          use_fp4_acts: bool = False) -> None:
+    _C.mega_moe_pre_dispatch(
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, use_fp4_acts,
+    )
