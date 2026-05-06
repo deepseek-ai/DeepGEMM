@@ -32,6 +32,11 @@ public:
         // kind::mxf8f6f4 (K=32 with-padding) for both L1 and L2 mainloops.
         // Only honored when `use_fp4_acts` is also set.
         bool use_mxf4_kind;
+        // Stream B (combine path): when set, the L2 epilogue writes FP8 E4M3
+        // + per-(token,N=128) UE8M0 SF over NVLink instead of BF16. The
+        // combine reduce dequantizes on the fly. Halves NVLink bytes/token
+        // on the second a2a (kHidden + kHidden/128 vs kHidden*2).
+        bool use_fp8_combine;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -79,6 +84,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -98,7 +104,8 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     args.use_fp4_acts ? "true" : "false",
-    args.use_mxf4_kind ? "true" : "false");
+    args.use_mxf4_kind ? "true" : "false",
+    args.use_fp8_combine ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -136,7 +143,8 @@ static void sm100_fp8_fp4_mega_moe(
     const float& activation_clamp,
     const bool& fast_math,
     const bool& use_fp4_acts = false,
-    const bool& use_mxf4_kind = false
+    const bool& use_mxf4_kind = false,
+    const bool& use_fp8_combine = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -297,6 +305,7 @@ static void sm100_fp8_fp4_mega_moe(
         .fast_math = fast_math,
         .use_fp4_acts = use_fp4_acts,
         .use_mxf4_kind = use_mxf4_kind,
+        .use_fp8_combine = use_fp8_combine,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
