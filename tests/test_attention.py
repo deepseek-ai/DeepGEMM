@@ -111,8 +111,8 @@ def test_mqa_logits():
         for is_fp4 in ((True, False) if get_arch_major() == 10 else (False, )):
             for logits_dtype in (torch.float, torch.bfloat16):
                 for compressed_logits, clean_logits in [(False, True), (True, False)]:
-                    for seq_len in (2048, 4096):
-                        for seq_len_kv in (4096, 8192):
+                    for seq_len in (510, 512):
+                        for seq_len_kv in (130560,):
                             for num_heads, head_dim in [(64, 128), (32, 128)]:
                                 for disable_cp in (False, True):
                                     yield is_fp4, logits_dtype, compressed_logits, clean_logits, seq_len, seq_len_kv, num_heads, head_dim, disable_cp
@@ -123,6 +123,12 @@ def test_mqa_logits():
         q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
         kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
         weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float32)
+        # Passing FP16 weights explicitly selects sm100_fp8_mqa_logits_f16_weights (FP8 inputs only,
+        # asserts seq_len % 4 == 0); FP32 weights use the generic kernel. FP4 inputs always require
+        # FP32 weights. The FP16 path accumulates the score in FP16, so scale down to avoid overflow.
+        if (not is_fp4) and seq_len % 4 == 0:
+            weights = (weights * 0.1).to(torch.float16)
+
         ks, ke = generate_ks_ke_tests(seq_len, seq_len_kv, disable_cp)
 
         # Calculate reference logits
@@ -178,7 +184,7 @@ def test_mqa_logits():
         logits = logits.masked_fill(ref_neginf_mask, 0)
         diff = calc_diff(logits, ref_logits)
         simulated_diff = calc_diff(logits, simulated_logits)
-        assert diff < 0.02 if is_fp4 else 1e-3, f"Diff: {diff}"
+        assert diff < (0.02 if is_fp4 else 1e-3), f"Diff: {diff}"
         assert simulated_diff < 5e-6, f"Simulated Diff: {simulated_diff}"
 
         # Profiling
@@ -186,7 +192,7 @@ def test_mqa_logits():
         t, clean_t = bench_kineto(lambda: deep_gemm.fp8_fp4_mqa_logits(**kernel_kwargs), ('mqa_logits', 'clean_logits'))
         clean_bytes = (seq_len * seq_len_kv - ref_cost) * 4 + count_bytes(ks, ke)
 
-        print(f' > FP4={is_fp4}, BF16={logits_dtype == torch.bfloat16}, S={seq_len:4}, SKV={seq_len_kv:6}, H={num_heads:3}, D={head_dim:3}, CP={0 if disable_cp else 1}: '
+        print(f' > FP4={is_fp4}, LogitsBF16={logits_dtype == torch.bfloat16}, WeightFP16={weights.dtype == torch.float16}, S={seq_len:4}, SKV={seq_len_kv:6}, H={num_heads:3}, D={head_dim:3}, CP={0 if disable_cp else 1}: '
               f'{tflops / t:4.0f} TFLOPS, {t * 1e6:4.0f} us, '
               f'{(count_bytes(q_in, kv_in, weights, ks, ke) + ref_cost * 4) / t / 1e9:4.0f} GB/s', end='')
         print(f' | clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s' if clean_logits else '')
@@ -398,7 +404,7 @@ def test_paged_mqa_logits():
         simulated_masked = simulated_logits.masked_fill(ref_neginf_mask, 0)
         diff = calc_diff(logits_masked, ref_masked)
         simulated_diff = calc_diff(logits_masked, simulated_masked)
-        assert diff < 0.02 if is_fp4 else 1e-3, f"Diff: {diff}"
+        assert diff < (0.02 if is_fp4 else 1e-3), f"Diff: {diff}"
         assert simulated_diff < 5e-6, f"Simulated Diff: {simulated_diff}"
 
         # Profiling
@@ -411,7 +417,7 @@ def test_paged_mqa_logits():
 
         peak_allocated, peak_reserved = get_cuda_peak_memory_gib()
         t, clean_t = bench_kineto(lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**kernel_kwargs), ('paged_mqa_logits', 'clean_logits'))
-        print(f' > FP4={is_fp4}, BF16={logits_dtype == torch.bfloat16}, BLOCK_KV={block_kv}, BSZ={raw_batch_size:3}, NextN={raw_next_n:1}, H={num_heads:2}, D={head_dim:2}, L={avg_kv:6}: '
+        print(f' > FP4={is_fp4}, LogitsBF16={logits_dtype == torch.bfloat16}, BLOCK_KV={block_kv}, BSZ={raw_batch_size:3}, NextN={raw_next_n:1}, H={num_heads:2}, D={head_dim:2}, L={avg_kv:6}: '
               f'{tflops_calc / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, {total_bytes / t / 1e9:4.0f} GB/s', end='')
         if is_varlen:
             print(f' | Varlen, MaxTPB={max_tokens_per_batch}, NumTokens={batch_size}', end='')
