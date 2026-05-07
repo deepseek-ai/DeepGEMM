@@ -9,15 +9,15 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 ## News
 
 - 2026.04.16: Mega MoE, FP8xFP4 GEMM, FP4 Indexer, PDL, faster JIT compilation and more.
-  - Performance comparison will be posted later.
-  - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) for more details.
+    - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) for more details.
+    - For Mega MoE benchmarks, refer to [#316](https://github.com/deepseek-ai/DeepGEMM/pull/316).
 - 2025.09.28: DeepGEMM now supports scoring kernels (weighted ReLU MQA logits) for the lightning indexer for DeepSeek v3.2.
-  - Please see [#200](https://github.com/deepseek-ai/DeepGEMM/pull/200) for more details.
+    - Please see [#200](https://github.com/deepseek-ai/DeepGEMM/pull/200) for more details.
 - 2025.07.20: DeepGEMM now supports both SM90/SM100, and has a full refactor with a low-CPU-overhead JIT CPP module.
-  - NVRTC and post-compilation SASS optimization are all disabled.
-  - NVRTC will be supported later.
-  - As NVCC 12.9 will automatically do the FFMA interleaving, all post optimizations will be no longer supported.
-  - Please see [#112](https://github.com/deepseek-ai/DeepGEMM/pull/112) for more details.
+    - NVRTC and post-compilation SASS optimization are all disabled.
+    - NVRTC will be supported later.
+    - As NVCC 12.9 will automatically do the FFMA interleaving, all post optimizations will be no longer supported.
+    - Please see [#112](https://github.com/deepseek-ai/DeepGEMM/pull/112) for more details.
 - 2025.05.14: DeepGEMM now offers weight gradient kernels for dense and MoE backward! See [#95](https://github.com/deepseek-ai/DeepGEMM/pull/95) for details.
 - 2025.05.07: DeepGEMM now supports NVRTC with up to 10x compilation speedup! See [#94](https://github.com/deepseek-ai/DeepGEMM/pull/94) for details. Please use `DG_JIT_USE_NVRTC=1` to enable it (may have performance loss with some cases).
 - 2025.04.18: DeepGEMM now achieves up to **1550 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81), [#86](https://github.com/deepseek-ai/DeepGEMM/pull/86) and [340d988](https://github.com/deepseek-ai/DeepGEMM/commit/340d9880f4a418d943d34260d20a79f41f4c0526) for details.
@@ -30,9 +30,9 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 - Python 3.8 or higher
 - Compilers with C++20 support
 - CUDA Toolkit:
-  - CUDA 12.3 or higher for SM90
-    - **We highly recommend 12.9 or higher for the best performance**
-  - CUDA 12.9 or higher for SM100
+    - CUDA 12.3 or higher for SM90
+        - **We highly recommend 12.9 or higher for the best performance**
+    - CUDA 12.9 or higher for SM100
 - PyTorch 2.1 or higher
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
 - `{fmt}` library (could be cloned by Git submodule)
@@ -159,30 +159,30 @@ The library provides some utility functions besides the above kernels:
 The library also provides some environment variables, which may be useful:
 
 - General
-  - `DG_JIT_DEBUG`: `0` or `1`, print JIT debugging information, `0` by default
-  - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
+    - `DG_JIT_DEBUG`: `0` or `1`, print JIT debugging information, `0` by default
+    - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
 - JIT cache
-  - `DG_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_gemm` by default
+    - `DG_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_gemm` by default
 - Compiler selection
-  - `DG_JIT_USE_NVRTC`: `0` or `1`, use NVRTC instead of NVCC (faster compilation, may have lower performance for some cases), `0` by default
-  - `DG_JIT_NVCC_COMPILER`: string, NVCC compiler path; defaults to `torch.utils.cpp_extension.CUDA_HOME`
-  - `DG_JIT_CPP_STANDARD`: integer, C++ standard version, `20` by default
+    - `DG_JIT_USE_NVRTC`: `0` or `1`, use NVRTC instead of NVCC (faster compilation, may have lower performance for some cases), `0` by default
+    - `DG_JIT_NVCC_COMPILER`: string, NVCC compiler path; defaults to `torch.utils.cpp_extension.CUDA_HOME`
+    - `DG_JIT_CPP_STANDARD`: integer, C++ standard version, `20` by default
 - Compiler output
-  - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print compilation commands, `0` by default
-  - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS output, `0` by default
-  - `DG_JIT_PTXAS_CHECK`: `0` or `1`, assert no local memory usage in compiled kernels, `0` by default
-  - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print kernel load time, `0` by default
+    - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print compilation commands, `0` by default
+    - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS output, `0` by default
+    - `DG_JIT_PTXAS_CHECK`: `0` or `1`, assert no local memory usage in compiled kernels, `0` by default
+    - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print kernel load time, `0` by default
 - Debug and profiling
-  - `DG_JIT_WITH_LINEINFO`: `0` or `1`, embed source line info for profiling tools, `0` by default
-  - `DG_JIT_DUMP_ASM`: `0` or `1`, dump both PTX and SASS, `0` by default
-  - `DG_JIT_DUMP_PTX`: `0` or `1`, dump PTX output, `0` by default
-  - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
-  - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero symmetric buffer before each Mega MoE call for debugging, `0` by default
-  - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
+    - `DG_JIT_WITH_LINEINFO`: `0` or `1`, embed source line info for profiling tools, `0` by default
+    - `DG_JIT_DUMP_ASM`: `0` or `1`, dump both PTX and SASS, `0` by default
+    - `DG_JIT_DUMP_PTX`: `0` or `1`, dump PTX output, `0` by default
+    - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
+    - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero symmetric buffer before each Mega MoE call for debugging, `0` by default
+    - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
 - Build options
-  - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
-  - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
-  - `DG_JIT_USE_RUNTIME_API`: `0` or `1`, use CUDA Runtime API for kernel loading (requires CUDA runtime >= 12.8), `0` by default
+    - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
+    - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
+    - `DG_JIT_USE_RUNTIME_API`: `0` or `1`, use CUDA Runtime API for kernel loading (requires CUDA runtime >= 12.8), `0` by default
 
 For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
 

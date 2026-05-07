@@ -1,10 +1,19 @@
 #pragma once
 
+#include <cutlass/arch/barrier.h>
+
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 
 namespace deep_gemm::comm {
+
+CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
+    // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
+    // This is slightly faster than `cute::cluster_sync` but has weaker memory ordering guarantee
+    cute::cluster_arrive_relaxed();
+    cute::cluster_wait();
+}
 
 template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename sync_scope_t>
 CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
