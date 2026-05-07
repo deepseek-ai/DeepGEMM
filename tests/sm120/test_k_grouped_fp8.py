@@ -1,4 +1,4 @@
-"""SM120a K-Grouped Contiguous FP8/FP4 GEMM correctness and performance tests."""
+"""SM120a K-Grouped Contiguous FP8 GEMM correctness and performance tests."""
 
 import sys
 import os
@@ -18,7 +18,7 @@ from generators import (
 def test_correctness():
     assert get_arch_major() == 12, f"Expected SM120a, got arch_major={get_arch_major()}"
     print("=" * 60)
-    print("SM120a K-Grouped Contiguous FP8/FP4 GEMM — Correctness")
+    print("SM120a K-Grouped Contiguous FP8 GEMM — Correctness")
     print("=" * 60)
 
     major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
@@ -32,10 +32,6 @@ def test_correctness():
         ( 4, 7168, 2048, 2048, 128, False, "FP8  4g  7168x2048  gk=128"),
         ( 4, 4096, 7168, 2048,  32, False, "FP8  4g  4096x7168  gk=32"),
         ( 8, 4096, 7168, 2048,  32, False, "FP8  8g  4096x7168  gk=32"),
-        ( 4, 4096, 7168, 2048,  32, True,  "FP4  4g  4096x7168  gk=32"),
-        ( 8, 4096, 7168, 2048,  32, True,  "FP4  8g  4096x7168  gk=32"),
-        ( 4, 4096, 7168, 2048, 128, True,  "FP4  4g  4096x7168  gk=128"),
-        ( 4, 7168, 2048, 2048, 128, True,  "FP4  4g  7168x2048  gk=128"),
     ]
 
     num_total = 0
@@ -113,7 +109,7 @@ def test_performance():
         ( 4, 7168, 2048, 8192, "EP64  4g (alt)"),
     ]
 
-    for is_fp4, dtype_label in [(False, "FP8"), (True, "FP4")]:
+    for is_fp4, dtype_label in [(False, "FP8")]:
         print("=" * 60)
         print(f"SM120a K-Grouped Contiguous {dtype_label} GEMM — Performance")
         print("=" * 60)

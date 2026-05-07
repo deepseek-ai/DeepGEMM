@@ -352,14 +352,13 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
     const int gran_k = std::get<2>(recipe);
     DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
 
-    // Shape checks (K-grouped data is 1D flattened; FP4 has 2x packing)
+    // Shape checks (K-grouped is FP8 only; FP4 K-grouped is not supported)
+    DG_HOST_ASSERT(a.first.scalar_type() != kPackedFP4 and b.first.scalar_type() != kPackedFP4);
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto arch_major = device_runtime->get_arch_major();
     const int sum_k = std::accumulate(ks.begin(), ks.end(), 0);
-    const int pack_a = (a.first.scalar_type() == kPackedFP4) ? 2 : 1;
-    const int pack_b = (b.first.scalar_type() == kPackedFP4) ? 2 : 1;
-    DG_HOST_ASSERT(a.first.numel() * pack_a == static_cast<int64_t>(sum_k) * m);
-    DG_HOST_ASSERT(b.first.numel() * pack_b == static_cast<int64_t>(sum_k) * n);
+    DG_HOST_ASSERT(a.first.numel() == static_cast<int64_t>(sum_k) * m);
+    DG_HOST_ASSERT(b.first.numel() == static_cast<int64_t>(sum_k) * n);
 
     // Contiguity checks
     DG_HOST_ASSERT(a.first.is_contiguous());
