@@ -160,6 +160,10 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
 
     torch::Tensor logits;
     int aligned_seq_len = align(seq_len, block_q), stride_logits;
+    const auto arch_major = device_runtime->get_arch_major();
+    if (arch_major == 10 and seq_len % 4 == 0) {
+        aligned_seq_len = align(seq_len, block_q * 2);
+    }
     if (max_seqlen_k == 0) {
         // Logits stride must be 16-byte aligned
         stride_logits = align(seq_len_kv + block_kv, 8);
@@ -173,10 +177,12 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     }
 
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
     if (is_fp4 and arch_major == 10) {
         sm100_fp4_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                              seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
+    } else if (not is_fp4 and arch_major == 10 and seq_len % 4 == 0) {
+        sm100_fp8_mqa_logits_f16_weights(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
     } else if (not is_fp4 and (arch_major == 9 or arch_major == 10)) {
         smxx_fp8_mqa_logits(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                             seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
