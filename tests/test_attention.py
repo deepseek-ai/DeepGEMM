@@ -111,8 +111,10 @@ def test_mqa_logits():
         for is_fp4 in ((True, False) if get_arch_major() == 10 else (False, )):
             for logits_dtype in (torch.float, torch.bfloat16):
                 for compressed_logits, clean_logits in [(False, True), (True, False)]:
-                    for seq_len in (2048, 4096):
-                        for seq_len_kv in (4096, 8192):
+                    # for seq_len % 4 != 0, the kernel will be sm100_fp8_mqa_logits,
+                    # for seq_len % 4 == 0, the kernel will be sm100_fp8_mqa_logits_f16_weights
+                    for seq_len in (510, 512):
+                        for seq_len_kv in (130560,):
                             for num_heads, head_dim in [(64, 128)]:
                                 for disable_cp in (False, True):
                                     yield is_fp4, logits_dtype, compressed_logits, clean_logits, seq_len, seq_len_kv, num_heads, head_dim, disable_cp
@@ -123,6 +125,12 @@ def test_mqa_logits():
         q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
         kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
         weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float32)
+        # for seq_len % 4 == 0, the kernel will be sm100_fp8_mqa_logits_f16_weights,
+        # the mma output is fp16, annd weight sum is over f16
+        # we need to scale the weights to avoid overflow
+        if seq_len % 4 == 0:
+            weights = weights * 0.1
+
         ks, ke = generate_ks_ke_tests(seq_len, seq_len_kv, disable_cp)
 
         # Calculate reference logits
