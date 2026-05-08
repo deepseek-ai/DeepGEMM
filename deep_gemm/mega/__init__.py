@@ -61,10 +61,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  hidden: int, intermediate_hidden: int,
                                  use_fp8_dispatch: bool = True,
                                  activation: str = 'swiglu') -> SymmBuffer:
-    # Token count must be aligned to block m
-    num_ranks = group.size()
-    block_m = _C.get_block_m_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk)
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, block_m)
+    # Token count must be aligned to block sizes
+    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
     return SymmBuffer(
         group, num_experts,
@@ -111,6 +109,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
                      sym_buffer: SymmBuffer,
+                     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
@@ -118,6 +117,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,

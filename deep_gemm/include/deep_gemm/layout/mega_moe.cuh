@@ -1,19 +1,27 @@
 #pragma once
 
+#include <cute/numeric/math.hpp>
+
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
 
 namespace deep_gemm::layout {
 
-// Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding
+static constexpr int kNumCandidateBlockMs = 7;
+static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192};
+static constexpr int kMaxCandidateBlockM = 192;
+static constexpr int kMinCandidateBlockM = 8;
+static constexpr int kLCMCandidateBlockM = 384;
+
+// Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_tokens_per_rank, T num_topk,
-                                                        T num_experts_per_rank, T block_m) {
+                                                        T num_experts_per_rank) {
     const auto num_max_recv_tokens = num_ranks * num_max_tokens_per_rank;
     const auto num_max_experts_per_token = math::constexpr_min(num_topk, num_experts_per_rank);
     return math::constexpr_align(
-        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (block_m - 1),
-        block_m);
+        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (static_cast<T>(kMaxCandidateBlockM) - 1),
+        static_cast<T>(kLCMCandidateBlockM));
 }
 
 // SF pool capacity: all experts share a contiguous SF region, sized by pool blocks × SF_BLOCK_M
@@ -48,17 +56,14 @@ struct Workspace {
               const uint32_t& num_ranks,
               const uint32_t& num_experts,
               const uint32_t& num_max_tokens_per_rank,
-              const uint32_t& num_topk,
-              const uint32_t& block_m):
+              const uint32_t& num_topk):
         base(base),
         num_ranks(num_ranks), num_experts(num_experts),
         num_max_tokens_per_rank(num_max_tokens_per_rank) {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
-        num_max_pool_tokens = get_num_max_pool_tokens(
-            num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank, block_m);
-        num_max_pool_blocks = num_max_pool_tokens / block_m;
-        DG_UNIFIED_ASSERT(num_max_tokens_per_rank % block_m == 0);
+        num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+        num_max_pool_blocks = num_max_pool_tokens / kMinCandidateBlockM;
     }
 
     CUTLASS_HOST_DEVICE
