@@ -99,8 +99,25 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims);
     } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
-        sm120_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                major_a, major_b, compiled_dims);
+        auto a_data = a.first;
+        auto b_data = b.first;
+        auto eff_major_a = major_a;
+        auto eff_major_b = major_b;
+        if (major_a != cute::UMMA::Major::K) {
+            a_data = (a_data.scalar_type() == kPackedFP4)
+                ? fp4_repack_to_k_major(a_data, m) : a_data.contiguous();
+            eff_major_a = cute::UMMA::Major::K;
+        }
+        if (major_b != cute::UMMA::Major::K) {
+            b_data = (b_data.scalar_type() == kPackedFP4)
+                ? fp4_repack_to_k_major(b_data, n) : b_data.contiguous();
+            eff_major_b = cute::UMMA::Major::K;
+        }
+        const bool is_mixed_fp4 = (a_data.scalar_type() != b_data.scalar_type()) and
+                                  (a_data.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
+        DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0);
+        sm120_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
+                                eff_major_a, eff_major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -207,8 +224,18 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, expected_m_for_psum_layout);
     } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
-        sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
-                                                     num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
+        auto b_data = b.first;
+        auto eff_major_b = major_b;
+        if (major_b != cute::UMMA::Major::K) {
+            b_data = (b_data.scalar_type() == kPackedFP4)
+                ? fp4_repack_to_k_major(b_data, n) : b_data.contiguous();
+            eff_major_b = cute::UMMA::Major::K;
+        }
+        const bool is_mixed_fp4 = (a.first.scalar_type() != b_data.scalar_type()) and
+                                  (a.first.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
+        DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0);
+        sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b_data, sfb, d, grouped_layout,
+                                                     num_groups, m, n, k, gran_k_a, gran_k_b, major_a, eff_major_b,
                                                      compiled_dims, use_psum_layout, expected_m_for_psum_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");

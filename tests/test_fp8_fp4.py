@@ -31,6 +31,11 @@ def test_gemm() -> None:
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes(is_wgrad=(kernel_type.is_1d1d() and accumulate))
 
+        # SM120 mixed FP8xFP4 K-major requires K % 128 == 0 (16U4_ALIGN16B TMA constraint)
+        is_mixed_fp4 = (quant_config.is_fp4_a != quant_config.is_fp4_b) if hasattr(quant_config, 'is_fp4_a') else False
+        if is_mixed_fp4 and get_arch_major() == 12 and k % 128 != 0:
+            continue
+
         for test_alias in (False, True):
             a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0, quant_config=quant_config)
             func_name = f'fp8_fp4_gemm_{major_opt.lower() if test_alias else "nt"}'
@@ -46,7 +51,9 @@ def test_gemm() -> None:
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0, quant_config=quant_config)
         t = bench_kineto(lambda: deep_gemm.fp8_fp4_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
                          'gemm_', suppress_kineto_output=True)
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True) \
+        a_k = a[0].contiguous() if not major_a.is_k_major() else a[0]
+        b_k = b[0].contiguous() if not major_b.is_k_major() else b[0]
+        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a_k, b_k, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True) \
                               if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
