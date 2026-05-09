@@ -52,16 +52,18 @@ public:
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
-        // Tensormaps (same set as SM100, but SF descriptors use float per-128 layout)
+        // Tensormaps for activations and weights. Weight scale factors use
+        // block (128, 128) quantization and are loaded by the math warpgroup
+        // directly from global memory (no TMA descriptor required).
         CUtensorMap tensor_map_l1_acts;
         CUtensorMap tensor_map_l1_acts_sf;
         CUtensorMap tensor_map_l1_weights;
-        CUtensorMap tensor_map_l1_weights_sf;
+        const float* l1_weights_sf;
         CUtensorMap tensor_map_l1_output;
         CUtensorMap tensor_map_l2_acts;
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
-        CUtensorMap tensor_map_l2_weights_sf;
+        const float* l2_weights_sf;
 
         // Launch configs
         LaunchArgs launch_args;
@@ -71,7 +73,7 @@ public:
         const char* dbg_env = std::getenv("DG_DEBUG_SCHED_TRACE");
         const bool dbg_on = dbg_env != nullptr && std::string(dbg_env) != "0";
         return fmt::format(R"(
-// dbg_trace_v4_idle_warp_dealloc (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
+// dbg_trace_v5_block_128_128_weight_sf (bump to invalidate JIT cache when sm90_fp8_mega_moe.cuh changes)
 {}#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -116,12 +118,12 @@ static void __instantiate_kernel() {{
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
             args.tensor_map_l1_weights,
-            args.tensor_map_l1_weights_sf,
+            args.l1_weights_sf,
             args.tensor_map_l1_output,
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
-            args.tensor_map_l2_weights_sf
+            args.l2_weights_sf
         ));
     }
 };
@@ -153,10 +155,8 @@ static void sm90_fp8_mega_moe(
 
     // Tensormap construction
     // Acts/weights: standard 2D TMA descriptors (FP8 K-major).
-    // SF: per-128 channel float, MN-major, no swizzle (gran_k = 128 for SM90).
-    // Exception: L2 *activation* SF uses gran_k = 64 so that each L1 epilogue
-    // block (which produces 64 post-SwiGLU columns and quantises them with its
-    // own amax) can write its SF independently without cross-CTA reduction.
+    // Activation SF: per-128 channel float for L1, per-64 for L2 (MN-major, no swizzle).
+    // Weight SF: block (128, 128) raw float pointer (no TMA descriptor).
     constexpr int kGranK = 128;
     constexpr int kL2ActsSFGranK = 64;
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
@@ -173,10 +173,6 @@ static void sm90_fp8_mega_moe(
                                                         config.block_k, config.block_n,
                                                         static_cast<int>(l1_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
-    const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
-                                                           intermediate_hidden * 2, hidden,
-                                                           config.block_n, kGranK,
-                                                           num_experts_per_rank, 0);
     // L1 output (post-SwiGLU FP8): N is halved. The SM90 epilogue writes this
     // staging tile to SMEM as plain row-major bytes, so the TMA store descriptor
     // must use no shared-memory swizzle. Later L2 TMA loads may still swizzle
@@ -205,10 +201,6 @@ static void sm90_fp8_mega_moe(
                                                         config.block_k, config.block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
-    const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
-                                                           hidden, intermediate_hidden,
-                                                           config.block_n, kGranK,
-                                                           num_experts_per_rank, 0);
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
@@ -232,12 +224,12 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
         .tensor_map_l1_weights = tensor_map_l1_weights,
-        .tensor_map_l1_weights_sf = tensor_map_l1_weights_sf,
+        .l1_weights_sf = l1_weights_sf.data_ptr<float>(),
         .tensor_map_l1_output = tensor_map_l1_output,
         .tensor_map_l2_acts = tensor_map_l2_acts,
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
-        .tensor_map_l2_weights_sf = tensor_map_l2_weights_sf,
+        .l2_weights_sf = l2_weights_sf.data_ptr<float>(),
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };

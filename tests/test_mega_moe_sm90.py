@@ -52,43 +52,43 @@ from deep_gemm.testing import calc_diff, get_arch_major
 # Quantization helpers
 # ----------------------------------------------------------------------------
 
-def _quantize_grouped_fp8_per_128_k(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-channel-row FP8 quantization with per-128 K float scale.
+def _quantize_grouped_fp8_block_128_128(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Block (128, 128) FP8 quantization along (N, K).
 
     Args
     ----
-    w : (G, N, K) bf16
+    w : (G, N, K) bf16, with N % 128 == 0 and K % 128 == 0
 
     Returns
     -------
     fp8 : (G, N, K) torch.float8_e4m3fn
-    sf  : (G, N, K // 128) torch.float32 — K-major (C-contiguous in this shape).
-          The host launcher calls `check_sf_layout(..., tma_stride_check=true)`
-          on weight SF, which requires MN-major; the caller is responsible for
-          transposing this output via
-          ``deep_gemm.transform_sf_into_required_layout(sf, n, k, (1, 128), g)``
-          before passing it to the kernel.
+    sf  : (G, N // 128, K // 128) torch.float32, MN-major in the (N, K)
+          plane (i.e. K is the inner contiguous dim, matching the kernel's
+          ``stride_k = 1`` expectation and the DeepEP convention).
     """
     g, n, k = w.shape
-    assert k % 128 == 0
-    w_view = w.view(g, n, k // 128, 128).float()
-    amax = w_view.abs().amax(dim=-1).clamp(1e-4)
+    assert n % 128 == 0 and k % 128 == 0
+    w_view = w.view(g, n // 128, 128, k // 128, 128).float()
+    amax = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4)        # (G, N/128, K/128)
     sf = amax / 448.0
-    w_fp8 = (w_view / sf.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    w_fp8 = (w_view / sf.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn)
     return w_fp8.view(g, n, k).contiguous(), sf.contiguous()
 
 
-def _dequant_per_128_k(w_fp8: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
-    """Inverse of `_quantize_grouped_fp8_per_128_k`.  Returns fp32."""
+def _dequant_block_128_128(w_fp8: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """Inverse of `_quantize_grouped_fp8_block_128_128`. Returns fp32."""
     *prefix, n, k = w_fp8.shape
-    w_view = w_fp8.float().view(*prefix, n, k // 128, 128)
-    return (w_view * sf.unsqueeze(-1)).view(*prefix, n, k)
+    assert n % 128 == 0 and k % 128 == 0
+    w_view = w_fp8.float().view(*prefix, n // 128, 128, k // 128, 128)
+    return (w_view * sf.unsqueeze(-1).unsqueeze(-3)).view(*prefix, n, k)
 
 
 def _dequant_per_token_per_128_k(x_fp8: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     """For (M, K) fp8 with (M, K // 128) float SF (per-token, K-major)."""
     m, k = x_fp8.shape
-    return _dequant_per_128_k(x_fp8.unsqueeze(0), sf.unsqueeze(0)).squeeze(0)
+    assert k % 128 == 0
+    w_view = x_fp8.float().view(m, k // 128, 128)
+    return (w_view * sf.unsqueeze(-1)).view(m, k)
 
 
 # ----------------------------------------------------------------------------
@@ -190,7 +190,7 @@ def _reference_fused(
             dst_local = (eids % num_experts_per_rank).long()
 
             # L1 GEMM (per-token): y = x @ W^T  shape (S, 2*IH)
-            l1_w_sel = _dequant_per_128_k(
+            l1_w_sel = _dequant_block_128_128(
                 l1_w_all[dst_rank, dst_local],                     # (S, 2*IH, H)
                 l1_sf_all[dst_rank, dst_local],
             )
@@ -210,7 +210,7 @@ def _reference_fused(
             l2_in = (l1_q * sf2.unsqueeze(-1)).view(s_, ih)        # (S, IH) fp32
 
             # L2 GEMM
-            l2_w_sel = _dequant_per_128_k(
+            l2_w_sel = _dequant_block_128_128(
                 l2_w_all[dst_rank, dst_local],                     # (S, H, IH)
                 l2_sf_all[dst_rank, dst_local],
             )
@@ -277,20 +277,16 @@ def _run_scenario(
         topk_w.masked_fill_(topk_idx < 0, 0)
 
     # Quantize x to FP8 with per-128 K float SF (SM90 format)
+    # Quantize x to FP8 with per-128 K float SF (SM90 format)
     x_fp8, x_sf = per_token_cast_to_fp8(x_bf, use_ue8m0=False, gran_k=128,
                                         use_packed_ue8m0=False)
-    # Quantize weights — keep K-major copies for the reference dequant path.
-    l1_w_fp8, l1_w_sf_kmajor = _quantize_grouped_fp8_per_128_k(l1_bf)
-    l2_w_fp8, l2_w_sf_kmajor = _quantize_grouped_fp8_per_128_k(l2_bf)
+    # Quantize weights with block (128, 128) — matches DeepSeekV4FlashFp8 / DeepEP.
+    l1_w_fp8, l1_w_sf = _quantize_grouped_fp8_block_128_128(l1_bf)
+    l2_w_fp8, l2_w_sf = _quantize_grouped_fp8_block_128_128(l2_bf)
 
-    # The kernel expects MN-major, TMA-aligned weight SFs (per `check_sf_layout`
-    # with `tma_stride_check=true`). Convert via the public helper, which on
-    # SM90 is exactly what `transform_sf_into_required_layout` does for
-    # ``(FP32, gran_mn=1, gran_k=128)``.
-    l1_w_sf = deep_gemm.get_mn_major_tma_aligned_tensor(l1_w_sf_kmajor)
-    l2_w_sf = deep_gemm.get_mn_major_tma_aligned_tensor(l2_w_sf_kmajor)
-
-    # SM90 weight transform (gate/up interleave only)
+    # SM90 weight transform (gate/up interleave only). With block (128, 128)
+    # SF, the SF tensor is consumed by the kernel as-is — no MN-major TMA
+    # transform and no SF-side gate/up interleave is needed.
     _trace('weight_transform')
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
         (l1_w_fp8, l1_w_sf), (l2_w_fp8, l2_w_sf)
@@ -317,7 +313,7 @@ def _run_scenario(
     deep_gemm.fp8_mega_moe(
         y_fused, transformed_l1, transformed_l2, buffer,
         cumulative_local_expert_recv_stats=cum_stats,
-        recipe=(1, 128, 128),
+        recipe=(128, 128, 128),
         activation='swiglu',
         activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
         fast_math=fast_math,
@@ -327,13 +323,13 @@ def _run_scenario(
     _trace('fused_done')
 
     # ---- Reference & check ---------------------------------------------------
-    # Use the *un-interleaved*, K-major SF weights for the reference path —
-    # the dequant helper expects K-major SF, and the original (gate||up) row
+    # Use the FP8 weights and their block-(128, 128) SF directly — the dequant
+    # helper expects this MN/K-block SF layout, and the original (gate||up) row
     # ordering is what `_swiglu_fp32` splits with ``[..., :IH], [..., IH:]``.
     _trace('reference')
     y_ref = _reference_fused(
         x_fp8, x_sf, topk_idx, topk_w,
-        l1_w_fp8, l1_w_sf_kmajor, l2_w_fp8, l2_w_sf_kmajor,
+        l1_w_fp8, l1_w_sf, l2_w_fp8, l2_w_sf,
         rank_idx, num_ranks, group,
         num_experts, num_topk,
         hidden, intermediate_hidden,

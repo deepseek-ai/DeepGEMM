@@ -134,12 +134,12 @@ sm90_fp8_mega_moe_impl(void* y,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
-                       const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights_sf,
+                       const float* __restrict__ l1_weights_sf,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
                        const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
-                       const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {
+                       const float* __restrict__ l2_weights_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900) and (__CUDA_ARCH__ < 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
@@ -167,12 +167,10 @@ sm90_fp8_mega_moe_impl(void* y,
         cute::prefetch_tma_descriptor(&tensor_map_l1_acts);
         cute::prefetch_tma_descriptor(&tensor_map_l1_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l1_weights);
-        cute::prefetch_tma_descriptor(&tensor_map_l1_weights_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l1_output);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
-        cute::prefetch_tma_descriptor(&tensor_map_l2_weights_sf);
     }
 
     // =====================================================================
@@ -246,8 +244,10 @@ sm90_fp8_mega_moe_impl(void* y,
     // SFA per-stage must be sized for the larger of L1 (BLOCK_M floats) and L2 (2*BLOCK_M floats per-64).
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
         math::constexpr_align<uint32_t>(2 * BLOCK_M * sizeof(float), 128u);
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE =
-        math::constexpr_align<uint32_t>(BLOCK_N * sizeof(float), 128u);
+    // Block (128, 128) weight SF: 1 float per (BLOCK_N, BLOCK_K) tile for L2,
+    // 2 floats (gate/up) for L1. Loaded by math warpgroup directly from global,
+    // so no SMEM is needed.
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = 0;
 
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte * num_wg) and
     // L2 BF16 (BLOCK_M * BLOCK_N * 2 bytes * num_wg).
@@ -284,13 +284,10 @@ sm90_fp8_mega_moe_impl(void* y,
     auto smem_sfa = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<float*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
-    auto smem_sfb = utils::PatternVisitor([=](const uint32_t& i) {
-        return reinterpret_cast<float*>(sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE + i * SMEM_SFB_SIZE_PER_STAGE);
-    });
 
-    // Barriers live after SF
+    // Barriers live after SF (SFB is loaded directly from global, no SMEM)
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
-        sf_start_ptr + kNumStages * (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE));
+        sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE);
     auto dispatch_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + i; });
     auto full_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + i; });
     auto empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages + i; });
@@ -730,8 +727,6 @@ sm90_fp8_mega_moe_impl(void* y,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
             const auto tensor_map_b_ptr =
                 block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights : &tensor_map_l1_weights;
-            const auto tensor_map_sfb_ptr =
-                block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights_sf : &tensor_map_l1_weights_sf;
 
             const uint32_t shape_n = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_N : L1_SHAPE_N;
 
@@ -741,22 +736,13 @@ sm90_fp8_mega_moe_impl(void* y,
                 if (cute::elect_one_sync()) {
                     const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
-                    const uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
-                    const uint32_t sfb_k_idx = local_expert_idx * (block_phase == sched::BlockPhase::Linear2 ?
-                                                  L2_SHAPE_K / kGranK : L1_SHAPE_K / kGranK) + k_block_idx;
 
-                    // TMA load B
+                    // TMA load B (weight SF is now loaded directly by math warps from global)
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                         tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx],
                         k_idx, n_idx, 1);
 
-                    // TMA load SFB (per-128 K float)
-                    tma::copy<BLOCK_N, 1, 0, float>(
-                        tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx],
-                        sfb_n_idx, sfb_k_idx, 1);
-
-                    full_barriers[stage_idx]->arrive_and_expect_tx(
-                        SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(float));
+                    full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
                 }
                 __syncwarp();
             }
@@ -830,10 +816,33 @@ sm90_fp8_mega_moe_impl(void* y,
                     scale_a_0_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + epilogue_wg_idx * WGMMA::M + r_0);
                     scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + epilogue_wg_idx * WGMMA::M + r_1);
                 }
-                float2 scales_b[kAccumPerThread / 4];
-                #pragma unroll
-                for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i)
-                    scales_b[i] = ptx::ld_shared(reinterpret_cast<float2*>(smem_sfb[stage_idx] + i * 8 + col_idx * 2));
+
+                // ----- Block (128, 128) weight SF (loaded directly from global) -----
+                // L1 weight SF shape: (E, 2*IH/128, H/128) MN-major. The N axis is
+                // [gate(IH/128), up(IH/128)]; with the gate/up gran-8 interleave on
+                // the FP8 weight, each BLOCK_N=128 tile covers 64 rows of gate plus
+                // 64 rows of up taken from the same original 128-row block, so:
+                //     gate_sf_n = n_block_idx / 2
+                //     up_sf_n   = (IH/128) + n_block_idx / 2
+                //
+                // L2 weight SF shape: (E, H/128, IH/128) MN-major. One scalar per
+                // (BLOCK_N, BLOCK_K) tile, broadcast across all WGMMA accumulators.
+                constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
+                constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
+                constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
+                constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
+                constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
+                float gate_sf = 0.0f, up_sf = 0.0f, l2_sf = 0.0f;
+                if (block_phase == sched::BlockPhase::Linear1) {
+                    const uint32_t gate_n = n_block_idx / 2u;
+                    const uint32_t up_n   = kL1SFGateBlks + gate_n;
+                    const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert + k_block_idx;
+                    gate_sf = __ldg(base + gate_n * kL1SFKBlocks);
+                    up_sf   = __ldg(base + up_n   * kL1SFKBlocks);
+                } else {
+                    l2_sf = __ldg(l2_weights_sf + local_expert_idx * kL2SFPerExpert
+                                                + n_block_idx * kL2SFKBlocks + k_block_idx);
+                }
 
                 if (block_phase == sched::BlockPhase::Linear1) {
                     // Single per-128 K-block WGMMA group
@@ -857,13 +866,16 @@ sm90_fp8_mega_moe_impl(void* y,
                         empty_barriers[stage_idx]->arrive();
                     DG_DBG_MATH_STATE(3);
 
+                    // L1: gate/up alternate at gran=8 along N; each `i` block of 8
+                    // cols belongs entirely to one of {gate, up}, so .x and .y
+                    // share the same scalar.
                     #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                        const float sb0 = scales_b[i].x, sb1 = scales_b[i].y;
-                        final_accum[i*4+0] += scale_a_0_lo * sb0 * accum[i*4+0];
-                        final_accum[i*4+1] += scale_a_0_lo * sb1 * accum[i*4+1];
-                        final_accum[i*4+2] += scale_a_1_lo * sb0 * accum[i*4+2];
-                        final_accum[i*4+3] += scale_a_1_lo * sb1 * accum[i*4+3];
+                        const float sb = (i & 1u) ? up_sf : gate_sf;
+                        final_accum[i*4+0] += scale_a_0_lo * sb * accum[i*4+0];
+                        final_accum[i*4+1] += scale_a_0_lo * sb * accum[i*4+1];
+                        final_accum[i*4+2] += scale_a_1_lo * sb * accum[i*4+2];
+                        final_accum[i*4+3] += scale_a_1_lo * sb * accum[i*4+3];
                     }
                 } else {
                     // L2: split BLOCK_K=128 into two halves (per-64 SFA), each 2 WGMMAs.
@@ -884,13 +896,13 @@ sm90_fp8_mega_moe_impl(void* y,
                     for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                     ptx::warpgroup_wait<0>();
 
+                    // L2 first half: single scalar `l2_sf` broadcast across N.
                     #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                        const float sb0 = scales_b[i].x, sb1 = scales_b[i].y;
-                        final_accum[i*4+0] += scale_a_0_lo * sb0 * accum[i*4+0];
-                        final_accum[i*4+1] += scale_a_0_lo * sb1 * accum[i*4+1];
-                        final_accum[i*4+2] += scale_a_1_lo * sb0 * accum[i*4+2];
-                        final_accum[i*4+3] += scale_a_1_lo * sb1 * accum[i*4+3];
+                        final_accum[i*4+0] += scale_a_0_lo * l2_sf * accum[i*4+0];
+                        final_accum[i*4+1] += scale_a_0_lo * l2_sf * accum[i*4+1];
+                        final_accum[i*4+2] += scale_a_1_lo * l2_sf * accum[i*4+2];
+                        final_accum[i*4+3] += scale_a_1_lo * l2_sf * accum[i*4+3];
                     }
 
                     // Second half: K=64..127, SFA = scale_a_*_hi
@@ -915,13 +927,13 @@ sm90_fp8_mega_moe_impl(void* y,
                         empty_barriers[stage_idx]->arrive();
                     DG_DBG_MATH_STATE(3);
 
+                    // L2 second half: same broadcast scalar `l2_sf`.
                     #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                        const float sb0 = scales_b[i].x, sb1 = scales_b[i].y;
-                        final_accum[i*4+0] += scale_a_0_hi * sb0 * accum[i*4+0];
-                        final_accum[i*4+1] += scale_a_0_hi * sb1 * accum[i*4+1];
-                        final_accum[i*4+2] += scale_a_1_hi * sb0 * accum[i*4+2];
-                        final_accum[i*4+3] += scale_a_1_hi * sb1 * accum[i*4+3];
+                        final_accum[i*4+0] += scale_a_0_hi * l2_sf * accum[i*4+0];
+                        final_accum[i*4+1] += scale_a_0_hi * l2_sf * accum[i*4+1];
+                        final_accum[i*4+2] += scale_a_1_hi * l2_sf * accum[i*4+2];
+                        final_accum[i*4+3] += scale_a_1_hi * l2_sf * accum[i*4+3];
                     }
                 }
             }

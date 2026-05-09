@@ -364,9 +364,10 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // SF on SM90:
     //   * SFA per stage must hold the larger of L1 (BLOCK_M floats, per-128 K)
     //     and L2 (2 * BLOCK_M floats, per-64 K), aligned to 128 bytes
-    //   * SFB per stage = align(BLOCK_N * sizeof(float), 128)
+    //   * SFB is loaded directly from global by the math warpgroup (block-(128,128)
+    //     weight quantization), so no SMEM is reserved for it.
     const int smem_sfa_per_stage = align(2 * block_m * static_cast<int>(sizeof(float)), 128);
-    const int smem_sfb_per_stage = align(block_n * static_cast<int>(sizeof(float)), 128);
+    const int smem_sfb_per_stage = 0;
 
     // Per-stage: A tile + B tile + SFA tile + SFB tile
     const int smem_per_stage = block_m * block_k + block_n * block_k +
