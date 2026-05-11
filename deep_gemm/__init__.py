@@ -77,10 +77,6 @@ try:
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_gemm_nt_masked
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
     try:
-        fp8_fp4_gemm_nt_sm90_cuda_core = _C.fp8_fp4_gemm_nt_sm90_cuda_core
-    except AttributeError:
-        pass
-    try:
         fp8_fp4_gemm_nt_sm90_fused_wgmma = _C.fp8_fp4_gemm_nt_sm90_fused_wgmma
     except AttributeError:
         pass
