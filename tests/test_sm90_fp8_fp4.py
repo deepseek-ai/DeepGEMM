@@ -67,7 +67,6 @@ def _normal_case(m: int, n: int, k: int, gran_k: int = 128) -> None:
         )
 
     d_fp8 = torch.empty_like(d)
-    d_fused = torch.empty_like(d)
 
     def run_fp8():
         deep_gemm.fp8_gemm_nt(
@@ -77,17 +76,6 @@ def _normal_case(m: int, n: int, k: int, gran_k: int = 128) -> None:
             c=c,
             recipe_a=(1, gran_k),
             recipe_b=(1, gran_k),
-        )
-
-    d_fused = torch.empty_like(d)
-
-    def run_fused():
-        deep_gemm.fp8_fp4_gemm_nt_sm90_cuda_core(
-            a,
-            b,
-            d_fused,
-            c=c,
-            gran_k=gran_k,
         )
 
     d_fused_wgmma = torch.empty_like(d)
@@ -103,14 +91,11 @@ def _normal_case(m: int, n: int, k: int, gran_k: int = 128) -> None:
 
     run()
     run_fp8()
-    if hasattr(deep_gemm, "fp8_fp4_gemm_nt_sm90_cuda_core"):
-        run_fused()
     if hasattr(deep_gemm, "fp8_fp4_gemm_nt_sm90_fused_wgmma"):
         run_fused_wgmma()
     fallback_diff = calc_diff(d, ref)
     fp8_diff = calc_diff(d_fp8, ref)
     fallback_vs_fp8_diff = calc_diff(d, d_fp8)
-    fused_diff = calc_diff(d_fused, ref) if hasattr(deep_gemm, "fp8_fp4_gemm_nt_sm90_cuda_core") else None
     fused_wgmma_diff = (
         calc_diff(d_fused_wgmma, ref)
         if hasattr(deep_gemm, "fp8_fp4_gemm_nt_sm90_fused_wgmma")
@@ -118,11 +103,6 @@ def _normal_case(m: int, n: int, k: int, gran_k: int = 128) -> None:
     )
     fallback_elapsed = _time_cuda(run)
     fp8_elapsed = _time_cuda(run_fp8)
-    fused_elapsed = (
-        _time_cuda(run_fused)
-        if hasattr(deep_gemm, "fp8_fp4_gemm_nt_sm90_cuda_core")
-        else None
-    )
     fused_wgmma_elapsed = (
         _time_cuda(run_fused_wgmma)
         if hasattr(deep_gemm, "fp8_fp4_gemm_nt_sm90_fused_wgmma")
@@ -130,9 +110,6 @@ def _normal_case(m: int, n: int, k: int, gran_k: int = 128) -> None:
     )
     fallback_tflops = 2 * m * n * k / fallback_elapsed / 1e12
     fp8_tflops = 2 * m * n * k / fp8_elapsed / 1e12
-    fused_tflops = (
-        2 * m * n * k / fused_elapsed / 1e12 if fused_elapsed is not None else None
-    )
     fused_wgmma_tflops = (
         2 * m * n * k / fused_wgmma_elapsed / 1e12
         if fused_wgmma_elapsed is not None
@@ -148,12 +125,6 @@ def _normal_case(m: int, n: int, k: int, gran_k: int = 128) -> None:
         f"  fallback vs fp8:  diff={fallback_vs_fp8_diff:.6f}\n"
         f"  slowdown:         {slowdown:.2f}x"
     )
-    if fused_elapsed is not None:
-        message += (
-            f"\n  cuda-core fused:  diff={fused_diff:.6f}, "
-            f"time={fused_elapsed * 1e6:.1f} us, {fused_tflops:.2f} TFLOPS, "
-            f"slowdown_vs_fp8={fused_elapsed / fp8_elapsed:.2f}x"
-        )
     if fused_wgmma_elapsed is not None:
         message += (
             f"\n  fused wgmma:      diff={fused_wgmma_diff:.6f}, "
@@ -164,8 +135,6 @@ def _normal_case(m: int, n: int, k: int, gran_k: int = 128) -> None:
     assert fallback_diff < 0.015
     assert fp8_diff < 0.015
     assert fallback_vs_fp8_diff < 1e-6
-    if fused_diff is not None:
-        assert fused_diff < 0.015
     if fused_wgmma_diff is not None:
         assert fused_wgmma_diff < 0.015
 
