@@ -256,7 +256,7 @@ def test_sm90_fp8_fp4_fallback() -> None:
 
     rows = []
     for groups in (8, 16, 24, 32):
-        for m_per_group in (128, 256, 512, 1024):
+        for m_per_group in (256, 512, 1024, 2048):
             rows.append(_benchmark_case(groups, m_per_group, n=4096, k=7168))
     _print_markdown_table(rows)
 
@@ -267,9 +267,9 @@ def test_sm90_fp8_fp4_fallback_accuracy() -> None:
 
     cases = (
         (8, 128, 1024, 1024),
-        (16, 128, 2048, 2048),
-        (24, 256, 4096, 7168),
-        (32, 512, 4096, 7168),
+        (16, 256, 2048, 2048),
+        (24, 512, 4096, 7168),
+        (32, 1024, 4096, 7168),
     )
     for groups, m_per_group, n, k in cases:
         w4_diff, fp8_diff = _accuracy_case(groups, m_per_group, n, k)
