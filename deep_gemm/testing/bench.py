@@ -95,6 +95,13 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     # For some auto-tuning kernels with prints
     fn()
 
+    # Ensure kineto/CUPTI is initialized before real profiling
+    if not getattr(bench_kineto, '_kineto_initialized', False):
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]):
+            fn()
+        torch.cuda.synchronize()
+        bench_kineto._kineto_initialized = True
+
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():

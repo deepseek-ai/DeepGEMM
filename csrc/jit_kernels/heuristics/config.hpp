@@ -22,6 +22,11 @@ struct GemmDesc {
     int num_sms, tc_util;
     std::string compiled_dims;
 
+    // W4AFP8 mode (INT4 weight, FP8 activation), SM90 only
+    // Weight encoding: true when B is INT4 packed as FP8 (requires software dequant).
+    // Detected from a.size(-1) != b.size(-1) at the API layer.
+    bool is_w4 = false;
+
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
@@ -63,7 +68,8 @@ struct GemmDesc {
            << ", expected_m=" << desc.expected_m
            << ", expected_n=" << desc.expected_n
            << ", expected_k=" << desc.expected_k
-           << ", expected_num_groups=" << desc.expected_num_groups << ")";
+           << ", expected_num_groups=" << desc.expected_num_groups
+           << ", is_w4=" << static_cast<int>(desc.is_w4) << ")";
         return os;
     }
 };

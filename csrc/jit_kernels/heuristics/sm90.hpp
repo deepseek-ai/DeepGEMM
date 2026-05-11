@@ -16,7 +16,23 @@ struct SM90ArchSpec {
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         // Block M candidates
         std::vector<int> block_m_candidates;
-        if (desc.gemm_type == GemmType::Normal or
+        if (desc.is_w4) {
+            // W4 uses swap_ab: STSM pattern requires BLOCK_M >= 64
+            // For masked GEMM, restrict block_m candidates based on expected_m to avoid
+            // unnecessary multi-M-block scheduling when a larger block_m fits exactly.
+            if (desc.gemm_type == GemmType::MGroupedContiguous)
+                block_m_candidates = std::vector{heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
+            else if (desc.gemm_type == GemmType::MGroupedMasked) {
+                // W4 BM=128 (MMA_N=128): async WGMMA runs longer, hiding more of the ldmatrix+dequant latency.
+                // Validated for single-tile-per-SM cases; larger problems keep BM=64 as safe default.
+                const int est_tiles = ceil_div(desc.get_expected_m(), 64)
+                    * ceil_div(desc.get_expected_n(), 256)
+                    * desc.get_expected_num_groups();
+                const bool use_large_block_m = est_tiles <= desc.num_sms and desc.get_expected_m() >= 49;
+                block_m_candidates = use_large_block_m ? std::vector{128} : std::vector{64};
+            } else
+                block_m_candidates = {64, 128, 256};
+        } else if (desc.gemm_type == GemmType::Normal or
             desc.gemm_type == GemmType::Batched or
             desc.gemm_type == GemmType::KGroupedContiguous) {
             // TODO: check 256's performance
@@ -37,24 +53,30 @@ struct SM90ArchSpec {
 
         // Block N candidates
         std::vector<int> block_n_candidates;
-        int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
-        int start = step;
-        // Avoid bank conflicts for 1D1D kernel FP32 output
-        if (desc.kernel_type == KernelType::Kernel1D1D and desc.cd_dtype == torch::kFloat) {
-            DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K);
-            DG_HOST_ASSERT(desc.major_b == cute::UMMA::Major::K);
-            start = 24;
-            block_n_candidates.push_back(16);
+        if (desc.is_w4) {
+            // W4 small-m: STSM only fills MMA_N/64 of smem_d atom, restrict to {64}
+            const bool w4_small_m = (desc.gemm_type == GemmType::Normal) and (desc.m > 0 and desc.m <= 56);
+            block_n_candidates = w4_small_m ? std::vector{64} : std::vector{64, 128, 256};
+        } else {
+            int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
+            int start = step;
+            // Avoid bank conflicts for 1D1D kernel FP32 output
+            if (desc.kernel_type == KernelType::Kernel1D1D and desc.cd_dtype == torch::kFloat) {
+                DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K);
+                DG_HOST_ASSERT(desc.major_b == cute::UMMA::Major::K);
+                start = 24;
+                block_n_candidates.push_back(16);
+            }
+            // Register spills
+            int end = 256;
+            if (desc.kernel_type == KernelType::Kernel1D2D)
+                end = 192;
+            if (desc.kernel_type == KernelType::Kernel1D1D)
+                end = 160;
+            // Enumerate
+            for (int i = start; i <= end; i += step)
+                block_n_candidates.push_back(i);
         }
-        // Register spills
-        int end = 256;
-        if (desc.kernel_type == KernelType::Kernel1D2D)
-            end = 192;
-        if (desc.kernel_type == KernelType::Kernel1D1D)
-            end = 160;
-        // Enumerate
-        for (int i = start; i <= end; i += step)
-            block_n_candidates.push_back(i);
 
         // Block K is always in a fixed manner
         const int block_k = 128 / get_element_size(desc.get_mma_kind());
@@ -91,7 +113,10 @@ struct SM90ArchSpec {
                             continue;
 
                         // The block sizes cannot be too large (for enough registers), so at least one dim less than 128
-                        if (block_m > 128 and block_n > 128)
+                        // W4 RS-mode swaps layout↔compute: block_n→compute_m, block_m→compute_n
+                        const int compute_m = desc.is_w4 ? block_n : block_m;
+                        const int compute_n = desc.is_w4 ? block_m : block_n;
+                        if (compute_m > 128 and compute_n > 128)
                             continue;
 
                         // Calculate swizzling
@@ -119,6 +144,7 @@ struct SM90ArchSpec {
 
     static StorageConfig get_storage_config(const GemmDesc& desc, const Layout& layout) {
         constexpr int wgmma_m = 64;
+        const int weight_ratio = desc.is_w4 ? 2 : 1;
 
         // Load/store block sizes (w/o consideration of swizzling atoms, w/ consideration of loop atoms)
         // TODO: support swap AB
@@ -132,8 +158,9 @@ struct SM90ArchSpec {
         // Decide swizzling by the inner dim
         const auto swizzle_mode_a = get_swizzle_mode(
             desc.major_a == cute::UMMA::Major::K ? layout.block_k : load_block_m, c10::elementSize(desc.a_dtype));
+        // W4: B weight is packed INT4 (half the bytes per element), so swizzle uses block_k / weight_ratio
         const auto swizzle_mode_b = get_swizzle_mode(
-            desc.major_b == cute::UMMA::Major::K ? layout.block_k : load_block_n, c10::elementSize(desc.b_dtype));
+            desc.major_b == cute::UMMA::Major::K ? (layout.block_k / weight_ratio) : load_block_n, c10::elementSize(desc.b_dtype));
         // We only enable swizzling for non-FP32 outputs
         const auto swizzle_mode_cd = desc.cd_dtype != torch::kFloat ?
             get_swizzle_mode(store_block_n, c10::elementSize(desc.cd_dtype)) : 0;
@@ -147,6 +174,7 @@ struct SM90ArchSpec {
 
     static PipelineConfig get_pipeline_config(const GemmDesc& desc, const Layout& layout, const StorageConfig& storage_config) {
         constexpr int kNumMaxStages = 16;
+        const int weight_ratio = desc.is_w4 ? 2 : 1;
 
         // TODO: consider swap AB
         // C/D for TMA stores
@@ -157,17 +185,20 @@ struct SM90ArchSpec {
 
         // Calculate A/B per stages
         const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
-        const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
+        // W4: B weight is INT4, halved smem
+        const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype) / weight_ratio;
 
         // Calculate SF A/B per stages
+        // W4 RS-mode: SFA slot stores weight scales (compute_m = block_n), not activation scales
+        const int compute_m = desc.is_w4 ? layout.block_n : layout.block_m;
         const int smem_sfa_per_stage = desc.kernel_type == KernelType::KernelNoSF ?
-            0 : align(layout.block_m * static_cast<int>(sizeof(float)), 128);
+            0 : align(compute_m * static_cast<int>(sizeof(float)), 128);
         const int smem_sfb_per_stage = desc.kernel_type != KernelType::Kernel1D1D ?
             0 : align(layout.block_n * static_cast<int>(sizeof(float)), 128);
 
-        // Extra SFB sizes for 1D2D kernels
+        // Extra SFB sizes for 1D2D kernels (W4 has no extra SFB — per-tensor scale)
         const int use_uniform_sfb = layout.block_k % layout.block_n == 0 ? 1 : 2;
-        const int smem_extra_sfb = desc.kernel_type != KernelType::Kernel1D2D ?
+        const int smem_extra_sfb = (desc.kernel_type != KernelType::Kernel1D2D or desc.is_w4) ?
             0 : align<int>(ceil_div(desc.k, layout.block_k) * static_cast<int>(sizeof(float)) * use_uniform_sfb, 8);
 
         // Extra tensormap for 1D1D kernels
@@ -188,7 +219,9 @@ struct SM90ArchSpec {
 
     static LaunchConfig get_launch_config(const GemmDesc& desc, const Layout& layout) {
         const int num_tma_threads = 128;
-        const int num_math_threads = layout.block_m <= 64 ? 128 : 256;
+        // W4 RS-mode: block_n is compute_m after swap
+        const int compute_m = desc.is_w4 ? layout.block_n : layout.block_m;
+        const int num_math_threads = compute_m <= 64 ? 128 : 256;
         return {
             desc.num_sms,
             layout.get_cluster_size(),
@@ -211,27 +244,46 @@ struct SM90ArchSpec {
         const int l2_bandwidth_per_cycle = std::min(64. * desc.num_sms, 8e6 / (1.3e3)); // B/cycle
         const int l1_bandwidth_per_cycle = 128 * desc.num_sms; // B/cycle
         const int wgmma_m = 64;
-        const int elem_size_ab = c10::elementSize(desc.a_dtype);
+        const int elem_size_a = c10::elementSize(desc.a_dtype);
         const int elem_size_cd = c10::elementSize(desc.cd_dtype);
-        DG_HOST_ASSERT(desc.a_dtype == desc.b_dtype);
+        // W4: B is INT4 packed — use 2x scale factor to avoid integer truncation.
+        // All byte counts are computed at 2x scale (bandwidth terms cancel out).
+        const int scale = desc.is_w4 ? 2 : 1;
+        const int elem_size_a_s  = elem_size_a * scale;
+        // W4: c10::elementSize(FP8)=1, times scale=2 divided by weight_ratio=2 → 1. No truncation.
+        const int weight_ratio   = desc.is_w4 ? 2 : 1;
+        const int elem_size_b_s  = c10::elementSize(desc.b_dtype) * scale / weight_ratio;
+        const int elem_size_cd_s = elem_size_cd * scale;
 
-        // Data movement per block
+        // Data movement per block (at 2x scale for W4, 1x for FP8)
         int64_t expected_k = desc.get_expected_k();
-        int64_t num_bytes_l2_ab = expected_k * (layout.block_m / layout.cluster_n + layout.block_n / layout.cluster_m) * elem_size_ab;
-        int64_t num_bytes_l1_ab = expected_k * (layout.block_m + layout.block_n) * elem_size_ab;
-        int64_t num_bytes_l1_tc = expected_k * (std::max(wgmma_m, layout.block_m) + layout.block_n) * elem_size_ab
-                                  + layout.block_m * layout.block_n * elem_size_cd;
-        int64_t num_bytes_l1_l2_cd = layout.block_m * layout.block_n * elem_size_cd * (desc.with_accumulation ? 2 : 1);
+        int64_t num_bytes_l2_ab = expected_k * (layout.block_m / layout.cluster_n * elem_size_a_s + layout.block_n / layout.cluster_m * elem_size_b_s);
+        int64_t num_bytes_l1_ab = expected_k * (layout.block_m * elem_size_a_s + layout.block_n * elem_size_b_s);
+        int64_t num_bytes_l1_tc = expected_k * (std::max(wgmma_m, layout.block_m) * elem_size_a_s + layout.block_n * elem_size_b_s)
+                                  + layout.block_m * layout.block_n * elem_size_cd_s;
+        int64_t num_bytes_l1_l2_cd = layout.block_m * layout.block_n * elem_size_cd_s * (desc.with_accumulation ? 2 : 1);
 
         // HBM bandwidth and total compute (Tensor/CUDA cores) are constant across configs
         // We only model L1/L2 cycles as they are the primary variables between configs
+        // Scale factor cancels in the ratio (bytes * scale) / (bandwidth * scale) when scale is uniform
         int64_t num_l2_cycles = (num_bytes_l2_ab + num_bytes_l1_l2_cd) * num_blocks / l2_bandwidth_per_cycle;
         int64_t num_l1_cycles = (num_bytes_l1_ab + num_bytes_l1_tc + num_bytes_l1_l2_cd) * num_blocks / l1_bandwidth_per_cycle;
         float wave_efficiency = static_cast<float>(num_blocks) / (num_waves * desc.num_sms);
         int64_t num_cycles = std::max(num_l1_cycles, num_l2_cycles) / wave_efficiency;
 
-        // Disable multicasting if only one wave exists
+        // Disable multicasting if only one wave exists: cluster sync overhead
+        // outweighs bandwidth savings when all SMs are already utilized.
+        // NOTE: For W4 masked GEMM small-m, cluster_n=2 (weight multicast) was
+        // tested and found NOT beneficial — L2 working set fits within 50MB cache,
+        // so no DRAM savings, only added cluster sync overhead.
         if (layout.cluster_n * layout.cluster_m > 1 and num_waves <= 1)
+            num_cycles = std::numeric_limits<int64_t>::max();
+
+        // For masked GEMM: disable all multicast when expected_m ≤ block_m
+        // (each group has only 1 M-block, cluster sync overhead outweighs savings).
+        if (layout.cluster_n * layout.cluster_m > 1 and
+            desc.gemm_type == GemmType::MGroupedMasked and
+            desc.get_expected_m() <= layout.block_m)
             num_cycles = std::numeric_limits<int64_t>::max();
 
         return {num_waves, last_wave_util, num_cycles, layout};
