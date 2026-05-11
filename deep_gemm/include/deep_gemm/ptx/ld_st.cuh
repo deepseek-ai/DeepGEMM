@@ -138,6 +138,42 @@ CUTLASS_DEVICE void st_shared(const __int128_t* ptr, __int128_t val) {
     asm volatile("st.shared.b128 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "q"(val));
 }
 
+CUTLASS_DEVICE void st_shared(const float4* ptr, float4 val) {
+    asm volatile("st.shared.v4.f32 [%0], {%1, %2, %3, %4};" ::
+                 "l"(__cvta_generic_to_shared(ptr)),
+                 "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w));
+}
+
+// 16-byte vector store as two 64-bit values (st.shared.v2.u64). Useful when
+// the data is naturally produced as two 64-bit lanes; saves one instruction
+// versus issuing 2 separate `st.shared.u64`.
+CUTLASS_DEVICE void st_shared_v2_u64(void* ptr, uint64_t a, uint64_t b) {
+    asm volatile("st.shared.v2.u64 [%0], {%1, %2};" ::
+                 "l"(__cvta_generic_to_shared(ptr)), "l"(a), "l"(b));
+}
+
+/// Async copy from global to shared (cp.async)
+// 16-byte cache-global async copy
+CUTLASS_DEVICE void cp_async_16(void* smem_dst, const void* gmem_src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::
+                 "l"(__cvta_generic_to_shared(smem_dst)), "l"(gmem_src));
+}
+
+// 4-byte cache-all async copy (for scalar / strided fallback)
+CUTLASS_DEVICE void cp_async_4(void* smem_dst, const void* gmem_src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::
+                 "l"(__cvta_generic_to_shared(smem_dst)), "l"(gmem_src));
+}
+
+CUTLASS_DEVICE void cp_async_commit_group() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+CUTLASS_DEVICE void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
 CUTLASS_DEVICE void st_shared_bulk(void* smem_ptr, const uint32_t& num_bytes) {
     // `size` must be 64-bit before PTX ISA 9.0
     asm volatile("st.bulk.weak.shared::cta [%0], %1, 0;" ::
