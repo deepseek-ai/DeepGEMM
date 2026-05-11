@@ -659,7 +659,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("use_psum_layout") = false,
           py::arg("expected_m_for_psum_layout") = std::nullopt,
           py::arg("block_m_override") = std::nullopt,
-          py::arg("block_n_override") = std::nullopt);
+          py::arg("block_n_override") = std::nullopt,
+          py::arg("decode_stub") = false);
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
