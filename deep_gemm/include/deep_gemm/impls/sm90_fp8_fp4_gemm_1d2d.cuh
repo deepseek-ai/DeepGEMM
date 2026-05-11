@@ -39,11 +39,12 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumGroups,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleDMode,
-          uint32_t kNumStages, uint32_t kNumPackedStages,
+          uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
-          typename epilogue_type_t>
+          typename epilogue_type_t,
+          bool kDecodeStub = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -118,14 +119,15 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
         //   LUT_LO[mag] = {0x00, 0x30, 0x38, 0x3c}, LUT_HI[mag-4] = {0x40, 0x44, 0x48, 0x4c}
         //   __byte_perm(LUT_LO, LUT_HI, mag) returns 4 copies of the byte at index `mag`
         //   (mag is in 0..7, fits in the lower nibble, used as the byte selector).
-        // Sign: bit 3 of code shifted to MSB, masked to 0 if mag==0 to avoid -0.
+        // Sign: bit 3 of code shifted to MSB. We deliberately allow the FP4 "negative zero"
+        // (mag=0, sign=1) to map to E4M3 0x80 (which is -0, not NaN). WGMMA treats -0 as 0,
+        // so dropping the explicit mag!=0 mask saves ~4 ops per nibble (~128 per uint4 of
+        // packed FP4) without affecting numerical results.
         constexpr uint32_t LUT_LO = 0x3c383000u;
         constexpr uint32_t LUT_HI = 0x4c484440u;
-        const uint32_t mag       = code & 0x07u;
-        const uint32_t mag_nz_m1 = (mag + 0x07u) >> 3;          // 1 if mag!=0 else 0
-        const uint32_t sign_mask = -mag_nz_m1;                  // 0xffffffff if mag!=0 else 0
-        const uint32_t mag_byte  = __byte_perm(LUT_LO, LUT_HI, mag) & 0xffu;
-        const uint32_t sign      = ((code & 0x08u) << 4) & sign_mask;
+        const uint32_t mag      = code & 0x07u;
+        const uint32_t mag_byte = __byte_perm(LUT_LO, LUT_HI, mag) & 0xffu;
+        const uint32_t sign     = (code & 0x08u) << 4;          // 0 or 0x80
         return mag_byte | sign;
     };
     auto fp4_pair_to_e4m3_pair = [&](uint32_t packed) {
@@ -146,7 +148,7 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
     auto smem_b_packed = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<uint8_t*>(smem_buffer + SMEM_B_PACKED_OFFSET + i * SMEM_B_PACKED_SIZE_PER_STAGE);
     });
-    constexpr uint32_t SMEM_SF_OFFSET = SMEM_B_PACKED_OFFSET + kNumPackedStages * SMEM_B_PACKED_SIZE_PER_STAGE;
+    constexpr uint32_t SMEM_SF_OFFSET = SMEM_B_PACKED_OFFSET + kNumStages * SMEM_B_PACKED_SIZE_PER_STAGE;
     auto smem_sfa = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
     });
@@ -156,13 +158,12 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
     auto smem_sfb = reinterpret_cast<float*>(smem_buffer);
     DG_TRAP_ONLY_DEVICE_ASSERT(smem_sfb_bytes <= SMEM_D_SIZE);
 
-    // Fill barriers (SFB does not allocate any extra space because it aliases smem_d)
+    // Fill barriers (SFB does not allocate any extra space because it aliases smem_d).
+    // After the A/packed-B barrier merge there is only one set of full/empty barriers.
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_SF_OFFSET +
                                                        kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
     auto full_barriers     = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers    = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
-    auto packed_full_barriers  = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + 2 * kNumStages + i; });
-    auto packed_empty_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + 2 * kNumStages + kNumPackedStages + i; });
 
     // Initialize barriers
     DG_STATIC_ASSERT(kNumTMAMulticast <= 32, "Too many TMA multicast");
@@ -173,11 +174,6 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             full_barriers[i]->init(1);
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
-        }
-        #pragma unroll
-        for (uint32_t i = 0; i < kNumPackedStages; ++ i) {
-            packed_full_barriers[i]->init(1);
-            packed_empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
         // Make initialized barrier visible in async proxy
@@ -210,19 +206,14 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
         }
     };
 
-    // Pipeline and TMA phases
+    // Pipeline and TMA phases (single shared pipeline for A/SFA/packed-B after the barrier merge)
     uint32_t stage_idx = 0, phase = 0;
-    uint32_t packed_stage_idx = 0, packed_phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
         ++ k_block_idx;
 
         // Flip phases only if reach the next first stage
         stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
         phase ^= stage_idx == 0;
-
-        // Packed-B pipeline runs in lock-step with the K loop but with its own depth
-        packed_stage_idx = packed_stage_idx == kNumPackedStages - 1 ? 0 : packed_stage_idx + 1;
-        packed_phase ^= packed_stage_idx == 0;
     };
 
     if (warp_idx >= kNumMathThreads / 32) {
@@ -242,9 +233,8 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                 DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
 
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                    // Wait consumer release for A/SFA slot and packed-B slot independently
+                    // Wait consumer release for the (now merged) A/SFA/packed-B slot
                     empty_barriers[stage_idx]->wait(phase ^ 1);
-                    packed_empty_barriers[packed_stage_idx]->wait(packed_phase ^ 1);
 
                     // Issue TMA A
                     constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
@@ -259,17 +249,17 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                     tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
                              smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(shape_k_scales, 1, k_block_idx),
                              num_tma_multicast_a);
-                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
 
-                    // Issue TMA B (packed FP4 bytes loaded as raw uint8 via FP8 alias)
-                    auto& packed_full_barrier = *packed_full_barriers[packed_stage_idx];
+                    // Issue TMA B (packed FP4 bytes loaded as raw uint8 via FP8 alias) on the same barrier
                     const uint32_t k_idx_packed = k_block_idx * BLOCK_K_PACKED;
-                    tma::copy<BLOCK_K_PACKED, BLOCK_N, 0, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &packed_full_barrier,
-                             reinterpret_cast<__nv_fp8_e4m3*>(smem_b_packed[packed_stage_idx]),
+                    tma::copy<BLOCK_K_PACKED, BLOCK_N, 0, __nv_fp8_e4m3, kIsBatchedMM>(&tensor_map_b, &full_barrier,
+                             reinterpret_cast<__nv_fp8_e4m3*>(smem_b_packed[stage_idx]),
                              k_idx_packed,
                              scheduler.template get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                              num_tma_multicast_b, batch_idx);
-                    packed_full_barrier.arrive_and_expect_tx(SMEM_B_PACKED_SIZE_PER_STAGE);
+
+                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE +
+                                                     SMEM_B_PACKED_SIZE_PER_STAGE);
                 }
             }
 
@@ -279,11 +269,6 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                     empty_barriers[stage_idx]->wait(phase ^ 1);
                     stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
                     phase ^= stage_idx == 0;
-                }
-                for (uint32_t i = 0; i < kNumPackedStages; ++ i) {
-                    packed_empty_barriers[packed_stage_idx]->wait(packed_phase ^ 1);
-                    packed_stage_idx = packed_stage_idx == kNumPackedStages - 1 ? 0 : packed_stage_idx + 1;
-                    packed_phase ^= packed_stage_idx == 0;
                 }
             }
         }
@@ -305,28 +290,74 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const uint32_t current_group_idx = get_current_group_idx();
 
-            // Cooperatively prefetch the SFB tile for this block from gmem to smem
+            // Cooperatively prefetch the SFB tile for this block from gmem to smem.
             // Layout in smem: [shape_k_scales, BLOCK_N] (k outer, n inner).
             // Out-of-bound n is filled with 1.0f to keep `n_idx >= shape_n` neutral.
+            //
+            // Optimization: use cp.async to copy gmem->smem directly (no register
+            // round-trip). For MN-major (n innermost in gmem) we can issue 16-byte
+            // (float4) cp.async per thread, cutting #instructions by 4x. K-major
+            // and the OOB tail use scalar 4-byte cp.async / st.shared.
             {
                 const uint32_t n_block_base = n_block_idx * BLOCK_N;
-                const uint32_t total = shape_k_scales * BLOCK_N;
-                for (uint32_t i = threadIdx.x; i < total; i += kNumMathThreads) {
-                    const uint32_t k_idx = i / BLOCK_N;
-                    const uint32_t n_off = i % BLOCK_N;
-                    const uint32_t n_idx = n_block_base + n_off;
-                    float val;
-                    if (n_idx >= shape_n) {
-                        val = 1.0f;
-                    } else if constexpr (kMajorSFB == cute::UMMA::Major::MN) {
-                        val = sfb[current_group_idx * aligned_shape_n_sfb * shape_k_scales +
-                                  k_idx * aligned_shape_n_sfb + n_idx];
-                    } else {
-                        val = sfb[current_group_idx * shape_n * shape_k_scales +
-                                  n_idx * shape_k_scales + k_idx];
+                if constexpr (kMajorSFB == cute::UMMA::Major::MN) {
+                    constexpr uint32_t kVec = 4;
+                    DG_STATIC_ASSERT(BLOCK_N % kVec == 0,
+                                     "BLOCK_N must be a multiple of 4 for vectorized SFB load");
+                    constexpr uint32_t kVecsPerRow = BLOCK_N / kVec;
+                    const uint32_t total_vecs = shape_k_scales * kVecsPerRow;
+                    const float* sfb_base = sfb +
+                        current_group_idx * aligned_shape_n_sfb * shape_k_scales;
+                    // Issue cp.async (16B per thread) for fully in-bounds vectors;
+                    // fall back to scalar st.shared with 1.0f-fill for the tail.
+                    for (uint32_t i = threadIdx.x; i < total_vecs; i += kNumMathThreads) {
+                        const uint32_t k_idx = i / kVecsPerRow;
+                        const uint32_t vec_n = i % kVecsPerRow;
+                        const uint32_t n_off = vec_n * kVec;
+                        const uint32_t n_idx = n_block_base + n_off;
+                        float* smem_dst = smem_sfb + k_idx * BLOCK_N + n_off;
+                        if (n_idx + kVec <= shape_n) {
+                            const float* gmem_src = sfb_base +
+                                k_idx * aligned_shape_n_sfb + n_idx;
+                            ptx::cp_async_16(smem_dst, gmem_src);
+                        } else {
+                            // Tail: at least one element is OOB; use scalar st with 1.0f fill.
+                            float4 vals;
+                            vals.x = (n_idx + 0 < shape_n) ?
+                                sfb_base[k_idx * aligned_shape_n_sfb + n_idx + 0] : 1.0f;
+                            vals.y = (n_idx + 1 < shape_n) ?
+                                sfb_base[k_idx * aligned_shape_n_sfb + n_idx + 1] : 1.0f;
+                            vals.z = (n_idx + 2 < shape_n) ?
+                                sfb_base[k_idx * aligned_shape_n_sfb + n_idx + 2] : 1.0f;
+                            vals.w = (n_idx + 3 < shape_n) ?
+                                sfb_base[k_idx * aligned_shape_n_sfb + n_idx + 3] : 1.0f;
+                            ptx::st_shared(reinterpret_cast<float4*>(smem_dst), vals);
+                        }
                     }
-                    ptx::st_shared(smem_sfb + k_idx * BLOCK_N + n_off, val);
+                } else {
+                    // K-major: sfb is strided along n; cannot easily vectorize across n.
+                    // Use scalar 4B cp.async for in-bounds, st.shared with 1.0f for OOB.
+                    const uint32_t total = shape_k_scales * BLOCK_N;
+                    for (uint32_t i = threadIdx.x; i < total; i += kNumMathThreads) {
+                        const uint32_t k_idx = i / BLOCK_N;
+                        const uint32_t n_off = i % BLOCK_N;
+                        const uint32_t n_idx = n_block_base + n_off;
+                        float* smem_dst = smem_sfb + k_idx * BLOCK_N + n_off;
+                        if (n_idx >= shape_n) {
+                            ptx::st_shared(smem_dst, 1.0f);
+                        } else {
+                            const float* gmem_src = sfb +
+                                current_group_idx * shape_n * shape_k_scales +
+                                n_idx * shape_k_scales + k_idx;
+                            ptx::cp_async_4(smem_dst, gmem_src);
+                        }
+                    }
                 }
+                // Commit and wait for all cp.async issued above; pair with the
+                // existing NamedBarrier so the smem cache is visible to all
+                // math warps before they enter the K loop.
+                ptx::cp_async_commit_group();
+                ptx::cp_async_wait_group<0>();
                 cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
             }
 
@@ -363,17 +394,6 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                     lane_idx < kNumTMAMulticast ? empty_barriers[stage_idx]->arrive(target_cta) : void();
                 }
             };
-            auto packed_empty_barrier_arrive_at = [&](uint32_t which_packed_stage) {
-                if constexpr (kNumTMAMulticast == 1) {
-                    lane_idx == 0 ? packed_empty_barriers[which_packed_stage]->arrive() : void();
-                } else {
-                    auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
-                    lane_idx < kNumTMAMulticast ? packed_empty_barriers[which_packed_stage]->arrive(target_cta) : void();
-                }
-            };
-            auto packed_empty_barrier_arrive = [&]() {
-                packed_empty_barrier_arrive_at(packed_stage_idx);
-            };
 
             // Skip useless computations
             const bool is_cta_computation_valid = scheduler.is_computation_valid(m_block_idx, 0);
@@ -383,15 +403,15 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                 constexpr uint32_t kGap = math::constexpr_gcd(BLOCK_K, BLOCK_N) / 8;
                 constexpr uint32_t kEnd = kShouldOptimize ? BLOCK_K / 8 : 0;
 
-                // Decode helper: wait for full[s] / packed[ps], decode packed FP4 B
-                // into the swizzled `smem_b[s]`. Caller must subsequently issue a
-                // NamedBarrier::sync(...,7) and packed_empty_barrier_arrive_at(ps)
-                // to make the decoded data visible to the wgmma async-proxy and to
-                // release the packed buffer.
-                auto wait_and_decode = [&](uint32_t s, uint32_t p, uint32_t ps, uint32_t pp) {
+                // Decode helper: wait for the (merged) full[s] barrier, then
+                // decode packed FP4 B from `smem_b_packed[s]` into the swizzled
+                // `smem_b[s]`. Caller must subsequently issue
+                // NamedBarrier::sync(...,7) to publish the decoded data to the
+                // wgmma async-proxy. The packed slot is released together with
+                // A/SFA via the single empty_barrier_arrive() after wgmma_wait.
+                auto wait_and_decode = [&](uint32_t s, uint32_t p) {
                     full_barriers[s]->wait(p);
-                    packed_full_barriers[ps]->wait(pp);
-                    auto smem_b_packed_bytes = smem_b_packed[ps];
+                    auto smem_b_packed_bytes = smem_b_packed[s];
                     auto smem_b_bytes = reinterpret_cast<uint8_t*>(smem_b[s]);
                     constexpr uint32_t kVecPackedBytes = 16;  // 16 packed bytes -> 32 e4m3 bytes
                     constexpr uint32_t kVecsPerRow = BLOCK_K_PACKED / kVecPackedBytes;
@@ -400,41 +420,46 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                                      "Packed K must be multiple of 16-byte vector width");
                     DG_STATIC_ASSERT(BLOCK_K == 128,
                                      "Swizzle assumes BLOCK_K == 128 so 32B store stays in-range");
-                    for (uint32_t idx = threadIdx.x; idx < kNumVecs; idx += kNumMathThreads) {
-                        const uint32_t tile_n = idx / kVecsPerRow;
-                        const uint32_t vec_k  = idx % kVecsPerRow;
-                        const uint32_t tile_k = vec_k * (kVecPackedBytes * 2);  // 32-byte step in K
-                        const uint4 packed16 = *reinterpret_cast<const uint4*>(
-                            smem_b_packed_bytes + tile_n * BLOCK_K_PACKED + vec_k * kVecPackedBytes);
-                        uint64_t decoded[4] = {0, 0, 0, 0};
-                        auto decode_u32 = [&](uint32_t packed_word, uint64_t& out) {
-                            #pragma unroll
-                            for (uint32_t b = 0; b < 4; ++ b) {
-                                const uint32_t pair = fp4_pair_to_e4m3_pair((packed_word >> (b * 8)) & 0xffu);
-                                out |= static_cast<uint64_t>(pair) << (b * 16);
+                    if constexpr (not kDecodeStub) {
+                        for (uint32_t idx = threadIdx.x; idx < kNumVecs; idx += kNumMathThreads) {
+                            const uint32_t tile_n = idx / kVecsPerRow;
+                            const uint32_t vec_k  = idx % kVecsPerRow;
+                            const uint32_t tile_k = vec_k * (kVecPackedBytes * 2);  // 32-byte step in K
+                            const uint4 packed16 = *reinterpret_cast<const uint4*>(
+                                smem_b_packed_bytes + tile_n * BLOCK_K_PACKED + vec_k * kVecPackedBytes);
+                            uint64_t decoded[4] = {0, 0, 0, 0};
+                            auto decode_u32 = [&](uint32_t packed_word, uint64_t& out) {
+                                #pragma unroll
+                                for (uint32_t b = 0; b < 4; ++ b) {
+                                    const uint32_t pair = fp4_pair_to_e4m3_pair((packed_word >> (b * 8)) & 0xffu);
+                                    out |= static_cast<uint64_t>(pair) << (b * 16);
+                                }
+                            };
+                            decode_u32(packed16.x, decoded[0]);
+                            decode_u32(packed16.y, decoded[1]);
+                            decode_u32(packed16.z, decoded[2]);
+                            decode_u32(packed16.w, decoded[3]);
+                            const uint32_t n_group = tile_n / 8;
+                            const uint32_t n_in_group = tile_n % 8;
+                            const uint32_t row_base = n_group * 8 * BLOCK_K + n_in_group * BLOCK_K;
+                            // Each segment writes 16 bytes (= 2 u64). Use a
+                            // single st.shared.v2.u64 instead of two
+                            // st.shared.u64, halving the store instruction
+                            // count for the decoded B tile.
+                            {
+                                const uint32_t swizzled_k = tile_k ^ (n_in_group * 16);
+                                ptx::st_shared_v2_u64(smem_b_bytes + row_base + swizzled_k,
+                                                      decoded[0], decoded[1]);
                             }
-                        };
-                        decode_u32(packed16.x, decoded[0]);
-                        decode_u32(packed16.y, decoded[1]);
-                        decode_u32(packed16.z, decoded[2]);
-                        decode_u32(packed16.w, decoded[3]);
-                        const uint32_t n_group = tile_n / 8;
-                        const uint32_t n_in_group = tile_n % 8;
-                        const uint32_t row_base = n_group * 8 * BLOCK_K + n_in_group * BLOCK_K;
-                        {
-                            const uint32_t swizzled_k = tile_k ^ (n_in_group * 16);
-                            uint64_t* dst = reinterpret_cast<uint64_t*>(smem_b_bytes + row_base + swizzled_k);
-                            dst[0] = decoded[0];
-                            dst[1] = decoded[1];
-                        }
-                        {
-                            const uint32_t swizzled_k = (tile_k + 16) ^ (n_in_group * 16);
-                            uint64_t* dst = reinterpret_cast<uint64_t*>(smem_b_bytes + row_base + swizzled_k);
-                            dst[0] = decoded[2];
-                            dst[1] = decoded[3];
+                            {
+                                const uint32_t swizzled_k = (tile_k + 16) ^ (n_in_group * 16);
+                                ptx::st_shared_v2_u64(smem_b_bytes + row_base + swizzled_k,
+                                                      decoded[2], decoded[3]);
+                            }
                         }
                     }
                 };
+
 
                 // Dispatch `num_former_iters` and launch MMAs with decode/wgmma
                 // pipeline overlap: decode runs one stage ahead of wgmma so that
@@ -444,19 +469,15 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                     // Lead pointers: track the stage that decode is currently
                     // working on (one ahead of wgmma's `stage_idx`).
                     uint32_t lead_stage = stage_idx, lead_phase = phase;
-                    uint32_t lead_packed = packed_stage_idx, lead_packed_phase = packed_phase;
                     auto advance_lead = [&]() {
                         lead_stage = lead_stage == kNumStages - 1 ? 0 : lead_stage + 1;
                         lead_phase ^= lead_stage == 0;
-                        lead_packed = lead_packed == kNumPackedStages - 1 ? 0 : lead_packed + 1;
-                        lead_packed_phase ^= lead_packed == 0;
                     };
 
                     // Prologue: decode the first stage so iter 0's wgmma can
                     // consume it without waiting.
-                    wait_and_decode(stage_idx, phase, packed_stage_idx, packed_phase);
+                    wait_and_decode(stage_idx, phase);
                     cutlass::arch::NamedBarrier::sync(kNumMathThreads, 7);
-                    packed_empty_barrier_arrive_at(packed_stage_idx);
                     advance_lead();  // lead now points one stage ahead of wgmma
 
                     #pragma unroll 8
@@ -514,7 +535,7 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             // the same wait/decode/sync sequence per K iter.
                             const bool is_last_wave = (local_idx == BLOCK_M / WAVE_BLOCK_M - 1);
                             if (is_last_wave and has_next) {
-                                wait_and_decode(lead_stage, lead_phase, lead_packed, lead_packed_phase);
+                                wait_and_decode(lead_stage, lead_phase);
                             }
 
                             ptx::warpgroup_wait<0>();
@@ -542,10 +563,10 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                         }
 
                         // Publish next iter's decoded smem_b to the wgmma
-                        // async-proxy and release the packed-B slot.
+                        // async-proxy. The packed-B slot is released together
+                        // with A/SFA via the unified empty_barrier_arrive() above.
                         if (has_next) {
                             cutlass::arch::NamedBarrier::sync(kNumMathThreads, 7);
-                            packed_empty_barrier_arrive_at(lead_packed);
                             advance_lead();
                         }
                     }
@@ -553,8 +574,6 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
             } else {
                 #pragma unroll
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                    packed_full_barriers[packed_stage_idx]->wait(packed_phase);
-                    packed_empty_barrier_arrive();
                     full_barriers[stage_idx]->wait(phase);
                     empty_barrier_arrive();
                 }
