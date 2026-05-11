@@ -83,7 +83,7 @@ public:
         LaunchArgs launch_args;
 
         cute::UMMA::Major major_sfb;
-        int num_packed_stages;
+        bool decode_stub;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -107,10 +107,11 @@ static void __instantiate_kernel() {{
         {},
         {}, {}, {},
         {}, {}, {},
+        {},
         {}, {},
         {}, {},
         {}, {},
-        {}, {},
+        {},
         {}
     >);
 }};
@@ -123,11 +124,12 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.block_m, args.gemm_config.layout.block_n, args.gemm_config.layout.block_k,
         args.gemm_config.storage_config.swizzle_a_mode, args.gemm_config.storage_config.swizzle_b_mode,
         args.gemm_config.storage_config.swizzle_cd_mode,
-        args.gemm_config.pipeline_config.num_stages, args.num_packed_stages,
+        args.gemm_config.pipeline_config.num_stages,
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        get_default_epilogue_type(std::nullopt));
+        get_default_epilogue_type(std::nullopt),
+        args.decode_stub ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -231,7 +233,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
         const bool& use_psum_layout,
         const std::optional<int>& expected_m_for_psum_layout,
         const std::optional<int>& block_m_override,
-        const std::optional<int>& block_n_override) {
+        const std::optional<int>& block_n_override,
+        const bool& decode_stub) {
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
     DG_HOST_ASSERT(gran_k == 128);
     DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
@@ -365,7 +368,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
     auto layout = layout_candidates[0];
     auto layout_info = SM90ArchSpec::get_layout_info(desc, layout);
     bool found_layout = false;
-    // FP4 B is decoded by each CTA, so only A multicast (cluster_n) is legal here.
+    // FP4 B is decoded by each CTA, so only A multicast (cluster_n) is enabled.
     for (const auto& candidate: layout_candidates) {
         if (candidate.cluster_m != 1) {
             continue;
@@ -387,8 +390,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
     if (not use_psum_layout and m >= num_groups * 256 and n >= 1024) {
         layout.block_m = 256;
         layout.block_n = 64;
-        layout.cluster_m = 1;
     }
+    layout.cluster_m = 1;
     auto config = rebuild_config(layout);
 
     if (block_m_override or block_n_override) {
@@ -409,20 +412,18 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
 
     // Re-derive `num_stages` and `smem_size` to account for:
-    //   (1) the extra packed-FP4 B staging buffer (BLOCK_N * BLOCK_K / 2 bytes per packed stage)
+    //   (1) the extra packed-FP4 B staging buffer (BLOCK_N * BLOCK_K / 2 bytes per stage)
+    //       — after the A/packed-B barrier merge it is sized at `num_stages` slots
+    //       (same as A/SFA), so it folds into the per-stage cost.
     //   (2) the enlarged SFB cache: now stores (shape_k_scales, BLOCK_N) floats per block
-    //       so the K loop reads SFB from smem instead of gmem.
-    // The packed-B pipeline uses an independent (smaller) number of stages so we can keep
-    // `num_stages` large for the WGMMA consumer pipeline.
-    int num_packed_stages = 2;
+    //       so the K loop reads SFB from smem instead of gmem. SFB cache aliases
+    //       smem_d (no separate allocation), so we only subtract the original SFB bytes.
     {
         const int block_k = config.layout.block_k;
         const int block_n = config.layout.block_n;
         const int shape_k_scales = ceil_div(static_cast<int>(k), block_k);
         const bool uniform_scale_b = (block_k % block_n == 0);
         const int sfb_old_bytes = align(shape_k_scales * (uniform_scale_b ? 1 : 2) * static_cast<int>(sizeof(float)), 16);
-        // SFB cache now aliases smem_d (no separate allocation). We only need to
-        // remove the original SFB bytes from the baseline.
         const int sfb_extra = -sfb_old_bytes;
 
         const int packed_per_stage = block_n * (block_k / 2);
@@ -432,31 +433,21 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
                                      static_cast<int>(c10::elementSize(desc.b_dtype));
         const int smem_sfa_per_stage = align(config.layout.block_m * static_cast<int>(sizeof(float)), 128);
         const int original_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage;
+        const int merged_per_stage = original_per_stage + packed_per_stage;
         const int orig_num_stages = config.pipeline_config.num_stages;
         const int smem_extra = config.pipeline_config.smem_size - orig_num_stages * original_per_stage + sfb_extra;
 
-        auto fits = [&](int stages, int p_stages) {
-            return smem_extra + stages * original_per_stage + p_stages * packed_per_stage
-                   <= SM90ArchSpec::smem_capacity;
+        auto fits = [&](int stages) {
+            return smem_extra + stages * merged_per_stage <= SM90ArchSpec::smem_capacity;
         };
 
-        // Try to keep `num_stages = orig_num_stages` with packed_stages=2; otherwise drop num_stages,
-        // and finally fall back to packed_stages=1 if needed.
+        // Try to keep `num_stages = orig_num_stages`; otherwise drop until it fits.
         int chosen_stages = orig_num_stages;
-        int chosen_packed = 2;
-        while (chosen_stages >= 3 and not fits(chosen_stages, chosen_packed))
+        while (chosen_stages >= 3 and not fits(chosen_stages))
             -- chosen_stages;
-        if (chosen_stages < 3) {
-            chosen_packed = 1;
-            chosen_stages = orig_num_stages;
-            while (chosen_stages >= 3 and not fits(chosen_stages, chosen_packed))
-                -- chosen_stages;
-        }
         DG_HOST_ASSERT(chosen_stages >= 3);
         config.pipeline_config.num_stages = chosen_stages;
-        num_packed_stages = chosen_packed;
-        config.pipeline_config.smem_size = smem_extra + chosen_stages * original_per_stage +
-                                           chosen_packed * packed_per_stage;
+        config.pipeline_config.smem_size = smem_extra + chosen_stages * merged_per_stage;
     }
 
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a.first, m, k,
@@ -483,7 +474,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused(
                                   config.pipeline_config.smem_size,
                                   config.layout.get_cluster_size()),
         .major_sfb = get_major_type_ab(sfb),
-        .num_packed_stages = num_packed_stages,
+        .decode_stub = decode_stub,
         .gmem_b_ptr = b.first.data_ptr(),
         .gmem_d_ptr = d.data_ptr(),
         .sfb = sfb.data_ptr(),
