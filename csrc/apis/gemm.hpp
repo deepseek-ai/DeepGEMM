@@ -5,6 +5,7 @@
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
+#include "../jit_kernels/impls/sm90_fp8_fp4_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
@@ -138,6 +139,27 @@ static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const bool& disable_ue8m0_cast) {
     fp8_fp4_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)}, b,
                     d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
+}
+
+static void fp8_fp4_gemm_nt_sm90_fused_wgmma(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                             const std::pair<torch::Tensor, torch::Tensor>& b,
+                                             const torch::Tensor& d,
+                                             const std::optional<torch::Tensor>& c,
+                                             const int& gran_k,
+                                             const std::string& compiled_dims) {
+    const auto [m, k] = get_shape<2>(a.first);
+    const auto [n, half_k] = get_shape<2>(b.first);
+    DG_HOST_ASSERT(half_k * 2 == k);
+
+    std::optional<std::tuple<int, int, int>> recipe = std::nullopt;
+    std::optional<std::tuple<int, int>> recipe_a = std::make_tuple(1, gran_k);
+    std::optional<std::tuple<int, int>> recipe_b = std::make_tuple(1, gran_k);
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, false);
+    DG_HOST_ASSERT(gran_k_a == gran_k and gran_k_b == gran_k);
+
+    sm90_fp8_fp4_gemm_1d1d_fused(
+        {a.first, sfa}, {b.first, sfb}, d, c, gran_k, compiled_dims);
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -624,6 +646,20 @@ static void register_apis(pybind11::module_& m) {
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "mn",
           py::arg("disable_ue8m0_cast") = false);
+    m.def("fp8_fp4_gemm_nt_sm90_fused_wgmma", &fp8_fp4_gemm_nt_sm90_fused_wgmma,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("c") = std::nullopt,
+          py::arg("gran_k") = 128,
+          py::arg("compiled_dims") = "nk");
+    m.def("m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma",
+          &sm90_m_grouped_fp8_fp4_gemm_contiguous_1d1d_fused,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
+          py::arg("gran_k") = 128,
+          py::arg("compiled_dims") = "nk",
+          py::arg("use_psum_layout") = false,
+          py::arg("expected_m_for_psum_layout") = std::nullopt,
+          py::arg("block_m_override") = std::nullopt,
+          py::arg("block_n_override") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
