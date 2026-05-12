@@ -277,6 +277,7 @@ from .mega import (
     SymmBuffer,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
+    mega_moe_pre_dispatch,
 )
 
 

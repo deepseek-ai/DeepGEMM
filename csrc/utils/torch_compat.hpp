@@ -131,6 +131,20 @@ inline torch::Tensor convert_to_torch_tensor(tvm::ffi::TensorView tensor) {
                     .device(torch::kCUDA, device_id)
                     .requires_grad(false);
 
+    // Zero-numel tensors may carry a nullptr data_ptr, which trips
+    // torch::from_blob() getDeviceFromPtr() host-vs-device check.
+    // Allocate a fresh empty CUDA tensor in that case: any kernel reading
+    // through it must already guard on the zero-size dimension.
+    int64_t numel = 1;
+    for (auto s : sizes) numel *= s;
+    if (numel == 0 || data == nullptr) {
+        if (tensor.strides().data()) {
+            auto strides = std::vector<int64_t>(tensor.strides().begin(), tensor.strides().end());
+            return torch::empty_strided(sizes, strides, opts);
+        }
+        return torch::empty(sizes, opts);
+    }
+
     if (tensor.strides().data()) {
         auto strides = std::vector<int64_t>(tensor.strides().begin(), tensor.strides().end());
         return torch::from_blob(data, sizes, strides, opts);

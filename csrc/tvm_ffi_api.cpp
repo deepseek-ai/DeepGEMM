@@ -696,11 +696,31 @@ void dg_fp8_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_
     );
 }
 
+void dg_mega_moe_pre_dispatch(
+    TensorView x, TensorView topk_idx, TensorView topk_weights,
+    TensorView buf_x, TensorView buf_x_sf,
+    TensorView buf_topk_idx, TensorView buf_topk_weights,
+    int64_t num_tokens, int64_t group_size, bool use_fp4_acts) {
+    mega_moe_pre_dispatch(
+        convert_to_torch_tensor(x),
+        convert_to_torch_tensor(topk_idx),
+        convert_to_torch_tensor(topk_weights),
+        convert_to_torch_tensor(buf_x),
+        convert_to_torch_tensor(buf_x_sf),
+        convert_to_torch_tensor(buf_topk_idx),
+        convert_to_torch_tensor(buf_topk_weights),
+        static_cast<int>(num_tokens),
+        static_cast<int>(group_size),
+        use_fp4_acts
+    );
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_mega_moe, dg_get_token_alignment_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_mega_moe, dg_get_symm_buffer_size_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_sm90_mega_moe, dg_get_symm_buffer_size_for_sm90_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe, dg_fp8_fp4_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mega_moe, dg_fp8_mega_moe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mega_moe_pre_dispatch, dg_mega_moe_pre_dispatch);
 
 
 #endif  // DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
