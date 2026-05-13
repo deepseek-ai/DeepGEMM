@@ -79,8 +79,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kNTiles = BLOCK_N / MMA_N;
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
 
-    // Cooperative warp layout: warps split across M and N dimensions
-    static constexpr uint32_t kNWarps = 2;
+    // Cooperative warp layout: warps split across M and N dimensions.
+    // At BLOCK_M=32 the default kMWarps=4 split leaves kMTilesPerWarp=0
+    // (32/4/16=0), so swap to a 2×4 (M×N) layout for the smaller tile.
+    // Larger blocks keep the original 4×2 split for better A-reuse across
+    // the 2 N-warps.
+    static constexpr uint32_t kNWarps = (BLOCK_M < 64) ? 4 : 2;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -89,6 +93,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(BLOCK_M == kMWarps * kMTilesPerWarp * MMA_M, "M tiles must divide evenly");
     DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp >= 1, "Need at least 1 N-tile per warp");
+    DG_STATIC_ASSERT(kMTilesPerWarp >= 1, "Need at least 1 M-tile per warp (BLOCK_M too small for kMWarps)");
 
     static constexpr uint32_t kTMARegisters = 40;
     static constexpr uint32_t kMMARegisters = 232;

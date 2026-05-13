@@ -22,24 +22,36 @@ struct SM120ArchSpec {
         // small expected_m (MoE decode), larger values amortize launch
         // overhead at prefill. Kernel constraints:
         //   * BLOCK_M must be a multiple of MMA_M=16
-        //   * Cooperative warp layout uses kMWarps=4 (kNWarps=2 hardcoded
-        //     in the kernel), so kMTilesPerWarp = BLOCK_M/4/16 must be ≥1
-        //     ⇒ BLOCK_M ≥ 64
-        //   * Plus the caller's runtime alignment cap and expected_m fit
+        //   * Cooperative warp layout in the kernel:
+        //       BLOCK_M  < 64 → kNWarps=4, kMWarps=2 (smaller A tile)
+        //       BLOCK_M >= 64 → kNWarps=2, kMWarps=4 (default, more A reuse)
+        //     So kMTilesPerWarp = BLOCK_M / kMWarps / 16 ≥ 1 always.
+        //   * For kNWarps=4 (i.e., BLOCK_M=32) we need BLOCK_N % 32 == 0
+        //     so kNTiles = BLOCK_N/8 is divisible by kNWarps. Filtered below
+        //     in the (block_m, block_n) cross-product.
         const int expected_m = desc.get_expected_m();
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
-        constexpr int kMinBlockM = 64;
+        constexpr int kMinBlockM = 32;
         std::vector<int> block_m_candidates;
-        for (int bm : {64, 128}) {
+        for (int bm : {32, 64, 128}) {
             if (runtime_align > 0 and bm > runtime_align)
                 continue;
             if (expected_m > 0 and bm > expected_m and bm > kMinBlockM)
+                continue;
+            // Skip small BLOCK_M when expected_m dwarfs it: the layout-info
+            // scorer in `compare()` measures cycles via flops_per_block /
+            // (peak × mma_efficiency × wave_efficiency); the launch/pipeline
+            // overhead of running many tiny tiles is not modelled, so it
+            // wrongly picks BLOCK_M=32 for large-M shapes and regresses
+            // throughput. Cap small-BLOCK_M candidates to the regime where
+            // they actually win (expected_m ≲ 4×BLOCK_M).
+            if (bm < 128 and expected_m > 4 * bm)
                 continue;
             block_m_candidates.push_back(bm);
         }
         // Allow runtime_align itself as a candidate if it's a valid
         // BLOCK_M (multiple of MMA_M=16, ≥ kMinBlockM, ≤128) and not
-        // already in the list (e.g., 80, 96, 112 from the theoretical
+        // already in the list (e.g., 48, 80, 96, 112 from the theoretical
         // helper's MMA_M-stepped sequence).
         if (runtime_align >= kMinBlockM and runtime_align <= 128 and runtime_align % 16 == 0
             and std::find(block_m_candidates.begin(), block_m_candidates.end(), runtime_align) == block_m_candidates.end()) {
@@ -70,9 +82,15 @@ struct SM120ArchSpec {
 
         std::vector<Layout> candidates;
         for (int block_m : block_m_candidates) {
+        // Match the kernel's warp layout: BLOCK_M<64 uses kNWarps=4, else kNWarps=2.
+        // kNTiles = BLOCK_N / MMA_N(=8) must be divisible by kNWarps.
+        const int k_n_warps = (block_m < 64) ? 4 : 2;
+        const int block_n_multiple = 8 * k_n_warps;     // 32 if kNWarps=4, 16 if kNWarps=2
         for (int block_k : block_k_candidates) {
         for (int block_n : block_n_candidates) {
             if (block_n > 128 or block_n > mn_major_b_max_n)
+                continue;
+            if (block_n % block_n_multiple != 0)
                 continue;
 
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
