@@ -16,9 +16,16 @@ struct SM120ArchSpec {
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
 
-        // SM120a always uses warp-specialized pipeline: BM=128, BK=128/elem_size
         const int block_m = 128;
-        const int block_k = 128 / elem_size;
+
+        // Block K candidates: BK=64 enables 4 pipeline stages (better TMA hiding),
+        // but only beneficial for large M (>= 2048) and non-mixed dtypes.
+        const bool is_mixed = (desc.a_dtype != desc.b_dtype);
+        const int expected_m = desc.get_expected_m();
+        std::vector<int> block_k_candidates;
+        if (!is_mixed and expected_m >= 2048)
+            block_k_candidates.push_back(64 / elem_size);
+        block_k_candidates.push_back(128 / elem_size);
 
         // Block N candidates: must be multiples of 8 (mma.sync N=8)
         std::vector<int> block_n_candidates;
@@ -33,6 +40,7 @@ struct SM120ArchSpec {
         const int mn_major_b_max_n = 128;
 
         std::vector<Layout> candidates;
+        for (int block_k : block_k_candidates) {
         for (int block_n : block_n_candidates) {
             if (block_n > 128 or block_n > mn_major_b_max_n)
                 continue;
@@ -48,6 +56,7 @@ struct SM120ArchSpec {
                 continue;
 
             candidates.push_back(layout);
+        }
         }
 
         DG_HOST_ASSERT(not candidates.empty());
@@ -204,9 +213,12 @@ struct SM120ArchSpec {
         if (a.num_cycles != b.num_cycles)
             return a.num_cycles < b.num_cycles;
 
-        // Tie-break: prefer larger tile for better reuse
+        // Tie-break: prefer larger N tile for better reuse
         if (a.layout.block_n != b.layout.block_n)
             return a.layout.block_n > b.layout.block_n;
+        // Tie-break: prefer smaller K tile (more pipeline stages for TMA hiding)
+        if (a.layout.block_k != b.layout.block_k)
+            return a.layout.block_k < b.layout.block_k;
         return false;
     }
 };
