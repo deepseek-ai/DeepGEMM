@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <cute/arch/mma_sm100_desc.hpp>
 #include <deep_gemm/common/types.cuh>
 
@@ -16,12 +18,39 @@ struct SM120ArchSpec {
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
 
-        const int block_m = 128;
+        // BLOCK_M candidates: smaller values reduce grouped-GEMM padding at
+        // small expected_m (MoE decode), larger values amortize launch
+        // overhead at prefill. Kernel constraints:
+        //   * BLOCK_M must be a multiple of MMA_M=16
+        //   * Cooperative warp layout uses kMWarps=4 (kNWarps=2 hardcoded
+        //     in the kernel), so kMTilesPerWarp = BLOCK_M/4/16 must be ≥1
+        //     ⇒ BLOCK_M ≥ 64
+        //   * Plus the caller's runtime alignment cap and expected_m fit
+        const int expected_m = desc.get_expected_m();
+        const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+        constexpr int kMinBlockM = 64;
+        std::vector<int> block_m_candidates;
+        for (int bm : {64, 128}) {
+            if (runtime_align > 0 and bm > runtime_align)
+                continue;
+            if (expected_m > 0 and bm > expected_m and bm > kMinBlockM)
+                continue;
+            block_m_candidates.push_back(bm);
+        }
+        // Allow runtime_align itself as a candidate if it's a valid
+        // BLOCK_M (multiple of MMA_M=16, ≥ kMinBlockM, ≤128) and not
+        // already in the list (e.g., 80, 96, 112 from the theoretical
+        // helper's MMA_M-stepped sequence).
+        if (runtime_align >= kMinBlockM and runtime_align <= 128 and runtime_align % 16 == 0
+            and std::find(block_m_candidates.begin(), block_m_candidates.end(), runtime_align) == block_m_candidates.end()) {
+            block_m_candidates.push_back(runtime_align);
+        }
+        if (block_m_candidates.empty())
+            block_m_candidates.push_back(128);
 
         // Block K candidates: BK=64 enables 4 pipeline stages (better TMA hiding),
         // but only beneficial for large M (>= 2048) and non-mixed dtypes.
         const bool is_mixed = (desc.a_dtype != desc.b_dtype);
-        const int expected_m = desc.get_expected_m();
         std::vector<int> block_k_candidates;
         if (!is_mixed and expected_m >= 2048)
             block_k_candidates.push_back(64 / elem_size);
@@ -40,6 +69,7 @@ struct SM120ArchSpec {
         const int mn_major_b_max_n = 128;
 
         std::vector<Layout> candidates;
+        for (int block_m : block_m_candidates) {
         for (int block_k : block_k_candidates) {
         for (int block_n : block_n_candidates) {
             if (block_n > 128 or block_n > mn_major_b_max_n)
@@ -56,6 +86,7 @@ struct SM120ArchSpec {
                 continue;
 
             candidates.push_back(layout);
+        }
         }
         }
 
