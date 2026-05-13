@@ -258,7 +258,7 @@ def test_paged_mqa_logits():
         for is_varlen in ((True, False) if arch_major in (10, 12) else (False, )):
             for is_fp4 in ((True, False) if arch_major in (10, 12) else (False, )):
                 for logits_dtype in (torch.float, torch.bfloat16):
-                    for block_kv in (32, 64):
+                    for block_kv in ((32, 64) if (arch_major == 10 or (arch_major == 12 and is_fp4)) else (64, )):
                         for use_2d_context_lens, clean_logits in [(True, False)]:
                             for batch_size in (256, ):
                                 for next_n in ((1, ) if is_varlen else ((1, 2, 4, 5, 6) if arch_major == 10 else (1, 2, 4))):

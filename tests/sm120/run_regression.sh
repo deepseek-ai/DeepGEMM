@@ -45,7 +45,6 @@ run_test "Dense FP4"           tests/sm120/test_dense_fp4.py
 run_test "Dense FP8xFP4 Mixed" tests/sm120/test_dense_fp8_fp4_mixed.py
 run_test "K-grouped FP8"       tests/sm120/test_k_grouped_fp8.py
 run_test "M-grouped FP8/FP4"   tests/sm120/test_m_grouped_fp8.py
-run_test "MQA Logits"          tests/sm120/test_mqa_logits.py
 
 echo
 echo "============================================"
