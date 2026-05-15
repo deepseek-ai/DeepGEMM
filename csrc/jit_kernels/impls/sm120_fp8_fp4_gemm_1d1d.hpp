@@ -29,6 +29,7 @@ public:
         bool k_grouped_constant_stride;
         int stride_cd_m;
         int stride_cd_batch;
+        int stride_cd_n = 1;  // column stride; only the AB-swap bmm caller overrides this
 
         void* gmem_d;
         void* gmem_c;
@@ -100,6 +101,7 @@ static void __instantiate_kernel() {{
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.stride_cd_m, args.stride_cd_batch,
+            args.stride_cd_n,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
             args.tensor_map_cd));
@@ -487,7 +489,8 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                               const int& batch_size, const int& m, const int& n, const int& k,
                               const int& gran_k_a, const int& gran_k_b,
                               const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                              const std::string& compiled_dims) {
+                              const std::string& compiled_dims,
+                              const bool& swap_ab = false) {
     // SM120 FP8 BMM currently requires K-major operands. MN-major B has a verified
     // scalar-load kernel path (kBKMajor=false) but is 3x slower than K-major ldmatrix.
     // Callers use .contiguous() to ensure K-major layout.
@@ -527,10 +530,27 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                                                  config.layout.block_n, gran_k_b, batch_size, 0);
     const int cd_store_m = config.storage_config.store_block_m > 0
         ? config.storage_config.store_block_m : config.layout.block_m;
+    // The TMA-CD descriptor is built with the natural (M, N) view of `d`.
+    // In swap-AB mode the heuristic forces swizzle_cd_mode=0 (BLOCK_N≤32),
+    // so kUseTMAStoreEpilogue is false and the kernel only consults the
+    // runtime stride_cd_m / stride_cd_n below — the descriptor view is unused.
     const auto tensor_map_cd = make_tma_3d_desc(d, n, m, batch_size,
                                                 config.layout.block_n, cd_store_m, 1,
                                                 d.stride(1), d.stride(0),
                                                 config.storage_config.swizzle_cd_mode);
+
+    // Direct-store stride remap. The kernel writes
+    //   gmem[batch*stride_cd_batch + m_kernel*stride_cd_m + n_kernel*stride_cd_n].
+    // In swap mode (m_kernel, n_kernel) = (n_orig, m_orig), so we set
+    // (stride_cd_m, stride_cd_n) = (d.stride(-1)=1, d.stride(-2)=N_orig) to
+    // hit the caller's (B, M_orig, N_orig) row-major buffer byte-for-byte.
+    // Normal path keeps the natural strides.
+    const int stride_cd_m_runtime = swap_ab
+        ? static_cast<int>(d.stride(-1))
+        : static_cast<int>(d.stride(-2));
+    const int stride_cd_n_runtime = swap_ab
+        ? static_cast<int>(d.stride(-2))
+        : static_cast<int>(d.stride(-1));
 
     const SM120FP8FP4Gemm1D1DRuntime::Args args = {
         .gemm_desc = desc,
@@ -544,8 +564,9 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .is_fp4 = is_fp4,
         .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
-        .stride_cd_m = static_cast<int>(d.stride(1)),
+        .stride_cd_m = stride_cd_m_runtime,
         .stride_cd_batch = static_cast<int>(d.stride(0)),
+        .stride_cd_n = stride_cd_n_runtime,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,

@@ -50,6 +50,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              cute::TmaDescriptor* tensor_map_buffer,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              uint32_t stride_cd_m, uint32_t stride_cd_batch,
+                             uint32_t stride_cd_n,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
@@ -1218,18 +1219,32 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
-                        if (row0 < total_shape_m and col + 1 < shape_n) {
-                            auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
-                            float v0 = accum[ai + 0], v1 = accum[ai + 1];
-                            if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
-                            store_pair(&gmem_d[idx], v0, v1);
-                        }
-                        if (row1 < total_shape_m and col + 1 < shape_n) {
-                            auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
-                            float v2 = accum[ai + 2], v3 = accum[ai + 3];
-                            if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); v3 += read_cd(gmem_c[idx + 1]); }
-                            store_pair(&gmem_d[idx], v2, v3);
-                        }
+                        // Direct-store path. stride_cd_n is 1 on the normal
+                        // path (cols adjacent → pair-write fast path) and
+                        // d.stride(-2) on the AB-swap path (cols are N apart
+                        // → single-element fallback).
+                        const int64_t cd_n_stride = static_cast<int64_t>(stride_cd_n);
+                        const bool can_pair = (cd_n_stride == 1);
+                        auto store_one = [&](uint32_t row, uint32_t col_off, float v) {
+                            if (row >= total_shape_m or col + col_off >= shape_n) return;
+                            auto idx = cd_batch_offset + static_cast<int64_t>(row) * cd_m_stride
+                                       + static_cast<int64_t>(col + col_off) * cd_n_stride;
+                            if constexpr (kWithAccumulation) v += read_cd(gmem_c[idx]);
+                            gmem_d[idx] = cd_dtype_t(v);
+                        };
+                        auto write_row = [&](uint32_t row, uint32_t accum_off) {
+                            if (row < total_shape_m and col + 1 < shape_n and can_pair) {
+                                auto idx = cd_batch_offset + static_cast<int64_t>(row) * cd_m_stride + col;
+                                float v0 = accum[ai + accum_off], v1 = accum[ai + accum_off + 1];
+                                if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
+                                store_pair(&gmem_d[idx], v0, v1);
+                            } else {
+                                store_one(row, 0, accum[ai + accum_off]);
+                                store_one(row, 1, accum[ai + accum_off + 1]);
+                            }
+                        };
+                        write_row(row0, 0);
+                        write_row(row1, 2);
                     }
                 }
             }

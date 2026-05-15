@@ -56,12 +56,24 @@ struct SM120ArchSpec {
             block_k_candidates.push_back(64 / elem_size);
         block_k_candidates.push_back(128 / elem_size);
 
-        // Block N candidates: must be multiples of 8 (mma.sync N=8)
+        // Block N candidates. Kernel structural minimum BLOCK_N=16 (BLOCK_N/MMA_N
+        // must be divisible by kNWarps=2). The default cp.async/TMA alignment
+        // floor `(BN * elem_size) % 64 == 0` forces BN ∈ {64, 128} on the normal
+        // path. The AB-swap small-N path (`desc.n ≤ 32` after the caller swap,
+        // see apis/einsum.hpp::fp8_bmm) relaxes that floor and only emits
+        // {16, 32} so we don't waste lanes covering M_orig ≤ 32.
+        const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
+        const bool is_small_n_swap = (n_for_tile > 0 and n_for_tile <= 32);
         std::vector<int> block_n_candidates;
-        int step = std::lcm(8, heuristics_runtime->get_block_n_multiple_of());
+        int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
         for (int i = step; i <= 256; i += step) {
-            if ((i * get_element_size(desc.get_mma_kind())) % 64 != 0)
+            const int aligned = i * get_element_size(desc.get_mma_kind());
+            if (is_small_n_swap) {
+                if (i > 32)
+                    continue;
+            } else if (aligned % 64 != 0) {
                 continue;
+            }
             block_n_candidates.push_back(i);
         }
 
@@ -132,7 +144,12 @@ struct SM120ArchSpec {
             : layout.block_n * static_cast<int>(c10::elementSize(desc.b_dtype));
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
-        const auto swizzle_mode_cd = (c10::elementSize(desc.cd_dtype) <= 2) ? 128 : 0;
+        // swizzle_mode_cd: enable TMA-store (128 B) only when the BN row fits a
+        // full swizzle row. Below that the kernel falls back to direct-store,
+        // which is also the path the AB-swap small-N caller needs (TMA-store
+        // can't write into the caller's row-major (M_orig, N_orig) layout).
+        const int cd_size = static_cast<int>(c10::elementSize(desc.cd_dtype));
+        const int swizzle_mode_cd = (cd_size <= 2 and layout.block_n * cd_size >= 128) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.

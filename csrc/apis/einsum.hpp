@@ -171,12 +171,40 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     if (batch_size == 0 or gemm::early_return(m, n, k, d, c))
         return;
 
-    // Transform scaling factors
+    // AB-swap small-M decode path. Mirrors TRT-LLM's runGemmSwapAB
+    // (cpp/include/tensorrt_llm/deep_gemm/fp8_gemm.cuh): SM120 1d1d has
+    // BLOCK_M ≥ 64, so M_orig ≤ 32 wastes lanes. Swapping A↔B moves the
+    // small dim to N where BLOCK_N can shrink to {16, 32}. The swap runs
+    // BEFORE the SF layout transform so transform_sf_pair_into_required_layout
+    // sees operands in their post-swap roles. The kernel writes back into the
+    // caller's (B, M_orig, N_orig) buffer directly via runtime stride_cd_m/n
+    // (no temp buffer); see sm120_fp8_fp4_bmm for the stride remap.
+    const auto arch_major = device_runtime->get_arch_major();
+    constexpr int kSwapAbMMax = 32;
+    const bool swap_ab_eligible =
+        arch_major == 12 and m >= 1 and m <= kSwapAbMMax
+        and major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K
+        and d.stride(-1) == 1;  // d's innermost dim must be contiguous
+
+    if (swap_ab_eligible) {
+        const auto [transformed_sfa_swap, transformed_sfb_swap, gran_k_a_swap, gran_k_b_swap]
+            = layout::transform_sf_pair_into_required_layout(
+                sfb, sfa, /*m=*/n, /*n=*/m, k, recipe,
+                std::nullopt, std::nullopt, batch_size, batch_size, false);
+        sm120_fp8_fp4_bmm(
+            b, transformed_sfa_swap, a, transformed_sfb_swap, c, d,
+            batch_size, /*m=*/n, /*n=*/m, k,
+            gran_k_a_swap, gran_k_b_swap,
+            major_b, major_a, compiled_dims,
+            /*swap_ab=*/true);
+        return;
+    }
+
+    // Transform scaling factors (non-swap path)
     const auto [transformed_sfa, transformed_sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
         sfa, sfb, m, n, k, recipe, std::nullopt, std::nullopt, batch_size, batch_size, false);
 
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 12) {
         sm120_fp8_fp4_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
     } else if (arch_major == 10) {
