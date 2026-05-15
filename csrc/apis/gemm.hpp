@@ -116,6 +116,40 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         const bool is_mixed_fp4 = (a_data.scalar_type() != b_data.scalar_type()) and
                                   (a_data.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
         DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0);
+
+        // AB-swap small-M decode path. Mirrors einsum.hpp's logic for the plain
+        // GEMM. Eligibility check is post K-major fixup. The SF transform is
+        // redone with operands and recipe in their swapped roles (the gran_mn
+        // entries of the recipe must be swapped too — recipes can be asymmetric
+        // e.g. (1, 128, 128) for per-token A + per-block B).
+        constexpr int kSwapAbMMax = 32;
+        const bool swap_ab_eligible = m >= 1 and m <= kSwapAbMMax
+            and eff_major_a == cute::UMMA::Major::K and eff_major_b == cute::UMMA::Major::K
+            and d.stride(-1) == 1 and !is_mixed_fp4;
+        if (swap_ab_eligible) {
+            std::optional<std::tuple<int, int, int>> swap_recipe = std::nullopt;
+            std::optional<std::tuple<int, int>> swap_recipe_a, swap_recipe_b;
+            if (recipe_a.has_value()) {
+                swap_recipe_a = recipe_b;
+                swap_recipe_b = recipe_a;
+            } else {
+                const auto eff_recipe = recipe.has_value()
+                    ? recipe.value()
+                    : get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+                const auto& [ga, gb, gk] = eff_recipe;
+                swap_recipe_a = std::make_tuple(gb, gk);
+                swap_recipe_b = std::make_tuple(ga, gk);
+            }
+            const auto [sfa_sw, sfb_sw, gka_sw, gkb_sw]
+                = layout::transform_sf_pair_into_required_layout(
+                    b.second, a.second, /*m=*/n, /*n=*/m, k, swap_recipe,
+                    swap_recipe_a, swap_recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+            sm120_fp8_fp4_gemm_1d1d(b_data, sfa_sw, a_data, sfb_sw, c, d,
+                                    /*m=*/n, /*n=*/m, k, gka_sw, gkb_sw,
+                                    eff_major_b, eff_major_a, compiled_dims,
+                                    std::nullopt, std::nullopt, /*swap_ab=*/true);
+            return;
+        }
         sm120_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 eff_major_a, eff_major_b, compiled_dims);
     } else {

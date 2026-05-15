@@ -117,7 +117,8 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                     const std::string& compiled_dims,
                                     const std::optional<std::string>& epilogue_type = std::nullopt,
-                                    const std::optional<Layout>& override_layout = std::nullopt) {
+                                    const std::optional<Layout>& override_layout = std::nullopt,
+                                    const bool& swap_ab = false) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
@@ -175,6 +176,15 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                                 d_stride, 1,
                                                 config.storage_config.swizzle_cd_mode);
 
+    // Direct-store stride remap. In swap-AB mode the kernel's
+    // (m_kernel, n_kernel) = (n_orig, m_orig) lands in the caller's
+    // (M_orig, N_orig) row-major buffer via (stride_cd_m=1, stride_cd_n=N_orig).
+    // Normal path keeps the natural (stride_cd_m=N, stride_cd_n=1).
+    const int stride_cd_m_runtime = swap_ab
+        ? static_cast<int>(d.stride(-1)) : d_stride;
+    const int stride_cd_n_runtime = swap_ab
+        ? d_stride : 1;
+
     const SM120FP8FP4Gemm1D1DRuntime::Args args = {
         .gemm_desc = desc,
         .gemm_config = config,
@@ -187,8 +197,9 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .is_fp4 = is_fp4,
         .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
-        .stride_cd_m = d_stride,
+        .stride_cd_m = stride_cd_m_runtime,
         .stride_cd_batch = 0,
+        .stride_cd_n = stride_cd_n_runtime,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
         .gmem_a_ptr = nullptr,

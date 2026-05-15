@@ -187,10 +187,21 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         and d.stride(-1) == 1;  // d's innermost dim must be contiguous
 
     if (swap_ab_eligible) {
+        // Swap the recipe's gran_mn entries too: (gran_mn_a, gran_mn_b, gran_k)
+        // describes the original A/B roles, so after operand swap the per-tensor
+        // granularities must follow. Without this, asymmetric recipes
+        // like (1, 128, 128) trip the SF layout shape check.
+        const auto eff_recipe = recipe.has_value()
+            ? recipe.value()
+            : get_default_recipe(sfa.scalar_type(), sfb.scalar_type());
+        const auto& [ga, gb, gk] = eff_recipe;
+        std::optional<std::tuple<int, int, int>> swap_recipe = std::nullopt;
+        std::optional<std::tuple<int, int>> swap_recipe_a = std::make_tuple(gb, gk);
+        std::optional<std::tuple<int, int>> swap_recipe_b = std::make_tuple(ga, gk);
         const auto [transformed_sfa_swap, transformed_sfb_swap, gran_k_a_swap, gran_k_b_swap]
             = layout::transform_sf_pair_into_required_layout(
-                sfb, sfa, /*m=*/n, /*n=*/m, k, recipe,
-                std::nullopt, std::nullopt, batch_size, batch_size, false);
+                sfb, sfa, /*m=*/n, /*n=*/m, k, swap_recipe,
+                swap_recipe_a, swap_recipe_b, batch_size, batch_size, false);
         sm120_fp8_fp4_bmm(
             b, transformed_sfa_swap, a, transformed_sfb_swap, c, d,
             batch_size, /*m=*/n, /*n=*/m, k,
