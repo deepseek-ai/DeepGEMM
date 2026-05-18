@@ -313,14 +313,14 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     // Pick block_m and number of math (epilogue) warpgroups. WGMMA::M = 64 is
     // the hard floor on Hopper, so each warpgroup needs at least 64 rows;
     // i.e. (block_m / num_epilogue_warpgroups) >= 64.
-    const auto& [block_m, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int> {
-        const float num_expected_tokens_per_expert =
-            static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-        if (num_expected_tokens_per_expert <= 64.5)  return {64, 1};
-        if (num_expected_tokens_per_expert <= 96.5)  return {128, 2};
-        if (num_expected_tokens_per_expert <= 192.5) return {128, 2};
-        return {128, 2};
-    }();
+    //
+    // The 2-WG BLOCK_M=128 path lowers the number of CTAs, but on SM90 it also
+    // reduces pipeline depth and leaves large-batch fused L2/epilogue/combine
+    // throughput behind the legacy grouped-GEMM baseline. The 1-WG BLOCK_M=64
+    // path has finer scheduling granularity and was the best default across the
+    // DeepSeek-V4-Flash batch sweep.
+    constexpr int block_m = 64;
+    constexpr int num_epilogue_warpgroups = 1;
 
     DG_HOST_ASSERT(std::any_of(
         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
@@ -334,20 +334,13 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
     // SM90 (Hopper) wave heuristic.
     //
-    // For low-batch decode workloads we observed that the SM100 generic heuristic
-    // (which packs ~`kImbalanceFactor * num_sms` blocks into a wave) creates
-    // unnecessary wave boundaries: e.g. with block_m=64, IH=2048, num_topk=8,
-    // num_experts_per_rank=32 the heuristic returns 8 experts/wave => 4 waves,
-    // even though there is barely any per-expert work to overlap. Each wave
-    // boundary triggers a full L1->L2 transition with `set_expert_idx` rewinds,
-    // workspace re-reads, and per-stage barrier resets that don't shrink with
-    // batch size.
-    //
-    // On SM90 we prefer a single-wave schedule whenever per-expert work is so
-    // small that even a single wave doesn't oversubscribe the SMs (block_m=64
-    // path = the small-batch heuristic band). When per-expert work is large
-    // (block_m > 64) we fall back to the generic heuristic.
-    if (block_m == 64) {
+    // The generic heuristic is useful in the middle of the block_m=64 band, but
+    // very sparse routing and large batches both do better as a single all-expert
+    // wave: sparse cases avoid extra L1->L2 wave transitions, while large cases
+    // keep enough work resident without fragmenting expert scheduling.
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    if (block_m == 64 and (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f)) {
         return num_experts_per_rank;
     }
     return get_num_experts_per_wave_for_mega_moe(
