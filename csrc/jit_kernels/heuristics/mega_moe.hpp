@@ -332,8 +332,24 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
 static int get_num_experts_per_wave_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
-    // Reuse SM100 logic; the block-shape units are different but the wave-balancing
-    // intent is identical.
+    // SM90 (Hopper) wave heuristic.
+    //
+    // For low-batch decode workloads we observed that the SM100 generic heuristic
+    // (which packs ~`kImbalanceFactor * num_sms` blocks into a wave) creates
+    // unnecessary wave boundaries: e.g. with block_m=64, IH=2048, num_topk=8,
+    // num_experts_per_rank=32 the heuristic returns 8 experts/wave => 4 waves,
+    // even though there is barely any per-expert work to overlap. Each wave
+    // boundary triggers a full L1->L2 transition with `set_expert_idx` rewinds,
+    // workspace re-reads, and per-stage barrier resets that don't shrink with
+    // batch size.
+    //
+    // On SM90 we prefer a single-wave schedule whenever per-expert work is so
+    // small that even a single wave doesn't oversubscribe the SMs (block_m=64
+    // path = the small-batch heuristic band). When per-expert work is large
+    // (block_m > 64) we fall back to the generic heuristic.
+    if (block_m == 64) {
+        return num_experts_per_rank;
+    }
     return get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
