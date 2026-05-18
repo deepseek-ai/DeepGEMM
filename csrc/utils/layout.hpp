@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstdlib>
+
 #include <cute/arch/mma_sm100_umma.hpp>
 #include <torch/python.h>
 
-#include "math.hpp"
-#include "exception.hpp"
+#include "../utils/math.hpp"
+#include "../utils/exception.hpp"
 #include "../jit/device_runtime.hpp"
 
 namespace deep_gemm {
@@ -95,7 +97,12 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
     if (num_groups.has_value())
         DG_HOST_ASSERT(sf.size(-3) == num_groups.value());
     DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
-    DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4)));
+    const char* scale_b_lut_env = std::getenv("DG_W4_SCALE_B_LUT");
+    const bool scale_b_lut = sf_dtype == torch::kInt and
+        scale_b_lut_env != nullptr and scale_b_lut_env[0] != '\0' and scale_b_lut_env[0] != '0';
+    const int expected_sf_k = scale_b_lut ?
+        ceil_div(k, gran_k) * 2 : ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4));
+    DG_HOST_ASSERT(sf.size(-1) == expected_sf_k);
 
     // TMA stride checks: TMA aligned and MN-major
     if (tma_stride_check) {
