@@ -82,15 +82,14 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
     static constexpr uint32_t ALIGNED_SMEM_SFA_SIZE_PER_STAGE = math::constexpr_align(SMEM_SFA_SIZE_PER_STAGE, 128u);
     const uint32_t shape_k_scales = math::ceil_div(shape_k, BLOCK_K);
     const uint32_t aligned_shape_n_sfb = math::align<uint32_t>(shape_n, 16u / sizeof(float));
-    // SFB cache aliases the smem_d region (BLOCK_M * BLOCK_N * sizeof(bf16) bytes)
-    // for the entire K loop. smem_d is only used during epilogue (after the K
-    // loop), and the cooperative SFB prefetch sync + final wgmma wait give us a
-    // clean handoff. We require sfb_bytes <= smem_d_bytes; with BLOCK_K=128
-    // this reduces to BLOCK_M*128 >= shape_k*2 -> BLOCK_M*64 >= shape_k. The
-    // assert below verifies this at runtime; for typical kernels (BLOCK_M>=64,
-    // shape_k<=8192) this is always satisfied.
+    // SFB cache aliases smem_d when it fits. Small-M tiles may not have enough
+    // smem_d capacity, so they fall back to a separate SFB region.
     const uint32_t smem_sfb_bytes = math::align<uint32_t>(shape_k_scales * BLOCK_N * sizeof(float), 16u);
-    constexpr uint32_t smem_sfb_size = 0;  // SFB aliases smem_d, no separate allocation
+    constexpr uint32_t COMPILED_SHAPE_K_SCALES = SHAPE_K == 0 ? 0 : math::constexpr_ceil_div(SHAPE_K, BLOCK_K);
+    constexpr uint32_t COMPILED_SMEM_SFB_BYTES =
+        math::constexpr_align(COMPILED_SHAPE_K_SCALES * BLOCK_N * static_cast<uint32_t>(sizeof(float)), 16u);
+    constexpr bool kUseSeparateSFB = SHAPE_K != 0 and COMPILED_SMEM_SFB_BYTES > SMEM_D_SIZE;
+    constexpr uint32_t SMEM_SFB_SIZE = kUseSeparateSFB ? COMPILED_SMEM_SFB_BYTES : 0;
 
     // NOTES: Make sure we have enough shared memory for WGMMA padding
     static constexpr uint32_t WGMMA_A_SIZE_PER_STAGE = WGMMA::M * BLOCK_K * sizeof(__nv_fp8_e4m3);
@@ -152,16 +151,17 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
     auto smem_sfa = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
     });
-    // SFB cache aliases the smem_d region (smem_buffer base). Safe because
-    // smem_d is only used in the epilogue, after the K loop completes and
-    // wgmma writes are drained.
-    auto smem_sfb = reinterpret_cast<float*>(smem_buffer);
-    DG_TRAP_ONLY_DEVICE_ASSERT(smem_sfb_bytes <= SMEM_D_SIZE);
+    constexpr uint32_t SMEM_SFB_OFFSET = SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE;
+    // Prefer aliasing SFB onto smem_d. For small-M tiles smem_d is too small,
+    // so allocate a separate SFB cache to enable BLOCK_M=64 masked kernels.
+    auto smem_sfb = reinterpret_cast<float*>(smem_buffer + (kUseSeparateSFB ? SMEM_SFB_OFFSET : 0));
+    if constexpr (not kUseSeparateSFB) {
+        DG_TRAP_ONLY_DEVICE_ASSERT(smem_sfb_bytes <= SMEM_D_SIZE);
+    }
 
-    // Fill barriers (SFB does not allocate any extra space because it aliases smem_d).
+    // Fill barriers.
     // After the A/packed-B barrier merge there is only one set of full/empty barriers.
-    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_SF_OFFSET +
-                                                       kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_SFB_OFFSET + SMEM_SFB_SIZE);
     auto full_barriers     = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers    = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
 
@@ -199,6 +199,8 @@ sm90_fp8_fp4_gemm_1d2d_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
     auto get_current_group_idx = [&]() {
         if constexpr (kGemmType == GemmType::MGroupedContiguous) {
             return static_cast<uint32_t>(cute::max(0, grouped_layout[m_block_idx * BLOCK_M]));
+        } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
+            return scheduler.current_group_idx;
         } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
             return scheduler.current_group_idx;
         } else {
