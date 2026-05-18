@@ -99,11 +99,17 @@ static void __instantiate_kernel() {{
     }
 };
 
-static std::tuple<int, int, int, int, int, torch::Tensor> preprocess_sf(const torch::Tensor& sf) {
+static std::tuple<int, int, int, int, int, torch::Tensor> preprocess_sf(const torch::Tensor& sf,
+                                                                        const bool& require_float = true) {
     // NOTES: for the extreme performance, you may rewrite/fuse this function in CUDA
     const auto dim = sf.dim();
     DG_HOST_ASSERT(dim == 2 or dim == 3);
-    DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat);
+    if (require_float) {
+        DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat);
+    } else {
+        DG_HOST_ASSERT(sf.scalar_type() == torch::kFloat or sf.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(sf.element_size() == sizeof(float));
+    }
     const auto batched_sf = dim == 2 ? sf.unsqueeze(0) : sf;
 
     const auto [num_groups, mn, sf_k] = get_shape<3>(batched_sf);
@@ -112,7 +118,7 @@ static std::tuple<int, int, int, int, int, torch::Tensor> preprocess_sf(const to
 }
 
 static torch::Tensor get_mn_major_tma_aligned_tensor(const torch::Tensor& sf) {
-    const auto [dim, num_groups, mn, sf_k, tma_aligned_mn, batched_sf] = preprocess_sf(sf);
+    const auto [dim, num_groups, mn, sf_k, tma_aligned_mn, batched_sf] = preprocess_sf(sf, false);
 
     // The last kernel already gives a column-major TMA aligned layout
     if ((batched_sf.stride(0) == tma_aligned_mn * sf_k or dim == 2) and batched_sf.stride(1) == 1 and batched_sf.stride(2) == tma_aligned_mn)
