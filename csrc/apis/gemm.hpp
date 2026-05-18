@@ -661,6 +661,19 @@ static void register_apis(pybind11::module_& m) {
           py::arg("block_m_override") = std::nullopt,
           py::arg("block_n_override") = std::nullopt,
           py::arg("decode_stub") = false);
+    m.def("m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma",
+          &sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
+          py::arg("expected_m"),
+          py::arg("gran_k") = 128,
+          py::arg("gran_k_a") = std::nullopt,
+          py::arg("gran_k_b") = std::nullopt,
+          py::arg("compiled_dims") = "nk",
+          py::arg("block_m_override") = std::nullopt,
+          py::arg("block_n_override") = std::nullopt,
+          py::arg("decode_stub") = false);
+    m.attr("m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma") =
+        m.attr("m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma");
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
