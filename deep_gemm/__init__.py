@@ -86,6 +86,15 @@ try:
         )
     except AttributeError:
         pass
+    try:
+        m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma = (
+            _C.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma
+        )
+        m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma = (
+            _C.m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma
+        )
+    except AttributeError:
+        pass
 except ImportError:
     # Expected behavior for CUDA runtime version before 12.1
     pass
