@@ -334,8 +334,9 @@ static void fp8_mega_moe(
     const auto arch_major = device_runtime->get_arch_major();
     DG_HOST_ASSERT(arch_major == 9);
 
-    // Config checks: SM90 uses block (128, 128) float SF for weights,
-    // per-token per-128-K float SF for activations.
+    // Config checks: SM90 uses block (128, 128) float SF for weights.
+    // Activation SF is float as well: L1 input is per-128 K and the L2
+    // intermediate activation produced by the fused L1 epilogue is per-64 K.
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 128 and rn == 128 and rk == 128);

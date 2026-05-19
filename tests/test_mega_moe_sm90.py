@@ -277,7 +277,6 @@ def _run_scenario(
         topk_w.masked_fill_(topk_idx < 0, 0)
 
     # Quantize x to FP8 with per-128 K float SF (SM90 format)
-    # Quantize x to FP8 with per-128 K float SF (SM90 format)
     x_fp8, x_sf = per_token_cast_to_fp8(x_bf, use_ue8m0=False, gran_k=128,
                                         use_packed_ue8m0=False)
     # Quantize weights with block (128, 128) — matches DeepSeekV4FlashFp8 / DeepEP.

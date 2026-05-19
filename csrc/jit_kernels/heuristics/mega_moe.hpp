@@ -260,11 +260,11 @@ static MegaMoEConfig get_mega_moe_config(
 // ----------------------------------------------------------------------------
 // SM90 differs from SM100 in:
 //   - No tensor memory (TMEM): WGMMA accumulators live in registers.
-//   - No FP4: weights are FP8 e4m3, scales are per-128 channel float.
+//   - No FP4: weights are FP8 e4m3 with per-128 channel float scales.
 //   - No 2-CTA cluster MMA: TMA multicast cluster=2 may still be used.
-//   - SF for activations is float (not UE8M0 int) and per-128 (not per-32).
-// The kernel is in `deep_gemm/impls/sm90_fp8_mega_moe.cuh` and is currently
-// a skeleton; this config is what the host runtime reads.
+//   - Activation SF is float, not UE8M0 int: L1 input uses per-128 K and the
+//     fused L1 epilogue writes L2 activation SF at per-64 K granularity.
+// The kernel implementation is in `deep_gemm/impls/sm90_fp8_mega_moe.cuh`.
 // ============================================================================
 
 struct MegaMoESM90Config {
@@ -274,7 +274,7 @@ struct MegaMoESM90Config {
     // Cluster size for TMA multicast (1 or 2). Multicast is on A.
     int cluster_size;
 
-    // Pool capacity and SF-padded token count (SF is per-128 float on SM90)
+    // Pool capacity and SF-padded token count.
     int num_max_pool_tokens;
     int num_padded_sf_pool_tokens;
 

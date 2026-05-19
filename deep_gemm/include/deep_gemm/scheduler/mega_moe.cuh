@@ -207,8 +207,8 @@ struct MegaMoEScheduler {
         // Initialize current expert with 0
         set_expert_idx(0);
 
-        // Iterate over all blocks
-        // TODO: add swizzle within expert waves for better L2 cache utilization
+        // Iterate over all blocks in expert-major order. This keeps scheduling
+        // deterministic and avoids changing the cross-rank work partitioning.
         while (true) {
             CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
             if (block_phase == BlockPhase::None)

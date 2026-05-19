@@ -18,15 +18,13 @@ namespace deep_gemm {
 // SM90 (Hopper) FP8 MegaMoE host runtime
 // ----------------------------------------------------------------------------
 // This is the SM90 counterpart of `SM100FP8FP4MegaMoERuntime`. The kernel
-// itself lives in `deep_gemm/impls/sm90_fp8_mega_moe.cuh` and is currently a
-// skeleton: dispatch/combine paths are intended to be portable from the SM100
-// version, while the GEMM (TMA load + WGMMA + epilogue) is being implemented
-// in a follow-up step.
+// itself lives in `deep_gemm/impls/sm90_fp8_mega_moe.cuh`.
 //
 // Differences from SM100 path:
 //   * Activations and weights are both FP8 (e4m3); no FP4.
-//   * Activation/weight scale factors (SF) are per-128-channel float (not UE8M0
-//     int + per-32 UTCCP layout).
+//   * Activation/weight scale factors (SF) are float, not UE8M0 int + per-32
+//     UTCCP layout. L1 activation SF and weight SF are per-128 K; the fused L1
+//     epilogue writes L2 activation SF at per-64 K granularity.
 //   * No tensor memory: WGMMA accumulators are register-resident.
 //   * Cluster size is at most 2 (TMA multicast on A); no 2-CTA UMMA.
 // ============================================================================
