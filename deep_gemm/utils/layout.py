@@ -12,8 +12,8 @@ from .math import align, ceil_div
 
 
 def _get_C():
-    from .. import _C
-    return _C
+    import deep_gemm
+    return deep_gemm._C
 
 
 def get_tma_aligned_size(mn: int, element_size: int) -> int:
