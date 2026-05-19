@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import Tuple, Optional
 from ..utils.math import align
@@ -11,6 +12,14 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+
+
+def _from_dlpack_if_needed(tensor, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.utils.dlpack.from_dlpack(tensor)
+    if dtype is not None and tensor.dtype != dtype:
+        tensor = tensor.view(dtype)
+    return tensor
 
 
 class SymmBuffer:
@@ -42,10 +51,17 @@ class SymmBuffer:
         torch.cuda.synchronize()
 
         # Create input buffer views
-        (self.x, self.x_sf,
-         self.topk_idx, self.topk_weights,
-         self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+        (x, x_sf, topk_idx, topk_weights,
+         l1_acts, l1_acts_sf, l2_acts, l2_acts_sf) = slice_input_buffers(self.buffer)
+        x_dtype = torch.int8 if int(os.getenv('DG_USE_FP4_ACTS', '0')) != 0 else torch.float8_e4m3fn
+        self.x = _from_dlpack_if_needed(x, x_dtype)
+        self.x_sf = _from_dlpack_if_needed(x_sf)
+        self.topk_idx = _from_dlpack_if_needed(topk_idx)
+        self.topk_weights = _from_dlpack_if_needed(topk_weights)
+        self.l1_acts = _from_dlpack_if_needed(l1_acts, x_dtype)
+        self.l1_acts_sf = _from_dlpack_if_needed(l1_acts_sf)
+        self.l2_acts = _from_dlpack_if_needed(l2_acts, torch.float8_e4m3fn)
+        self.l2_acts_sf = _from_dlpack_if_needed(l2_acts_sf)
 
     def destroy(self):
         self.handle = None
