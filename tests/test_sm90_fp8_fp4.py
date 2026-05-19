@@ -395,24 +395,24 @@ def test_sm90_fp8_fp4_masked_direct_fp32_scale() -> None:
     print("direct FP32 B scale case: b.second shape = [groups, N, K/128]")
     rows = []
     for m_per_group in (1, 4, 8, 16, 32):
-        rows.append(_masked_benchmark_case(8, m_per_group, n=4096, k=7168))
+        rows.append(_masked_benchmark_case(8, m_per_group, n=4096, k=7168, b_gran_k=128))
     for m_per_group in (1, 4, 8, 16, 32):
-        rows.append(_masked_benchmark_case(8, m_per_group, n=7168, k=2048))
+        rows.append(_masked_benchmark_case(8, m_per_group, n=7168, k=2048, b_gran_k=128))
     for m_per_group in (1, 4, 8, 16, 32):
-        rows.append(_masked_benchmark_case(16, m_per_group, n=4096, k=7168))
+        rows.append(_masked_benchmark_case(16, m_per_group, n=4096, k=7168, b_gran_k=128))
     for m_per_group in (1, 4, 8, 16, 32):
-        rows.append(_masked_benchmark_case(16, m_per_group, n=7168, k=2048))
+        rows.append(_masked_benchmark_case(16, m_per_group, n=7168, k=2048, b_gran_k=128))
     for m_per_group in (1, 4, 8, 16, 32):
-        rows.append(_masked_benchmark_case(32, m_per_group, n=4096, k=7168))
+        rows.append(_masked_benchmark_case(32, m_per_group, n=4096, k=7168, b_gran_k=128))
     for m_per_group in (1, 4, 8, 16, 32):
-        rows.append(_masked_benchmark_case(32, m_per_group, n=7168, k=2048))
+        rows.append(_masked_benchmark_case(32, m_per_group, n=7168, k=2048, b_gran_k=128))
     _print_markdown_table(rows)
 
 
 if __name__ == "__main__":
     start_time = time.time()
-    if os.getenv("DG_W4_CONTIGUOUS_DIRECT_FP32_SCALE", "0") not in ("", "0"):
-        test_sm90_fp8_fp4_contiguous()
+    # if os.getenv("DG_W4_CONTIGUOUS_DIRECT_FP32_SCALE", "0") not in ("", "0"):
+    #     test_sm90_fp8_fp4_contiguous()
     if os.getenv("DG_W4_MASKED_DIRECT_FP32_SCALE", "0") not in ("", "0"):
         test_sm90_fp8_fp4_masked_direct_fp32_scale()
     else:
