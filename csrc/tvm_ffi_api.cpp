@@ -41,6 +41,8 @@ void dg_set_num_sms(int64_t n) { device_runtime->set_num_sms(static_cast<int>(n)
 // void dg_set_compile_mode(int64_t n) { device_runtime->set_compile_mode(static_cast<int>(n)); }
 int64_t dg_get_tc_util() { return device_runtime->get_tc_util(); }
 void dg_set_tc_util(int64_t n) { device_runtime->set_tc_util(static_cast<int>(n)); }
+bool dg_get_pdl() { return device_runtime->get_pdl(); }
+void dg_set_pdl(bool v) { device_runtime->set_pdl(v); }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init, dg_init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_num_sms, dg_get_num_sms);
@@ -49,6 +51,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_num_sms, dg_set_num_sms);
 // TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_compile_mode, dg_set_compile_mode);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_tc_util, dg_get_tc_util);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_tc_util, dg_set_tc_util);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_pdl, dg_get_pdl);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_pdl, dg_set_pdl);
 
 // ---------------------------------------------------------------------------
 // Layout utilities
