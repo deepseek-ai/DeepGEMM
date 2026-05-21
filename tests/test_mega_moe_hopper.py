@@ -1,6 +1,7 @@
 """
 H200 (SM90 / Hopper) mega-MoE: fused kernel + 同管线 baseline 性能对比。
 
+<<<<<<< Updated upstream
 结构对齐 tests/test_mega_moe.py（B 系列 SM100 FP4 路径），但所有路径都换成 H200 FP8：
   * fused：调用 `deep_gemm.fp8_mega_moe`（kernel symbol `sm90_fp8_mega_moe_impl`），
            使用 `transform_weights_for_mega_moe_sm90` 处理过的权重 + SymmBuffer。
@@ -11,6 +12,28 @@ H200 (SM90 / Hopper) mega-MoE: fused kernel + 同管线 baseline 性能对比。
               不是 bitwise apples-to-apples correctness oracle。
   * 性能输出涵盖：TFLOPS / overlap TFLOPS / HBM GB/s / NVL GB/s / fused us /
                   reduction us / `t_baseline / t_fused` legacy 比。
+=======
+This follows the structure of ``tests/test_mega_moe.py`` for the SM100 FP4
+path, with the compute path changed to SM90 FP8:
+
+* fused: calls ``deep_gemm.fp8_mega_moe`` (kernel symbol
+  ``sm90_fp8_mega_moe_impl``) with weights transformed by
+  ``transform_weights_for_mega_moe_sm90`` and a ``SymmBuffer``.
+* baseline: DeepEP dispatch, two grouped FP8 GEMMs, Triton SwiGLU, and DeepEP
+  combine with untransformed weights. The current SM90 grouped GEMM path accepts
+  per-128-K L2 activation SF, while the fused SM90 MegaMoE L1 epilogue writes
+  per-64-K L2 activation SF to avoid cross-CTA synchronization. This is a
+  same-pipeline performance reference, not a bitwise correctness oracle.
+* low-latency baseline (optional, ``--run-low-latency-baseline``): mirrors the
+  sglang low-latency MoE pipeline (see
+  ``sglang/srt/layers/moe/token_dispatcher/deepep.py::_DeepEPDispatcherImplLowLatency``):
+  ``Buffer.low_latency_dispatch`` (use_fp8=True) -> per-expert masked-layout
+  FP8 grouped GEMM -> masked SwiGLU + FP8 quant -> masked FP8 grouped GEMM ->
+  ``Buffer.low_latency_combine`` (which applies topk weights internally). This
+  is the canonical decode path used in production EP serving.
+* output: TFLOPS, overlap-adjusted TFLOPS, HBM GB/s, NVLink GB/s, fused time,
+  reduction estimate, and ``t_baseline / t_fused``.
+>>>>>>> Stashed changes
 """
 
 import argparse
@@ -305,6 +328,166 @@ def _make_deep_ep_buffer(deep_ep, group, num_max_tokens_per_rank, hidden, num_to
     return _DeepEPBufferCompat(deep_ep, group, num_nvl_bytes=num_nvl_bytes)
 
 
+def _make_deep_ep_low_latency_buffer(
+    deep_ep, group, num_max_dispatch_tokens_per_rank, hidden, num_experts
+):
+    """Build a DeepEP ``Buffer`` configured for low-latency dispatch/combine.
+
+    Mirrors the buffer construction used by sglang's
+    ``_DeepEPDispatcherImplLowLatency`` (see
+    ``sglang/srt/layers/moe/token_dispatcher/deepep.py``): RDMA bytes from
+    ``get_low_latency_rdma_size_hint`` and one QP per local expert.
+    """
+    num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
+        num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts
+    )
+    return deep_ep.Buffer(
+        group,
+        num_nvl_bytes=0,
+        num_rdma_bytes=num_rdma_bytes,
+        low_latency_mode=True,
+        num_qps_per_rank=num_experts // group.size(),
+        allow_nvlink_for_low_latency_mode=True,
+        explicitly_destroy=True,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Masked SwiGLU + FP8 quantization (low-latency layout).
+# ----------------------------------------------------------------------------
+# DeepEP low-latency dispatch returns tokens packed as
+#   x: [num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, 2*IH]
+# with a per-expert valid-token count ``masked_m[g]``. The masked GEMM does
+# not care about the trailing junk rows, but to feed the L2 masked GEMM with
+# correct scales we still need a per-token-per-128-K FP32 scale tensor with
+# the same masked-layout convention. This kernel produces:
+#   y    : [E, M, IH]                    fp8_e4m3fn
+#   y_sf : [E, M, IH // BLOCK_K]         fp32 (row-major; DeepGEMM SM90 path
+#                                              accepts this layout)
+# Modeled on sglang's ``_silu_and_mul_post_quant_kernel`` in
+# ``sglang/srt/layers/moe/ep_moe/kernels.py``.
+
+
+@triton.jit
+def _swiglu_masked_post_quant_kernel(
+    x_ptr,
+    stride_x_e,
+    stride_x_m,
+    stride_x_n,
+    y_ptr,
+    stride_y_e,
+    stride_y_m,
+    stride_y_n,
+    y_sf_ptr,
+    stride_sf_e,
+    stride_sf_m,
+    stride_sf_k,
+    masked_m_ptr,
+    H,
+    clamp_value,
+    HAS_CLAMP: tl.constexpr,
+    USE_UE8M0_SCALE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    pid_k = tl.program_id(0)  # column tile within IH
+    pid_m = tl.program_id(1)  # token-stripe within this expert
+    pid_e = tl.program_id(2)  # expert
+
+    num_token_stripes = tl.num_programs(1)
+    num_valid_tokens = tl.load(masked_m_ptr + pid_e)
+
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    # Element ptrs for one (expert, token_index, k_block).
+    x_base = x_ptr + pid_e * stride_x_e + offs_k * stride_x_n
+    y_base = y_ptr + pid_e * stride_y_e + offs_k * stride_y_n
+    sf_base = y_sf_ptr + pid_e * stride_sf_e + pid_k * stride_sf_k
+
+    for token in tl.range(pid_m, num_valid_tokens, num_token_stripes, num_stages=NUM_STAGES):
+        gate = tl.load(x_base + token * stride_x_m).to(tl.float32)
+        up = tl.load(x_base + token * stride_x_m + H * stride_x_n).to(tl.float32)
+
+        if HAS_CLAMP:
+            gate = tl.minimum(gate, clamp_value)
+            up = tl.minimum(tl.maximum(up, -clamp_value), clamp_value)
+
+        y = gate * tl.sigmoid(gate) * up
+
+        amax = tl.max(tl.abs(y))
+        sf = tl.maximum(amax / _FP8_E4M3_MAX_TL, 1.0e-30)
+        if USE_UE8M0_SCALE:
+            sf = tl.exp2(tl.ceil(tl.log2(sf)))
+
+        y_fp8 = (y / sf).to(tl.float8e4nv)
+
+        tl.store(y_base + token * stride_y_m, y_fp8)
+        tl.store(sf_base + token * stride_sf_m, sf)
+
+
+def swiglu_masked_post_quant_to_fp8(
+    x: torch.Tensor,
+    masked_m: torch.Tensor,
+    quant_group_size: int = BASELINE_L2_ACT_SF_GRAN,
+    clamp_value: float | None = None,
+    use_ue8m0_scale: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SwiGLU + per-(token, BLOCK_K) FP8 quant on masked-layout input.
+
+    Input:
+        x          : (E, M, 2*H) bf16, contiguous
+        masked_m   : (E,) int, number of valid rows per expert
+    Returns:
+        y          : (E, M, H) fp8_e4m3fn
+        y_sf       : (E, M, H // quant_group_size) fp32 (row-major)
+
+    The MoE low-latency path applies topk weights inside
+    ``low_latency_combine``, so this kernel does NOT multiply by topk weights.
+    """
+    assert x.is_cuda and x.dtype == torch.bfloat16
+    assert x.is_contiguous(), "Expects contiguous masked-layout input"
+    assert x.dim() == 3 and x.shape[-1] % 2 == 0
+    E, M, two_H = x.shape
+    H = two_H // 2
+    assert H % quant_group_size == 0
+    assert masked_m.shape == (E,)
+
+    y = torch.empty((E, M, H), dtype=torch.float8_e4m3fn, device=x.device)
+    y_sf = torch.empty(
+        (E, M, H // quant_group_size), dtype=torch.float32, device=x.device
+    )
+
+    BLOCK_K = quant_group_size
+    # Heuristic similar to sglang's silu_and_mul_masked_post_quant_fwd.
+    block_num_per_expert = 64 if E < 4 else 32
+
+    grid = (H // BLOCK_K, block_num_per_expert, E)
+
+    _swiglu_masked_post_quant_kernel[grid](
+        x,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        y,
+        y.stride(0),
+        y.stride(1),
+        y.stride(2),
+        y_sf,
+        y_sf.stride(0),
+        y_sf.stride(1),
+        y_sf.stride(2),
+        masked_m,
+        H,
+        float(clamp_value) if clamp_value is not None else 0.0,
+        HAS_CLAMP=clamp_value is not None,
+        USE_UE8M0_SCALE=use_ue8m0_scale,
+        BLOCK_K=BLOCK_K,
+        NUM_STAGES=4,
+        num_warps=1,
+    )
+    return y, y_sf
+
+
 # ============================================================================
 # 模块 4：CUDA event 中位数测时（避开对 tilelang.do_bench 的依赖）
 # ============================================================================
@@ -435,6 +618,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # SwiGLU clamp：finite → 传给 fused/triton；inf → None（关闭 clamp，与 SM90 fused 一致）
     clamp_arg = args.activation_clamp if math.isfinite(args.activation_clamp) else None
     run_baseline_enabled = args.run_baseline or bool(args.check_output_diff)
+    run_ll_baseline_enabled = bool(args.run_low_latency_baseline)
 
     # ---- DeepGEMM grouped GEMM 的 M 维 alignment（baseline 走 DeepEP 时也用这个）----
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
@@ -494,6 +678,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         once_in_node=True,
     )
     dist_print(
+        f" > Low-latency baseline: {'enabled' if run_ll_baseline_enabled else 'disabled'}",
+        once_in_node=True,
+    )
+    dist_print(
         f" > Buffer: {sym_buffer.buffer.nbytes / 2**30:.3f} GiB", once_in_node=True
     )
     dist_print(once_in_node=True)
@@ -510,10 +698,19 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist.destroy_process_group()
         return
 
+<<<<<<< Updated upstream
     # ---- 分配 DeepEP buffer（baseline 用）----
     deep_ep = _import_deep_ep() if run_baseline_enabled else None
+=======
+    # ---- Allocate DeepEP buffer for the baseline ----
+    deep_ep = (
+        _import_deep_ep()
+        if (run_baseline_enabled or run_ll_baseline_enabled)
+        else None
+    )
+>>>>>>> Stashed changes
     ep_buffer = None
-    if deep_ep is not None:
+    if deep_ep is not None and run_baseline_enabled:
         ep_buffer = _make_deep_ep_buffer(
             deep_ep,
             group,
@@ -521,6 +718,21 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             hidden,
             num_topk,
             sym_buffer.buffer.nbytes,
+        )
+
+    # ---- Allocate DeepEP buffer for the low-latency baseline ----
+    # Low-latency mode requires its own ``Buffer(low_latency_mode=True, ...)``
+    # with ``num_qps_per_rank == num_local_experts`` and RDMA bytes sized via
+    # ``get_low_latency_rdma_size_hint``. See sglang's
+    # ``DeepEPBuffer.get_deepep_buffer`` for the canonical setup.
+    ll_buffer = None
+    if deep_ep is not None and run_ll_baseline_enabled:
+        ll_buffer = _make_deep_ep_low_latency_buffer(
+            deep_ep,
+            group,
+            num_max_tokens_per_rank,
+            hidden,
+            num_experts,
         )
 
     # ----------------------------------------------------------------
@@ -582,7 +794,112 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # DeepEP combine：把每个 token 在 topk 个 expert 上的输出汇聚回源 rank
         return ep_buffer.combine(l2_y, handle=handle)[0]
 
+<<<<<<< Updated upstream
     # ---- 跑一次确保不报错（fused + 可选 baseline）----
+=======
+    # ----------------------------------------------------------------
+    # Low-latency baseline body. Mirrors the sglang
+    # ``_DeepEPDispatcherImplLowLatency`` pipeline:
+    #   1. ``low_latency_dispatch(use_fp8=True)`` -> per-expert packed FP8 tokens
+    #      with shape ``[E_local, M_max, hidden]`` plus FP32 scales
+    #      ``[E_local, M_max, hidden // 128]`` and per-expert ``masked_m``.
+    #   2. Masked grouped FP8 GEMM with L1 weights.
+    #   3. Masked SwiGLU + per-128-K FP8 quantize. (topk weights are NOT
+    #      applied here — ``low_latency_combine`` applies them internally.)
+    #   4. Masked grouped FP8 GEMM with L2 weights.
+    #   5. ``low_latency_combine`` (reduces with topk weights).
+    # ----------------------------------------------------------------
+    M_max_ll = num_max_tokens_per_rank * num_ranks
+    # Expected per-expert mean of ``masked_m`` after dispatch. Used as the
+    # ``expected_m`` hint for the DeepGEMM masked kernel selector.
+    expected_m_ll = max(
+        1,
+        (num_max_tokens_per_rank * num_ranks * num_topk + num_experts - 1)
+        // num_experts,
+    )
+    # Pre-allocate per-call output buffers; the masked GEMM writes into them
+    # in place and ignores rows past ``masked_m[g]``.
+    ll_l1_y = torch.empty(
+        (num_experts_per_rank, M_max_ll, intermediate_hidden * 2),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    ll_l2_y = torch.empty(
+        (num_experts_per_rank, M_max_ll, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    ll_combined = torch.empty(
+        (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    # DeepEP low-latency dispatch requires int64 topk indices.
+    topk_idx_ll = topk_idx.to(torch.int64)
+
+    def run_baseline_low_latency():
+        # 1) Low-latency dispatch with FP8 cast.
+        (recv_x_data, recv_x_sf), masked_m, ll_handle, event, hook = (
+            ll_buffer.low_latency_dispatch(
+                x_bf16,
+                topk_idx_ll,
+                num_max_tokens_per_rank,
+                num_experts,
+                use_fp8=True,
+                round_scale=False,
+                use_ue8m0=False,
+                async_finish=False,
+                return_recv_hook=False,
+            )
+        )
+
+        # 2) L1 masked grouped FP8 GEMM:
+        #    (E_local, M_max, hidden) @ (E_local, 2*IH, hidden)^T -> (E_local, M_max, 2*IH).
+        deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            (recv_x_data, recv_x_sf),
+            l1_weights,
+            ll_l1_y,
+            masked_m,
+            expected_m_ll,
+            disable_ue8m0_cast=True,
+        )
+
+        # 3) Masked SwiGLU + per-128-K FP8 quant. Topk weights are NOT applied
+        #    here — they are reduced inside ``low_latency_combine``.
+        l1_fp8, l1_sf = swiglu_masked_post_quant_to_fp8(
+            ll_l1_y,
+            masked_m,
+            quant_group_size=BASELINE_L2_ACT_SF_GRAN,
+            clamp_value=clamp_arg,
+            use_ue8m0_scale=False,
+        )
+
+        # 4) L2 masked grouped FP8 GEMM:
+        #    (E_local, M_max, IH) @ (E_local, H, IH)^T -> (E_local, M_max, H).
+        deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            (l1_fp8, l1_sf),
+            l2_weights,
+            ll_l2_y,
+            masked_m,
+            expected_m_ll,
+            disable_ue8m0_cast=True,
+        )
+
+        # 5) Low-latency combine: per-token weighted reduction across topk
+        #    expert replicas; outputs (num_tokens, hidden) bf16.
+        combined_x, event, hook = ll_buffer.low_latency_combine(
+            ll_l2_y,
+            topk_idx_ll,
+            topk_weights,
+            ll_handle,
+            use_logfmt=False,
+            zero_copy=False,
+            async_finish=False,
+            return_recv_hook=False,
+            out=ll_combined,
+        )
+        return combined_x
+
+    # ---- Run once to check fused and optional baseline paths ----
+>>>>>>> Stashed changes
     y = run_fused()
     assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, (
         f"fused 输出 shape/dtype 异常: shape={y.shape}, dtype={y.dtype}"
@@ -597,6 +914,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             denom = out_b.float().abs().mean().clamp_min(1e-12)
             dist_print(
                 "Output diff (fused vs legacy-per128 baseline):", once_in_node=True
+            )
+            dist_print(
+                f" > max_abs={diff.max().item():.6e}, "
+                f"mean_abs={diff.mean().item():.6e}, "
+                f"mean_abs/mean_ref={diff.mean().div(denom).item():.6e}",
+                once_in_node=True,
+            )
+            dist_print(once_in_node=True)
+    if ll_buffer is not None:
+        out_ll = run_baseline_low_latency()
+        assert out_ll.shape == (num_tokens, hidden) and out_ll.dtype == torch.bfloat16, (
+            f"unexpected LL baseline output shape/dtype: shape={out_ll.shape}, dtype={out_ll.dtype}"
+        )
+        if args.check_output_diff:
+            diff = (y.float() - out_ll.float()).abs()
+            denom = out_ll.float().abs().mean().clamp_min(1e-12)
+            dist_print(
+                "Output diff (fused vs low-latency baseline):", once_in_node=True
             )
             dist_print(
                 f" > max_abs={diff.max().item():.6e}, "
@@ -642,6 +977,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             l2_flush_gb=args.l2_flush_gb,
         )
         if ep_buffer is not None
+        else 0.0
+    )
+    # Low-latency baseline timing (same CUDA-event median methodology).
+    t_baseline_ll = (
+        _bench_cuda_events(
+            run_baseline_low_latency,
+            num_warmup=args.num_warmup,
+            num_repeat=args.num_repeat,
+            l2_flush_gb=args.l2_flush_gb,
+        )
+        if ll_buffer is not None
         else 0.0
     )
 
@@ -703,6 +1049,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     hbm_gbs_baseline = safe_div(num_hbm_bytes / 1e9, t_baseline)
     nvlink_gbs_baseline = safe_div(num_nvlink_bytes / 1e9, t_baseline)
+    # Low-latency baseline pads each expert's activation to ``M_max_ll``, so
+    # the weights are streamed once per expert regardless of routing. NVLink
+    # bytes match the normal-mode baseline (same per-routed-token volume).
+    tflops_baseline_ll = safe_div(
+        2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_baseline_ll
+    )
+    hbm_gbs_baseline_ll = safe_div(num_hbm_bytes / 1e9, t_baseline_ll)
+    nvlink_gbs_baseline_ll = safe_div(num_nvlink_bytes / 1e9, t_baseline_ll)
 
     def fmt_perf_line(
         name: str,
@@ -766,12 +1120,28 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             else "deep_ep unavailable"
         )
         dist_print(f" > [baseline] ({reason})", once_in_node=True)
+    if ll_buffer is not None:
+        speedup_ll = safe_div(t_baseline_ll, t_fused)
+        dist_print(
+            fmt_perf_line(
+                "[ll_base]",
+                t_baseline_ll,
+                tflops_baseline_ll,
+                hbm_gbs_baseline_ll,
+                nvlink_gbs_baseline_ll,
+                speedup=speedup_ll,
+            )
+        )
+    elif run_ll_baseline_enabled:
+        dist_print(" > [ll_base] (deep_ep unavailable)", once_in_node=True)
 
     # ---- 清理 ----
     dist.barrier()
     sym_buffer.destroy()
     if ep_buffer is not None:
         ep_buffer.destroy()
+    if ll_buffer is not None:
+        ll_buffer.destroy()
     dist.destroy_process_group()
 
 
@@ -866,6 +1236,16 @@ if __name__ == "__main__":
         "--run-baseline",
         action="store_true",
         help="启用 DeepEP+grouped-FP8 legacy baseline；默认关闭以避免 full-size 默认配置触发 baseline kernel 非法访问",
+    )
+    parser.add_argument(
+        "--run-low-latency-baseline",
+        action="store_true",
+        help=(
+            "Enable the sglang low-latency baseline "
+            "(DeepEP low_latency_dispatch -> masked grouped FP8 GEMM -> masked "
+            "SwiGLU+FP8 quant -> masked FP8 GEMM -> low_latency_combine); "
+            "disabled by default"
+        ),
     )
     parser.add_argument(
         "--check-output-diff",
