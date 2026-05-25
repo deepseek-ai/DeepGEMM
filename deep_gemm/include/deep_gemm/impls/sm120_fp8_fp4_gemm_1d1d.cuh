@@ -1236,19 +1236,20 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 store_pair(&gmem_d[idx], v2, v3);
                             }
                         } else {
-                            if (row0 < total_shape_m and col + 1 < shape_n) {
-                                float v0 = accum[ai + 0], v1 = accum[ai + 1];
-                                auto i0 = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + static_cast<int64_t>(col) * cd_n_stride;
-                                auto i1 = i0 + cd_n_stride;
-                                gmem_d[i0] = cd_dtype_t(v0);
-                                gmem_d[i1] = cd_dtype_t(v1);
+                            // Strided store: per-element N bounds check (handles shape_n=1)
+                            if (row0 < total_shape_m) {
+                                auto base = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride;
+                                if (col < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 0]);
+                                if (col + 1 < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 1]);
                             }
-                            if (row1 < total_shape_m and col + 1 < shape_n) {
-                                float v2 = accum[ai + 2], v3 = accum[ai + 3];
-                                auto i0 = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + static_cast<int64_t>(col) * cd_n_stride;
-                                auto i1 = i0 + cd_n_stride;
-                                gmem_d[i0] = cd_dtype_t(v2);
-                                gmem_d[i1] = cd_dtype_t(v3);
+                            if (row1 < total_shape_m) {
+                                auto base = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride;
+                                if (col < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 2]);
+                                if (col + 1 < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 3]);
                             }
                         }
                     }

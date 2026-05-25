@@ -82,23 +82,9 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     if (early_return(m, n, k, d, c))
         return;
 
-    // Transform SFA and SFB into compute-required layout
-    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
-
-    // Dispatch into different implements
-    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
-        const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
-        if (gran_n == 1) {
-            sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
-        } else {
-            const auto major_sfb = get_major_type_ab(sfb);
-            sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
-        }
-    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                major_a, major_b, compiled_dims);
-    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+    // Dispatch into different arch implementations
+    if (arch_major == 12) {
+        // SM120: AB-swap decision BEFORE SF transform (single transform call)
         auto a_data = a.first;
         auto b_data = b.first;
         auto eff_major_a = major_a;
@@ -117,31 +103,49 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                                   (a_data.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
         DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0);
 
-        // AB-swap for small-M decode: transpose problem so small M becomes N
-        constexpr int kSwapAbMMin = 16;  // BN minimum is 16
-        constexpr int kSwapAbMMax = 32;
-        const bool swap_ab_eligible = (m >= kSwapAbMMin and m <= kSwapAbMMax
+        // AB-swap for small-M decode: swap A↔B so small M becomes N (BN=16).
+        // K-major B has N as TMA outer dim — no minimum size restriction.
+        constexpr int kSwapAbMMax = 16;
+        const bool swap_ab = (m >= 1 and m <= kSwapAbMMax
             and eff_major_a == cute::UMMA::Major::K and eff_major_b == cute::UMMA::Major::K
             and d.stride(-1) == 1 and !is_mixed_fp4 and !c.has_value());
-        if (swap_ab_eligible) {
-            // Swap recipe: A's granularity becomes new B's, B's becomes new A's
-            std::optional<std::tuple<int, int, int>> swap_recipe = std::nullopt;
-            std::optional<std::tuple<int, int>> swap_recipe_a = std::nullopt;
-            std::optional<std::tuple<int, int>> swap_recipe_b = std::nullopt;
-            if (recipe.has_value()) {
-                const auto [ga, gb, gk] = recipe.value();
-                swap_recipe_a = std::make_tuple(gb, gk);
-                swap_recipe_b = std::make_tuple(ga, gk);
-            } else {
-                swap_recipe_a = recipe_b;
-                swap_recipe_b = recipe_a;
-            }
-            auto [swap_sfa, swap_sfb, swap_gka, swap_gkb] = layout::transform_sf_pair_into_required_layout(
-                b.second, a.second, n, m, k, swap_recipe,
-                swap_recipe_a, swap_recipe_b,
-                std::nullopt, std::nullopt, disable_ue8m0_cast);
-            sm120_fp8_fp4_gemm_1d1d(b_data, swap_sfa, a_data, swap_sfb, std::nullopt, d,
-                                    n, m, k, swap_gka, swap_gkb,
+
+        // Resolve actual granularities, swap if needed
+        int ga, gb, gk;
+        if (recipe.has_value()) {
+            std::tie(ga, gb, gk) = recipe.value();
+        } else if (recipe_a.has_value()) {
+            ga = std::get<0>(recipe_a.value());
+            gb = std::get<0>(recipe_b.value());
+            gk = std::get<1>(recipe_a.value());
+        } else {
+            std::tie(ga, gb, gk) = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+        }
+
+        std::optional<std::tuple<int, int, int>> eff_recipe = std::nullopt;
+        std::optional<std::tuple<int, int>> eff_recipe_a, eff_recipe_b;
+        if (swap_ab) {
+            eff_recipe_a = std::make_tuple(gb, gk);
+            eff_recipe_b = std::make_tuple(ga, gk);
+        } else if (recipe_a.has_value()) {
+            eff_recipe_a = recipe_a;
+            eff_recipe_b = recipe_b;
+        } else {
+            eff_recipe = recipe;
+        }
+
+        const auto& sf_a_raw = swap_ab ? b.second : a.second;
+        const auto& sf_b_raw = swap_ab ? a.second : b.second;
+        const int eff_m = swap_ab ? n : m;
+        const int eff_n = swap_ab ? m : n;
+
+        const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+            sf_a_raw, sf_b_raw, eff_m, eff_n, k, eff_recipe,
+            eff_recipe_a, eff_recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+
+        if (swap_ab) {
+            sm120_fp8_fp4_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
+                                    eff_m, eff_n, k, gran_k_a, gran_k_b,
                                     eff_major_b, eff_major_a, compiled_dims,
                                     std::nullopt, std::nullopt, true);
         } else {
@@ -149,7 +153,24 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                                     eff_major_a, eff_major_b, compiled_dims);
         }
     } else {
-        DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
+        // SM90/SM100: transform SF then dispatch
+        const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+
+        if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+            const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
+            if (gran_n == 1) {
+                sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+            } else {
+                const auto major_sfb = get_major_type_ab(sfb);
+                sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
+            }
+        } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+            sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
+                                    major_a, major_b, compiled_dims);
+        } else {
+            DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
+        }
     }
 }
 

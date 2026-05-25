@@ -48,10 +48,11 @@ struct SM120ArchSpec {
 
         std::vector<int> block_n_candidates;
         if (is_small_n) {
-            for (int bn : {16, 32}) {
-                if (bn <= n_for_tile)
-                    block_n_candidates.push_back(bn);
-            }
+            // BN=16 always valid: K-major B has N as TMA outer dim, no minimum.
+            // Kernel epilogue bounds-checks shape_n for partial N tiles.
+            block_n_candidates.push_back(16);
+            if (n_for_tile > 16)
+                block_n_candidates.push_back(32);
         } else {
             int step = std::lcm(8, heuristics_runtime->get_block_n_multiple_of());
             for (int i = step; i <= 256; i += step) {
