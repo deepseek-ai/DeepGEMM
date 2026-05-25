@@ -49,13 +49,10 @@ public:
         if (arch_major != 10 and arch_major != 12)
             return kLegacyMKAlignmentForContiguousLayout;
 
-        // SM120's grouped FP8/FP4 kernel uses 4 M-warps × MMA_M=16, so
-        // BLOCK_M ≥ 64. SM100 supports the full 32..max range.
-        // Stepping in MMA_M=16 increments lets the kernel pick an exact
-        // fit (e.g. 64, 80, 96, 112, 128) for the given expected_m.
+        // SM120: kMWarps=4, MMA_M=16, valid BLOCK_M must be multiple of 64
         int block_m = arch_major == 12 ? 128 : 240;
         int min_block_m = arch_major == 12 ? 64 : 32;
-        int mma_step = 16;
+        int mma_step = arch_major == 12 ? 64 : 16;
         if (expected_m.has_value()) {
             for (; block_m > min_block_m and block_m - mma_step >= expected_m.value(); block_m -= mma_step);
         }

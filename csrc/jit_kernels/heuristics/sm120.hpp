@@ -1,7 +1,5 @@
 #pragma once
 
-#include <algorithm>
-
 #include <cute/arch/mma_sm100_desc.hpp>
 #include <deep_gemm/common/types.cuh>
 
@@ -15,35 +13,23 @@ namespace deep_gemm {
 struct SM120ArchSpec {
     static constexpr int smem_capacity = 101376;  // 99KB
 
+    static constexpr int kMinBlockM = 64;   // kMWarps(4) * MMA_M(16)
+
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
-
-        // BLOCK_M candidates: smaller values reduce grouped-GEMM padding at
-        // small expected_m (MoE decode), larger values amortize launch
-        // overhead at prefill. Kernel constraints:
-        //   * BLOCK_M must be a multiple of MMA_M=16
-        //   * Cooperative warp layout uses kMWarps=4 (kNWarps=2 hardcoded
-        //     in the kernel), so kMTilesPerWarp = BLOCK_M/4/16 must be ≥1
-        //     ⇒ BLOCK_M ≥ 64
-        //   * Plus the caller's runtime alignment cap and expected_m fit
-        const int expected_m = desc.get_expected_m();
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
-        constexpr int kMinBlockM = 64;
+        const int expected_m = desc.get_expected_m();
+
+        // BLOCK_M candidates: only {64, 128} are valid (must be multiple of kMWarps * MMA_M = 64).
+        // CRITICAL: BLOCK_M must not exceed runtime_align for grouped contiguous GEMM,
+        // otherwise tiles straddle expert boundaries causing wrong results.
         std::vector<int> block_m_candidates;
-        for (int bm : {64, 128}) {
-            if (runtime_align > 0 and bm > runtime_align)
-                continue;
-            if (expected_m > 0 and bm > expected_m and bm > kMinBlockM)
-                continue;
-            block_m_candidates.push_back(bm);
-        }
-        // Allow runtime_align itself as a candidate if it's a valid
-        // BLOCK_M (multiple of MMA_M=16, ≥ kMinBlockM, ≤128) and not
-        // already in the list (e.g., 80, 96, 112 from the theoretical
-        // helper's MMA_M-stepped sequence).
-        if (runtime_align >= kMinBlockM and runtime_align <= 128 and runtime_align % 16 == 0
-            and std::find(block_m_candidates.begin(), block_m_candidates.end(), runtime_align) == block_m_candidates.end()) {
-            block_m_candidates.push_back(runtime_align);
+        if (runtime_align <= kMinBlockM)
+            block_m_candidates.push_back(64);
+        else {
+            block_m_candidates.push_back(128);
+            if (expected_m > 0 and expected_m <= kMinBlockM)
+                block_m_candidates.push_back(64);
         }
         if (block_m_candidates.empty())
             block_m_candidates.push_back(128);
@@ -56,41 +42,38 @@ struct SM120ArchSpec {
             block_k_candidates.push_back(64 / elem_size);
         block_k_candidates.push_back(128 / elem_size);
 
-        // Block N candidates. Kernel structural minimum BLOCK_N=16 (BLOCK_N/MMA_N
-        // must be divisible by kNWarps=2). The default cp.async/TMA alignment
-        // floor `(BN * elem_size) % 64 == 0` forces BN ∈ {64, 128} on the normal
-        // path. The AB-swap small-N path (`desc.n ≤ 32` after the caller swap,
-        // see apis/einsum.hpp::fp8_bmm) relaxes that floor and only emits
-        // {16, 32} so we don't waste lanes covering M_orig ≤ 32.
+        // Block N candidates
         const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
-        const bool is_small_n_swap = (n_for_tile > 0 and n_for_tile <= 32);
+        const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
+
         std::vector<int> block_n_candidates;
-        int step = std::lcm(16, heuristics_runtime->get_block_n_multiple_of());
-        for (int i = step; i <= 256; i += step) {
-            const int aligned = i * get_element_size(desc.get_mma_kind());
-            if (is_small_n_swap) {
-                if (i > 32)
-                    continue;
-            } else if (aligned % 64 != 0) {
-                continue;
+        if (is_small_n) {
+            for (int bn : {16, 32}) {
+                if (bn <= n_for_tile)
+                    block_n_candidates.push_back(bn);
             }
-            block_n_candidates.push_back(i);
+        } else {
+            int step = std::lcm(8, heuristics_runtime->get_block_n_multiple_of());
+            for (int i = step; i <= 256; i += step) {
+                if ((i * get_element_size(desc.get_mma_kind())) % 64 != 0)
+                    continue;
+                block_n_candidates.push_back(i);
+            }
         }
 
-        // MN-major B: ldmatrix.trans.x2 handles multi-atom SMEM correctly
         const int mn_major_b_max_n = 128;
 
         std::vector<Layout> candidates;
         for (int block_m : block_m_candidates) {
         for (int block_k : block_k_candidates) {
         for (int block_n : block_n_candidates) {
-            if (block_n > 128 or block_n > mn_major_b_max_n)
+            if (!is_small_n and (block_n > 128 or block_n > mn_major_b_max_n))
                 continue;
 
             const auto layout = Layout{0, block_m, block_n, block_k, 1, 1};
             const auto storage_config = get_storage_config(desc, layout);
 
-            if (storage_config.swizzle_a_mode < 64 or storage_config.swizzle_b_mode < 64)
+            if (!is_small_n and (storage_config.swizzle_a_mode < 64 or storage_config.swizzle_b_mode < 64))
                 continue;
 
             int num_stages = get_pipeline_config(desc, layout, storage_config).num_stages;
@@ -144,12 +127,8 @@ struct SM120ArchSpec {
             : layout.block_n * static_cast<int>(c10::elementSize(desc.b_dtype));
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
-        // swizzle_mode_cd: enable TMA-store (128 B) only when the BN row fits a
-        // full swizzle row. Below that the kernel falls back to direct-store,
-        // which is also the path the AB-swap small-N caller needs (TMA-store
-        // can't write into the caller's row-major (M_orig, N_orig) layout).
-        const int cd_size = static_cast<int>(c10::elementSize(desc.cd_dtype));
-        const int swizzle_mode_cd = (cd_size <= 2 and layout.block_n * cd_size >= 128) ? 128 : 0;
+        const int cd_size = c10::elementSize(desc.cd_dtype);
+        const auto swizzle_mode_cd = (cd_size <= 2 and layout.block_n * cd_size >= 128) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
@@ -227,47 +206,65 @@ struct SM120ArchSpec {
     }
 
     static LayoutInfo get_layout_info(const GemmDesc& desc, const Layout& layout) {
-        const auto num_blocks =
-            ceil_div(desc.get_expected_m(), layout.block_m) *
-            ceil_div(desc.get_expected_n(), layout.block_n) *
-            desc.get_expected_num_groups();
+        const auto num_m_blocks = ceil_div(desc.get_expected_m(), layout.block_m);
+        const auto num_n_blocks = ceil_div(desc.get_expected_n(), layout.block_n);
+        const auto num_blocks = num_m_blocks * num_n_blocks * desc.get_expected_num_groups();
         const auto num_waves = ceil_div(num_blocks, desc.num_sms);
         const auto num_last_blocks = num_blocks % desc.num_sms;
         const auto last_wave_util = num_last_blocks == 0 ? desc.num_sms : num_last_blocks;
 
+        // TMA-bound latency model (empirically validated on SM120a):
+        //   block_time = k_blocks * (tma_bytes_per_kblock * kCyPerTmaByte + kSyncPerKBlock) + kBlockOverheadCy
+        //   total_latency = num_waves * block_time
+        // The kernel is TMA-bound for most tile configs. The discrete num_waves
+        // (ceil division) dominates the BM=64 vs BM=128 decision.
+        // kSyncPerKBlock captures per-kblock barrier overhead (mbarrier ~137 cy).
+        // More pipeline stages reduce effective stall: kSyncPerKBlock / sqrt(stages).
+        static constexpr double kCyPerTmaByte = 0.07;     // ~35 GB/s per SM
+        static constexpr double kSyncBaseCy = 120.0;      // per-kblock barrier overhead
+        static constexpr double kBlockOverheadCy = 2000;   // epilogue + scheduling
+
         const int64_t expected_k = desc.get_expected_k();
-        int64_t flops_per_block = 2LL * layout.block_m * layout.block_n * expected_k;
+        const int k_blocks = ceil_div(static_cast<int>(expected_k), layout.block_k);
 
-        // Empirical warp-spec MMA efficiency model.
-        // A reuse = BN/8 (each A fragment reused across N-tiles).
-        // Cooperative layout: larger BN reduces epilogue overhead (fewer tiles) and
-        // increases compute per K-block (better TMA latency amortization).
-        const double a_reuse = static_cast<double>(layout.block_n) / 8.0;
-        double mma_efficiency = 0.69 + 0.12 * std::min(1.0, (a_reuse - 4.0) / 12.0);
+        const int elem_size = get_element_size(desc.get_mma_kind());
+        const int sf_bytes_a = (desc.kernel_type == KernelType::Kernel1D1D)
+            ? align(layout.block_m * 4, 128) : 0;
+        const int sf_bytes_b = (desc.kernel_type == KernelType::Kernel1D1D)
+            ? align(layout.block_n * 4, 128) : 0;
+        const int64_t tma_bytes_per_kb = (int64_t)layout.block_m * layout.block_k * elem_size
+                                       + (int64_t)layout.block_n * layout.block_k * elem_size
+                                       + sf_bytes_a + sf_bytes_b;
 
-        const double peak_flops_per_ns = (desc.a_dtype == at::kBFloat16) ? 380000.0 : 762000.0;
-        double block_ns = flops_per_block / (peak_flops_per_ns * mma_efficiency);
+        const auto storage_config = get_storage_config(desc, layout);
+        const int num_stages = get_pipeline_config(desc, layout, storage_config).num_stages;
+        const double sync_per_kb = kSyncBaseCy / std::sqrt(static_cast<double>(num_stages));
 
-        float wave_efficiency = static_cast<float>(num_blocks) / (num_waves * desc.num_sms);
-        int64_t num_cycles = static_cast<int64_t>(block_ns * num_blocks / wave_efficiency);
+        const double tma_per_kb = tma_bytes_per_kb * kCyPerTmaByte + sync_per_kb;
+        const double block_time = k_blocks * tma_per_kb + kBlockOverheadCy;
+        const int64_t total_latency = static_cast<int64_t>(num_waves * block_time);
 
-        return {num_waves, last_wave_util, num_cycles, layout};
+        return {num_waves, last_wave_util, total_latency, layout};
     }
 
     static bool compare(const LayoutInfo& a, const LayoutInfo& b) {
-        if (a.num_waves != b.num_waves and (a.num_waves == 1 or b.num_waves == 1))
-            return a.num_waves < b.num_waves;
+        // Use 5% tolerance: within this band, prefer tile-shape tie-breaks
+        const double ratio = (b.num_cycles > 0)
+            ? static_cast<double>(a.num_cycles) / b.num_cycles : 1.0;
+        if (ratio < 0.95) return true;   // a clearly better
+        if (ratio > 1.05) return false;  // b clearly better
 
-        if (a.num_cycles != b.num_cycles)
-            return a.num_cycles < b.num_cycles;
-
-        // Tie-break: prefer larger N tile for better reuse
+        // Within 5%: prefer larger N tile for better reuse
         if (a.layout.block_n != b.layout.block_n)
             return a.layout.block_n > b.layout.block_n;
-        // Tie-break: prefer smaller K tile (more pipeline stages for TMA hiding)
+        // Prefer smaller K tile (more pipeline stages for TMA hiding)
         if (a.layout.block_k != b.layout.block_k)
             return a.layout.block_k < b.layout.block_k;
-        return false;
+        // Prefer larger M tile for better per-block efficiency
+        if (a.layout.block_m != b.layout.block_m)
+            return a.layout.block_m > b.layout.block_m;
+        // Final: lower absolute latency
+        return a.num_cycles < b.num_cycles;
     }
 };
 
