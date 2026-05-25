@@ -48,11 +48,10 @@ struct SM120ArchSpec {
 
         std::vector<int> block_n_candidates;
         if (is_small_n) {
-            // BN=16 always valid: kernel epilogue bounds-checks N.
-            // cp.async B loader handles partial N (N < BN) correctly.
-            block_n_candidates.push_back(16);
-            if (n_for_tile > 16)
-                block_n_candidates.push_back(32);
+            for (int bn : {16, 32}) {
+                if (bn <= n_for_tile)
+                    block_n_candidates.push_back(bn);
+            }
         } else {
             int step = std::lcm(8, heuristics_runtime->get_block_n_multiple_of());
             for (int i = step; i <= 256; i += step) {
