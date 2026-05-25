@@ -11,6 +11,7 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
 
+#include <deep_gemm/common/cpasync_copy.cuh>
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/sm120_utils.cuh>
@@ -121,6 +122,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // For packed FP4 (kIsFP4): SMEM already uses packed size, so SMEM_B = GMEM bytes.
     static constexpr uint32_t TMA_B_BYTES = kBIsFP4 ? (SMEM_B / 2) : SMEM_B;
     static constexpr uint32_t SMEM_TMA_BYTES = SMEM_A + TMA_B_BYTES + TMA_SFA_BYTES + TMA_SFB_BYTES;
+    static constexpr bool kUseCpAsyncB = (BLOCK_N <= 32);
+    static constexpr uint32_t SMEM_TMA_BYTES_NO_B = SMEM_A + TMA_SFA_BYTES + TMA_SFB_BYTES;
     // ldmatrix K stride in bytes: FP4 packed = MMA_K/2, FP8 = MMA_K. Both = 32 bytes.
     static constexpr uint32_t kLdmK = kIsFP4 ? (MMA_K / 2) : MMA_K;
     // tma::copy swizzle for split computation: FP4 packed with B64 has 64 byte rows = full BLOCK_K,
@@ -212,101 +215,186 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     if (warp_idx >= kNumMathWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kTMARegisters>();
 
-        const bool is_tma_leader = (warp_idx == kNumMathWarps and lane_idx == 0);
+        const bool is_tma_warp0 = (warp_idx == kNumMathWarps);
+        const bool is_tma_leader = (is_tma_warp0 and lane_idx == 0);
         uint32_t tma_iter_idx = 0;
 
-        if (is_tma_leader) {
-            uint32_t last_group_idx = kNumGroups;
-            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-                if constexpr (kGemmType == GemmType::KGroupedContiguous) {
-                    if (last_group_idx != scheduler.current_group_idx) {
-                        last_group_idx = scheduler.current_group_idx;
+        if constexpr (kUseCpAsyncB) {
+            DG_STATIC_ASSERT(kGemmType != GemmType::KGroupedContiguous,
+                "cp.async B path does not support K-grouped GEMM");
+            // Restructured producer: leader + all lanes of TMA warp 0 cooperate.
+            // Leader drives scheduler and TMA A/SF. All 32 lanes do cp.async B.
+            // Other TMA warps (1-3) remain idle.
+            if (is_tma_warp0) {
+                while (true) {
+                    // Leader gets next block, broadcast to warp
+                    uint32_t has_work_u = 0;
+                    if (lane_idx == 0)
+                        has_work_u = scheduler.get_next_block(m_block_idx, n_block_idx) ? 1u : 0u;
+                    has_work_u = __shfl_sync(0xFFFFFFFF, has_work_u, 0);
+                    if (!has_work_u) break;
 
-                        const auto a_base = reinterpret_cast<const char*>(gmem_a_ptr);
-                        const auto b_base = reinterpret_cast<const char*>(gmem_b_ptr);
+                    // Broadcast block indices from leader
+                    m_block_idx = __shfl_sync(0xFFFFFFFF, m_block_idx, 0);
+                    n_block_idx = __shfl_sync(0xFFFFFFFF, n_block_idx, 0);
 
-                        if constexpr (kKGroupedConstantStride) {
-                            const uint64_t a_k_byte_offset = kIsFP4
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
-                            const uint64_t b_k_byte_offset = (kIsFP4 || kBIsFP4)
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
-                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_k_byte_offset);
-                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_k_byte_offset);
-                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
-                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
-                        } else {
-                            const uint64_t a_offset = kIsFP4
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
-                            const uint64_t b_offset = (kIsFP4 || kBIsFP4)
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
-                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
-                            ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
-                            const uint64_t a_new_stride = kIsFP4
-                                ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
-                                : static_cast<uint64_t>(scheduler.current_shape_k);
-                            const uint64_t b_new_stride = (kIsFP4 || kBIsFP4)
-                                ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
-                                : static_cast<uint64_t>(scheduler.current_shape_k);
-                            ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
-                                smem_tm_a, scheduler.current_shape_k, a_new_stride);
-                            ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
-                                smem_tm_b, scheduler.current_shape_k, b_new_stride);
+                    const uint32_t current_shape_k = shape_k;
+                    const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
+                    const uint32_t n_idx = n_block_idx * BLOCK_N;
+                    constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
+                    uint32_t batch_idx = 0;
+                    if constexpr (kIsBatchedMM) {
+                        if (lane_idx == 0) batch_idx = scheduler.current_group_idx;
+                        batch_idx = __shfl_sync(0xFFFFFFFF, batch_idx, 0);
+                    }
+
+                    // B GMEM base: K-major layout, byte stride = shape_k * elem_bytes
+                    DG_STATIC_ASSERT(kBKMajor, "cp.async B path requires K-major B");
+                    // FP4: 0.5 byte/element, FP8: 1 byte/element. kSMEMKBytes handles this.
+                    const uint32_t gmem_k_bytes = kIsFP4 ? (current_shape_k / 2) : current_shape_k;
+                    const auto* b_block_base = reinterpret_cast<const uint8_t*>(gmem_b_ptr)
+                        + static_cast<uint64_t>(n_idx) * gmem_k_bytes
+                        + (kIsBatchedMM ? static_cast<uint64_t>(batch_idx) * shape_n * gmem_k_bytes : 0);
+
+                    for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
+                        CUTE_TIE_DECL(get_pipeline(tma_iter_idx++), s, p);
+
+                        if (lane_idx == 0)
+                            empty_barriers[s]->wait(p ^ 1);
+                        __syncwarp();
+
+                        const uint32_t k_idx = kb * BLOCK_K;  // element-level for TMA A/SF
+                        const uint32_t k_byte_idx = kb * kSMEMKBytes;  // byte-level for cp.async B
+
+                        const int b_n_rows = min(static_cast<uint32_t>(BLOCK_N), shape_n - n_idx);
+                        sm120::smem_zero_fill(reinterpret_cast<char*>(smem_b[s]), SMEM_B, lane_idx);
+                        __syncwarp();
+                        sm120::cpasync_load_b_tile<kSMEMKBytes, kSwizzleBMode>(
+                            reinterpret_cast<char*>(smem_b[s]),
+                            b_block_base + static_cast<uint64_t>(k_byte_idx),
+                            b_n_rows, kSMEMKBytes, gmem_k_bytes, lane_idx);
+                        sm120::cpasync_commit_and_wait();
+                        __syncwarp();
+
+                        // Leader: TMA load A + SFA + SFB, then signal barrier
+                        if (lane_idx == 0) {
+                            constexpr bool kAGroupOffset = (kGemmType == GemmType::MGroupedMasked);
+                            const uint32_t m_idx = scheduler.template get_global_idx<kAGroupOffset>(shape_m, BLOCK_M, m_block_idx);
+
+                            uint32_t sfa_k, sfb_k;
+                            const uint32_t shape_sfa_k = math::ceil_div(shape_k, BLOCK_K * kNumSFAStagesPerLoad);
+                            const uint32_t shape_sfb_k = math::ceil_div(shape_k, BLOCK_K * kNumSFBStagesPerLoad);
+                            constexpr bool kSFAGroupOffset = not is_m_grouped_contiguous(kGemmType);
+                            sfa_k = scheduler.template get_global_idx<kSFAGroupOffset, sched::IndexType::SF_K>(
+                                shape_sfa_k, 1, kb / kNumSFAStagesPerLoad, m_block_idx);
+                            constexpr bool kSFBGroupOffset = not (kGemmType == GemmType::Normal);
+                            sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
+                                shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
+
+                            tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
+                            tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
+                            tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(
+                                &tensor_map_a_base, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
+                            full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES_NO_B);
                         }
-
-                        *gmem_tm_a = *smem_tm_a;
-                        *gmem_tm_b = *smem_tm_b;
-                        ptx::tensor_map_release_gpu();
-                        ptx::tensor_map_acquire_gpu(gmem_tm_a);
-                        ptx::tensor_map_acquire_gpu(gmem_tm_b);
                     }
                 }
-
-                const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
-                const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
-                constexpr bool kAGroupOffset = (kGemmType == GemmType::MGroupedMasked);
-                const uint32_t m_idx = scheduler.template get_global_idx<kAGroupOffset>(shape_m, BLOCK_M, m_block_idx);
-                constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous);
-                const uint32_t n_idx = scheduler.template get_global_idx<kBGroupOffset>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
-                const auto tma_a_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_a : &tensor_map_a_base);
-                const auto tma_b_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_b : &tensor_map_b_base);
-
-                constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
-                const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
-
-                for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
-                    CUTE_TIE_DECL(get_pipeline(tma_iter_idx++), s, p);
-                    empty_barriers[s]->wait(p ^ 1);
-
-                    const uint32_t k_idx = kb * BLOCK_K;
-                    uint32_t sfa_k, sfb_k;
+            }
+        } else {
+            // Original TMA-only path: single leader thread handles everything
+            if (is_tma_leader) {
+                uint32_t last_group_idx = kNumGroups;
+                while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                     if constexpr (kGemmType == GemmType::KGroupedContiguous) {
-                        sfa_k = scheduler.current_sf_k_cumsum + kb / kNumSFAStagesPerLoad;
-                        sfb_k = scheduler.current_sf_k_cumsum + kb / kNumSFBStagesPerLoad;
-                    } else {
-                        const uint32_t shape_sfa_k = math::ceil_div(shape_k, BLOCK_K * kNumSFAStagesPerLoad);
-                        const uint32_t shape_sfb_k = math::ceil_div(shape_k, BLOCK_K * kNumSFBStagesPerLoad);
-                        constexpr bool kSFAGroupOffset = not is_m_grouped_contiguous(kGemmType);
-                        sfa_k = scheduler.template get_global_idx<kSFAGroupOffset, sched::IndexType::SF_K>(
-                            shape_sfa_k, 1, kb / kNumSFAStagesPerLoad, m_block_idx);
-                        constexpr bool kSFBGroupOffset = not (kGemmType == GemmType::Normal);
-                        sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
-                            shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
+                        if (last_group_idx != scheduler.current_group_idx) {
+                            last_group_idx = scheduler.current_group_idx;
+
+                            const auto a_base = reinterpret_cast<const char*>(gmem_a_ptr);
+                            const auto b_base = reinterpret_cast<const char*>(gmem_b_ptr);
+
+                            if constexpr (kKGroupedConstantStride) {
+                                const uint64_t a_k_byte_offset = kIsFP4
+                                    ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
+                                    : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                                const uint64_t b_k_byte_offset = (kIsFP4 || kBIsFP4)
+                                    ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
+                                    : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                                ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_k_byte_offset);
+                                ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_k_byte_offset);
+                                ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
+                                ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
+                            } else {
+                                const uint64_t a_offset = kIsFP4
+                                    ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
+                                    : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
+                                const uint64_t b_offset = (kIsFP4 || kBIsFP4)
+                                    ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
+                                    : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
+                                ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
+                                ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
+                                const uint64_t a_new_stride = kIsFP4
+                                    ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
+                                    : static_cast<uint64_t>(scheduler.current_shape_k);
+                                const uint64_t b_new_stride = (kIsFP4 || kBIsFP4)
+                                    ? static_cast<uint64_t>(scheduler.current_shape_k / 2)
+                                    : static_cast<uint64_t>(scheduler.current_shape_k);
+                                ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
+                                    smem_tm_a, scheduler.current_shape_k, a_new_stride);
+                                ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
+                                    smem_tm_b, scheduler.current_shape_k, b_new_stride);
+                            }
+
+                            *gmem_tm_a = *smem_tm_a;
+                            *gmem_tm_b = *smem_tm_b;
+                            ptx::tensor_map_release_gpu();
+                            ptx::tensor_map_acquire_gpu(gmem_tm_a);
+                            ptx::tensor_map_acquire_gpu(gmem_tm_b);
+                        }
                     }
-                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
-                    tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
-                    tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
-                    if constexpr (kBKMajor) {
-                        tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
-                    } else {
-                        tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
-                            tma_b_desc, full_barriers[s], smem_b[s],
-                            n_idx, k_idx, 1, batch_idx);
+
+                    const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
+                    const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
+                    constexpr bool kAGroupOffset = (kGemmType == GemmType::MGroupedMasked);
+                    const uint32_t m_idx = scheduler.template get_global_idx<kAGroupOffset>(shape_m, BLOCK_M, m_block_idx);
+                    constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous);
+                    const uint32_t n_idx = scheduler.template get_global_idx<kBGroupOffset>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
+                    const auto tma_a_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_a : &tensor_map_a_base);
+                    const auto tma_b_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_b : &tensor_map_b_base);
+
+                    constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
+                    const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
+
+                    for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
+                        CUTE_TIE_DECL(get_pipeline(tma_iter_idx++), s, p);
+                        empty_barriers[s]->wait(p ^ 1);
+
+                        const uint32_t k_idx = kb * BLOCK_K;
+                        uint32_t sfa_k, sfb_k;
+                        if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+                            sfa_k = scheduler.current_sf_k_cumsum + kb / kNumSFAStagesPerLoad;
+                            sfb_k = scheduler.current_sf_k_cumsum + kb / kNumSFBStagesPerLoad;
+                        } else {
+                            const uint32_t shape_sfa_k = math::ceil_div(shape_k, BLOCK_K * kNumSFAStagesPerLoad);
+                            const uint32_t shape_sfb_k = math::ceil_div(shape_k, BLOCK_K * kNumSFBStagesPerLoad);
+                            constexpr bool kSFAGroupOffset = not is_m_grouped_contiguous(kGemmType);
+                            sfa_k = scheduler.template get_global_idx<kSFAGroupOffset, sched::IndexType::SF_K>(
+                                shape_sfa_k, 1, kb / kNumSFAStagesPerLoad, m_block_idx);
+                            constexpr bool kSFBGroupOffset = not (kGemmType == GemmType::Normal);
+                            sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
+                                shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
+                        }
+                        tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
+                        tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
+                        tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
+                        if constexpr (kBKMajor) {
+                            tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
+                        } else {
+                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
+                                tma_b_desc, full_barriers[s], smem_b[s],
+                                n_idx, k_idx, 1, batch_idx);
+                        }
+                        full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
                     }
-                    full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
                 }
             }
         }
@@ -1236,19 +1324,21 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 store_pair(&gmem_d[idx], v2, v3);
                             }
                         } else {
-                            if (row0 < total_shape_m and col + 1 < shape_n) {
-                                float v0 = accum[ai + 0], v1 = accum[ai + 1];
-                                auto i0 = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + static_cast<int64_t>(col) * cd_n_stride;
-                                auto i1 = i0 + cd_n_stride;
-                                gmem_d[i0] = cd_dtype_t(v0);
-                                gmem_d[i1] = cd_dtype_t(v1);
+                            // Strided store: elements at col and col+1 map to separate N positions.
+                            // Bounds check per-element (not per-pair) to handle shape_n=1.
+                            if (row0 < total_shape_m) {
+                                auto base = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride;
+                                if (col < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 0]);
+                                if (col + 1 < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 1]);
                             }
-                            if (row1 < total_shape_m and col + 1 < shape_n) {
-                                float v2 = accum[ai + 2], v3 = accum[ai + 3];
-                                auto i0 = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + static_cast<int64_t>(col) * cd_n_stride;
-                                auto i1 = i0 + cd_n_stride;
-                                gmem_d[i0] = cd_dtype_t(v2);
-                                gmem_d[i1] = cd_dtype_t(v3);
+                            if (row1 < total_shape_m) {
+                                auto base = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride;
+                                if (col < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 2]);
+                                if (col + 1 < shape_n)
+                                    gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 3]);
                             }
                         }
                     }
