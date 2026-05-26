@@ -190,7 +190,7 @@ struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
         current_q_atom_idx = current_pack.x, current_kv_idx = current_pack.y * kNumBlocksPerSplit;
         end_q_atom_idx = end_pack.x, end_kv_idx = end_pack.y * kNumBlocksPerSplit;
 
-        current_num_kv = get_num_kv(current_q_atom_idx);
+        current_num_kv = exist_q_atom_idx(current_q_atom_idx) ? get_num_kv(current_q_atom_idx) : 0;
     }
 
     // Advance step in q_atom_idx space when moving to the next atom.
