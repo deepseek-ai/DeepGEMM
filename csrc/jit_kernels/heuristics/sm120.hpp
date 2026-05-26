@@ -23,10 +23,17 @@ struct SM120ArchSpec {
         // BLOCK_M candidates: only {64, 128} are valid (must be multiple of kMWarps * MMA_M = 64).
         // CRITICAL: BLOCK_M must not exceed runtime_align for grouped contiguous GEMM,
         // otherwise tiles straddle expert boundaries causing wrong results.
+        const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
+        const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
+
         std::vector<int> block_m_candidates;
         if (runtime_align <= kMinBlockM)
             block_m_candidates.push_back(64);
         else {
+            // For swap path (small N, large M): prefer BM=64 for better SM utilization
+            // (more blocks → more active SMs in single-wave regime).
+            if (is_small_n)
+                block_m_candidates.push_back(64);
             block_m_candidates.push_back(128);
             if (expected_m > 0 and expected_m <= kMinBlockM)
                 block_m_candidates.push_back(64);
@@ -43,9 +50,6 @@ struct SM120ArchSpec {
         block_k_candidates.push_back(128 / elem_size);
 
         // Block N candidates
-        const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
-        const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
-
         std::vector<int> block_n_candidates;
         if (is_small_n) {
             // BN=16 always valid: K-major B has N as TMA outer dim, no minimum.
