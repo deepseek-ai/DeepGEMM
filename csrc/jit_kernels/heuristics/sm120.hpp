@@ -13,37 +13,33 @@ namespace deep_gemm {
 struct SM120ArchSpec {
     static constexpr int smem_capacity = 101376;  // 99KB
 
-    static constexpr int kMinBlockM_FP8 = 64;   // kMWarps(4) * MMA_M(16), FP8 kernel has kNWarps=2
-    static constexpr int kMinBlockM_BF16 = 128; // 8 math warps * MMA_M(16), BF16 kernel has no N-warp split
+    static constexpr int kMinBlockM = 64;   // kMWarps(4) * MMA_M(16), both FP8 and BF16 with kNWarps=2
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
         const int expected_m = desc.get_expected_m();
-        const bool is_bf16 = (desc.a_dtype == at::kBFloat16);
-        const int kMinBlockM = is_bf16 ? kMinBlockM_BF16 : kMinBlockM_FP8;
 
-        // BLOCK_M candidates: FP8 supports {64, 128}, BF16 only supports {128}.
+        // BLOCK_M candidates: {64, 128} valid for both FP8 and BF16 (kNWarps=2, kMWarps=4).
         // CRITICAL: BLOCK_M must not exceed runtime_align for grouped contiguous GEMM,
         // otherwise tiles straddle expert boundaries causing wrong results.
         const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
         const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
 
         std::vector<int> block_m_candidates;
-        if (not is_bf16 and runtime_align <= kMinBlockM)
+        if (runtime_align <= kMinBlockM)
             block_m_candidates.push_back(64);
         else {
-            if (not is_bf16 and is_small_n)
+            if (is_small_n)
                 block_m_candidates.push_back(64);
             block_m_candidates.push_back(128);
-            if (not is_bf16 and expected_m > 0 and expected_m <= kMinBlockM)
+            if (expected_m > 0 and expected_m <= kMinBlockM)
                 block_m_candidates.push_back(64);
             // For Normal GEMM with very few MN blocks: BM=64 creates more blocks
-            // for split-K to fill SMs. Only when M fits in one BM=128 tile and
-            // the MN block count is critically low.
+            // for split-K to fill SMs.
             const int eff_m = expected_m > 0 ? expected_m : desc.m;
             const int approx_mn_blocks_128 = ceil_div(eff_m, 128) * ceil_div(n_for_tile, 64);
-            if (not is_bf16 and desc.gemm_type == GemmType::Normal
+            if (desc.gemm_type == GemmType::Normal
                 and eff_m <= 128 and approx_mn_blocks_128 < desc.num_sms / 8)
                 block_m_candidates.push_back(64);
         }
@@ -79,6 +75,10 @@ struct SM120ArchSpec {
 
         std::vector<Layout> candidates;
         for (int block_m : block_m_candidates) {
+        // For grouped contiguous GEMM, BLOCK_M must divide runtime_align
+        // to prevent tiles from straddling expert boundaries.
+        if (is_m_grouped_contiguous(desc.gemm_type) and block_m > runtime_align)
+            continue;
         for (int block_k : block_k_candidates) {
         for (int block_n : block_n_candidates) {
             if (!is_small_n and (block_n > 128 or block_n > mn_major_b_max_n))

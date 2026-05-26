@@ -34,6 +34,10 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        // kNWarps: BM=64 needs kNWarps=2 (kMWarps=4); BM=128 uses default
+        // kNWarps=kNumMathWarps (all warps along M, original layout).
+        const uint32_t block_m = args.gemm_config.layout.block_m;
+        const uint32_t k_n_warps = (block_m % 64 == 0 and block_m < 128) ? 2u : 1u;
         return fmt::format(R"(
 #include <deep_gemm/impls/sm120_bf16_gemm.cuh>
 
@@ -50,6 +54,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
+        {},
         {},
         {},
         {}
@@ -69,7 +74,8 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type),
-        args.gemm_desc.major_b == cute::UMMA::Major::K ? "true" : "false");
+        args.gemm_desc.major_b == cute::UMMA::Major::K ? "true" : "false",
+        k_n_warps);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

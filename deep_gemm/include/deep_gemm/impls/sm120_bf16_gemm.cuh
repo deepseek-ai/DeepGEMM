@@ -37,7 +37,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t,
           typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
-          bool kBKMajor = true>
+          bool kBKMajor = true,
+          uint32_t kNWarps_ = 1>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                      cutlass::bfloat16_t* gmem_a_ptr, cutlass::bfloat16_t* gmem_b_ptr,
@@ -63,14 +64,21 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(BLOCK_M % MMA_M == 0 and BLOCK_N % MMA_N == 0 and BLOCK_K % MMA_K == 0, "Invalid block dims");
 
     static constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
-    static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kNumMathWarps / MMA_M;
     static constexpr uint32_t kNTiles = BLOCK_N / MMA_N;
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
-    static constexpr uint32_t kAccumPerWarp = kMTilesPerWarp * kNTiles * MMA_ACCUM;
 
-    DG_STATIC_ASSERT(BLOCK_M == kNumMathWarps * kMTilesPerWarp * MMA_M, "M tiles must divide evenly");
-    DG_STATIC_ASSERT(kBKMajor or kNTiles > 0, "Need at least one N tile");
-    DG_STATIC_ASSERT(not kBKMajor or kNTiles % 2 == 0, "kNTiles must be even for ldmatrix.x2 B loading");
+    static constexpr uint32_t kNWarps = kNWarps_;
+    static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
+    static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
+    static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
+    static constexpr uint32_t kAccumPerWarp = kMTilesPerWarp * kNTilesPerWarp * MMA_ACCUM;
+
+    DG_STATIC_ASSERT(kNumMathWarps % kNWarps == 0, "kNWarps must divide kNumMathWarps");
+    DG_STATIC_ASSERT(BLOCK_M == kMWarps * kMTilesPerWarp * MMA_M, "M tiles must divide evenly");
+    DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
+    DG_STATIC_ASSERT(kMTilesPerWarp >= 1, "Need at least 1 M-tile per warp");
+    DG_STATIC_ASSERT(kBKMajor or kNTilesPerWarp > 0, "Need at least one N tile per warp");
+    DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp % 2 == 0, "kNTilesPerWarp must be even for ldmatrix.x2 B loading");
 
     static constexpr uint32_t kTMARegisters = 40;
     static constexpr uint32_t kMMARegisters = 232;
@@ -240,7 +248,10 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         const uint32_t math_warp_idx = warp_idx;
         const uint32_t group_id = lane_idx / 4;
         const uint32_t thread_id = lane_idx % 4;
-        const uint32_t m_tile_base = math_warp_idx * kMTilesPerWarp;
+        const uint32_t warp_m = math_warp_idx / kNWarps;
+        const uint32_t warp_n = math_warp_idx % kNWarps;
+        const uint32_t m_tile_base = warp_m * kMTilesPerWarp;
+        const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
 
         float accum[kAccumPerWarp];
         uint32_t iter_idx = 0;
@@ -265,22 +276,22 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 }
 
                 // B context: K-major uses SwizzleContext + ldmatrix, MN-major uses scalar loads
-                [[maybe_unused]] sm120::SwizzleContext<kSwizzleBMode> b_ctx[kBKMajor ? kNTiles : 1];
+                [[maybe_unused]] sm120::SwizzleContext<kSwizzleBMode> b_ctx[kBKMajor ? kNTilesPerWarp : 1];
                 if constexpr (kBKMajor) {
                     #pragma unroll
-                    for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                        int b_row = (lane_idx & 7) + nt * 8;
+                    for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                        int b_row = (lane_idx & 7) + (n_tile_base + nt) * 8;
                         b_ctx[nt].init(b_row, kSMEMKBytes);
                     }
                 }
 
                 uint32_t a_frag[2][kMTilesPerWarp][4];
-                uint32_t b_tile[2][kNTiles][2];
+                uint32_t b_tile[2][kNTilesPerWarp][2];
 
                 auto load_kstep = [&](int buf, uint32_t ks) {
                     if constexpr (kBKMajor) {
                         #pragma unroll
-                        for (uint32_t nt = 0; nt < kNTiles; ++nt)
+                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
                             sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
                     } else {
                         static constexpr uint32_t kBAtomElems = kSwizzleBMode > 0 ? kSwizzleBMode / 2 : BLOCK_N;
@@ -294,9 +305,12 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             char* atom_base = smem_b[stage] + atom * BLOCK_K * kSwizzleBMode;
                             #pragma unroll
                             for (uint32_t nt_in = 0; nt_in < kNTilesPerAtom; ++nt_in) {
-                                const uint32_t nt = atom * kNTilesPerAtom + nt_in;
-                                void* addr = b_mn_ctx.addr(atom_base, nt_in * MMA_N * 2);
-                                sm120::ldmatrix_x2_trans(b_tile[buf][nt][0], b_tile[buf][nt][1], addr);
+                                const uint32_t nt_global = atom * kNTilesPerAtom + nt_in;
+                                if (nt_global >= n_tile_base and nt_global < n_tile_base + kNTilesPerWarp) {
+                                    const uint32_t nt = nt_global - n_tile_base;
+                                    void* addr = b_mn_ctx.addr(atom_base, nt_in * MMA_N * 2);
+                                    sm120::ldmatrix_x2_trans(b_tile[buf][nt][0], b_tile[buf][nt][1], addr);
+                                }
                             }
                         }
                     }
@@ -309,8 +323,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     #pragma unroll
                     for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
                         #pragma unroll
-                        for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                            float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTiles + nt) * MMA_ACCUM]);
+                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                            float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
                             sm120_mma::bf16_mma(d, a_frag[buf][mt], b_tile[buf][nt]);
                         }
                     }
@@ -359,18 +373,18 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 #pragma unroll
                 for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
                     #pragma unroll
-                    for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                        const uint32_t ai = (mt * kNTiles + nt) * MMA_ACCUM;
+                    for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                        const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
                         const uint32_t local_row0 = (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t local_row1 = local_row0 + 8;
-                        const uint32_t local_col  = nt * MMA_N + thread_id * 2;
+                        const uint32_t local_col  = (n_tile_base + nt) * MMA_N + thread_id * 2;
                         float v0 = accum[ai + 0], v1 = accum[ai + 1];
                         float v2 = accum[ai + 2], v3 = accum[ai + 3];
 
                         if constexpr (kWithAccumulation) {
                             const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
                             const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
-                                n_base + nt * MMA_N) + thread_id * 2;
+                                n_base + (n_tile_base + nt) * MMA_N) + thread_id * 2;
                             if (gr0 < total_shape_m and gc + 1 < shape_n) {
                                 const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
                                 v0 += read_cd(gmem_c[ci]); v1 += read_cd(gmem_c[ci + 1]);
@@ -437,10 +451,10 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 #pragma unroll
                 for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
                     #pragma unroll
-                    for (uint32_t nt = 0; nt < kNTiles; ++nt) {
-                        const uint32_t ai = (mt * kNTiles + nt) * MMA_ACCUM;
-                        const uint32_t n_tile_base = n_base + nt * MMA_N;
-                        const uint32_t col = epilogue_type_t::template apply_index_n<MMA_N>(n_tile_base) + thread_id * 2;
+                    for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                        const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                        const uint32_t nt_global_base = n_base + (n_tile_base + nt) * MMA_N;
+                        const uint32_t col = epilogue_type_t::template apply_index_n<MMA_N>(nt_global_base) + thread_id * 2;
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
