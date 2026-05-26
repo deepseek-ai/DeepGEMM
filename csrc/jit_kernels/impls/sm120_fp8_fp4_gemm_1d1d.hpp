@@ -217,7 +217,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     } else {
         config = get_best_config<SM120ArchSpec>(desc);
     }
-    if (!override_layout.has_value())
+    if (!override_layout.has_value() and !swap_ab)
         config.split_k_factor = SM120ArchSpec::get_split_k_factor(desc, config.layout);
 
     const auto cd = c.value_or(d);
