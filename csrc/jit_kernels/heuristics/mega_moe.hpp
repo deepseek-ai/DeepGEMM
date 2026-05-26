@@ -9,6 +9,7 @@
 #include "../../utils/math.hpp"
 #include "../../utils/system.hpp"
 #include "sm100.hpp"
+#include "sm90.hpp"
 
 namespace deep_gemm {
 
@@ -227,6 +228,274 @@ static MegaMoEConfig get_mega_moe_config(
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
             "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+        static std::unordered_set<std::string> printed;
+        if (printed.count(key) == 0) {
+            std::cout << key << ": " << config << std::endl;
+            printed.insert(key);
+        }
+    }
+    return config;
+}
+
+// ============================================================================
+// SM90 (Hopper) MegaMoE configuration
+// ----------------------------------------------------------------------------
+// SM90 differs from SM100 in:
+//   - No tensor memory (TMEM): WGMMA accumulators live in registers.
+//   - No FP4: weights are FP8 e4m3, scales are per-128 channel float.
+//   - No 2-CTA cluster MMA: TMA multicast cluster=2 may still be used.
+//   - SF for activations is float (not UE8M0 int) and per-128 (not per-32).
+// The kernel is in `deep_gemm/impls/sm90_fp8_mega_moe.cuh` and is currently
+// a skeleton; this config is what the host runtime reads.
+// ============================================================================
+
+struct MegaMoESM90Config {
+    // Block tiling (no STORE_BLOCK_M / SF_BLOCK_M concept on SM90)
+    int block_m, block_n, block_k;
+
+    // Cluster size for TMA multicast (1 or 2). Multicast is on A.
+    int cluster_size;
+
+    // Pool capacity and SF-padded token count (SF is per-128 float on SM90)
+    int num_max_pool_tokens;
+    int num_padded_sf_pool_tokens;
+
+    // Swizzle modes for TMA descriptors (acts/weights). Both are 128B on FP8 K-major.
+    int swizzle_acts_mode, swizzle_weights_mode;
+
+    // Number of experts to process per wave
+    int num_experts_per_wave;
+
+    // Pipeline stages and shared memory
+    int num_stages, smem_size;
+
+    // Thread layout: dispatch + non-epilogue (TMA) + epilogue (math)
+    int num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads;
+
+    friend std::ostream& operator << (std::ostream& os, const MegaMoESM90Config& config) {
+        os << "MegaMoESM90Config("
+           << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
+           << ", cluster_size=" << config.cluster_size
+           << ", num_max_pool_tokens=" << config.num_max_pool_tokens
+           << ", num_padded_sf_pool_tokens=" << config.num_padded_sf_pool_tokens
+           << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
+           << ", num_experts_per_wave=" << config.num_experts_per_wave
+           << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
+           << ", num_dispatch_threads=" << config.num_dispatch_threads
+           << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
+           << ", num_epilogue_threads=" << config.num_epilogue_threads << ")";
+        return os;
+    }
+};
+
+static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
+    const int& num_ranks, const int& num_experts,
+    const int& num_max_tokens_per_rank, const int& num_topk,
+    const int& num_tokens) {
+    // Keep mma.sync decode variants gated. M16 was correct but slower on H20;
+    // M32 is an experimental middle ground that cuts M64 padding without paying
+    // as much CTA/epilogue overhead as M16.
+    const int num_experts_per_rank = num_experts / num_ranks;
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    const int requested_mma_m = get_env<int>("DG_SM90_MOE_MMA_SYNC_M") > 0
+        ? get_env<int>("DG_SM90_MOE_MMA_SYNC_M")
+        : (get_env<int>("DG_SM90_MOE_MMA_SYNC") != 0 ? 16 : 0);
+    DG_HOST_ASSERT(requested_mma_m == 0 or requested_mma_m == 16 or requested_mma_m == 32);
+    const bool use_mma_sync_decode =
+        requested_mma_m > 0 and expected_tokens_per_expert <= static_cast<float>(requested_mma_m);
+    const bool use_bn256_split_n =
+        get_env<int>("DG_SM90_MOE_BN256_2WG") != 0 and not use_mma_sync_decode;
+    const bool use_bn256_seq_n =
+        get_env<int>("DG_SM90_MOE_BN256_SEQ") != 0 and not use_mma_sync_decode;
+    const bool use_b_stationary_2wg =
+        get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0 and not use_mma_sync_decode;
+    DG_HOST_ASSERT(not (use_bn256_split_n and use_bn256_seq_n));
+    DG_HOST_ASSERT(not (use_b_stationary_2wg and (use_bn256_split_n or use_bn256_seq_n)));
+    const int forced_block_m = get_env<int>("DG_SM90_MOE_FORCE_BLOCK_M");
+    const int forced_epilogue_warpgroups = get_env<int>("DG_SM90_MOE_FORCE_EPILOGUE_WG");
+    DG_HOST_ASSERT(forced_block_m == 0 or forced_block_m == 64 or forced_block_m == 128);
+    DG_HOST_ASSERT(forced_epilogue_warpgroups == 0 or
+                   forced_epilogue_warpgroups == 1 or
+                   forced_epilogue_warpgroups == 2);
+    const int block_m = forced_block_m > 0
+        ? forced_block_m
+        : (use_b_stationary_2wg ? 128 : (use_mma_sync_decode ? requested_mma_m : 64));
+    const int num_epilogue_warpgroups = forced_epilogue_warpgroups > 0
+        ? forced_epilogue_warpgroups
+        : ((use_b_stationary_2wg or use_bn256_split_n) ? 2 : 1);
+    DG_HOST_ASSERT(block_m % num_epilogue_warpgroups == 0);
+    DG_HOST_ASSERT((block_m != 16 and block_m != 32) or num_epilogue_warpgroups == 1);
+    DG_HOST_ASSERT(block_m != 128 or num_epilogue_warpgroups == 2);
+
+    DG_HOST_ASSERT(std::any_of(
+        layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
+        [=](const auto& candidate) { return candidate == block_m; })
+    );
+    return {block_m, num_epilogue_warpgroups * 128};
+}
+
+static int get_num_experts_per_wave_for_mega_moe_sm90(
+    const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
+    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
+    if (const int forced = get_env<int>("DG_SM90_MOE_EXPERTS_PER_WAVE"); forced > 0) {
+        DG_HOST_ASSERT(forced <= num_experts_per_rank);
+        DG_HOST_ASSERT(num_experts_per_rank % forced == 0);
+        return forced;
+    }
+
+    // SM90 (Hopper) wave heuristic.
+    //
+    // The generic heuristic is useful in the middle of the block_m=64 band, but
+    // very sparse routing and large batches both do better as a single all-expert
+    // wave: sparse cases avoid extra L1->L2 wave transitions, while large cases
+    // keep enough work resident without fragmenting expert scheduling.
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
+    if (block_m == 64 and (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f)) {
+        return num_experts_per_rank;
+    }
+    return get_num_experts_per_wave_for_mega_moe(
+        num_experts_per_rank, num_tokens, num_topk,
+        intermediate_hidden, block_m, block_n, num_sms);
+}
+
+static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
+    const int& smem_capacity,
+    const int& num_experts, const int& hidden,
+    const int& block_m, const int& block_n, const int& block_k,
+    const int& num_dispatch_warps, const int& num_epilogue_warps) {
+    constexpr int kSmemAlignment = 1024;
+
+    // Dispatch region (same as SM100)
+    const int smem_expert_count_size = align(
+        num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
+    const int smem_send_buffers_size = align(
+        static_cast<int>(layout::Buffer(layout::Data(hidden), num_dispatch_warps, 1).get_num_bytes()),
+        kSmemAlignment);
+    const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
+
+    // C/D output region: max of L1 FP8 (single-buffered, BLOCK_N/2 post-SwiGLU)
+    // and L2 BF16, then 1024-byte aligned (matches kernel's SMEM_CD_SIZE).
+    // The mma.sync decode path additionally stages one BLOCK_M x BLOCK_N FP32
+    // accumulator tile in SMEM for logical-row epilogue mapping.
+    const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
+    const bool split_n_warpgroups = block_m == 64 and block_n == 256 and num_epilogue_warpgroups == 2;
+    const bool serial_n_warpgroups = false;
+    const int wg_block_m = split_n_warpgroups ? block_m : block_m / num_epilogue_warpgroups;
+    const int wg_block_n = (split_n_warpgroups or serial_n_warpgroups) ? block_n / 2 : block_n;
+    const int smem_cd_accum = (block_m == 16 or block_m == 32) ? align(block_m * block_n * static_cast<int>(sizeof(float)), kSmemAlignment) : 0;
+    const int smem_cd_l1 = num_epilogue_warpgroups * wg_block_m * (wg_block_n / 2);  // 1 byte/elem (FP8)
+    const bool direct_l2_scatter = get_env<int>("DG_SM90_MOE_DIRECT_L2_SCATTER", 0) != 0 and
+                                   block_m != 16 and block_m != 32 and
+                                   not split_n_warpgroups and not serial_n_warpgroups;
+    const bool async_l1_tma_store = get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0 and
+                                    block_m != 16 and block_m != 32 and
+                                    not split_n_warpgroups and num_epilogue_warpgroups == 1;
+    const int smem_cd_l2 = direct_l2_scatter ? 0 :
+        num_epilogue_warpgroups * wg_block_m * wg_block_n * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd_l1_async = async_l1_tma_store ?
+        2 * num_epilogue_warpgroups * wg_block_m * (block_n / 2) : 0;
+    const int smem_cd = smem_cd_accum + align(std::max(std::max(smem_cd_l1, smem_cd_l2), smem_cd_l1_async), kSmemAlignment);
+
+    // SF on SM90:
+    //   * SFA per stage must hold the larger of L1 (BLOCK_M floats, per-128 K)
+    //     and L2 (2 * BLOCK_M floats, per-64 K), aligned to 128 bytes
+    //   * SFB is loaded directly from global by the math warpgroup (block-(128,128)
+    //     weight quantization), so no SMEM is reserved for it.
+    const int smem_sfa_half_stride_bytes = align(block_m * static_cast<int>(sizeof(float)), 128);
+    const int smem_sfa_per_stage = 2 * smem_sfa_half_stride_bytes;
+    const int smem_sfb_per_stage = 0;
+
+    // Per-stage: A tile + B tile + SFA tile + SFB tile
+    const int smem_per_stage = block_m * block_k + block_n * block_k +
+                               smem_sfa_per_stage + smem_sfb_per_stage;
+
+    // Barriers (8 bytes each):
+    //   * dispatch: num_dispatch_warps
+    //   * GEMM full + empty: 2 * num_stages
+    //   * combine: 2 * num_epilogue_warps
+    const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
+    const int smem_barriers_per_stage = 2 * 8;
+
+    // Fixed total
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_barriers_fixed;
+
+    // Select max num_stages, with an optional SM90-only sweep override.
+    const int max_num_stages = (smem_capacity - smem_fixed) /
+                               (smem_per_stage + smem_barriers_per_stage);
+    const int forced_num_stages = get_env<int>("DG_SM90_MOE_NUM_STAGES");
+    const int num_stages = forced_num_stages > 0 ? forced_num_stages : max_num_stages;
+    DG_HOST_ASSERT(num_stages >= 2 and num_stages <= max_num_stages);
+    return {num_stages,
+            smem_fixed + num_stages * (smem_per_stage + smem_barriers_per_stage)};
+}
+
+static MegaMoESM90Config get_mega_moe_config_sm90(
+    const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
+    const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
+    const int& hidden, const int& intermediate_hidden,
+    const int& num_padded_sf_pool_tokens) {
+    const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
+    const bool use_bn256_split_n =
+        get_env<int>("DG_SM90_MOE_BN256_2WG") != 0 and block_m != 16 and block_m != 32;
+    const bool use_bn256_seq_n =
+        get_env<int>("DG_SM90_MOE_BN256_SEQ") != 0 and block_m != 16 and block_m != 32;
+    DG_HOST_ASSERT(not (use_bn256_split_n and use_bn256_seq_n));
+    const int block_n = (use_bn256_split_n or use_bn256_seq_n) ? 256 : 128;
+    DG_HOST_ASSERT((not use_bn256_split_n) or num_epilogue_threads == 256);
+    const int block_k = 128;
+    // Default remains cluster_size=1.  The experimental cluster=2 path below
+    // is M-split/B-multicast for exact-balanced large-M tests: peer CTAs process
+    // adjacent M blocks for the same expert/N tile and share the B TMA load.
+    // `DG_SM90_MOE_B_STATIONARY_2WG=1` extends the same idea to M128/2WG:
+    // two WGs split M within each CTA, and the cluster pair reuses one B tile
+    // across four M64 WGMMA consumers.
+    const bool use_b_stationary_2wg = get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0;
+    const bool use_cluster_bcast_b = get_env<int>("DG_SM90_MOE_CLUSTER_BCAST_B") != 0 or use_b_stationary_2wg;
+    DG_HOST_ASSERT((not use_cluster_bcast_b) or
+                   ((block_m == 64 and block_n == 128 and num_epilogue_threads == 128) or
+                    (block_m == 128 and block_n == 128 and num_epilogue_threads == 256)));
+    const int cluster_size = use_cluster_bcast_b ? 2 : 1;
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+        num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+    const int swizzle_acts_mode = (block_m == 16 or block_m == 32) ? 0 : 128;
+    const int swizzle_weights_mode = (block_m == 16 or block_m == 32) ? 0 : 128;
+
+    const int num_sms = device_runtime->get_num_sms();
+    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
+        num_experts_per_rank, num_tokens, num_topk,
+        intermediate_hidden, block_m, block_n, num_sms);
+
+    const int forced_dispatch_warps = get_env<int>("DG_SM90_MOE_DISPATCH_WARPS");
+    const bool compact_frontend = get_env<int>("DG_SM90_MOE_COMPACT_FRONTEND") != 0;
+    DG_HOST_ASSERT(forced_dispatch_warps == 0 or forced_dispatch_warps == 2 or
+                   forced_dispatch_warps == 4 or forced_dispatch_warps == 8);
+    const int num_dispatch_threads = (forced_dispatch_warps > 0 ? forced_dispatch_warps : 4) * 32;
+    DG_HOST_ASSERT((not compact_frontend) or num_dispatch_threads == 64);
+    const int num_non_epilogue_threads = compact_frontend ? 64 : 128;
+
+    const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
+        SM90ArchSpec::smem_capacity,
+        num_experts, hidden,
+        block_m, block_n, block_k,
+        num_dispatch_threads / 32, num_epilogue_threads / 32);
+
+    const auto config = MegaMoESM90Config {
+        block_m, block_n, block_k,
+        cluster_size,
+        num_max_pool_tokens, num_padded_sf_pool_tokens,
+        swizzle_acts_mode, swizzle_weights_mode,
+        num_experts_per_wave,
+        num_stages, smem_size,
+        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
+    };
+
+    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
+        const auto key = fmt::format(
+            "MegaMoESM90Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {

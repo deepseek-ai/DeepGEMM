@@ -151,7 +151,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_topk=num_topk, use_fp8_dispatch=True,
         explicitly_destroy=True,
         allow_multiple_reduction=False,
-        gpu_timeout_secs=10, cpu_timeout_secs=30
+        num_gpu_timeout_secs=10, num_cpu_timeout_secs=30
     ) if is_legacy_loaded else None
 
     def run_baseline():
