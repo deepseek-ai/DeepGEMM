@@ -1190,6 +1190,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if args.dump_profile_traces
             else None
         ),
+        with_multiple_kernels=os.environ.get(
+            "DG_SM90_MOE_SPLIT_L1_L2",
+            "1" if args.num_max_tokens_per_rank >= 1024 else "0",
+        ) != "0",
     )
     if phase_profile_enabled:
         cum_stats_fused.zero_()

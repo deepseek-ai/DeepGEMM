@@ -49,6 +49,7 @@ public:
         bool l1_dual_k_accum;
         bool l2_nmajor_schedule;
         bool l1_nmajor_schedule;
+        int split_phase_mode;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -102,6 +103,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -126,7 +128,8 @@ static void __instantiate_kernel() {{
     args.phase_profile ? "true" : "false",
     args.l1_dual_k_accum ? "true" : "false",
     args.l2_nmajor_schedule ? "true" : "false",
-    args.l1_nmajor_schedule ? "true" : "false");
+    args.l1_nmajor_schedule ? "true" : "false",
+    args.split_phase_mode);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -246,6 +249,7 @@ static void sm90_fp8_mega_moe(
         .l1_dual_k_accum = get_env<int>("DG_SM90_MOE_L1_DUAL_K", 0) != 0,
         .l2_nmajor_schedule = get_env<int>("DG_SM90_MOE_L2_NMAJOR", 0) != 0,
         .l1_nmajor_schedule = get_env<int>("DG_SM90_MOE_L1_NMAJOR", 0) != 0,
+        .split_phase_mode = 0,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -263,9 +267,22 @@ static void sm90_fp8_mega_moe(
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
-    const auto code = SM90FP8MegaMoERuntime::generate(args);
-    const auto runtime = compiler->build("sm90_fp8_mega_moe", code);
-    SM90FP8MegaMoERuntime::launch(runtime, args);
+    const auto launch_with_split_mode = [&](const int split_phase_mode, const char* kernel_name) {
+        auto split_args = args;
+        split_args.split_phase_mode = split_phase_mode;
+        const auto code = SM90FP8MegaMoERuntime::generate(split_args);
+        const auto runtime = compiler->build(kernel_name, code);
+        SM90FP8MegaMoERuntime::launch(runtime, split_args);
+    };
+
+    const bool split_l1_l2 = get_env<int>(
+        "DG_SM90_MOE_SPLIT_L1_L2", num_max_tokens_per_rank >= 1024 ? 1 : 0) != 0;
+    if (split_l1_l2) {
+        launch_with_split_mode(1, "sm90_fp8_mega_moe_split_l1");
+        launch_with_split_mode(2, "sm90_fp8_mega_moe_split_l2");
+    } else {
+        launch_with_split_mode(0, "sm90_fp8_mega_moe");
+    }
 }
 
 } // namespace deep_gemm

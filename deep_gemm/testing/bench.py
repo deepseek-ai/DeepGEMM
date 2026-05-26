@@ -141,6 +141,11 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
                         total_time += float(time_str.replace(unit, '')) / scale * int(num_str)
                         total_num += int(num_str)
                         break
-        kernel_times.append(total_time / total_num if total_num > 0 else 0)
+        if total_num > 0 and with_multiple_kernels:
+            # Multiple matching kernels can belong to one logical benchmarked op
+            # (e.g. split MegaMoE L1/L2). Report summed CUDA time per fn() call.
+            kernel_times.append(total_time / num_tests)
+        else:
+            kernel_times.append(total_time / total_num if total_num > 0 else 0)
 
     return tuple(kernel_times) if is_tuple else kernel_times[0]

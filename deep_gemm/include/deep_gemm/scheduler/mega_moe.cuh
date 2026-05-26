@@ -242,6 +242,39 @@ struct MegaMoEScheduler {
                  m_block_idx, n_block_idx);
         }
     }
+
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_linear1_block(Func&& func) {
+        // Split-kernel mode: K1 owns only dispatch + Linear1. Unlike
+        // for_each_block(), do not burn scheduler iterations on Linear2 blocks.
+        fetch_expert_recv_count();
+        set_expert_idx(0);
+        while (current_local_expert_idx < kNumExpertsPerRank) {
+            if (fetch_next_l1_block()) {
+                block_idx += kNumSMs / kClusterSize;
+                func(current_local_expert_idx, kNumL1BlockKs, m_block_idx, n_block_idx);
+            } else if (current_local_expert_idx >= kNumExpertsPerRank) {
+                break;
+            }
+        }
+    }
+
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_linear2_block(Func&& func) {
+        // Split-kernel mode: K2 starts after K1 has completed globally, so all
+        // L2-ready masks are already final. Schedule Linear2 blocks directly
+        // from the phase start, like a standalone grouped GEMM.
+        fetch_expert_recv_count();
+        set_expert_idx(0);
+        while (current_local_expert_idx < kNumExpertsPerRank) {
+            if (fetch_next_l2_block()) {
+                block_idx += kNumSMs / kClusterSize;
+                func(current_local_expert_idx, kNumL2BlockKs, m_block_idx, n_block_idx);
+            } else if (current_local_expert_idx >= kNumExpertsPerRank) {
+                break;
+            }
+        }
+    }
 };
 
 } // namespace deep_gemm::sched
