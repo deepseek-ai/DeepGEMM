@@ -49,7 +49,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              int* grouped_layout,
                              cute::TmaDescriptor* tensor_map_buffer,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                             uint32_t stride_cd_m, uint32_t stride_cd_batch,
+                             uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
@@ -1208,9 +1208,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
                 };
 
-                // stride_cd_m == 1 signals AB-swap mode (normal: stride_cd_m >= BLOCK_N)
-                const bool can_pair = (cd_m_stride > 1);
-                const int64_t cd_n_stride = can_pair ? 1 : static_cast<int64_t>(shape_m);
+                const bool can_pair = (stride_cd_n == 0);
+                const int64_t cd_n_stride = can_pair ? 1 : static_cast<int64_t>(stride_cd_n);
 
                 #pragma unroll
                 for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {

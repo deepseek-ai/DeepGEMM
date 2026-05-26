@@ -13,29 +13,30 @@ namespace deep_gemm {
 struct SM120ArchSpec {
     static constexpr int smem_capacity = 101376;  // 99KB
 
-    static constexpr int kMinBlockM = 64;   // kMWarps(4) * MMA_M(16)
+    static constexpr int kMinBlockM_FP8 = 64;   // kMWarps(4) * MMA_M(16), FP8 kernel has kNWarps=2
+    static constexpr int kMinBlockM_BF16 = 128; // 8 math warps * MMA_M(16), BF16 kernel has no N-warp split
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
         const int expected_m = desc.get_expected_m();
+        const bool is_bf16 = (desc.a_dtype == at::kBFloat16);
+        const int kMinBlockM = is_bf16 ? kMinBlockM_BF16 : kMinBlockM_FP8;
 
-        // BLOCK_M candidates: only {64, 128} are valid (must be multiple of kMWarps * MMA_M = 64).
+        // BLOCK_M candidates: FP8 supports {64, 128}, BF16 only supports {128}.
         // CRITICAL: BLOCK_M must not exceed runtime_align for grouped contiguous GEMM,
         // otherwise tiles straddle expert boundaries causing wrong results.
         const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
         const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
 
         std::vector<int> block_m_candidates;
-        if (runtime_align <= kMinBlockM)
+        if (not is_bf16 and runtime_align <= kMinBlockM)
             block_m_candidates.push_back(64);
         else {
-            // For swap path (small N, large M): prefer BM=64 for better SM utilization
-            // (more blocks → more active SMs in single-wave regime).
-            if (is_small_n)
+            if (not is_bf16 and is_small_n)
                 block_m_candidates.push_back(64);
             block_m_candidates.push_back(128);
-            if (expected_m > 0 and expected_m <= kMinBlockM)
+            if (not is_bf16 and expected_m > 0 and expected_m <= kMinBlockM)
                 block_m_candidates.push_back(64);
         }
         if (block_m_candidates.empty())
@@ -145,7 +146,8 @@ struct SM120ArchSpec {
 
         int store_m = layout.block_m;
         constexpr int kSubTileM = 64;
-        if (swizzle_mode_cd > 0 and layout.block_m > kSubTileM) {
+        const bool supports_subtile = (desc.kernel_type != KernelType::KernelNoSF);
+        if (supports_subtile and swizzle_mode_cd > 0 and layout.block_m > kSubTileM) {
             const int smem_d_sub = get_smem_d_size_for_swizzle(desc, layout, swizzle_mode_cd, kSubTileM);
             const int stages_sub = std::min((smem_capacity - smem_barriers - smem_d_sub) / per_stage, kNumMaxStages);
             if (stages_sub > stages_full)

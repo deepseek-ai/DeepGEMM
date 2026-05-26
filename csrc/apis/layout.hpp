@@ -142,9 +142,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_mk_alignment_for_contiguous_layout", [&]() {
         return heuristics_runtime->get_mk_alignment_for_contiguous_layout();
     });
-    m.def("get_theoretical_mk_alignment_for_contiguous_layout", [&](const std::optional<int>& expected_m) {
-        return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(expected_m);
-    }, py::arg("expected_m") = std::nullopt);
+    m.def("get_theoretical_mk_alignment_for_contiguous_layout", [&](const std::optional<int>& expected_m,
+                                                                       const std::optional<int>& num_groups) {
+        return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(expected_m, num_groups);
+    }, py::arg("expected_m") = std::nullopt, py::arg("num_groups") = std::nullopt);
 }
 
 } // namespace deep_gemm::layout

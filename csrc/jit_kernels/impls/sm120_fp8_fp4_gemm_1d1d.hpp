@@ -28,6 +28,7 @@ public:
         bool b_is_fp4;
         bool k_grouped_constant_stride;
         int stride_cd_m;
+        int stride_cd_n;
         int stride_cd_batch;
 
         void* gmem_d;
@@ -99,7 +100,7 @@ static void __instantiate_kernel() {{
             args.grouped_layout,
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.stride_cd_m, args.stride_cd_batch,
+            args.stride_cd_m, args.stride_cd_n, args.stride_cd_batch,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
             args.tensor_map_cd));
@@ -187,6 +188,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = swap_ab ? static_cast<int>(d.stride(-1)) : d_stride,
+        .stride_cd_n = swap_ab ? static_cast<int>(d.stride(-2)) : 0,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,
@@ -288,6 +290,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = k_grouped_constant_stride,
         .stride_cd_m = n,
+        .stride_cd_n = 0,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = cd.data_ptr(),
@@ -380,6 +383,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = n,
+        .stride_cd_n = 0,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
@@ -463,6 +467,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = n,
+        .stride_cd_n = 0,
         .stride_cd_batch = 0,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
@@ -547,6 +552,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .b_is_fp4 = b_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = swap_ab ? static_cast<int>(d.stride(-1)) : static_cast<int>(d.stride(1)),
+        .stride_cd_n = swap_ab ? static_cast<int>(d.stride(1)) : 0,
         .stride_cd_batch = static_cast<int>(d.stride(0)),
         .gmem_d = d.data_ptr(),
         .gmem_c = c.has_value() ? cd.data_ptr() : nullptr,

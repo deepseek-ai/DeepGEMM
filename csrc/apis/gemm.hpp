@@ -505,7 +505,19 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     } else if (arch_major == 10) {
         sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
     } else if (arch_major == 12) {
-        sm120_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
+        auto a_k = a;
+        auto b_k = b;
+        auto eff_major_a = major_a;
+        auto eff_major_b = major_b;
+        if (major_a != cute::UMMA::Major::K) {
+            a_k = a.contiguous();
+            eff_major_a = cute::UMMA::Major::K;
+        }
+        if (major_b != cute::UMMA::Major::K) {
+            b_k = b.contiguous();
+            eff_major_b = cute::UMMA::Major::K;
+        }
+        sm120_bf16_gemm(a_k, b_k, c, d, m, n, k, eff_major_a, eff_major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
