@@ -38,6 +38,14 @@ struct SM120ArchSpec {
             block_m_candidates.push_back(128);
             if (not is_bf16 and expected_m > 0 and expected_m <= kMinBlockM)
                 block_m_candidates.push_back(64);
+            // For Normal GEMM with very few MN blocks: BM=64 creates more blocks
+            // for split-K to fill SMs. Only when M fits in one BM=128 tile and
+            // the MN block count is critically low.
+            const int eff_m = expected_m > 0 ? expected_m : desc.m;
+            const int approx_mn_blocks_128 = ceil_div(eff_m, 128) * ceil_div(n_for_tile, 64);
+            if (not is_bf16 and desc.gemm_type == GemmType::Normal
+                and eff_m <= 128 and approx_mn_blocks_128 < desc.num_sms / 8)
+                block_m_candidates.push_back(64);
         }
         if (block_m_candidates.empty())
             block_m_candidates.push_back(128);
@@ -248,10 +256,26 @@ struct SM120ArchSpec {
         const double sync_per_kb = kSyncBaseCy / std::sqrt(static_cast<double>(num_stages));
 
         const double tma_per_kb = tma_bytes_per_kb * kCyPerTmaByte + sync_per_kb;
-        const double block_time = k_blocks * tma_per_kb + kBlockOverheadCy;
-        const int64_t total_latency = static_cast<int64_t>(num_waves * block_time);
 
-        return {num_waves, last_wave_util, total_latency, layout};
+        // Account for split-K when evaluating tile candidates: if the tile produces
+        // too few blocks, split-K will divide K across more blocks. Model this by
+        // computing the effective k_blocks per partition and total waves.
+        const int split_k = (desc.gemm_type == GemmType::Normal) ? get_split_k_factor(desc, layout) : 1;
+        const int k_blocks_eff = (split_k > 1) ? k_blocks / split_k : k_blocks;
+        const int total_blocks = num_blocks * split_k;
+        const auto num_waves_eff = ceil_div(total_blocks, desc.num_sms);
+
+        const double block_time = k_blocks_eff * tma_per_kb + kBlockOverheadCy;
+        // Split-K adds reduction overhead: reduce kernel launch + workspace write/read.
+        // Empirically ~2-3 us on SM120a, modeled as fixed + per-element cost.
+        const double reduce_fixed_cy = 5000.0;
+        const double reduce_per_elem_cy = 0.01;
+        const double reduce_overhead = (split_k > 1)
+            ? reduce_fixed_cy + reduce_per_elem_cy * desc.get_expected_m() * desc.get_expected_n()
+            : 0.0;
+        const int64_t total_latency = static_cast<int64_t>(num_waves_eff * block_time + reduce_overhead);
+
+        return {num_waves_eff, last_wave_util, total_latency, layout};
     }
 
     static bool compare(const LayoutInfo& a, const LayoutInfo& b) {
@@ -272,6 +296,37 @@ struct SM120ArchSpec {
             return a.layout.block_m > b.layout.block_m;
         // Final: lower absolute latency
         return a.num_cycles < b.num_cycles;
+    }
+
+    static int get_split_k_factor(const GemmDesc& desc, const Layout& layout) {
+        if (desc.gemm_type != GemmType::Normal)
+            return 1;
+
+        const int num_m_blocks = ceil_div(desc.get_expected_m(), layout.block_m);
+        const int num_n_blocks = ceil_div(desc.get_expected_n(), layout.block_n);
+        const int num_mn_blocks = num_m_blocks * num_n_blocks;
+        const int num_k_blocks = ceil_div(static_cast<int>(desc.get_expected_k()), layout.block_k);
+
+        if (num_mn_blocks >= desc.num_sms / 2)
+            return 1;
+
+        const int target_blocks = desc.num_sms * 3 / 4;
+        int split_k = ceil_div(target_blocks, num_mn_blocks);
+
+        // k_per_split must be divisible by SF tile size (4 k-blocks = one packed int32 SF)
+        // so each partition starts at an SF tile boundary.
+        constexpr int kSFTileKBlocks = 4;
+        while (split_k > 1 and (num_k_blocks % split_k != 0 or (num_k_blocks / split_k) % kSFTileKBlocks != 0))
+            --split_k;
+
+        split_k = std::min(split_k, num_k_blocks / (2 * kSFTileKBlocks));
+
+        constexpr int64_t kMaxWorkspaceBytes = 32 * 1024 * 1024;
+        const int64_t mn_bytes = static_cast<int64_t>(desc.get_expected_m()) * desc.get_expected_n() * sizeof(float);
+        if (mn_bytes > 0)
+            split_k = std::min(split_k, std::max(static_cast<int>(kMaxWorkspaceBytes / mn_bytes), 1));
+
+        return std::max(split_k, 1);
     }
 };
 

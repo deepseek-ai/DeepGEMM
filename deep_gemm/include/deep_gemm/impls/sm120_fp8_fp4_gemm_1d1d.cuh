@@ -42,12 +42,14 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBIsFP4 = false,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false,
-          uint32_t kEpiSubM = BLOCK_M>
+          uint32_t kEpiSubM = BLOCK_M,
+          uint32_t kSplitKFactor = 1>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                              int* grouped_layout,
                              cute::TmaDescriptor* tensor_map_buffer,
+                             float* gmem_workspace,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
@@ -200,7 +202,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = kGranKA * 4;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs, kSFKAlignment>(
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs, kSFKAlignment,
+        sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, false>(), kSplitKFactor>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
@@ -267,6 +270,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                 const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
                 const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
+                uint32_t kb_start = 0, kb_end = num_k_blocks;
+                if constexpr (kSplitKFactor > 1) {
+                    const uint32_t k_per_split = num_k_blocks / kSplitKFactor;
+                    kb_start = scheduler.split_k_idx * k_per_split;
+                    kb_end = (scheduler.split_k_idx == kSplitKFactor - 1) ? num_k_blocks : kb_start + k_per_split;
+                }
                 constexpr bool kAGroupOffset = (kGemmType == GemmType::MGroupedMasked);
                 const uint32_t m_idx = scheduler.template get_global_idx<kAGroupOffset>(shape_m, BLOCK_M, m_block_idx);
                 constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous);
@@ -277,7 +286,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
                 const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
 
-                for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
+                for (uint32_t kb = kb_start; kb < kb_end; ++kb) {
                     CUTE_TIE_DECL(get_pipeline(tma_iter_idx++), s, p);
                     empty_barriers[s]->wait(p ^ 1);
 
@@ -330,7 +339,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
-            const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
+            const uint32_t num_k_blocks_total = math::ceil_div(current_shape_k, BLOCK_K);
+            uint32_t num_k_blocks_start = 0, num_k_blocks = num_k_blocks_total;
+            if constexpr (kSplitKFactor > 1) {
+                const uint32_t k_per_split = num_k_blocks_total / kSplitKFactor;
+                num_k_blocks_start = scheduler.split_k_idx * k_per_split;
+                num_k_blocks = ((scheduler.split_k_idx == kSplitKFactor - 1) ? num_k_blocks_total : num_k_blocks_start + k_per_split) - num_k_blocks_start;
+            }
 
             #pragma unroll
             for (uint32_t i = 0; i < kAccumPerWarp; ++i) accum[i] = 0.f;
@@ -397,8 +412,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
 
                     // Compile-time byte index: maps kb_inner to the correct byte within packed SF.
-                    // For BK=128, gran_k=128: sf_byte = kb_inner (0,1,2,3)
-                    // For BK=64,  gran_k=128: sf_byte = (kb_inner/2)%4 (0,0,1,1,2,2,3,3)
+                    // For split-K: k_per_split must be aligned to kSFTileKBlocks so
+                    // each partition starts at an SF tile boundary.
                     constexpr uint32_t sf_byte_a = (kb_inner * BLOCK_K / kGranKA) % 4;
                     constexpr uint32_t sf_byte_b = (kb_inner * BLOCK_K / kGranKB) % 4;
 
@@ -1100,6 +1115,35 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             } // else (!kUseSFMajorLoop) — original path
 
             // ======== EPILOGUE ========
+            if constexpr (kSplitKFactor > 1) {
+                // Split-K: write FP32 partials to workspace
+                const uint32_t m_base_sk = m_block_idx * BLOCK_M;
+                const uint32_t n_base_sk = n_block_idx * BLOCK_N;
+                float* ws = gmem_workspace + static_cast<int64_t>(scheduler.split_k_idx) * shape_m * shape_n;
+
+                #pragma unroll
+                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                    #pragma unroll
+                    for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                        const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                        const uint32_t col = n_base_sk + (n_tile_base + nt) * MMA_N + thread_id * 2;
+                        const uint32_t row0 = m_base_sk + (m_tile_base + mt) * MMA_M + group_id;
+                        const uint32_t row1 = row0 + 8;
+
+                        if (row0 < shape_m and col + 1 < shape_n) {
+                            auto idx = static_cast<int64_t>(row0) * shape_n + col;
+                            ws[idx] = accum[ai + 0];
+                            ws[idx + 1] = accum[ai + 1];
+                        }
+                        if (row1 < shape_m and col + 1 < shape_n) {
+                            auto idx = static_cast<int64_t>(row1) * shape_n + col;
+                            ws[idx] = accum[ai + 2];
+                            ws[idx + 1] = accum[ai + 3];
+                        }
+                    }
+                }
+            } else {
+            // Normal epilogue (non-split-K)
             constexpr bool kEpilogueGroupOffset = not is_m_grouped_contiguous(kGemmType);
             const uint32_t m_base = scheduler.template get_global_idx<kEpilogueGroupOffset>(shape_m, BLOCK_M, m_block_idx);
             const uint32_t n_base = n_block_idx * BLOCK_N;
@@ -1254,13 +1298,19 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
                 }
             }
+            } // end else (non-split-K epilogue)
         } // persistent loop
 
         // Final TMA store drain
-        if constexpr (kUseTMAStoreEpilogue) {
+        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1) {
             if (math_warp_idx == 0 and lane_idx == 0)
                 cute::tma_store_wait<0>();
         }
+    }
+
+    // Signal completion for PDL (allows dependent reduce kernel to start)
+    if constexpr (kSplitKFactor > 1) {
+        cudaTriggerProgrammaticLaunchCompletion();
     }
 
 #else

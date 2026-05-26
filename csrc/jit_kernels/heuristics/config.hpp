@@ -141,13 +141,15 @@ struct GemmConfig {
     StorageConfig storage_config;
     PipelineConfig pipeline_config;
     LaunchConfig launch_config;
+    int split_k_factor = 1;
 
     friend std::ostream& operator << (std::ostream& os, const GemmConfig& config) {
         os << "GemmConfig("
            << "layout=" << config.layout
            << ", storage_config=" << config.storage_config
            << ", pipeline_config=" << config.pipeline_config
-           << ", launch_config=" << config.launch_config << ")";
+           << ", launch_config=" << config.launch_config
+           << ", split_k=" << config.split_k_factor << ")";
         return os;
     }
 };
