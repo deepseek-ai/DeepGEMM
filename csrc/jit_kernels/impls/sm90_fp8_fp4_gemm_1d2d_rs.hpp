@@ -29,9 +29,35 @@ public:
 
         cute::UMMA::Major major_sfb;
         bool scale_b_direct_load;
+        bool scale_b_pow2_promote;
         bool k32_quad_reduce;
+        bool k32_quad_split_promote;
+        bool k32_quad_scale_b_inline;
+        bool k32_quad_scale_b_prefetch;
+        bool k32_quad_scale_b_vec4;
+        bool k32_quad_pair4x2_promote;
         bool small_m_simple_sched;
+        bool compact_masked_sched;
+        // Fused-decode：在 cache_sfb_k32 阶段把 e8m0 scale 编进 LUT，wgmma 后省一次 fmul。
+        // 与 scale_b_direct_load / k32_quad_reduce / e8m0/bf16/pow2/compact_sched 互斥
+        // （host 决策侧保证），路径走 path-B 通用 cache_sfb_k32 + LUT decode。
+        bool fuse_scale_b_decode;
+        // 配合 fuse_scale_b_decode：sfb 物理布局是 [groups, K/32/4, N]（MN-major + 4 个
+        // e8m0 打包成 1 个 int32），体积 = fp32 的 1/4。需 sfb.scalar_type() == kInt。
+        bool scale_b_packed_ue8m0;
         uint32_t scale_b_gran_k;
+        // INT4-sym (signed [-8, 7] packed two nibbles/byte) variant for B.
+        // Path-A: per-128 fp32 SFB, no fused-decode. See kernel header.
+        bool b_is_int4_sym;
+        // bf16 SFB（path-A k128 / path-B fast-path）：体积砍半，scale 用 __nv_bfloat16。
+        bool scale_b_bf16;
+        // E8M0 SFB（path-B fast-path 专用）：每元素 1B = fp32 的 8 位指数。
+        // 解码 `__uint_as_float(uint32(e) << 23)` 零误差。仅 pow2 scale 适用。
+        bool scale_b_e8m0;
+        // compact_masked_sched 按 m_max 降序遍历 active group（实验性扩展）：
+        // 仅在 compact_masked_sched 开启时生效，让 wave 0 优先吃重 group，
+        // 减少 last-wave imbalance。host 默认关。
+        bool reorder_masked_by_max_m;
         void *gmem_b_ptr;
         void *gmem_d_ptr;
         void *sfb;
@@ -59,6 +85,11 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
+        {},
+        {},
+        {},
+        {},
         {},
         {},
         {},
@@ -147,7 +178,7 @@ static void __instantiate_kernel() {{
         "false",
         "false",
         "false",
-        "false",
+        args.scale_b_pow2_promote ? "true" : "false",
         "false",
         "false",
         args.scale_b_direct_load ? "true" : "false",
@@ -176,17 +207,18 @@ static void __instantiate_kernel() {{
         args.k32_quad_reduce ? "true" : "false",
         "false",
         args.k32_quad_reduce ? "true" : "false",
-        "false",
-        "false",
-        "false",
-        "false",
-        "false",
+        args.k32_quad_split_promote ? "true" : "false",
+        args.k32_quad_scale_b_inline ? "true" : "false",
+        args.k32_quad_scale_b_prefetch ? "true" : "false",
+        args.k32_quad_scale_b_vec4 ? "true" : "false",
+        args.k32_quad_pair4x2_promote ? "true" : "false",
         "false",
         "false",
         "false",
         "false",
         args.small_m_simple_sched ? "true" : "false",
-        "false",
+        args.compact_masked_sched ? "true" : "false",
+        args.fuse_scale_b_decode ? "true" : "false",
         "false",
         "false",
         "false",
@@ -197,11 +229,15 @@ static void __instantiate_kernel() {{
         "false",
         "false",
         0,
-        "false",
+        args.scale_b_packed_ue8m0 ? "true" : "false",
         args.scale_b_gran_k,
         1,
         1,
-        0);
+        0,
+        args.b_is_int4_sym ? "true" : "false",
+        args.scale_b_bf16 ? "true" : "false",
+        args.scale_b_e8m0 ? "true" : "false",
+        args.reorder_masked_by_max_m ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
