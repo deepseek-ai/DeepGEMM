@@ -96,7 +96,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kMMARegisters = 232;
 
     // SMEM D buffer for TMA store epilogue (sub-tile: kEpiSubM rows at a time)
-    static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
+    static constexpr bool kUseTMAStoreEpilogue = kSwizzleCDMode > 0
         and BLOCK_N * sizeof(cd_dtype_t) >= kSwizzleCDMode
         and (BLOCK_N * sizeof(cd_dtype_t)) % kSwizzleCDMode == 0;
     static constexpr uint32_t kNumEpiMSubs = kUseTMAStoreEpilogue ? (BLOCK_M / kEpiSubM) : 0;
@@ -1206,10 +1206,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 cd_dtype_t p1[2] = {cd_dtype_t(v2), cd_dtype_t(v3)};
                                 auto* smem_d_bytes = reinterpret_cast<char*>(smem_d_base);
                                 const uint32_t sub_base = sub_tile * kSwizzleCDMode * kEpiSubM;
-                                *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
-                                    *reinterpret_cast<const uint32_t*>(p0);
-                                *reinterpret_cast<uint32_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
-                                    *reinterpret_cast<const uint32_t*>(p1);
+                                using pair_store_t = cute::conditional_t<sizeof(cd_dtype_t) <= 2, uint32_t, uint64_t>;
+                                *reinterpret_cast<pair_store_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
+                                    *reinterpret_cast<const pair_store_t*>(p0);
+                                *reinterpret_cast<pair_store_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
+                                    *reinterpret_cast<const pair_store_t*>(p1);
                             }
                         }
                     }

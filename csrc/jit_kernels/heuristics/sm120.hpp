@@ -109,7 +109,7 @@ struct SM120ArchSpec {
 
     static int get_smem_d_size_for_swizzle(const GemmDesc& desc, const Layout& layout, int swizzle_cd, int store_m) {
         const int cd_size = c10::elementSize(desc.cd_dtype);
-        if (swizzle_cd > 0 and cd_size <= 2
+        if (swizzle_cd > 0
             and layout.block_n * cd_size >= swizzle_cd
             and (layout.block_n * cd_size) % swizzle_cd == 0)
             return (layout.block_n * cd_size / swizzle_cd) * swizzle_cd * store_m;
@@ -142,7 +142,7 @@ struct SM120ArchSpec {
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
         const int cd_size = c10::elementSize(desc.cd_dtype);
-        const auto swizzle_mode_cd = (cd_size <= 2 and layout.block_n * cd_size >= 128) ? 128 : 0;
+        const auto swizzle_mode_cd = (layout.block_n * cd_size >= 128) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
