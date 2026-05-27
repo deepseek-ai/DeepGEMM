@@ -18,15 +18,13 @@ namespace deep_gemm {
 // SM90 (Hopper) FP8 MegaMoE host runtime
 // ----------------------------------------------------------------------------
 // This is the SM90 counterpart of `SM100FP8FP4MegaMoERuntime`. The kernel
-// itself lives in `deep_gemm/impls/sm90_fp8_mega_moe.cuh` and is currently a
-// skeleton: dispatch/combine paths are intended to be portable from the SM100
-// version, while the GEMM (TMA load + WGMMA + epilogue) is being implemented
-// in a follow-up step.
+// itself lives in `deep_gemm/impls/sm90_fp8_mega_moe.cuh`.
 //
 // Differences from SM100 path:
 //   * Activations and weights are both FP8 (e4m3); no FP4.
-//   * Activation/weight scale factors (SF) are per-128-channel float (not UE8M0
-//     int + per-32 UTCCP layout).
+//   * Activation/weight scale factors (SF) are float, not UE8M0 int + per-32
+//     UTCCP layout. L1 activation SF and weight SF are per-128 K; the fused L1
+//     epilogue writes L2 activation SF at per-64 K granularity.
 //   * No tensor memory: WGMMA accumulators are register-resident.
 //   * Cluster size is at most 2 (TMA multicast on A); no 2-CTA UMMA.
 // ============================================================================
@@ -41,6 +39,11 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        int epilogue_registers;
+        bool reuse_accum_as_final;
+        bool l2_arrival_counter;
+        bool skip_l2_epilogue_sync;
+        bool split_phase_hot_path;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -85,6 +88,11 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
+        {},
+        {},
+        {},
+        {},
         {}
     >);
 }};
@@ -100,7 +108,12 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.epilogue_registers,
+    args.reuse_accum_as_final ? "true" : "false",
+    args.l2_arrival_counter ? "true" : "false",
+    args.skip_l2_epilogue_sync ? "true" : "false",
+    args.split_phase_hot_path ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -146,6 +159,26 @@ static void sm90_fp8_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens);
+    const int default_epilogue_registers =
+        config.num_epilogue_threads == 512 ? 112 : 0;
+    const int epilogue_registers = default_epilogue_registers;
+    if (epilogue_registers > 0) {
+        const int dispatch_registers =
+            config.num_epilogue_threads == 512 ? 32 : 48;
+        const int non_epilogue_registers =
+            config.num_epilogue_threads == 512 ? 24 : 40;
+        DG_HOST_ASSERT(dispatch_registers * config.num_dispatch_threads +
+                       non_epilogue_registers * config.num_non_epilogue_threads +
+                       epilogue_registers * config.num_epilogue_threads <= 64512);
+    }
+    const bool reuse_accum_as_final = config.block_m == 128;
+    const bool default_split_mn_barrier_opt =
+        config.block_m == 128 and config.block_n == 256 and
+        config.num_epilogue_threads == 512;
+    const bool l2_arrival_counter = default_split_mn_barrier_opt;
+    const bool skip_l2_epilogue_sync = default_split_mn_barrier_opt;
+    const bool split_phase_hot_path =
+        config.block_m == 128 and config.block_n == 256 and hidden >= 7168;
 
     // Tensormap construction
     // Acts/weights: standard 2D TMA descriptors (FP8 K-major).
@@ -162,25 +195,41 @@ static void sm90_fp8_mega_moe(
                                                         config.num_padded_sf_pool_tokens, hidden,
                                                         config.block_m, kGranK,
                                                         1, 0);
+    const int weight_tma_block_n = config.block_n > 256 ? 256 : config.block_n;
     const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights,
                                                         hidden, num_experts_per_rank * intermediate_hidden * 2,
-                                                        config.block_k, config.block_n,
+                                                        config.block_k, weight_tma_block_n,
                                                         static_cast<int>(l1_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
-    // L1 output (post-SwiGLU FP8): N is halved. The SM90 epilogue writes this
-    // staging tile to SMEM as plain row-major bytes, so the TMA store descriptor
-    // must use no shared-memory swizzle. Later L2 TMA loads may still swizzle
-    // from this row-major global buffer into their own SMEM tile.
+    // L1 output (post-SwiGLU FP8): N is halved. The correctness path stages
+    // this tile in plain row-major SMEM before the TMA store. Later L2 TMA
+    // loads may still swizzle from this row-major global buffer into their own
+    // SMEM tile.
     // The TMA store is issued *per warpgroup*, each writing a `WG_BLOCK_M`
     // (= block_m / num_epilogue_warpgroups) row tile from its own SMEM offset.
     // The descriptor outer-box dim therefore must be `WG_BLOCK_M`, not block_m.
     const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
-    const int wg_block_m = config.block_m / num_epilogue_warpgroups_h;
+    const bool split_n_warpgroups =
+        config.block_m == 64 and config.block_n % 128 == 0 and
+        num_epilogue_warpgroups_h == config.block_n / 128 and
+        num_epilogue_warpgroups_h > 1;
+    const bool split_mn_warpgroups =
+        config.block_m == 128 and config.block_n == 256 and num_epilogue_warpgroups_h == 4;
+    const int wg_split_m = split_n_warpgroups ? 1 :
+        (split_mn_warpgroups ? 2 : num_epilogue_warpgroups_h);
+    const int wg_split_n = split_n_warpgroups ? num_epilogue_warpgroups_h :
+        (split_mn_warpgroups ? 2 : 1);
+    DG_HOST_ASSERT(wg_split_m * wg_split_n == num_epilogue_warpgroups_h);
+    const int wg_block_m = config.block_m / wg_split_m;
+    const int wg_block_n = config.block_n / wg_split_n;
+    const int wg_l1_out_block_n = wg_block_n / 2;
+    const int l1_output_swizzle_mode = 0;
+    const int l1_output_box_m = wg_block_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_max_pool_tokens,
-                                                       config.block_n / 2, wg_block_m,
+                                                       wg_l1_out_block_n, l1_output_box_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
-                                                       0);
+                                                       l1_output_swizzle_mode);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
                                                      intermediate_hidden, config.num_max_pool_tokens,
                                                      config.block_k, config.block_m,
@@ -192,7 +241,7 @@ static void sm90_fp8_mega_moe(
                                                         1, 0);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights,
                                                         intermediate_hidden, num_experts_per_rank * hidden,
-                                                        config.block_k, config.block_n,
+                                                        config.block_k, weight_tma_block_n,
                                                         static_cast<int>(l2_weights.stride(-2)),
                                                         config.swizzle_weights_mode);
 
@@ -210,6 +259,11 @@ static void sm90_fp8_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .epilogue_registers = epilogue_registers,
+        .reuse_accum_as_final = reuse_accum_as_final,
+        .l2_arrival_counter = l2_arrival_counter,
+        .skip_l2_epilogue_sync = skip_l2_epilogue_sync,
+        .split_phase_hot_path = split_phase_hot_path,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgl-deep-gemm"
+description = "SGLang fork of DeepGemm"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    {name = "SGLang Kernel Team", email="sglang@lmsys.org"},
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Environment :: GPU :: NVIDIA CUDA"
+]
+dynamic = ["version"]
+
+dependencies = [
+    "apache-tvm-ffi==0.1.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.urls]
+Repository = "https://github.com/sgl-project/DeepGEMM/tree/release"
+Upstream = "https://github.com/deepseek-ai/DeepGEMM"
+
+[tool.setuptools]
+# Distribution name is `sgl-deep-gemm`; the import target is `deep_gemm` so
+# that downstream code (e.g. sglang's deep_gemm_wrapper) can `import deep_gemm`
+# unchanged.
+packages = {find = {where = ["."], include = ["deep_gemm*"]}}
+
+[tool.setuptools.dynamic]
+version = {file = "deep_gemm/VERSION"}
+
+[tool.setuptools.package-data]
+deep_gemm = [
+    "VERSION",
+    "_C.so",
+    "include/deep_gemm/**/*",
+    "include/cute/**/*",
+    "include/cutlass/**/*",
+]

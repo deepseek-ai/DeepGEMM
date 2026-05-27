@@ -8,7 +8,11 @@
 
 namespace deep_gemm::comm {
 
-CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
+#ifndef DG_NVLINK_BARRIER_VERBOSE_TIMEOUT
+#define DG_NVLINK_BARRIER_VERBOSE_TIMEOUT 0
+#endif
+
+__forceinline__ __device__ void cluster_sync_with_relaxed_arrive() {
     // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
     // This is slightly faster than `cute::cluster_sync` but has weaker memory ordering guarantee
     cute::cluster_arrive_relaxed();
@@ -16,9 +20,9 @@ CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
 }
 
 template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename sync_scope_t>
-CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
-                              const uint32_t& sm_idx, const uint32_t& thread_idx,
-                              const sync_scope_t& sync_scope) {
+__forceinline__ __device__ void grid_sync(const layout::Workspace& workspace,
+                                          const uint32_t& sm_idx, const uint32_t& thread_idx,
+                                          const sync_scope_t& sync_scope) {
     // NOTES: the implementation idea is from `cooperative_groups::this_grid().sync()`
     static constexpr uint32_t kFinishSumTag = 0x80000000u;
     sync_scope();
@@ -35,12 +39,12 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
 }
 
 template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
-CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
-                                   const layout::SymBuffer<kNumRanks>& sym_buffer,
-                                   const uint32_t& sm_idx, const uint32_t& thread_idx,
-                                   const sync_scope_t& sync_scope,
-                                   const bool& sync_prologue = true,
-                                   const bool& sync_epilogue = true) {
+__forceinline__ __device__ void nvlink_barrier(const layout::Workspace& workspace,
+                                               const layout::SymBuffer<kNumRanks>& sym_buffer,
+                                               const uint32_t& sm_idx, const uint32_t& thread_idx,
+                                               const sync_scope_t& sync_scope,
+                                               const bool& sync_prologue = true,
+                                               const bool& sync_epilogue = true) {
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
 
     // Grid sync before NVLink signaling
@@ -59,17 +63,21 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
         sync_scope();
 
-        // Update status and wait arrival (with 30s timeout, at 2 GHz)
-        constexpr int64_t kNumTimeoutCycles = 30ll * 2000000000ll;
+        // Update status and wait arrival (with 180s timeout, at 2 GHz)
+        constexpr int64_t kNumTimeoutCycles = 180ll * 2000000000ll;
         if (thread_idx == 0) {
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
             const auto start_clock = clock64();
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    printf("DeepGEMM NVLink barrier timeout (30s): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+#if DG_NVLINK_BARRIER_VERBOSE_TIMEOUT
+                    printf("DeepGEMM NVLink barrier timeout (180s): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+#else
+                    DG_TRAP_ONLY_DEVICE_ASSERT(false);
+#endif
                 }
             }
         }

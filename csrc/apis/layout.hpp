@@ -115,6 +115,8 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
 
 #endif
 
+#if 0
+
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
@@ -139,5 +141,7 @@ static void register_apis(pybind11::module_& m) {
         return heuristics_runtime->get_theoretical_mk_alignment_for_contiguous_layout(expected_m);
     }, py::arg("expected_m") = std::nullopt);
 }
+
+#endif
 
 } // namespace deep_gemm::layout

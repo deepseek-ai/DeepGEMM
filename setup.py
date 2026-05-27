@@ -5,50 +5,41 @@ import shutil
 import setuptools
 import subprocess
 import sys
-import torch
 import platform
-import urllib
-import urllib.error
-import urllib.request
 from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from packaging.version import parse
 from pathlib import Path
-from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-from scripts.generate_pyi import generate_pyi_file
-
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
 
-# Compiler flags
-cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
-             f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
-if DG_JIT_USE_RUNTIME_API:
-    cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
-
-# Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
-sources = ['csrc/python_api.cpp']
-build_include_dirs = [
-    f'{CUDA_HOME}/include',
-    f'{CUDA_HOME}/include/cccl',
-    'deep_gemm/include',
-    'third-party/cutlass/include',
-    'third-party/fmt/include',
-]
-build_libraries = ['cudart', 'nvrtc']
-build_library_dirs = [f'{CUDA_HOME}/lib64']
+
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
 ]
 
-# Release
-base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'
+
+def _find_cuda_home():
+    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+    if cuda_home is None:
+        nvcc_path = shutil.which('nvcc')
+        if nvcc_path is not None:
+            cuda_home = str(Path(nvcc_path).parent.parent)
+        else:
+            cuda_home = '/usr/local/cuda'
+            if not Path(cuda_home).exists():
+                cuda_home = None
+    assert cuda_home is not None, 'Cannot find CUDA_HOME'
+    return cuda_home
+
+
+CUDA_HOME = _find_cuda_home()
 
 
 def get_package_version():
@@ -58,14 +49,7 @@ def get_package_version():
 
     revision = ''
     if DG_USE_LOCAL_VERSION:
-        # noinspection PyBroadException
         try:
-            status_cmd = ['git', 'status', '--porcelain']
-            status_output = subprocess.check_output(status_cmd).decode('ascii').strip()
-            if status_output:
-                print(f'Warning: Git working directory is not clean. Uncommitted changes:\n{status_output}')
-                assert False, 'Git working directory is not clean'
-
             cmd = ['git', 'rev-parse', '--short', 'HEAD']
             revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
         except Exception:
@@ -73,69 +57,96 @@ def get_package_version():
     return f'{public_version}{revision}'
 
 
-def get_platform():
-    if sys.platform.startswith('linux'):
-        return f'linux_{platform.uname().machine}'
-    else:
-        raise ValueError('Unsupported platform: {}'.format(sys.platform))
+def _get_cuda_arch():
+    try:
+        status = subprocess.run(
+            args=['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
+            capture_output=True, check=True,
+        )
+        return status.stdout.decode('utf-8').strip().split('\n')[0]
+    except Exception:
+        return '9.0'
 
 
-def get_wheel_url():
-    torch_version = parse(torch.__version__)
-    torch_version = f'{torch_version.major}.{torch_version.minor}'
-    python_version = f'cp{sys.version_info.major}{sys.version_info.minor}'
-    platform_name = get_platform()
-    deep_gemm_version = get_package_version()
-    cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
-
-    # Determine the version numbers that will be used to determine the correct wheel
-    # We're using the CUDA version used to build torch, not the one currently installed
-    cuda_version = parse(torch.version.cuda)
-    cuda_version = f'{cuda_version.major}'
-
-    # Determine wheel URL based on CUDA version, torch version, python version and OS
-    wheel_filename = f'deep_gemm-{deep_gemm_version}+cu{cuda_version}-torch{torch_version}-cxx11abi{cxx11_abi}-{python_version}-{platform_name}.whl'
-    wheel_url = base_wheel_url.format(tag_name=f'v{deep_gemm_version}', wheel_name=wheel_filename)
-    return wheel_url, wheel_filename
-
-
-def get_ext_modules():
+def build_tvm_ffi_module(build_lib_dir):
+    """Build the _C module using tvm_ffi.cpp.build()."""
     if DG_SKIP_CUDA_BUILD:
-        return []
+        return
 
-    return [CUDAExtension(name='deep_gemm._C',
-                          sources=sources,
-                          include_dirs=build_include_dirs,
-                          libraries=build_libraries,
-                          library_dirs=build_library_dirs,
-                          extra_compile_args=cxx_flags)]
+    import tvm_ffi.cpp
+    import torch
+
+    cxx_abi = int(torch.compiled_with_cxx11_abi())
+    arch = _get_cuda_arch()
+    os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', arch)
+
+    extra_cflags = [
+        '-std=c++17', '-O3', '-fPIC',
+        '-Wno-psabi', '-Wno-deprecated-declarations',
+        f'-D_GLIBCXX_USE_CXX11_ABI={cxx_abi}',
+    ]
+    if DG_JIT_USE_RUNTIME_API:
+        extra_cflags.append('-DDG_JIT_USE_RUNTIME_API')
+
+    import sysconfig
+    torch_dir = os.path.dirname(torch.__file__)
+    torch_include = os.path.join(torch_dir, 'include')
+    torch_include_csrc = os.path.join(torch_include, 'torch', 'csrc', 'api', 'include')
+    torch_lib = os.path.join(torch_dir, 'lib')
+    python_include = sysconfig.get_path('include')
+
+    extra_include_paths = [
+        f'{CUDA_HOME}/include',
+        python_include,
+        torch_include,
+        torch_include_csrc,
+        os.path.join(current_dir, 'deep_gemm', 'include'),
+        os.path.join(current_dir, 'third-party', 'cutlass', 'include'),
+        os.path.join(current_dir, 'third-party', 'fmt', 'include'),
+    ]
+    cccl_path = f'{CUDA_HOME}/include/cccl'
+    if os.path.exists(cccl_path):
+        extra_include_paths.append(cccl_path)
+
+    extra_ldflags = [
+        f'-L{CUDA_HOME}/lib64',
+        f'-L{torch_lib}',
+        '-lcudart',
+        '-lnvrtc',
+        '-lcublasLt',
+        '-lcublas',
+        '-ltorch',
+        '-ltorch_cpu',
+        '-lc10',
+        '-lc10_cuda',
+        '-ltorch_cuda',
+    ]
+
+    output_dir = os.path.join(build_lib_dir, 'deep_gemm')
+    os.makedirs(output_dir, exist_ok=True)
+
+    lib_path = tvm_ffi.cpp.build(
+        name='_C',
+        cpp_files=[os.path.join(current_dir, 'csrc', 'tvm_ffi_api.cpp')],
+        extra_cflags=extra_cflags,
+        extra_ldflags=extra_ldflags,
+        extra_include_paths=extra_include_paths,
+        build_directory=os.path.join(output_dir, '_C_build'),
+    )
+
+    target = os.path.join(output_dir, '_C.so')
+    if os.path.exists(target):
+        os.remove(target)
+    shutil.copy2(lib_path, target)
+    print(f'Built tvm-ffi module: {target}')
 
 
 class CustomBuildPy(build_py):
     def run(self):
-        # First, prepare the include directories
         self.prepare_includes()
-
-        # Second, make clusters' cache setting default into `envs.py`
         self.generate_default_envs()
-
-        # Third, generate and copy .pyi file to build root directory
-        self.generate_pyi_file()
-
-        # Finally, run the regular build
+        build_tvm_ffi_module(self.build_lib)
         build_py.run(self)
-
-    def generate_pyi_file(self):
-        generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
-        pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
-        pyi_target = os.path.join(self.build_lib, 'deep_gemm', '_C.pyi')
-
-        if os.path.exists(pyi_source):
-            print(f"Copying .pyi file from {pyi_source} to {pyi_target}")
-            os.makedirs(os.path.dirname(pyi_target), exist_ok=True)
-            shutil.copy2(pyi_source, pyi_target)
-        else:
-            print(f"Warning: .pyi file not found at {pyi_source}")
 
     def generate_default_envs(self):
         code = '# Pre-installed environment variables\n'
@@ -143,26 +154,25 @@ class CustomBuildPy(build_py):
         for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_CPP_STANDARD'):
             code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
 
-        with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
+        envs_dir = os.path.join(self.build_lib, 'deep_gemm')
+        os.makedirs(envs_dir, exist_ok=True)
+        with open(os.path.join(envs_dir, 'envs.py'), 'w') as f:
             f.write(code)
 
     def prepare_includes(self):
-        # Create temporary build directory instead of modifying package directory
         build_include_dir = os.path.join(self.build_lib, 'deep_gemm/include')
         os.makedirs(build_include_dir, exist_ok=True)
 
-        # Copy third-party includes to the build directory
         for d in third_party_include_dirs:
             dirname = d.split('/')[-1]
             src_dir = os.path.join(current_dir, d)
             dst_dir = os.path.join(build_include_dir, dirname)
 
-            # Remove existing directory if it exists
             if os.path.exists(dst_dir):
                 shutil.rmtree(dst_dir)
 
             # Copy the directory
-            shutil.copytree(src_dir, dst_dir)
+            shutil.copytree(src_dir, dst_dir, ignore_dangling_symlinks=True)
 
 
 class CachedWheelsCommand(_bdist_wheel):
@@ -193,7 +203,6 @@ class CachedWheelsCommand(_bdist_wheel):
 
 
 if __name__ == '__main__':
-    # noinspection PyTypeChecker
     setuptools.setup(
         name='deep_gemm',
         version=get_package_version(),
@@ -205,10 +214,12 @@ if __name__ == '__main__':
                 'include/cutlass/**/*',
             ]
         },
-        ext_modules=get_ext_modules(),
+        ext_modules=[],
         zip_safe=False,
         cmdclass={
             'build_py': CustomBuildPy,
-            'bdist_wheel': CachedWheelsCommand,
         },
+        install_requires=[
+            'apache-tvm-ffi==0.1.9',
+        ],
     )

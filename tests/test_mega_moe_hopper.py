@@ -1,18 +1,5 @@
-"""
-H200 (SM90 / Hopper) mega-MoE: fused kernel + 同管线 baseline 性能对比。
+"""SM90 (Hopper) MegaMoE fused-kernel and same-pipeline baseline benchmark.
 
-<<<<<<< Updated upstream
-结构对齐 tests/test_mega_moe.py（B 系列 SM100 FP4 路径），但所有路径都换成 H200 FP8：
-  * fused：调用 `deep_gemm.fp8_mega_moe`（kernel symbol `sm90_fp8_mega_moe_impl`），
-           使用 `transform_weights_for_mega_moe_sm90` 处理过的权重 + SymmBuffer。
-  * baseline：DeepEP dispatch + 2 个 grouped FP8 GEMM + Triton SwiGLU + DeepEP combine，
-              使用未变换的权重。由于当前 SM90 grouped GEMM 只支持 L2 activation
-              per-128-K SFA，而 fused SM90 mega-MoE 的 L1 epilogue 为避免跨 CTA
-              同步使用 per-64-K SFA，所以该 baseline 是同管线 legacy 参照，
-              不是 bitwise apples-to-apples correctness oracle。
-  * 性能输出涵盖：TFLOPS / overlap TFLOPS / HBM GB/s / NVL GB/s / fused us /
-                  reduction us / `t_baseline / t_fused` legacy 比。
-=======
 This follows the structure of ``tests/test_mega_moe.py`` for the SM100 FP4
 path, with the compute path changed to SM90 FP8:
 
@@ -33,7 +20,6 @@ path, with the compute path changed to SM90 FP8:
   is the canonical decode path used in production EP serving.
 * output: TFLOPS, overlap-adjusted TFLOPS, HBM GB/s, NVLink GB/s, fused time,
   reduction estimate, and ``t_baseline / t_fused``.
->>>>>>> Stashed changes
 """
 
 import argparse
@@ -59,15 +45,17 @@ except Exception as ex:
     _deep_ep_import_error = ex
 
 
-# 与 deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh 中模板入口同名，
-# bench_kineto 用它从 trace 里挑出 fused mega-MoE 的 GPU 段
+# Must match the template entry point in
+# deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh so bench_kineto can
+# select the fused MegaMoE GPU region from the trace.
 SM90_KERNEL_NAME = "sm90_fp8_mega_moe_impl"
 
 
-# FP8 e4m3fn 的最大可表示值，量化时用 amax / 448 作为 scale 基准
+# Max finite value of FP8 e4m3fn; quantization uses amax / 448 as the scale.
 FP8_E4M3_MAX = 448.0
-# 新版 Triton（>= 3.x）强制：jit 内核读到的 Python 全局必须是 tl.constexpr 实例，
-# 否则编译期 NameError。宿主 Python 侧仍用上面的普通 float 做 torch 运算。
+# Triton >= 3 requires Python globals read by a JIT kernel to be tl.constexpr,
+# otherwise compilation can fail with NameError. Host-side torch code still uses
+# the plain float above.
 _FP8_E4M3_MAX_TL = tl.constexpr(448.0)
 L1_ACT_SF_GRAN = 128
 FUSED_L2_ACT_SF_GRAN = 64
@@ -77,15 +65,15 @@ WEIGHT_SF_GRAN_K = 128
 
 
 # ============================================================================
-# 模块 1：Triton SwiGLU + FP8 量化内核
+# Section 1: Triton SwiGLU + FP8 quantization kernel.
 # ----------------------------------------------------------------------------
-# baseline 的 L2 仍走 DeepGEMM SM90 grouped FP8 GEMM，所以 activation SFA 只能按
-# per-128-K 输入；但 scale 数值采用 fused epilogue 同款 UE8M0/power-of-two 规则，
-# 避免再额外引入 exact-FP32-scale 差异。
-# 输入  x        : (M, 2*H) bf16，内层是 [gate_part | up_part]
-# 输入  topk_w   : (M,)     fp32，可选
-# 输出  y        : (M, H)   fp8_e4m3fn
-# 输出  y_sf     : (M, H/BLOCK_K) fp32 行主序
+# The baseline L2 path uses DeepGEMM SM90 grouped FP8 GEMM, which accepts
+# per-128-K activation SF. The scale values still use the same power-of-two
+# rounding as the fused epilogue to avoid adding an exact-FP32-scale difference.
+# Input  x        : (M, 2*H) bf16, laid out as [gate_part | up_part].
+# Input  topk_w   : (M,) fp32, optional.
+# Output y        : (M, H) fp8_e4m3fn.
+# Output y_sf     : (M, H / BLOCK_K) fp32, row-major.
 # ============================================================================
 
 
@@ -96,62 +84,62 @@ def _swiglu_apply_weight_to_fp8_kernel(
     y_ptr,
     y_sf_ptr,
     M,
-    H,  # 运行时形状
+    H,  # Runtime shape
     stride_xm,
-    stride_xn,  # x: (M, 2H) 的 stride
+    stride_xn,  # x: (M, 2H) stride
     stride_ym,
-    stride_yn,  # y: (M, H)  的 stride
+    stride_yn,  # y: (M, H) stride
     stride_sfm,
-    stride_sfk,  # y_sf: (M, H/BLOCK_K) 的 stride
-    clamp_value,  # 当 HAS_CLAMP=False 时这个参数无意义
+    stride_sfk,  # y_sf: (M, H / BLOCK_K) stride
+    clamp_value,  # Ignored when HAS_CLAMP=False
     HAS_TOPK: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
     USE_UE8M0_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,  # = num_per_channels
 ):
-    # 一个 program 处理 (BLOCK_M 个 token) × (第 pid_k 个 K-block 的 BLOCK_K 列)
+    # One program handles BLOCK_M tokens and one BLOCK_K column tile.
     pid_m = tl.program_id(0)
     pid_k = tl.program_id(1)
 
-    # 行索引：本 program 负责 [pid_m*BLOCK_M, pid_m*BLOCK_M+BLOCK_M)
+    # Row indices handled by this program.
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    # 当前 K-block 内的列索引（在 H 维度，不是 2H）
+    # Column indices inside the current K block, in the H dimension.
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
     mask_m = offs_m < M
 
-    # ---- 1) 载入 gate（x 的前半段 [0, H)）和 up（x 的后半段 [H, 2H)）----
-    # 注意 stride_xn 是元素 stride（一般 == 1），但 H + offs_k 偏移是按"元素"算的
+    # 1) Load gate from [0, H) and up from [H, 2H).
+    # stride_xn is an element stride, so H + offs_k is also element-based.
     gate_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xn
     up_ptrs = x_ptr + offs_m[:, None] * stride_xm + (H + offs_k[None, :]) * stride_xn
     gate = tl.load(gate_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
     up = tl.load(up_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
 
-    # ---- 2) 可选 clamp（参考 tilelang 实现：gate 单边 max，up 双边）----
+    # 2) Optional clamp: one-sided for gate, two-sided for up.
     if HAS_CLAMP:
         gate = tl.minimum(gate, clamp_value)
         up = tl.minimum(tl.maximum(up, -clamp_value), clamp_value)
 
-    # ---- 3) SwiGLU：silu(gate) * up = gate * sigmoid(gate) * up（全程 FP32 累计）----
+    # 3) SwiGLU: silu(gate) * up = gate * sigmoid(gate) * up, accumulated in FP32.
     y = gate * tl.sigmoid(gate) * up
 
-    # ---- 4) 可选 MoE 权重缩放（per-token 标量）----
+    # 4) Optional MoE weight scaling with a per-token scalar.
     if HAS_TOPK:
         w = tl.load(topk_w_ptr + offs_m, mask=mask_m, other=1.0)
         y = y * w[:, None]
 
-    # ---- 5) 当前 K-block 内每行 absmax → scale ----
+    # 5) Per-row absmax in the current K block -> scale.
     amax = tl.max(tl.abs(y), axis=1)  # (BLOCK_M,)
     sf = tl.maximum(amax / _FP8_E4M3_MAX_TL, 1.0e-30)
     if USE_UE8M0_SCALE:
-        # 对齐 deep_gemm/common/math.cuh::get_e4m3_sf_and_sf_inv:
+        # Match deep_gemm/common/math.cuh::get_e4m3_sf_and_sf_inv:
         # scale = 2 ** ceil(log2(amax / 448)).
         sf = tl.exp2(tl.ceil(tl.log2(sf)))
 
-    # ---- 6) 量化为 FP8 e4m3fn ----
+    # 6) Quantize to FP8 e4m3fn.
     y_fp8 = (y / sf[:, None]).to(tl.float8e4nv)
 
-    # ---- 7) 写回 y 和 sf ----
+    # 7) Store y and sf.
     y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yn
     tl.store(y_ptrs, y_fp8, mask=mask_m[:, None])
 
@@ -166,7 +154,7 @@ def swiglu_apply_weight_to_fp8_triton(
     num_per_channels: int = BASELINE_L2_ACT_SF_GRAN,
     use_ue8m0_scale: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """SwiGLU + FP8 量化。语义等价于 PyTorch reference：
+    """SwiGLU + FP8 quantization. Semantically equivalent to:
     gate, up = x[:, :H], x[:, H:]
     y = silu(gate.clamp(max=c)) * up.clamp(-c, c) * topk_w
     y_sf = y.view(M, H/np, np).abs().amax(-1) / 448
@@ -174,19 +162,19 @@ def swiglu_apply_weight_to_fp8_triton(
     y_fp8 = (y / y_sf.unsqueeze(-1)).to(fp8)
     """
     assert x.is_cuda and x.dtype == torch.bfloat16
-    assert x.is_contiguous(), "当前实现假设 x 是 contiguous 的，避免 stride 计算错位"
+    assert x.is_contiguous(), "This implementation expects contiguous x"
     M, two_H = x.shape
     H = two_H // 2
-    assert H % num_per_channels == 0, f"H={H} 必须是 {num_per_channels} 的整数倍"
+    assert H % num_per_channels == 0, f"H={H} must be divisible by {num_per_channels}"
 
     y = torch.empty((M, H), dtype=torch.float8_e4m3fn, device=x.device)
     y_sf = torch.empty((M, H // num_per_channels), dtype=torch.float32, device=x.device)
 
-    # BLOCK_M 取 16：内核每个 program 处理 16 个 token × 128 列，寄存器压力小、容易调
+    # BLOCK_M=16 keeps register pressure low for the Triton reference kernel.
     BLOCK_M = 16
     grid = (triton.cdiv(M, BLOCK_M), H // num_per_channels)
 
-    # HAS_TOPK=False 时仍要传一个有效指针（Triton 不允许 nullptr），用 x 占位
+    # Triton still needs a valid pointer when HAS_TOPK=False; x is a placeholder.
     topk_ptr = topk_weights if topk_weights is not None else x
 
     _swiglu_apply_weight_to_fp8_kernel[grid](
@@ -213,38 +201,37 @@ def swiglu_apply_weight_to_fp8_triton(
 
 
 # ============================================================================
-# 模块 2：grouped weight 的 (128, 128) FP8 块量化
+# Section 2: grouped weight block-(128, 128) FP8 quantization.
 # ----------------------------------------------------------------------------
-# m_grouped_fp8_gemm_nt_contiguous 在 SM90 上对 weight 的输入约定：
-#   每 (128, 128) 子块共享一个 FP32 SF，K 是 SF 的内层连续维（K-major）。
-# 与 SM100 FP4 路径的差异：
-#   * 不需要 deep_gemm.transform_sf_into_required_layout
-#   * SF 是 FP32，不是 UE8M0 packed
+# SM90 m_grouped_fp8_gemm_nt_contiguous expects each (128, 128) weight block to
+# share one FP32 SF, with K as the inner contiguous SF dimension (K-major).
+# Unlike the SM100 FP4 path:
+#   * deep_gemm.transform_sf_into_required_layout is not needed.
+#   * SF is FP32, not packed UE8M0.
 # ============================================================================
 
 
 def _quantize_grouped_fp8_block_128_128(
     w: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """(G, N, K) bf16 → (G, N, K) fp8_e4m3fn + (G, N//128, K//128) fp32 SF。"""
+    """(G, N, K) bf16 -> (G, N, K) fp8_e4m3fn plus FP32 block SF."""
     g, n, k = w.shape
-    assert n % 128 == 0 and k % 128 == 0, f"weight 的 N={n}, K={k} 都必须是 128 的倍数"
+    assert n % 128 == 0 and k % 128 == 0, f"weight N={n}, K={k} must be multiples of 128"
 
-    # 把 (N, K) 切成 (N/128, 128, K/128, 128)，最后一维和倒数第三维就是 128×128 子块内部
+    # Split (N, K) into (N/128, 128, K/128, 128) block interiors.
     w_view = w.view(g, n // 128, 128, k // 128, 128).float()
 
-    # 子块内 absmax → scale = amax / 448，clamp(1e-4) 避免全 0 子块
+    # In-block absmax -> scale = amax / 448; clamp avoids all-zero scales.
     amax = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4)  # (G, N/128, K/128)
     sf = amax / FP8_E4M3_MAX
 
-    # 量化：每个元素除以所属子块的 sf 后转 FP8
-    # sf 形状 (G, N/128, K/128)，需在 N-内 (axis -3) 和 K-内 (axis -1) 都补维度
+    # Divide by the owning block's SF before casting to FP8.
     w_fp8 = (w_view / sf.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn)
     return w_fp8.view(g, n, k).contiguous(), sf.contiguous()
 
 
 # ============================================================================
-# 模块 3：尝试导入 deep_ep（用于 dispatch / combine）
+# Section 3: optional deep_ep import for dispatch/combine.
 # ============================================================================
 
 
@@ -489,20 +476,20 @@ def swiglu_masked_post_quant_to_fp8(
 
 
 # ============================================================================
-# 模块 4：CUDA event 中位数测时（避开对 tilelang.do_bench 的依赖）
+# Section 4: CUDA event median timing, independent of tilelang.do_bench.
 # ============================================================================
 
 
 def _bench_cuda_events(
     fn, num_warmup: int = 5, num_repeat: int = 20, l2_flush_gb: float = 8.0
 ) -> float:
-    """返回 fn 的中位数耗时（秒）。"""
+    """Return median runtime of fn in seconds."""
     for _ in range(num_warmup):
         fn()
     torch.cuda.synchronize()
     times_ms = []
     for _ in range(num_repeat):
-        # L2 flush，避免重复访问命中 cache 让测时偏低
+        # Flush L2 to avoid optimistic timings from repeated cache hits.
         if l2_flush_gb > 0:
             free_bytes, _ = torch.cuda.mem_get_info()
             flush_bytes = min(int(l2_flush_gb * 1e9), int(free_bytes * 0.5))
@@ -520,12 +507,12 @@ def _bench_cuda_events(
 
 
 # ============================================================================
-# 模块 5：test() 主入口 — 在每个 rank 上跑一遍 baseline
+# Section 5: per-rank test entry point.
 # ============================================================================
 
 
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
-    # 初始化分布式：rank_idx 是全局 rank，group 是默认 NCCL group
+    # Initialize distributed state; rank_idx is global rank and group is NCCL.
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     torch.manual_seed(rank_idx)
     random.seed(rank_idx)
@@ -538,7 +525,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist.destroy_process_group()
         return
 
-    # 形状参数（与 test_mega_moe.py 同名同义）
+    # Shape parameters, with names matching tests/test_mega_moe.py.
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = (
         max(
@@ -554,35 +541,37 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_experts_per_rank = num_experts // num_ranks
     assert num_tokens <= num_max_tokens_per_rank
     assert num_experts % num_ranks == 0, (
-        f"num_experts={num_experts} 必须能被 num_ranks={num_ranks} 整除"
+        f"num_experts={num_experts} must be divisible by num_ranks={num_ranks}"
     )
 
-    # SM90 fused kernel 的形状约束（来自 csrc/apis/mega.hpp::fp8_mega_moe）：
-    #   * H、IH 必须是 128 的倍数（L1 input per-128-K SF + block-(128,128) weight SF）
-    #   * IH/64 ≤ 64 → IH ≤ 4096（l2_arrival_mask 是 uint64，每 bit 对应 64 列）
+    # SM90 fused-kernel shape constraints from csrc/apis/mega.hpp::fp8_mega_moe:
+    #   * H and IH must be multiples of 128 (L1 input per-128-K SF and
+    #     block-(128,128) weight SF).
+    #   * IH / 64 <= 64, i.e. IH <= 4096, because l2_arrival_mask is uint64
+    #     with one bit per 64-column block.
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
     assert intermediate_hidden // 64 <= 64, (
-        f"SM90 fused kernel 要求 intermediate_hidden <= 4096, 当前 {intermediate_hidden}"
+        f"SM90 fused kernel requires intermediate_hidden <= 4096, got {intermediate_hidden}"
     )
 
-    # ---- 创建 BF16 输入：token 与两层 weight ----
-    # x: 每 rank 本地 num_tokens 个 token，每个 token hidden 维
+    # ---- Create BF16 token and weight inputs ----
+    # x: local tokens for this rank.
     x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-    # L1 weight: 每个 expert 把 hidden → 2*intermediate_hidden（gate 和 up 拼一起）
+    # L1 weight maps hidden -> 2*intermediate_hidden (gate and up packed).
     l1_weights_bf16 = torch.randn(
         (num_experts_per_rank, intermediate_hidden * 2, hidden),
         dtype=torch.bfloat16,
         device="cuda",
     )
-    # L2 weight: 每个 expert 把 intermediate_hidden → hidden
+    # L2 weight maps intermediate_hidden -> hidden.
     l2_weights_bf16 = torch.randn(
         (num_experts_per_rank, hidden, intermediate_hidden),
         dtype=torch.bfloat16,
         device="cuda",
     )
 
-    # 路由：scores → topk_idx (M, K) + topk_weights (M, K)
+    # Routing: scores -> topk_idx (M, K) and topk_weights (M, K).
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device="cuda")
     topk_weights, topk_idx = torch.topk(
         scores, num_topk, dim=-1, largest=True, sorted=False
@@ -592,39 +581,39 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
         topk_weights.masked_fill_(topk_idx < 0, 0)
 
-    # 累计接收统计：fused 与 baseline 各持一份避免相互覆盖
+    # Keep separate recv counters so fused and baseline do not overwrite each other.
     cum_stats_fused = torch.zeros(
         (num_experts_per_rank,), dtype=torch.int, device="cuda"
     )
     cum_stats_baseline = cum_stats_fused.clone()
 
-    # ---- BF16 → FP8 量化 ----
-    # x_fp8 是元组：(token_fp8 (M, hidden), token_sf (M, hidden//128) fp32 行主序)
-    # 注意 use_ue8m0=False, use_packed_ue8m0=False：SM90 不接受 UE8M0 packed SF
+    # ---- BF16 -> FP8 quantization ----
+    # x_fp8 is (token_fp8 (M, hidden), token_sf (M, hidden//128) row-major FP32).
+    # SM90 expects FP32 SF, not packed UE8M0.
     x_fp8 = per_token_cast_to_fp8(
         x_bf16, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False
     )
 
-    # weight 量化：(G, N, K) bf16 → ((G, N, K) fp8 e4m3fn, (G, N//128, K//128) fp32 SF)
-    # baseline（DeepEP grouped GEMM）直接用这两个未变换的元组
+    # Weight quantization: (G, N, K) bf16 -> FP8 e4m3fn plus block FP32 SF.
+    # The DeepEP grouped-GEMM baseline uses these untransformed tuples directly.
     l1_weights = _quantize_grouped_fp8_block_128_128(l1_weights_bf16)
     l2_weights = _quantize_grouped_fp8_block_128_128(l2_weights_bf16)
 
-    # fused 路径：FP8 weight 上做 gate/up gran-8 N-轴 interleave；SF 不变
+    # Fused path: interleave gate/up along N for FP8 L1 weights; SF is unchanged.
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
         l1_weights, l2_weights
     )
 
-    # SwiGLU clamp：finite → 传给 fused/triton；inf → None（关闭 clamp，与 SM90 fused 一致）
+    # SwiGLU clamp: finite values enable clamp; inf maps to None and disables it.
     clamp_arg = args.activation_clamp if math.isfinite(args.activation_clamp) else None
     run_baseline_enabled = args.run_baseline or bool(args.check_output_diff)
     run_ll_baseline_enabled = bool(args.run_low_latency_baseline)
 
-    # ---- DeepGEMM grouped GEMM 的 M 维 alignment（baseline 走 DeepEP 时也用这个）----
+    # ---- M-dimension alignment for the grouped-GEMM baseline ----
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
 
-    # ---- 分配 fused 的 SymmBuffer 与输出 buffer ----
+    # ---- Allocate fused SymmBuffer and output buffer ----
     sym_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
         num_experts,
@@ -636,8 +625,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
 
     def run_fused():
-        # NOTE: 跟 SM100 test_mega_moe.py 的处理一致 —— DG_COMM_KERNEL_DEBUG=1 时
-        # kernel 出口会把 sym_buffer 整块清零，所以每次都要重新拷输入
+        # Match the SM100 test: DG_COMM_KERNEL_DEBUG=1 zeros the whole
+        # sym_buffer at kernel exit, so inputs must be re-copied every call.
         sym_buffer.x[:num_tokens].copy_(x_fp8[0])
         sym_buffer.x_sf[:num_tokens].copy_(x_fp8[1])
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
@@ -656,8 +645,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         return y_fused
 
-    # ---- 打印 config ----
-    dist_print("Config (H200 fused mega-MoE):", once_in_node=True)
+    # ---- Print config ----
+    dist_print("Config (SM90 fused MegaMoE):", once_in_node=True)
     dist_print(f" > Tokens: {num_tokens}/{num_max_tokens_per_rank}", once_in_node=True)
     dist_print(
         f" > Hidden: {hidden}, Intermediate: {intermediate_hidden}", once_in_node=True
@@ -668,9 +657,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     dist_print(f" > Masked ratio: {args.masked_ratio}", once_in_node=True)
     dist_print(
-        f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} UE8M0, "
-        f"baseline L2 per-{BASELINE_L2_ACT_SF_GRAN} UE8M0 "
-        f"(SM90 grouped GEMM constraint)",
+        f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} FP32 pow2, "
+        f"baseline L2 per-{BASELINE_L2_ACT_SF_GRAN} FP32 pow2 "
+        f"(SM90 grouped-GEMM constraint)",
         once_in_node=True,
     )
     dist_print(
@@ -686,7 +675,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     dist_print(once_in_node=True)
 
-    # 与社区版 test_mega_moe.py 对齐：NCU 模式只跑 fused kernel，避免 baseline 噪声。
+    # Match tests/test_mega_moe.py: NCU mode runs only the fused kernel to avoid
+    # baseline noise in the profile.
     if args.ncu_profile_only:
         dist_print("Run fused SM90 mega-MoE kernel:", once_in_node=True)
         y = run_fused()
@@ -698,17 +688,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist.destroy_process_group()
         return
 
-<<<<<<< Updated upstream
-    # ---- 分配 DeepEP buffer（baseline 用）----
-    deep_ep = _import_deep_ep() if run_baseline_enabled else None
-=======
     # ---- Allocate DeepEP buffer for the baseline ----
     deep_ep = (
         _import_deep_ep()
         if (run_baseline_enabled or run_ll_baseline_enabled)
         else None
     )
->>>>>>> Stashed changes
     ep_buffer = None
     if deep_ep is not None and run_baseline_enabled:
         ep_buffer = _make_deep_ep_buffer(
@@ -736,9 +721,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
 
     # ----------------------------------------------------------------
-    # baseline 主体：dispatch → L1 GEMM → SwiGLU+量化 → L2 GEMM → combine
-    # 与 fused 用同一份 (FP8 weight, FP32 block-(128,128) SF) —— 但是 **未变换**
-    # 的版本（baseline grouped GEMM 不需要 gate/up interleave）
+    # Baseline body: dispatch -> L1 GEMM -> SwiGLU+quantize -> L2 GEMM -> combine.
+    # It uses the same FP8 weights and FP32 block-(128,128) SF as the fused path,
+    # but without the fused-only gate/up interleave.
     # ----------------------------------------------------------------
     def run_baseline():
         recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
@@ -755,7 +740,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
         n = recv_x[0].size(0)
 
-        # L1 GEMM：FP8 token @ FP8 W1 → BF16 中间激活 (gate||up 拼接)
+        # L1 GEMM: FP8 token @ FP8 W1 -> BF16 intermediate activation (gate||up).
         l1_y = torch.empty(
             (n, intermediate_hidden * 2), dtype=torch.bfloat16, device="cuda"
         )
@@ -768,10 +753,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             disable_ue8m0_cast=True,
         )
 
-        # Triton SwiGLU + FP8 量化（含 topk 权重乘法）
-        # 注意：fused SM90 mega-MoE 的 L2 activation SFA 是 per-64-K；
-        # 当前 DeepGEMM SM90 grouped GEMM 只支持 per-128-K SFA，所以性能 baseline
-        # 只能用 per-128-K，但 scale 数值采用 fused 同款 UE8M0/power-of-two。
+        # Triton SwiGLU + FP8 quantization, including topk weight scaling.
+        # The fused SM90 MegaMoE L2 activation SF is per-64-K. The current
+        # DeepGEMM SM90 grouped GEMM supports only per-128-K activation SF, so
+        # the baseline uses per-128-K FP32 scales with the same power-of-two
+        # rounding rule as the fused epilogue.
         l1_y = swiglu_apply_weight_to_fp8_triton(
             x=l1_y,
             topk_weights=recv_topk_weights,
@@ -780,7 +766,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             use_ue8m0_scale=True,
         )
 
-        # L2 GEMM：FP8 中间激活 @ FP8 W2 → BF16
+        # L2 GEMM: FP8 intermediate activation @ FP8 W2 -> BF16.
         l2_y = torch.empty((n, hidden), dtype=torch.bfloat16, device="cuda")
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             l1_y,
@@ -791,12 +777,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             disable_ue8m0_cast=True,
         )
 
-        # DeepEP combine：把每个 token 在 topk 个 expert 上的输出汇聚回源 rank
+        # DeepEP combine: gather each token's topk expert outputs back to source rank.
         return ep_buffer.combine(l2_y, handle=handle)[0]
 
-<<<<<<< Updated upstream
-    # ---- 跑一次确保不报错（fused + 可选 baseline）----
-=======
     # ----------------------------------------------------------------
     # Low-latency baseline body. Mirrors the sglang
     # ``_DeepEPDispatcherImplLowLatency`` pipeline:
@@ -899,21 +882,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         return combined_x
 
     # ---- Run once to check fused and optional baseline paths ----
->>>>>>> Stashed changes
     y = run_fused()
     assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, (
-        f"fused 输出 shape/dtype 异常: shape={y.shape}, dtype={y.dtype}"
+        f"unexpected fused output shape/dtype: shape={y.shape}, dtype={y.dtype}"
     )
     if ep_buffer is not None:
         out_b = run_baseline()
         assert out_b.shape == (num_tokens, hidden) and out_b.dtype == torch.bfloat16, (
-            f"baseline 输出 shape/dtype 异常: shape={out_b.shape}, dtype={out_b.dtype}"
+            f"unexpected baseline output shape/dtype: shape={out_b.shape}, dtype={out_b.dtype}"
         )
         if args.check_output_diff:
             diff = (y.float() - out_b.float()).abs()
             denom = out_b.float().abs().mean().clamp_min(1e-12)
             dist_print(
-                "Output diff (fused vs legacy-per128 baseline):", once_in_node=True
+                "Output diff (fused vs per-128 baseline):", once_in_node=True
             )
             dist_print(
                 f" > max_abs={diff.max().item():.6e}, "
@@ -941,9 +923,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             )
             dist_print(once_in_node=True)
 
-    # ---- 统计本 rank 实际接收的 token 数与触达的 expert 数 ----
-    # 把所有 rank 的 topk_idx 收齐，再把不落在本 rank 持有 expert 范围内的条目
-    # 标成 -1；剩下的非 -1 条目数即"被路由进本 rank 的 (token, slot) 总数"。
+    # ---- Count tokens routed to this rank and touched local experts ----
+    # Gather all topk_idx tensors and mark entries outside this rank's local
+    # expert range as -1. Remaining entries are routed (token, slot) pairs.
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
     gathered_topk_idx[
         (gathered_topk_idx < rank_idx * num_experts_per_rank)
@@ -954,7 +936,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     num_touched_experts = int(torch.unique(local_expert_ids).numel())
 
     # ---- benchmark ----
-    # fused：bench_kineto 抓 sm90_fp8_mega_moe_impl 的 GPU 段（不含 host overhead）
+    # Fused: bench_kineto selects the sm90_fp8_mega_moe_impl GPU region only.
     t_fused = bench_kineto(
         run_fused,
         SM90_KERNEL_NAME,
@@ -968,7 +950,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             else None
         ),
     )
-    # baseline：cuda events 中位数（tilelang.do_bench 在 H200 不一定有，统一用 events）
+    # Baseline: use CUDA event median timing for consistency across SM90 setups.
     t_baseline = (
         _bench_cuda_events(
             run_baseline,
@@ -994,12 +976,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def safe_div(a, b):
         return float("nan") if b == 0 else a / b
 
-    # 端到端 TFLOPS：3 个 matmul（L1 gate、L1 up、L2），每个 2*M*N*K，M=num_recv_tokens
+    # End-to-end TFLOPS: three matmuls (L1 gate, L1 up, L2), each 2*M*N*K.
     tflops = safe_div(
         2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused
     )
 
-    # HBM 字节估算（SM90: weight 是 FP8 = 1B/elem，与 SM100 FP4=0.5B 不同）
+    # HBM byte estimate (SM90 weights are FP8 = 1B/elem, unlike SM100 FP4).
     l1_weight_bytes = num_touched_experts * intermediate_hidden * 2 * hidden
     l2_weight_bytes = num_touched_experts * hidden * intermediate_hidden
     l1_weight_sf_bytes = (
@@ -1024,26 +1006,26 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         + l1_weight_sf_bytes
         + l2_weight_sf_bytes  # weight SF (FP32)
         + num_recv_tokens * hidden
-        + l1_input_sf_bytes  # L1 输入读 (FP8 + SF)
+        + l1_input_sf_bytes  # L1 input read (FP8 + SF)
         + num_recv_tokens * intermediate_hidden
-        + l2_act_sf_bytes  # L1 输出写 (FP8 + SF)
+        + l2_act_sf_bytes  # L1 output write (FP8 + SF)
         + num_recv_tokens * intermediate_hidden
-        + l2_act_sf_bytes  # L2 输入读 (FP8 + SF)
-        + num_recv_tokens * hidden * 2  # L2 输出写 (BF16)
+        + l2_act_sf_bytes  # L2 input read (FP8 + SF)
+        + num_recv_tokens * hidden * 2  # L2 output write (BF16)
     )
     hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
 
-    # NVLink 字节：dispatch 拉 token + input SF + topk weight，combine 写回 BF16
+    # NVLink bytes: dispatch pulls token + input SF + topk weight; combine writes BF16.
     num_nvlink_bytes = num_recv_tokens * (hidden + hidden // 32 + 4 + hidden * 2)
     nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_fused)
 
-    # combine reduction 串行下界（解析估计；6.5e12 = HBM 串行 reduction 经验吞吐 B/s）
+    # Serial lower bound for combine reduction, using 6.5e12 B/s as an estimate.
     t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
 
-    # overlap 校正：扣掉 fused 中无法重叠的串行 reduction 段后估计稳态吞吐
+    # Overlap adjustment: remove the non-overlapped serial reduction estimate.
     approx_factor = t_fused / max(t_fused - t_reduction, 1e-12)
 
-    # baseline 用同一份 FLOPs / HBM 字节，时间换成 t_baseline
+    # Baseline uses the same FLOPs and HBM byte estimate, with t_baseline.
     tflops_baseline = safe_div(
         2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_baseline
     )
@@ -1135,7 +1117,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     elif run_ll_baseline_enabled:
         dist_print(" > [ll_base] (deep_ep unavailable)", once_in_node=True)
 
-    # ---- 清理 ----
+    # ---- Cleanup ----
     dist.barrier()
     sym_buffer.destroy()
     if ep_buffer is not None:
@@ -1146,57 +1128,57 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 
 # ============================================================================
-# 模块 6：argparse + spawn
+# Section 6: argparse + spawn.
 # ============================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="H200 mega-MoE: fused (deep_gemm.fp8_mega_moe) vs DeepEP+grouped-FP8 baseline"
+        description="SM90 MegaMoE: fused (deep_gemm.fp8_mega_moe) vs DeepEP+grouped-FP8 baseline"
     )
 
-    # 资源
+    # Resources.
     parser.add_argument(
         "--ncu-profile-only",
         action="store_true",
-        help="只运行一次 fused SM90 kernel，便于 NCU/Nsight 采样",
+        help="Run the fused SM90 kernel once for NCU/Nsight profiling",
     )
     parser.add_argument(
-        "--num-processes", type=int, default=8, help="spawn 出来的进程数（一卡一进程）"
+        "--num-processes", type=int, default=8, help="Number of spawned processes, one per GPU"
     )
     parser.add_argument(
         "--local-rank-idx",
         type=int,
         default=None,
-        help="单进程模式的 local rank；用于外部 launcher/NCU 分别启动每个 rank",
+        help="Local rank for single-process mode, useful for external launchers/NCU",
     )
 
-    # 模型形状
-    # 注：SM90 fused kernel 要求 intermediate_hidden ≤ 4096
+    # Model shape.
+    # SM90 fused kernel requires intermediate_hidden <= 4096.
     parser.add_argument("--num-max-tokens-per-rank", type=int, default=8192)
     parser.add_argument(
         "--num-tokens",
         type=int,
         default=0,
-        help="per-rank 实际 token 数；0 表示用 num-max-tokens-per-rank",
+        help="Actual per-rank token count; 0 means num-max-tokens-per-rank",
     )
     parser.add_argument(
         "--num-max-removed-tokens",
         type=int,
         default=0,
-        help="num-tokens 为 0 时，每个 rank 随机移除的最大 token 数",
+        help="Max random token removals per rank when num-tokens is 0",
     )
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument(
         "--intermediate-hidden",
         type=int,
         default=3072,
-        help="中间层维度（≤ 4096，受 SM90 l2_arrival_mask 约束）",
+        help="Intermediate dimension, constrained to <= 4096 by SM90 l2_arrival_mask",
     )
     parser.add_argument(
         "--activation-clamp",
         type=float,
         default=10.0,
-        help="SwiGLU 前对 gate/up 的 clamp 阈值；传 inf 表示关闭",
+        help="Clamp threshold for gate/up before SwiGLU; pass inf to disable",
     )
     parser.add_argument("--num-experts", type=int, default=384)
     parser.add_argument("--num-topk", type=int, default=6)
@@ -1204,38 +1186,38 @@ if __name__ == "__main__":
         "--masked-ratio",
         type=float,
         default=0.0,
-        help="随机 mask 掉部分 topk expert selection，用于验证稀疏路由边界",
+        help="Randomly mask some topk expert selections to test sparse routing edges",
     )
     parser.add_argument(
         "--fast-math",
         type=int,
         default=1,
-        help="fused 内 SwiGLU 是否启用 fast-math（0/1）",
+        help="Whether fused SwiGLU uses fast math (0/1)",
     )
 
-    # 测时
+    # Timing.
     parser.add_argument(
         "--num-bench-tests",
         type=int,
         default=30,
-        help="bench_kineto 抓 fused 时的迭代数",
+        help="Number of bench_kineto iterations for the fused kernel",
     )
     parser.add_argument(
         "--num-warmup", type=int, default=5, help="baseline cuda events warmup"
     )
     parser.add_argument(
-        "--num-repeat", type=int, default=20, help="baseline cuda events 测时迭代"
+        "--num-repeat", type=int, default=20, help="Baseline CUDA event timing iterations"
     )
     parser.add_argument(
         "--l2-flush-gb",
         type=float,
         default=8.0,
-        help="baseline event 测时前用于 flush L2 的临时写入大小；0 表示关闭",
+        help="Temporary write size used to flush L2 before baseline timing; 0 disables it",
     )
     parser.add_argument(
         "--run-baseline",
         action="store_true",
-        help="启用 DeepEP+grouped-FP8 legacy baseline；默认关闭以避免 full-size 默认配置触发 baseline kernel 非法访问",
+        help="Enable the DeepEP+grouped-FP8 baseline; disabled by default",
     )
     parser.add_argument(
         "--run-low-latency-baseline",
@@ -1251,13 +1233,13 @@ if __name__ == "__main__":
         "--check-output-diff",
         type=int,
         default=0,
-        help="非 0 时打印 fused 与 legacy-per128 baseline 的输出差异（预期非 bitwise）",
+        help="If nonzero, print fused vs per-128 baseline output differences",
     )
     parser.add_argument(
         "--dump-profile-traces",
         type=str,
         default="",
-        help="非空时把 fused 的 Chrome trace 写到该目录（每 rank 一份）",
+        help="If nonempty, write one fused Chrome trace per rank to this directory",
     )
 
     args = parser.parse_args()
@@ -1266,10 +1248,10 @@ if __name__ == "__main__":
         os.makedirs(args.dump_profile_traces, exist_ok=True)
 
     if args.local_rank_idx is not None:
-        # 单进程模式：由外部 launcher 分别设置 MASTER_ADDR/PORT/WORLD_SIZE/RANK。
+        # Single-process mode: external launcher sets MASTER_ADDR/PORT/WORLD_SIZE/RANK.
         test(args.local_rank_idx, args.num_processes, args)
     else:
-        # 多进程启动：每个进程对应一个 GPU；test() 内部用 init_dist 建 NCCL group。
+        # Multi-process mode: one process per GPU; test() creates the NCCL group.
         torch.multiprocessing.spawn(
             test, args=(args.num_processes, args), nprocs=args.num_processes
         )

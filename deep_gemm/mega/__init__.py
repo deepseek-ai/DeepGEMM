@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import Tuple, Optional
 from ..utils.math import align
@@ -11,6 +12,14 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+
+
+def _from_dlpack_if_needed(tensor, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.utils.dlpack.from_dlpack(tensor)
+    if dtype is not None and tensor.dtype != dtype:
+        tensor = tensor.view(dtype)
+    return tensor
 
 
 class SymmBuffer:
@@ -42,10 +51,17 @@ class SymmBuffer:
         torch.cuda.synchronize()
 
         # Create input buffer views
-        (self.x, self.x_sf,
-         self.topk_idx, self.topk_weights,
-         self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+        (x, x_sf, topk_idx, topk_weights,
+         l1_acts, l1_acts_sf, l2_acts, l2_acts_sf) = slice_input_buffers(self.buffer)
+        x_dtype = torch.int8 if int(os.getenv('DG_USE_FP4_ACTS', '0')) != 0 else torch.float8_e4m3fn
+        self.x = _from_dlpack_if_needed(x, x_dtype)
+        self.x_sf = _from_dlpack_if_needed(x_sf)
+        self.topk_idx = _from_dlpack_if_needed(topk_idx)
+        self.topk_weights = _from_dlpack_if_needed(topk_weights)
+        self.l1_acts = _from_dlpack_if_needed(l1_acts, x_dtype)
+        self.l1_acts_sf = _from_dlpack_if_needed(l1_acts_sf)
+        self.l2_acts = _from_dlpack_if_needed(l2_acts, torch.float8_e4m3fn)
+        self.l2_acts_sf = _from_dlpack_if_needed(l2_acts_sf)
 
     def destroy(self):
         self.handle = None
@@ -140,9 +156,62 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
+    (l1_weights_data, l1_weights_sf) = l1_weights
+    (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_fp4_mega_moe(
         y,
-        l1_weights, l2_weights,
+        l1_weights_data, l1_weights_sf,
+        l2_weights_data, l2_weights_sf,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
+
+
+def mega_moe_pre_dispatch(x: torch.Tensor,
+                          topk_idx: torch.Tensor,
+                          topk_weights: torch.Tensor,
+                          buf_x: torch.Tensor,
+                          buf_x_sf: torch.Tensor,
+                          buf_topk_idx: torch.Tensor,
+                          buf_topk_weights: torch.Tensor,
+                          num_tokens: int,
+                          group_size: int = 32,
+                          use_fp4_acts: bool = False) -> None:
+    _C.mega_moe_pre_dispatch(
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, use_fp4_acts,
+    )
+
+
+def fp8_mega_moe(y: torch.Tensor,
+                 l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                 l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                 sym_buffer: SymmBuffer,
+                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                 recipe: Tuple[int, int, int] = (128, 128, 128),
+                 activation: str = 'swiglu',
+                 activation_clamp: Optional[float] = None,
+                 fast_math: bool = True):
+    """SM90 (Hopper) MegaMoE entry point.
+
+    Expects FP8 e4m3 weights and block-(128, 128) float scale factors. The
+    weight SF layout matches the convention used by ``DeepSeekV4FlashFp8`` /
+    DeepEP, so the same SF tensors can be physically shared between the
+    DeepEP path and this kernel.
+    """
+    (l1_weights_data, l1_weights_sf) = l1_weights
+    (l2_weights_data, l2_weights_sf) = l2_weights
+    _C.fp8_mega_moe(
+        y,
+        l1_weights_data, l1_weights_sf,
+        l2_weights_data, l2_weights_sf,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
