@@ -221,33 +221,3 @@ def fp8_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
-
-
-def fp8_mega_moe(y: torch.Tensor,
-                 l1_weights: Tuple[torch.Tensor, torch.Tensor],
-                 l2_weights: Tuple[torch.Tensor, torch.Tensor],
-                 sym_buffer: SymmBuffer,
-                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-                 recipe: Tuple[int, int, int] = (128, 128, 128),
-                 activation: str = 'swiglu',
-                 activation_clamp: Optional[float] = None,
-                 fast_math: bool = True):
-    """SM90 (Hopper) MegaMoE entry point.
-
-    Expects FP8 e4m3 weights and block-(128, 128) float scale factors. The
-    weight SF layout matches the convention used by ``DeepSeekV4FlashFp8`` /
-    DeepEP, so the same SF tensors can be physically shared between the
-    DeepEP path and this kernel.
-    """
-    _C.fp8_mega_moe(
-        y,
-        l1_weights, l2_weights,
-        cumulative_local_expert_recv_stats,
-        sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe,
-        activation, activation_clamp,
-        fast_math
-    )
