@@ -792,31 +792,32 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     #   4. Masked grouped FP8 GEMM with L2 weights.
     #   5. ``low_latency_combine`` (reduces with topk weights).
     # ----------------------------------------------------------------
-    M_max_ll = num_max_tokens_per_rank * num_ranks
-    # Expected per-expert mean of ``masked_m`` after dispatch. Used as the
-    # ``expected_m`` hint for the DeepGEMM masked kernel selector.
-    expected_m_ll = max(
-        1,
-        (num_max_tokens_per_rank * num_ranks * num_topk + num_experts - 1)
-        // num_experts,
-    )
-    # Pre-allocate per-call output buffers; the masked GEMM writes into them
-    # in place and ignores rows past ``masked_m[g]``.
-    ll_l1_y = torch.empty(
-        (num_experts_per_rank, M_max_ll, intermediate_hidden * 2),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    ll_l2_y = torch.empty(
-        (num_experts_per_rank, M_max_ll, hidden),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    ll_combined = torch.empty(
-        (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
-    )
-    # DeepEP low-latency dispatch requires int64 topk indices.
-    topk_idx_ll = topk_idx.to(torch.int64)
+    if run_ll_baseline_enabled:
+        M_max_ll = num_max_tokens_per_rank * num_ranks
+        # Expected per-expert mean of ``masked_m`` after dispatch. Used as the
+        # ``expected_m`` hint for the DeepGEMM masked kernel selector.
+        expected_m_ll = max(
+            1,
+            (num_max_tokens_per_rank * num_ranks * num_topk + num_experts - 1)
+            // num_experts,
+        )
+        # Pre-allocate per-call output buffers; the masked GEMM writes into them
+        # in place and ignores rows past ``masked_m[g]``.
+        ll_l1_y = torch.empty(
+            (num_experts_per_rank, M_max_ll, intermediate_hidden * 2),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        ll_l2_y = torch.empty(
+            (num_experts_per_rank, M_max_ll, hidden),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        ll_combined = torch.empty(
+            (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
+        )
+        # DeepEP low-latency dispatch requires int64 topk indices.
+        topk_idx_ll = topk_idx.to(torch.int64)
 
     def run_baseline_low_latency():
         # 1) Low-latency dispatch with FP8 cast.
