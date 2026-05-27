@@ -671,7 +671,10 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk",
           py::arg("block_m_override") = std::nullopt,
           py::arg("block_n_override") = std::nullopt,
-          py::arg("decode_stub") = false);
+          py::arg("decode_stub") = false,
+          py::arg("b_is_int4_sym") = false,
+          py::arg("masked_m_max_hint") = std::nullopt,
+          py::arg("active_groups_hint") = std::nullopt);
     m.attr("m_grouped_fp8_fp4_gemm_nt_mask_sm90_fused_wgmma") =
         m.attr("m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma");
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,
