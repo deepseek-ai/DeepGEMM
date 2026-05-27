@@ -201,7 +201,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
-    static constexpr uint32_t kSFKAlignment = kGranKA * 4;
+    static constexpr uint32_t kSFKAlignment = (kGranKA > kGranKB ? kGranKA : kGranKB) * 4;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs, kSFKAlignment,
         sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, false>(), kSplitKFactor>(
         shape_m, shape_n, shape_k, grouped_layout);
@@ -1130,15 +1130,15 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t row0 = m_base_sk + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
-                        if (row0 < shape_m and col + 1 < shape_n) {
+                        if (row0 < shape_m) {
                             auto idx = static_cast<int64_t>(row0) * shape_n + col;
-                            ws[idx] = accum[ai + 0];
-                            ws[idx + 1] = accum[ai + 1];
+                            if (col < shape_n)     ws[idx]     = accum[ai + 0];
+                            if (col + 1 < shape_n) ws[idx + 1] = accum[ai + 1];
                         }
-                        if (row1 < shape_m and col + 1 < shape_n) {
+                        if (row1 < shape_m) {
                             auto idx = static_cast<int64_t>(row1) * shape_n + col;
-                            ws[idx] = accum[ai + 2];
-                            ws[idx + 1] = accum[ai + 3];
+                            if (col < shape_n)     ws[idx]     = accum[ai + 2];
+                            if (col + 1 < shape_n) ws[idx + 1] = accum[ai + 3];
                         }
                     }
                 }

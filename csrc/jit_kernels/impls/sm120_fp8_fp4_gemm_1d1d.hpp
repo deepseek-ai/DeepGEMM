@@ -117,7 +117,8 @@ public:
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
         LaunchArgs launch_args;
-        int stride_d;
+        int stride_cd_m;
+        int stride_cd_n;
         void* gmem_d;
         void* workspace;
     };
@@ -139,12 +140,13 @@ static void __instantiate_kernel() {{
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.gmem_d, args.workspace,
-            args.gemm_desc.m, args.gemm_desc.n, args.stride_d));
+            args.gemm_desc.m, args.gemm_desc.n, args.stride_cd_m, args.stride_cd_n));
     }
 };
 
 static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Tensor& d,
-                                  const int& m, const int& n, const int& split_k) {
+                                  const int& m, const int& n, const int& split_k,
+                                  const int stride_cd_m, const int stride_cd_n) {
     const int total = m * n;
     const int threads = 256;
     const int blocks = ceil_div(total, threads);
@@ -168,7 +170,8 @@ static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Te
         .gemm_desc = desc,
         .gemm_config = config,
         .launch_args = LaunchArgs(blocks, threads, 0, 0),
-        .stride_d = static_cast<int>(d.stride(-2)),
+        .stride_cd_m = stride_cd_m,
+        .stride_cd_n = stride_cd_n,
         .gmem_d = d.data_ptr(),
         .workspace = workspace.data_ptr(),
     };
@@ -193,7 +196,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
     const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
 
-    const auto desc = GemmDesc {
+    auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
         .kernel_type = KernelType::Kernel1D1D,
         .m = m, .n = n, .k = k, .num_groups = 1,
@@ -203,7 +206,8 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .with_accumulation = c.has_value(),
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
-        .compiled_dims = compiled_dims
+        .compiled_dims = compiled_dims,
+        .max_gran_k = std::max(gran_k_a, gran_k_b)
     };
 
     GemmConfig config;
@@ -217,7 +221,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     } else {
         config = get_best_config<SM120ArchSpec>(desc);
     }
-    if (!override_layout.has_value() and !swap_ab)
+    if (!override_layout.has_value())
         config.split_k_factor = SM120ArchSpec::get_split_k_factor(desc, config.layout);
 
     const auto cd = c.value_or(d);
@@ -285,8 +289,11 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     const auto runtime = compiler->build("sm120_fp8_fp4_gemm_1d1d", code);
     SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
 
-    if (split_k > 1)
-        sm120_split_k_reduce(workspace, d, m, n, split_k);
+    if (split_k > 1) {
+        const int reduce_stride_m = swap_ab ? static_cast<int>(d.stride(-1)) : d_stride;
+        const int reduce_stride_n = swap_ab ? static_cast<int>(d.stride(-2)) : 1;
+        sm120_split_k_reduce(workspace, d, m, n, split_k, reduce_stride_m, reduce_stride_n);
+    }
 }
 
 static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -316,7 +323,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         sum_sf_k_a += ceil_div(ks[i], gran_k_a * 4);
         sum_sf_k_b += ceil_div(ks[i], gran_k_b * 4);
         max_k = std::max(max_k, ks[i]);
-        DG_HOST_ASSERT(ks[i] % 128 == 0);
+        DG_HOST_ASSERT(ks[i] % 64 == 0);
     }
 
     const auto desc = GemmDesc {
@@ -330,6 +337,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
+        .max_gran_k = std::max(gran_k_a, gran_k_b),
         .expected_m = m, .expected_n = n, .expected_k = max_k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
@@ -424,6 +432,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
+        .max_gran_k = std::max(gran_k_a, gran_k_b),
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
         .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
@@ -511,6 +520,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
+        .max_gran_k = std::max(gran_k_a, gran_k_b),
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
@@ -598,7 +608,8 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .with_accumulation = c.has_value(),
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
-        .compiled_dims = compiled_dims
+        .compiled_dims = compiled_dims,
+        .max_gran_k = std::max(gran_k_a, gran_k_b)
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 

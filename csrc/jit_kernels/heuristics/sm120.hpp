@@ -299,7 +299,7 @@ struct SM120ArchSpec {
     }
 
     static int get_split_k_factor(const GemmDesc& desc, const Layout& layout) {
-        if (desc.gemm_type != GemmType::Normal)
+        if (desc.gemm_type != GemmType::Normal or desc.kernel_type == KernelType::KernelNoSF)
             return 1;
 
         const int num_m_blocks = ceil_div(desc.get_expected_m(), layout.block_m);
@@ -313,9 +313,12 @@ struct SM120ArchSpec {
         const int target_blocks = desc.num_sms * 3 / 4;
         int split_k = ceil_div(target_blocks, num_mn_blocks);
 
-        // k_per_split must be divisible by SF tile size (4 k-blocks = one packed int32 SF)
-        // so each partition starts at an SF tile boundary.
-        constexpr int kSFTileKBlocks = 4;
+        // k_per_split must be divisible by the kernel's SF tile size so each
+        // partition starts at an SF-aligned K-block boundary.  The kernel packs
+        // 4 UE8M0 bytes per int32, spanning (4 * max_gran_k / block_k) k-blocks.
+        const int kSFTileKBlocks = (4 * desc.max_gran_k) / layout.block_k;
+        if (kSFTileKBlocks == 0)
+            return 1;
         while (split_k > 1 and (num_k_blocks % split_k != 0 or (num_k_blocks / split_k) % kSFTileKBlocks != 0))
             --split_k;
 

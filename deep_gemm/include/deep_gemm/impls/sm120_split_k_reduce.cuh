@@ -8,7 +8,8 @@ template <typename cd_dtype_t, uint32_t kSplitKFactor>
 __global__ void sm120_split_k_reduce_impl(
     cd_dtype_t* __restrict__ gmem_d,
     const float* __restrict__ workspace,
-    uint32_t shape_m, uint32_t shape_n, uint32_t stride_d) {
+    uint32_t shape_m, uint32_t shape_n,
+    int stride_cd_m, int stride_cd_n) {
     cudaGridDependencySynchronize();
 
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -25,7 +26,7 @@ __global__ void sm120_split_k_reduce_impl(
     for (uint32_t s = 1; s < kSplitKFactor; ++s)
         sum += workspace[s * ws_stride + idx];
 
-    gmem_d[row * stride_d + col] = cd_dtype_t(sum);
+    gmem_d[static_cast<int64_t>(row) * stride_cd_m + static_cast<int64_t>(col) * stride_cd_n] = cd_dtype_t(sum);
 }
 
 } // namespace deep_gemm

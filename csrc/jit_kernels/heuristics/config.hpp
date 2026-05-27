@@ -22,6 +22,11 @@ struct GemmDesc {
     int num_sms, tc_util;
     std::string compiled_dims;
 
+    // SF granularity for split-K alignment: max(gran_k_a, gran_k_b).
+    // Kernel packs 4 UE8M0 bytes per int32, spanning (4 * max_gran_k / block_k)
+    // k-blocks.  Split-K partitions must start at this boundary.
+    int max_gran_k = 128;
+
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
