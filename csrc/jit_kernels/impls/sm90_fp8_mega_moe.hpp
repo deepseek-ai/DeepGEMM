@@ -42,7 +42,7 @@ public:
         int epilogue_registers;
         bool reuse_accum_as_final;
         bool l2_arrival_counter;
-        bool skip_l2_epilogue_sync;
+        bool l2_epilogue_requires_full_sync;
         bool split_phase_hot_path;
         MegaMoESM90Config config;
 
@@ -112,7 +112,7 @@ static void __instantiate_kernel() {{
     args.epilogue_registers,
     args.reuse_accum_as_final ? "true" : "false",
     args.l2_arrival_counter ? "true" : "false",
-    args.skip_l2_epilogue_sync ? "true" : "false",
+    args.l2_epilogue_requires_full_sync ? "true" : "false",
     args.split_phase_hot_path ? "true" : "false");
     }
 
@@ -176,7 +176,7 @@ static void sm90_fp8_mega_moe(
         config.block_m == 128 and config.block_n == 256 and
         config.num_epilogue_threads == 512;
     const bool l2_arrival_counter = default_split_mn_barrier_opt;
-    const bool skip_l2_epilogue_sync = default_split_mn_barrier_opt;
+    const bool l2_epilogue_requires_full_sync = not default_split_mn_barrier_opt;
     const bool split_phase_hot_path =
         config.block_m == 128 and config.block_n == 256 and hidden >= 7168;
 
@@ -262,7 +262,7 @@ static void sm90_fp8_mega_moe(
         .epilogue_registers = epilogue_registers,
         .reuse_accum_as_final = reuse_accum_as_final,
         .l2_arrival_counter = l2_arrival_counter,
-        .skip_l2_epilogue_sync = skip_l2_epilogue_sync,
+        .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
         .split_phase_hot_path = split_phase_hot_path,
         .config = config,
         .y = y.data_ptr(),

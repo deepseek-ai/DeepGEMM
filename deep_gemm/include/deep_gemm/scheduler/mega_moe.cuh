@@ -23,8 +23,6 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumSMs, uint32_t kNumRanks,
           uint32_t kClusterSize = 2,
-          bool kNMajorSchedule = false,
-          uint32_t kMBlockInterleaveGroup = 0,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -124,12 +122,7 @@ struct MegaMoEScheduler {
             const auto num_m_blocks = get_current_num_m_blocks();
             const auto num_blocks = num_m_blocks * kNumL1BlockNs;
             if (block_idx < num_blocks) {
-                if constexpr (kNMajorSchedule) {
-                    n_block_idx = block_idx / num_m_blocks;
-                    m_block_idx = block_idx - n_block_idx * num_m_blocks;
-                } else {
-                    m_block_idx = block_idx / kNumL1BlockNs;
-                }
+                m_block_idx = block_idx / kNumL1BlockNs;
                 return true;
             }
 
@@ -146,12 +139,7 @@ struct MegaMoEScheduler {
             const auto num_m_blocks = get_current_num_m_blocks();
             const auto num_blocks = num_m_blocks * kNumL2BlockNs;
             if (block_idx < num_blocks) {
-                if constexpr (kNMajorSchedule) {
-                    n_block_idx = block_idx / num_m_blocks;
-                    m_block_idx = block_idx - n_block_idx * num_m_blocks;
-                } else {
-                    m_block_idx = block_idx / kNumL2BlockNs;
-                }
+                m_block_idx = block_idx / kNumL2BlockNs;
                 return true;
             }
 
@@ -164,56 +152,6 @@ struct MegaMoEScheduler {
 
     // Core state machine: assigns the next block
     CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
-        if constexpr (kMBlockInterleaveGroup > 0) {
-            while (true) {
-                if (current_local_expert_idx >= kNumExpertsPerRank)
-                    break;
-
-                const auto wave_end_expert_idx = get_wave_expert_end_idx();
-                while (current_local_expert_idx < wave_end_expert_idx) {
-                    const auto num_m_blocks = get_current_num_m_blocks();
-                    uint32_t residual_block_idx = block_idx;
-
-                    for (uint32_t group_start_m = 0; group_start_m < num_m_blocks;
-                         group_start_m += kMBlockInterleaveGroup) {
-                        const uint32_t group_m_blocks = cute::min(
-                            static_cast<uint32_t>(kMBlockInterleaveGroup),
-                            num_m_blocks - group_start_m);
-                        const uint32_t num_group_l1_blocks = group_m_blocks * kNumL1BlockNs;
-                        const uint32_t num_group_l2_blocks = group_m_blocks * kNumL2BlockNs;
-                        const uint32_t num_group_blocks = num_group_l1_blocks + num_group_l2_blocks;
-
-                        if (residual_block_idx < num_group_blocks) {
-                            BlockPhase block_phase;
-                            uint32_t local_block_idx;
-                            uint32_t num_block_ns;
-                            if (residual_block_idx < num_group_l1_blocks) {
-                                block_phase = BlockPhase::Linear1;
-                                local_block_idx = residual_block_idx;
-                                num_block_ns = kNumL1BlockNs;
-                            } else {
-                                block_phase = BlockPhase::Linear2;
-                                local_block_idx = residual_block_idx - num_group_l1_blocks;
-                                num_block_ns = kNumL2BlockNs;
-                            }
-
-                            m_block_idx = group_start_m + local_block_idx / num_block_ns;
-                            n_block_idx = local_block_idx - (m_block_idx - group_start_m) * num_block_ns;
-                            block_idx += kNumSMs;
-                            return {block_phase, current_local_expert_idx, m_block_idx, n_block_idx};
-                        }
-
-                        residual_block_idx -= num_group_blocks;
-                    }
-
-                    block_idx = residual_block_idx;
-                    advance_expert_idx();
-                }
-            }
-
-            return {BlockPhase::None, 0, 0, 0};
-        }
-
         while (true) {
             if (current_local_expert_idx >= kNumExpertsPerRank)
                 break;
@@ -221,8 +159,7 @@ struct MegaMoEScheduler {
             if (next_phase == BlockPhase::Linear1) {
                 if (fetch_next_l1_block()) {
                     // Found a new L1 block
-                    if constexpr (not kNMajorSchedule)
-                        n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+                    n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
                     // Jump to next block
                     block_idx += kNumSMs;
                     return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
@@ -234,8 +171,7 @@ struct MegaMoEScheduler {
             } else {
                 if (fetch_next_l2_block()) {
                     // Found a new L2 block
-                    if constexpr (not kNMajorSchedule)
-                        n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
+                    n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
                     // Jump to next block
                     block_idx += kNumSMs;
                     return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};

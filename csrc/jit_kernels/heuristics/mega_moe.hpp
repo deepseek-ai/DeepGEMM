@@ -321,9 +321,7 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     // above that point the larger split-MN tile cuts scheduling overhead.
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    const bool auto_split_mn =
-        get_env<int>("DG_SM90_MEGA_MOE_DISABLE_AUTO_SPLIT_MN", 0) == 0 and
-        expected_tokens_per_expert >= 64.0f;
+    const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
     if (auto_split_mn)
         return {128, 512};
 
@@ -417,9 +415,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    const bool auto_split_mn =
-        get_env<int>("DG_SM90_MEGA_MOE_DISABLE_AUTO_SPLIT_MN", 0) == 0 and
-        expected_tokens_per_expert >= 64.0f;
+    const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
     const int block_n = auto_split_mn ? 256 : 128;
     const int block_k = 128;
     // NOTES: cluster_size=1 for SM90 in this initial implementation. Cluster=2
