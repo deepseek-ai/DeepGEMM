@@ -353,8 +353,13 @@ void sm100_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             using Loader = cute::conditional_t<N == 32,
                 cute::SM100_TMEM_LOAD_32dp32b32x,
                 cute::SM100_TMEM_LOAD_32dp32b64x>;
+#ifdef __CUDACC_DEBUG__
+            uint32_t addr = tmem_addr | (((threadIdx.x / 32) % 4 * 32) << 16);
+#else
+            const auto& addr = tmem_addr;
+#endif
             [&]<size_t... Is>(cute::index_sequence<Is...>) {
-                Loader::copy(tmem_addr, reinterpret_cast<uint32_t*>(accum)[Is]...);
+                Loader::copy(addr, reinterpret_cast<uint32_t*>(accum)[Is]...);
             }(cute::make_index_sequence<N>{});
             cutlass::arch::fence_view_async_tmem_load();
         };

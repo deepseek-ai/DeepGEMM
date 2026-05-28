@@ -60,6 +60,9 @@ sm100_store_cd_swap_ab(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint3
             uint32_t tmem_addr = tmem_base_addr +
                                  s * STORE_BLOCK_M +            // Store stage offset
                                  i * kNumSwizzleAtomRows;       // In-block offset
+#ifdef __CUDACC_DEBUG__
+            tmem_addr |= ((epilogue_warp_idx % 4) * 32) << 16;
+#endif
             uint32_t values[kNumSwizzleAtomRows];
 
             // Warps cooperatively write an atomic block to shared memory

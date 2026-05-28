@@ -978,6 +978,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Load from TMEM
                         uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
                         uint32_t values[ATOM_M];
+#ifdef __CUDACC_DEBUG__
+                        tmem_addr |= (warp_idx_in_wg * 32) << 16;
+#endif
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                                values[0], values[1], values[2], values[3]);
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
@@ -1141,6 +1144,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // Load from TMEM using .16x256b shape to satisfy STSM layout requirements
                         // Start from lane index 0 and 16
                         uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+#ifdef __CUDACC_DEBUG__
+                        tmem_addr |= (warp_idx_in_wg * 32) << 16;
+#endif
                         uint32_t values[ATOM_M];
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                                values[0], values[1], values[2], values[3]);

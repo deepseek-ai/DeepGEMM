@@ -77,6 +77,9 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
                 uint32_t tmem_addr = tmem_base_addr +                                       // Accumulator offset
                                      w * BLOCK_N +                                          // Wave offset
                                      s * STORE_BLOCK_N + i * kNumElemsPerBankGroup;         // In-block offset
+#ifdef __CUDACC_DEBUG__
+                tmem_addr |= ((epilogue_warp_idx % 4) * 32) << 16;
+#endif
                 auto smem_ptr = smem_base_ptr +                                             // Base pointer
                                 epilogue_warp_idx * 32 * kSwizzleCDMode +                   // Warp offset
                                 row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;  // In-atom offset
