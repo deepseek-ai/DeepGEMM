@@ -162,12 +162,14 @@ struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
 
     CUTLASS_DEVICE uint32_t get_num_kv(const uint32_t& q_atom_idx) const {
         if constexpr (kIsVarlen) {
+            if (q_atom_idx >= batch_size) return 0;
             const bool is_paired = (q_atom_idx + 1 < batch_size and
                                     this->indices[q_atom_idx] == this->indices[q_atom_idx + 1]);
             const uint32_t ctx_len = is_paired ? context_lens[q_atom_idx + 1] : context_lens[q_atom_idx];
             return math::ceil_div(ctx_len, BLOCK_KV);
         } else {
             const uint32_t q_idx = q_atom_idx / kNumNextNAtoms;
+            if (q_idx >= batch_size) return 0;
             const auto lens_idx = (kIsContextLens2D ? q_idx * kNextN + kNextN - 1 : q_idx);
             return math::ceil_div(context_lens[lens_idx], BLOCK_KV);
         }
