@@ -242,6 +242,9 @@ sm100_bmn_bnk_mn_gemm_impl(uint32_t shape_s,
             // Load from tensor memory, store into shared memory
             uint32_t values[kNumElemsPerBankGroup];
             DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
+#ifdef __CUDACC_DEBUG__
+            tmem_addr |= ((warp_idx % 4) * 32) << 16;
+#endif
             cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr,
                 values[0], values[1], values[2], values[3]);
             cutlass::arch::fence_view_async_tmem_load();

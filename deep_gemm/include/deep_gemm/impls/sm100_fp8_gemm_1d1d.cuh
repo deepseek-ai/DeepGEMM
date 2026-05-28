@@ -501,6 +501,9 @@ sm100_fp8_gemm_1d1d_impl(int* grouped_layout,
 
                         // Load from tensor memory, store into shared memory
                         uint32_t values[kNumElemsPerBankGroup];
+#ifdef __CUDACC_DEBUG__
+                        tmem_addr |= ((epilogue_warp_idx % 4) * 32) << 16;
+#endif
                         if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                             // For FP32 output, read and store
                             DG_STATIC_ASSERT(kNumElemsPerBankGroup == 4, "Invalid type");
