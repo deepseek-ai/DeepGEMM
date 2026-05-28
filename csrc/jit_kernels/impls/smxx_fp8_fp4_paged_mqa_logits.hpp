@@ -63,6 +63,7 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     constexpr int num_threads = 32;
     const int aligned_batch_size = align(batch_size, 32);
     const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
+    // SM90 pads NextN=3 as one paired atom plus one single-token tail in the kernel.
     const int num_next_n_atoms = (device_runtime->get_arch_major() == 9 and next_n == 3 and not is_varlen)
         ? 1 : ceil_div(next_n, next_n_atom);
     DG_HOST_ASSERT(split_kv % block_kv == 0);

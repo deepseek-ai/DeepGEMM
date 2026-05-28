@@ -39,6 +39,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     DG_STATIC_ASSERT(not kIsVarlen, "Varlen is not supported for SM90 paged MQA logits");
 
     // Types
+    // Odd NextN uses paired-token atoms for the common path and a single-token WGMMA tail.
     static constexpr bool kPadOddN = (not kIsVarlen) and (kNextN % 2 == 1) and (kNextN >= 3);
     static constexpr uint32_t kNextNAtom = (kIsVarlen or kNextN >= 2) ? 2 : 1;
     static constexpr uint32_t kNumNextNAtoms = kPadOddN ? 1 : math::constexpr_ceil_div(kNextN, kNextNAtom);
