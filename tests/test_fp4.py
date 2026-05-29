@@ -24,22 +24,23 @@ E2M1_LUT = torch.tensor([
 # ============================================================
 
 def pack_fp4_random(m: int, k_fp4: int, device='cuda'):
-    """生成随机 E2M1 FP4 数据并打包为 int32。每个 int32 包含 8 个 FP4 值。"""
-    assert k_fp4 % 8 == 0
+    """Generate random E2M1 FP4 values, pack as int8 (kPackedFP4, 2 FP4 per byte).
+    Memory layout identical to int32 packing (8 FP4 per int32) when viewed as int32.
+    """
+    assert k_fp4 % 2 == 0
     raw = torch.randint(0, 16, (m, k_fp4), dtype=torch.uint8, device=device)
-    packed = torch.zeros(m, k_fp4 // 8, dtype=torch.int32, device=device)
-    for i in range(8):
-        packed += (raw[:, i::8].to(torch.int32) << (i * 4))
+    packed = torch.zeros(m, k_fp4 // 2, dtype=torch.int8, device=device)
+    # Byte layout: low nibble = even FP4, high nibble = odd FP4 (matches per_token_cast_to_fp4)
+    packed |= (raw[:, 0::2].to(torch.int8) & 0x0F)
+    packed |= (raw[:, 1::2].to(torch.int8) & 0x0F) << 4
     return packed
 
 
 def pack_fp4_constant(m: int, k_fp4: int, fp4_bits: int = 0x2, device='cuda'):
-    """生成常量 FP4 打包数据。fp4_bits=0x2 -> E2M1 1.0"""
-    assert k_fp4 % 8 == 0
-    word = 0
-    for i in range(8):
-        word |= (fp4_bits & 0xF) << (i * 4)
-    return torch.full((m, k_fp4 // 8), word, dtype=torch.int32, device=device)
+    """Constant FP4 packed as int8. fp4_bits=0x2 -> E2M1 1.0"""
+    assert k_fp4 % 2 == 0
+    byte = (fp4_bits & 0x0F) | ((fp4_bits & 0x0F) << 4)
+    return torch.full((m, k_fp4 // 2), byte, dtype=torch.int8, device=device)
 
 
 def generate_mxf4_scale_factors(m, n, k_fp4, device='cuda', random_sf=False):
@@ -71,18 +72,17 @@ def generate_mxf4_scale_factors(m, n, k_fp4, device='cuda', random_sf=False):
 
 
 def fp4_reference(a_packed, b_packed, m, n, sf_a=None, sf_b=None):
-    """CPU 端 E2M1 FP4 GEMM reference: C = A @ B^T, 支持 block-scaled SF。
-
-    Block-scaled MXF4: C[m,n] = sum_g SF_A[m,g] * SF_B[n,g] * dot(A_g, B_g)
-    其中 g 是 VS=32 元素的组。sf_a/sf_b 为 float32 (pre-transform), 每组一个值。
+    """CPU FP4 GEMM reference: C = A @ B^T with block-scaled SF.
+    Works for both int8 packing (2 FP4/byte, kPackedFP4) and int32 packing (8 FP4/int32).
     """
     VS = 32
-    a_cpu = a_packed.cpu().to(torch.int64) & 0xFFFFFFFF
-    b_cpu = b_packed.cpu().to(torch.int64) & 0xFFFFFFFF
-    bits_a = torch.stack([(a_cpu >> (i*4)) & 0xF for i in range(8)], dim=-1).reshape(m, -1)
-    bits_b = torch.stack([(b_cpu >> (i*4)) & 0xF for i in range(8)], dim=-1).reshape(n, -1)
-    a_float = E2M1_LUT[bits_a.long()]  # [m, k_fp4]
-    b_float = E2M1_LUT[bits_b.long()]  # [n, k_fp4]
+    a_cpu = a_packed.cpu().contiguous().view(torch.uint8).reshape(m, -1)
+    b_cpu = b_packed.cpu().contiguous().view(torch.uint8).reshape(n, -1)
+    # Each byte holds 2 FP4: low nibble = even idx, high nibble = odd idx
+    bits_a = torch.stack([(a_cpu & 0xF).long(), ((a_cpu >> 4) & 0xF).long()], dim=-1).reshape(m, -1)
+    bits_b = torch.stack([(b_cpu & 0xF).long(), ((b_cpu >> 4) & 0xF).long()], dim=-1).reshape(n, -1)
+    a_float = E2M1_LUT[bits_a]  # [m, k_fp4]
+    b_float = E2M1_LUT[bits_b]  # [n, k_fp4]
 
     if sf_a is None:
         return torch.matmul(a_float, b_float.T)
@@ -107,12 +107,14 @@ def fp4_reference(a_packed, b_packed, m, n, sf_a=None, sf_b=None):
     return c
 
 
-def run_kernel(a_packed, b_packed, sf_a, sf_b, m, n, recipe=(1, 1, 128)):
-    """调用 FP4 GEMM kernel (复用 fp8_gemm_nt 入口, int32 dtype 触发 FP4 路径)"""
-    duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
-    d = torch.empty((m, n), device='cuda', dtype=torch.float32)
-    deep_gemm.fp8_gemm_nt((a_packed, sf_a), (b_packed, sf_b), d, c=None,
-                          recipe=recipe, disable_ue8m0_cast=duc)
+def run_kernel(a_packed, b_packed, sf_a, sf_b, m, n, recipe=(1, 1, 32)):
+    """Call FP4 GEMM kernel via main's fp8_fp4_gemm_nt (kPackedFP4=int8 triggers my MXF4 path).
+    recipe gran_k=32 matches FP4 VS=32 SF granularity.
+    """
+    d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    deep_gemm.fp8_fp4_gemm_nt((a_packed, sf_a), (b_packed, sf_b), d, c=None,
+                              recipe_a=(1, 32), recipe_b=(1, 32),
+                              disable_ue8m0_cast=False)
     torch.cuda.synchronize()
     return d
 

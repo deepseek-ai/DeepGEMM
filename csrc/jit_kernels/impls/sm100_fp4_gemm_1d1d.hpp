@@ -106,34 +106,35 @@ static int compute_num_last_stages_fp4(int k, int block_k_bytes, int num_stages)
 // my kernel's actual usage so num_stages selection is correct upstream.
 static std::pair<int, int> recompute_stages_for_fp4(const GemmConfig& config, int block_m, int block_n, int k_fp4) {
     constexpr int smem_capacity = 232448;
-    constexpr int sf_block_align = 128;  // kNumUTCCPAlignedElems
+    constexpr int sf_block_align = 128;
     const int sf_block_m = (block_m + sf_block_align - 1) / sf_block_align * sf_block_align;
     const int sf_block_n = (block_n + sf_block_align - 1) / sf_block_align * sf_block_align;
 
-    // My kernel SF per stage = SF_BLOCK_MN * SF_PACKED_K_PER_STAGE * 4 bytes;
-    // SF_PACKED_K_PER_STAGE = (BLOCK_K * 8 / 32) / 4 = BLOCK_K / 16 (in int32 units).
-    // For main's block_k bytes (= int32 units * 4), SF_PACKED_K_PER_STAGE = block_k_bytes / 64.
+    // Match fea-fp4 kernel's actual smem usage:
+    //   A per stage: load_block_m * block_k_bytes
+    //   B per stage: load_block_n * block_k_bytes
+    //   SFA/B per stage: sf_block_mn * sf_packed_k_per_stage * 4
+    // where sf_packed_k_per_stage = block_k_bytes / 64 (since BLOCK_K_FP4 / VS / 4 = block_k_int32 / 4 = block_k_bytes / 16 / 4 / 4 ... wait simpler: block_k_int32/4)
+    // Kernel: BLOCK_K_FP4 = block_k_int32 * 8; SF_K_PER_STAGE = BLOCK_K_FP4 / 32;
+    //         SF_PACKED_K_PER_STAGE = SF_K_PER_STAGE / 4 = block_k_int32 / 16.
+    // In bytes: block_k_bytes / 64.
     const int sf_packed_k_per_stage = config.layout.block_k / 64;
-    const int my_smem_sfa_per_stage = sf_block_m * sf_packed_k_per_stage * 4;
-    const int my_smem_sfb_per_stage = sf_block_n * sf_packed_k_per_stage * 4;
+    const int per_stage = config.storage_config.load_block_m * config.layout.block_k
+                        + config.storage_config.load_block_n * config.layout.block_k
+                        + sf_block_m * sf_packed_k_per_stage * 4
+                        + sf_block_n * sf_packed_k_per_stage * 4;
 
-    // Reconstruct main's smem_per_stage and extra parts.
-    const int main_smem_sfa_per_stage = sf_block_m * 4;
-    const int main_smem_sfb_per_stage = sf_block_n * 4;
-    const int main_smem_per_stage = config.storage_config.load_block_m * config.layout.block_k +
-                                    config.storage_config.load_block_n * config.layout.block_k +
-                                    main_smem_sfa_per_stage + main_smem_sfb_per_stage;
-    const int main_smem_extra = config.pipeline_config.smem_size -
-                                config.pipeline_config.num_stages * main_smem_per_stage;
+    // Fixed extras (CD smem + barriers + tmem_ptr, conservative estimate)
+    // CD (non-swap): store_block_m * swizzle_cd_mode * 2 stages
+    const int cd_size = config.storage_config.store_block_m * config.storage_config.swizzle_cd_mode * 2;
+    const int barriers = 12 * 8 * 4 + 4 * 8 * 2 + 8;  // ~ 416 bytes max
+    const int tmem_ptr = 4;
+    const int fixed_extras = cd_size + barriers + tmem_ptr;
 
-    const int my_smem_per_stage = main_smem_per_stage - main_smem_sfa_per_stage - main_smem_sfb_per_stage
-                                  + my_smem_sfa_per_stage + my_smem_sfb_per_stage;
-    const int max_stages = (smem_capacity - main_smem_extra) / my_smem_per_stage;
-    // Also clamp to num_k_blocks: my kernel assumes pipeline depth <= K iterations
-    // (fea-fp4 heuristic invariant). main's heuristic ignores this.
+    const int max_stages_smem = (smem_capacity - fixed_extras) / per_stage;
     const int num_k_blocks = ceil_div(k_fp4, config.layout.block_k * 2);
-    const int new_num_stages = std::min({config.pipeline_config.num_stages, max_stages, num_k_blocks});
-    const int new_smem_size = main_smem_extra + new_num_stages * my_smem_per_stage;
+    const int new_num_stages = std::min({12, max_stages_smem, num_k_blocks});
+    const int new_smem_size = fixed_extras + new_num_stages * per_stage;
     return {new_num_stages, new_smem_size};
 }
 
@@ -172,8 +173,13 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
                                     major_a, major_b, d.scalar_type(),
                                     c.has_value(), compiled_dims);
     auto config = get_best_config<SM100ArchSpec>(desc);
-    // v0: force single-CTA path (main's heuristic prefers cluster=2 too aggressively
-    // for shapes where fea-fp4 stayed at 1; multicast path needs more validation).
+    // v0: match fea-fp4's tested config block_m=128, block_n=112, single-CTA.
+    // block_n=112 makes kSwizzleCDMode=32 (since 112*2=224, gcd(224, 128/64)=32).
+    // This is what fea-fp4's tests actually exercised; block_n=128 (kSwizzleCDMode=128)
+    // path appears untested upstream.
+    config.layout.block_m = 128;
+    config.layout.block_n = 112;
+    config.layout.swap_ab = false;
     config.layout.cluster_m = 1;
     config.layout.cluster_n = 1;
     config.launch_config.num_sms_per_cluster = 1;
@@ -257,8 +263,13 @@ static void sm100_m_grouped_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, con
                                     major_a, major_b, d.scalar_type(),
                                     false, compiled_dims);
     auto config = get_best_config<SM100ArchSpec>(desc);
-    // v0: force single-CTA path (main's heuristic prefers cluster=2 too aggressively
-    // for shapes where fea-fp4 stayed at 1; multicast path needs more validation).
+    // v0: match fea-fp4's tested config block_m=128, block_n=112, single-CTA.
+    // block_n=112 makes kSwizzleCDMode=32 (since 112*2=224, gcd(224, 128/64)=32).
+    // This is what fea-fp4's tests actually exercised; block_n=128 (kSwizzleCDMode=128)
+    // path appears untested upstream.
+    config.layout.block_m = 128;
+    config.layout.block_n = 112;
+    config.layout.swap_ab = false;
     config.layout.cluster_m = 1;
     config.layout.cluster_n = 1;
     config.launch_config.num_sms_per_cluster = 1;
@@ -327,8 +338,13 @@ static void sm100_m_grouped_fp4_gemm_masked_1d1d(const torch::Tensor& a, const t
                                     false, compiled_dims,
                                     /*expected_m=*/expected_m, /*expected_num_groups=*/num_groups);
     auto config = get_best_config<SM100ArchSpec>(desc);
-    // v0: force single-CTA path (main's heuristic prefers cluster=2 too aggressively
-    // for shapes where fea-fp4 stayed at 1; multicast path needs more validation).
+    // v0: match fea-fp4's tested config block_m=128, block_n=112, single-CTA.
+    // block_n=112 makes kSwizzleCDMode=32 (since 112*2=224, gcd(224, 128/64)=32).
+    // This is what fea-fp4's tests actually exercised; block_n=128 (kSwizzleCDMode=128)
+    // path appears untested upstream.
+    config.layout.block_m = 128;
+    config.layout.block_n = 112;
+    config.layout.swap_ab = false;
     config.layout.cluster_m = 1;
     config.layout.cluster_n = 1;
     config.launch_config.num_sms_per_cluster = 1;
