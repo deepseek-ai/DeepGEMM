@@ -53,8 +53,14 @@ def test_gemm() -> None:
                          'gemm_', suppress_kineto_output=True)
         a_k = a[0].contiguous() if not major_a.is_k_major() else a[0]
         b_k = b[0].contiguous() if not major_b.is_k_major() else b[0]
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a_k, b_k, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True) \
-                              if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0)
+        # On SM120 (consumer Blackwell) cuBLAS picks either an nvjet GEMM kernel or
+        # falls back to a legacy sm89_xmma FP8 kernel depending on shape; match both,
+        # plus the split-K reduce kernel. (SM90/SM100 use nvjet and never the sm89
+        # fallback, so 'xmma' simply matches nothing there.)
+        cublas_nvjet, cublas_xmma, split_k_t = \
+            bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a_k, b_k, d, c=c), ('nvjet', 'xmma', 'reduce'), suppress_kineto_output=True) \
+            if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0, 0)
+        cublas_t = cublas_nvjet + cublas_xmma
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
