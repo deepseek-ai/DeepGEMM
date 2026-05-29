@@ -98,6 +98,45 @@ static int compute_num_last_stages_fp4(int k, int block_k_bytes, int num_stages)
     return rem == 0 ? num_stages : rem;
 }
 
+// My MXF4 kernel allocates 2x SF smem per stage (2 packed int32 per row to cover the
+// full BLOCK_K_FP4=256 of 8 SFs) than main's heuristic assumes (1 packed int32 per
+// row, covering only 128 FP4). Cap num_stages so total smem fits SM100's 232448-byte
+// capacity. Returns {new_num_stages, new_smem_size}.
+// Note: this is a v0 workaround. Phase 2: align main's heuristic SF computation with
+// my kernel's actual usage so num_stages selection is correct upstream.
+static std::pair<int, int> recompute_stages_for_fp4(const GemmConfig& config, int block_m, int block_n, int k_fp4) {
+    constexpr int smem_capacity = 232448;
+    constexpr int sf_block_align = 128;  // kNumUTCCPAlignedElems
+    const int sf_block_m = (block_m + sf_block_align - 1) / sf_block_align * sf_block_align;
+    const int sf_block_n = (block_n + sf_block_align - 1) / sf_block_align * sf_block_align;
+
+    // My kernel SF per stage = SF_BLOCK_MN * SF_PACKED_K_PER_STAGE * 4 bytes;
+    // SF_PACKED_K_PER_STAGE = (BLOCK_K * 8 / 32) / 4 = BLOCK_K / 16 (in int32 units).
+    // For main's block_k bytes (= int32 units * 4), SF_PACKED_K_PER_STAGE = block_k_bytes / 64.
+    const int sf_packed_k_per_stage = config.layout.block_k / 64;
+    const int my_smem_sfa_per_stage = sf_block_m * sf_packed_k_per_stage * 4;
+    const int my_smem_sfb_per_stage = sf_block_n * sf_packed_k_per_stage * 4;
+
+    // Reconstruct main's smem_per_stage and extra parts.
+    const int main_smem_sfa_per_stage = sf_block_m * 4;
+    const int main_smem_sfb_per_stage = sf_block_n * 4;
+    const int main_smem_per_stage = config.storage_config.load_block_m * config.layout.block_k +
+                                    config.storage_config.load_block_n * config.layout.block_k +
+                                    main_smem_sfa_per_stage + main_smem_sfb_per_stage;
+    const int main_smem_extra = config.pipeline_config.smem_size -
+                                config.pipeline_config.num_stages * main_smem_per_stage;
+
+    const int my_smem_per_stage = main_smem_per_stage - main_smem_sfa_per_stage - main_smem_sfb_per_stage
+                                  + my_smem_sfa_per_stage + my_smem_sfb_per_stage;
+    const int max_stages = (smem_capacity - main_smem_extra) / my_smem_per_stage;
+    // Also clamp to num_k_blocks: my kernel assumes pipeline depth <= K iterations
+    // (fea-fp4 heuristic invariant). main's heuristic ignores this.
+    const int num_k_blocks = ceil_div(k_fp4, config.layout.block_k * 2);
+    const int new_num_stages = std::min({config.pipeline_config.num_stages, max_stages, num_k_blocks});
+    const int new_smem_size = main_smem_extra + new_num_stages * my_smem_per_stage;
+    return {new_num_stages, new_smem_size};
+}
+
 // Build a GemmDesc forcing a_dtype=b_dtype=kPackedFP4 (since this is the FP4xFP4 wrapper).
 static GemmDesc make_fp4_desc(GemmType gemm_type, int m, int n, int k, int num_groups,
                               const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
@@ -132,18 +171,36 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
     const auto desc = make_fp4_desc(GemmType::Normal, m, n, k, 1,
                                     major_a, major_b, d.scalar_type(),
                                     c.has_value(), compiled_dims);
-    const auto config = get_best_config<SM100ArchSpec>(desc);
+    auto config = get_best_config<SM100ArchSpec>(desc);
+    // v0: force single-CTA path (main's heuristic prefers cluster=2 too aggressively
+    // for shapes where fea-fp4 stayed at 1; multicast path needs more validation).
+    config.layout.cluster_m = 1;
+    config.layout.cluster_n = 1;
+    config.launch_config.num_sms_per_cluster = 1;
+    config.storage_config = SM100ArchSpec::get_storage_config(desc, config.layout);
+    config.pipeline_config = SM100ArchSpec::get_pipeline_config(desc, config.layout, config.storage_config);
+    const auto [new_stages, new_smem] = recompute_stages_for_fp4(config, config.layout.block_m, config.layout.block_n, k);
+    config.pipeline_config.num_stages = new_stages;
+    config.pipeline_config.smem_size = new_smem;
+
+    // View FP4-packed-int8 tensors as int32 (8 FP4 per int32). Same memory layout,
+    // different dtype tag -- makes the TMA descriptor use INT32 (not 16U4_ALIGN16B
+    // unpacked-smem), which matches my kernel's int32-packed smem expectation.
+    const auto a_int32 = a.view(torch::kInt);
+    const auto b_int32 = b.view(torch::kInt);
+    const int k_int32 = k / 8;
+    const int block_k_int32 = config.layout.block_k / 4;
 
     const auto cd = c.value_or(d);
-    const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+    const auto tensor_map_a = make_tma_a_desc(major_a, a_int32, m, k_int32,
                                               config.storage_config.load_block_m,
-                                              config.layout.block_k,
-                                              static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                              block_k_int32,
+                                              static_cast<int>(a_int32.stride(get_non_contiguous_dim(major_a))), 1,
                                               config.storage_config.swizzle_a_mode);
-    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+    const auto tensor_map_b = make_tma_b_desc(major_b, b_int32, n, k_int32,
                                               config.storage_config.load_block_n,
-                                              config.layout.block_k,
-                                              static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), 1,
+                                              block_k_int32,
+                                              static_cast<int>(b_int32.stride(get_non_contiguous_dim(major_b))), 1,
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_d = make_tma_cd_desc(d, m, n,
                                                config.storage_config.store_block_m,
@@ -199,17 +256,32 @@ static void sm100_m_grouped_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, con
     const auto desc = make_fp4_desc(GemmType::MGroupedContiguous, m, n, k, num_groups,
                                     major_a, major_b, d.scalar_type(),
                                     false, compiled_dims);
-    const auto config = get_best_config<SM100ArchSpec>(desc);
+    auto config = get_best_config<SM100ArchSpec>(desc);
+    // v0: force single-CTA path (main's heuristic prefers cluster=2 too aggressively
+    // for shapes where fea-fp4 stayed at 1; multicast path needs more validation).
+    config.layout.cluster_m = 1;
+    config.layout.cluster_n = 1;
+    config.launch_config.num_sms_per_cluster = 1;
+    config.storage_config = SM100ArchSpec::get_storage_config(desc, config.layout);
+    config.pipeline_config = SM100ArchSpec::get_pipeline_config(desc, config.layout, config.storage_config);
+    const auto [new_stages_g, new_smem_g] = recompute_stages_for_fp4(config, config.layout.block_m, config.layout.block_n, k);
+    config.pipeline_config.num_stages = new_stages_g;
+    config.pipeline_config.smem_size = new_smem_g;
 
-    const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+    const auto a_int32 = a.view(torch::kInt);
+    const auto b_int32 = b.view(torch::kInt);
+    const int k_int32 = k / 8;
+    const int block_k_int32 = config.layout.block_k / 4;
+
+    const auto tensor_map_a = make_tma_a_desc(major_a, a_int32, m, k_int32,
                                               config.storage_config.load_block_m,
-                                              config.layout.block_k,
-                                              static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
+                                              block_k_int32,
+                                              static_cast<int>(a_int32.stride(get_non_contiguous_dim(major_a))), 1,
                                               config.storage_config.swizzle_a_mode);
-    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+    const auto tensor_map_b = make_tma_b_desc(major_b, b_int32, n, k_int32,
                                               config.storage_config.load_block_n,
-                                              config.layout.block_k,
-                                              static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
+                                              block_k_int32,
+                                              static_cast<int>(b_int32.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_d = make_tma_cd_desc(d, m, n,
                                                config.storage_config.store_block_m,
@@ -254,17 +326,32 @@ static void sm100_m_grouped_fp4_gemm_masked_1d1d(const torch::Tensor& a, const t
                                     major_a, major_b, d.scalar_type(),
                                     false, compiled_dims,
                                     /*expected_m=*/expected_m, /*expected_num_groups=*/num_groups);
-    const auto config = get_best_config<SM100ArchSpec>(desc);
+    auto config = get_best_config<SM100ArchSpec>(desc);
+    // v0: force single-CTA path (main's heuristic prefers cluster=2 too aggressively
+    // for shapes where fea-fp4 stayed at 1; multicast path needs more validation).
+    config.layout.cluster_m = 1;
+    config.layout.cluster_n = 1;
+    config.launch_config.num_sms_per_cluster = 1;
+    config.storage_config = SM100ArchSpec::get_storage_config(desc, config.layout);
+    config.pipeline_config = SM100ArchSpec::get_pipeline_config(desc, config.layout, config.storage_config);
+    const auto [new_stages_mk, new_smem_mk] = recompute_stages_for_fp4(config, config.layout.block_m, config.layout.block_n, k);
+    config.pipeline_config.num_stages = new_stages_mk;
+    config.pipeline_config.smem_size = new_smem_mk;
 
-    const auto tensor_map_a = make_tma_a_desc(major_a, a, m, k,
+    const auto a_int32 = a.view(torch::kInt);
+    const auto b_int32 = b.view(torch::kInt);
+    const int k_int32 = k / 8;
+    const int block_k_int32 = config.layout.block_k / 4;
+
+    const auto tensor_map_a = make_tma_a_desc(major_a, a_int32, m, k_int32,
                                               config.storage_config.load_block_m,
-                                              config.layout.block_k,
-                                              static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), num_groups,
+                                              block_k_int32,
+                                              static_cast<int>(a_int32.stride(get_non_contiguous_dim(major_a))), num_groups,
                                               config.storage_config.swizzle_a_mode);
-    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
+    const auto tensor_map_b = make_tma_b_desc(major_b, b_int32, n, k_int32,
                                               config.storage_config.load_block_n,
-                                              config.layout.block_k,
-                                              static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
+                                              block_k_int32,
+                                              static_cast<int>(b_int32.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode);
     const auto tensor_map_d = make_tma_cd_desc(d, m, n,
                                                config.storage_config.store_block_m,
