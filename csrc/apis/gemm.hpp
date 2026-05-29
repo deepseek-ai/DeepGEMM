@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm100_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #endif 
 
@@ -93,8 +94,13 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
             sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
         }
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
+        if (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4) {
+            sm100_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k,
                                 major_a, major_b, compiled_dims);
+        } else {
+            sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
+                                    major_a, major_b, compiled_dims);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -197,9 +203,15 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                 num_groups, m, n, k, major_a, major_b, major_sfb,
                                                 compiled_dims, use_psum_layout, expected_m_for_psum_layout);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
-                                                     num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
-                                                     compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+        if (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4) {
+            DG_HOST_ASSERT(not use_psum_layout);
+            sm100_m_grouped_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
+                                                     num_groups, m, n, k, major_a, major_b, compiled_dims);
+        } else {
+            sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
+                                                         num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
+                                                         compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -260,9 +272,15 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
         sm90_m_grouped_fp8_gemm_masked_1d2d(a.first, sfa, b.first, sfb, d, masked_m,
                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-        sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
-                                                 num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
+        if (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4) {
+            sm100_m_grouped_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
+                                                 num_groups, m, n, k, expected_m,
                                                  major_a, major_b, compiled_dims);
+        } else {
+            sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
+                                                     num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
+                                                     major_a, major_b, compiled_dims);
+        }
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
