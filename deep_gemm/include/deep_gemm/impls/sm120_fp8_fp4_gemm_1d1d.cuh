@@ -1183,7 +1183,14 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 float v0 = accum[ai + 0], v1 = accum[ai + 1];
                                 float v2 = accum[ai + 2], v3 = accum[ai + 3];
 
-                                if constexpr (kWithAccumulation) {
+                                // Batched accumulation is handled by SM90_TMA_REDUCE_ADD_3D
+                                // (adds SMEM to the existing global C). Reading gmem_c here
+                                // too would double-count, so only the non-batched path (plain
+                                // SM90_TMA_STORE_2D) reads and accumulates in registers.
+                                // NOTE: relies on the invariant below that batched+accumulation
+                                // ALWAYS uses SM90_TMA_REDUCE_ADD_3D. If that dispatch ever
+                                // becomes a plain STORE, this skip would drop the accumulation.
+                                if constexpr (kWithAccumulation and not kIsBatchedEpilogue) {
                                     const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
                                     const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
                                         n_base + (n_tile_base + nt) * MMA_N) + thread_id * 2;

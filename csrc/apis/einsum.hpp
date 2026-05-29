@@ -184,7 +184,12 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     const bool swap_ab_eligible =
         arch_major == 12 and m >= 1 and m <= kSwapAbMMax
         and major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K
-        and d.stride(-1) == 1;  // d's innermost dim must be contiguous
+        and d.stride(-1) == 1    // d's innermost dim must be contiguous
+        and not c.has_value();   // swap's strided/transposed output is incompatible with
+                                 // the batched accumulation epilogue (both the REDUCE_ADD
+                                 // TMA-store path and the direct-store path mishandle the
+                                 // batch offset + swapped strides). Mirrors the dense GEMM
+                                 // swap exclusion in gemm.hpp.
 
     if (swap_ab_eligible) {
         // Swap the recipe's gran_mn entries too: (gran_mn_a, gran_mn_b, gran_k)
