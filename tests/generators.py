@@ -189,7 +189,7 @@ def enumerate_k_grouped_contiguous(dtype: torch.dtype):
                        else (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
     # Must with FP32 accumulation and 1D1D kernels
     for num_groups, m, n, expected_k_per_group in (( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
-                                                   ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
+                                                   ( 8, 768, 2048, 128), ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
                                                    (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
         if dtype == torch.bfloat16:
             ks = [align(int(expected_k_per_group * random.uniform(0.7, 1.3)), get_mk_alignment_for_contiguous_layout()) for _ in range(num_groups)]
