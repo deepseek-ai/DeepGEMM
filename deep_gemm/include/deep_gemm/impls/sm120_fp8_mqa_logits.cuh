@@ -131,6 +131,12 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // Persistent scheduler
     const auto sm_idx = blockIdx.x;
+    // Split-KV: gridDim.y blocks cooperatively cover one q-block's KV range, each
+    // writing a disjoint kv-subrange (no reduction over KV → no combine needed).
+    // Fills idle SMs when num_q_blocks < num_sms (small-S dense). gridDim.y == 1
+    // reproduces the original single-block-per-q-block behavior exactly.
+    const uint32_t kv_split_idx = blockIdx.y;
+    const uint32_t kv_splits = gridDim.y;
     uint32_t block_q_idx = sm_idx, q_iter_idx = 0;
     const auto get_next_block_q_idx = [&]() -> cute::tuple<uint32_t, uint32_t> {
         return {block_q_idx + kNumSMs, q_iter_idx + 1};
@@ -148,9 +154,16 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             end = max(end, min(seq_k_end[i], seq_len_kv));
         }
         start = start / 4 * 4;
+        // Partition this q-block's KV blocks across the kv_splits cooperating blocks.
+        const uint32_t total_kv_blocks = math::ceil_div(end - start, BLOCK_KV);
+        const uint32_t chunk = math::ceil_div(total_kv_blocks, kv_splits);
+        const uint32_t kv_block_begin = kv_split_idx * chunk;
+        const uint32_t split_count = kv_block_begin < total_kv_blocks
+            ? min(chunk, total_kv_blocks - kv_block_begin) : 0u;
+        const uint32_t split_start = start + kv_block_begin * BLOCK_KV;
         return {(q_iter_idx + q_iter_offset) % kNumQStages,
                 ((q_iter_idx + q_iter_offset) / kNumQStages) & 1,
-                start, math::ceil_div(end - start, BLOCK_KV)};
+                split_start, split_count};
     };
 
     // KV pipeline

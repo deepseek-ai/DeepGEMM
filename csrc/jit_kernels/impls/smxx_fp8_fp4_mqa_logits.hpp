@@ -99,6 +99,33 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     const int num_q_stages = (arch_major == 12 ? 2 : 3);
     const int num_kv_stages = 3;
     const int num_math_threads = (arch_major == 12 ? 256 : (arch_major == 10 ? 256 : 512));
+    const int num_sms = device_runtime->get_num_sms();
+
+    // SM120 split-KV: when there are fewer q-blocks than SMs, split each q-block's
+    // KV range across gridDim.y cooperating blocks to fill idle SMs. logits[q,kv]
+    // are independent across kv (no reduction) so splits write disjoint output —
+    // no combine/atomics needed. Only SM120 reads blockIdx.y; SM90/SM100 keep
+    // gridDim.y == 1 and are unaffected.
+    int kv_splits = 1;
+    if (arch_major == 12) {
+        const int num_q_blocks = ceil_div(seq_len, block_q);
+        const int max_kv_blocks = ceil_div(seq_len_kv, block_kv);
+        // Pick the kv_split factor that minimizes wall time ~= waves / kv_splits,
+        // where waves = ceil(num_q_blocks * kv_splits / num_sms) and per-block work
+        // ~ 1/kv_splits. A plain ceil(num_sms/num_q_blocks) can overshoot a wave
+        // boundary; search instead. Keep >= 4 KV-blocks per split so the KV pipeline
+        // still amortizes its fill, and only split when q-blocks underfill the SMs.
+        if (num_q_blocks < num_sms and max_kv_blocks > 1) {
+            const int max_splits = std::max(1, std::min(num_sms / std::max(1, num_q_blocks) + 1,
+                                                        max_kv_blocks / 4));
+            double best_cost = 1e30;
+            for (int s = 1; s <= max_splits; ++s) {
+                const int waves = ceil_div(num_q_blocks * s, num_sms);
+                const double cost = static_cast<double>(waves) / s;  // waves * (work/split)
+                if (cost < best_cost - 1e-9) { best_cost = cost; kv_splits = s; }
+            }
+        }
+    }
 
     // Use compressed logits format when max_seqlen_k is specified
     const bool is_compressed_logits = (max_seqlen_k > 0);
@@ -158,7 +185,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
         .logits_dtype = logits_dtype,
         .num_specialized_threads = num_specialized_threads,
         .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
+        .launch_args = LaunchArgs({num_sms, kv_splits},
                                   num_specialized_threads + num_math_threads,
                                   smem_size)
     };
