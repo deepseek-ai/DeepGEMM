@@ -326,7 +326,15 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
         return {128, 512};
 
     const int block_m = expected_tokens_per_expert >= 128.0f ? 128 : 64;
-    const int num_epilogue_warpgroups = block_m / 64;
+    int num_epilogue_warpgroups = block_m / 64;
+
+    // 2-WG split-N for the decode tile (block_m=64, block_n=128). Each math
+    // warpgroup owns WG_BLOCK_N=64 of the L1 N dimension so the promote/epilogue
+    // work runs in parallel across two warpgroups (cross-WG amax keeps the
+    // per-64 FP8 scale factor exact). Measured ~11-17% faster across b1..b32 on
+    // H20, so it is the default; set DG_SM90_DECODE_SPLIT_N=0 to fall back.
+    if (block_m == 64 and get_env<int>("DG_SM90_DECODE_SPLIT_N", 1) != 0)
+        num_epilogue_warpgroups = 2;
 
     DG_HOST_ASSERT(std::any_of(
         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
@@ -434,10 +442,28 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
 
-    const int num_dispatch_threads = num_epilogue_threads == 512 ? 64 : 128;
+    // In the single-WG decode path (num_epilogue_threads == 128) shrink
+    // dispatch+loader to 64+64 so the total CTA thread count drops 384 -> 256.
+    // That raises the ptxas per-thread register-name ceiling from 65536/384
+    // (~168) to 65536/256 (256) AND frees SMEM for an extra pipeline stage,
+    // which measured ~4-5% faster on H20 (b8 518 -> ~490us) with zero spill.
+    // Enabled by default; set DG_SM90_DECODE_REDUCED_THREADS=0 to opt out.
+    const bool reduce_decode_threads =
+        get_env<int>("DG_SM90_DECODE_REDUCED_THREADS", 1) != 0 and
+        num_epilogue_threads == 128;
+    // 2-WG split-N decode (block_m=64, num_epilogue_threads=256) also shrinks
+    // dispatch+loader to 64+64 so the total CTA thread count is 384 (ceiling
+    // ~168) instead of 512 (ceiling 128), leaving register headroom for the
+    // two math warpgroups.
+    const bool decode_split_n =
+        block_m == 64 and num_epilogue_threads == 256;
+    const bool shrink_non_epilogue = reduce_decode_threads or decode_split_n;
+    const int num_dispatch_threads =
+        (num_epilogue_threads == 512 or shrink_non_epilogue) ? 64 : 128;
     const bool split_sfa_loader_warp = false;
     const int num_non_epilogue_threads =
-        split_sfa_loader_warp ? 128 : (num_epilogue_threads == 512 ? 64 : 128);
+        split_sfa_loader_warp ? 128 :
+            ((num_epilogue_threads == 512 or shrink_non_epilogue) ? 64 : 128);
     DG_HOST_ASSERT((num_dispatch_threads + num_non_epilogue_threads) % 128 == 0);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(

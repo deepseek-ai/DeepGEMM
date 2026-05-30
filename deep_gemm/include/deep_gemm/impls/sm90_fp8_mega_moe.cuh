@@ -201,9 +201,9 @@ sm90_fp8_mega_moe_impl(void* y,
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::float_e4m3_t;
     constexpr bool kSplitNWarpgroups =
-        BLOCK_M == 64 and BLOCK_N % 128 == 0 and
-        kNumEpilogueWarpgroups == BLOCK_N / 128 and
-        kNumEpilogueWarpgroups > 1;
+        BLOCK_M == 64 and kNumEpilogueWarpgroups > 1 and
+        BLOCK_N % kNumEpilogueWarpgroups == 0 and
+        ((BLOCK_N / kNumEpilogueWarpgroups == 64) or (BLOCK_N / kNumEpilogueWarpgroups == 128));
     constexpr bool kSplitMNWarpgroups =
         BLOCK_M == 128 and BLOCK_N == 256 and kNumEpilogueWarpgroups == 4;
     constexpr uint32_t kWarpgroupSplitM = kSplitNWarpgroups ? 1 :
@@ -230,6 +230,11 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr uint32_t LOAD_BLOCK_N    = BLOCK_N;
     constexpr uint32_t L1_OUT_BLOCK_N  = BLOCK_N / 2;  // post-SwiGLU
     constexpr uint32_t WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2;
+    // When WG_L1_OUT_BLOCK_N < 64 the two N-split warpgroups jointly own a
+    // single per-64 L2-acts SF group, so they must publish ONE shared SF slot
+    // (k_sf_idx == n_block_idx) instead of one per warpgroup. The amax that
+    // feeds that shared SF must be reduced across both warpgroups.
+    constexpr bool kSplitNSharesSF = kSplitNWarpgroups and (WG_L1_OUT_BLOCK_N < 64);
     constexpr uint32_t kSwizzleAMode   = BLOCK_K * sizeof(a_dtype_t);   // 128
     constexpr uint32_t kSwizzleBMode   = BLOCK_K * sizeof(b_dtype_t);   // 128
     constexpr uint32_t kSwizzleCDMode  = 128;
@@ -368,9 +373,15 @@ sm90_fp8_mega_moe_impl(void* y,
     //   128*48 + 128*40 + 256*208 = 64512 exactly.
     // For the 512-epilogue-thread split-MN path, trim dispatch and loader roles
     // so launch bounds still leave enough WGMMA registers.
+    // Reduced-thread decode (kNumThreads<=256) raises the launch-bounds
+    // register ceiling to 65536/256=256; grant the epilogue warpgroup the full
+    // 256 so the accumulator double-buffer fits without spilling.
+    //   64*48 + 64*40 + 128*256 = 38400 <= 64512.
     constexpr uint32_t kNumEpilogueRegisters    =
         kEpilogueRegisterBudget == 0 ?
-            (kNumEpilogueThreads == 512 ? 112 : 208) :
+            (kNumEpilogueThreads == 512 ? 112 :
+                (kNumEpilogueThreads == 256 ? 168 :
+                    (kNumThreads <= 256u ? 256 : 208))) :
             kEpilogueRegisterBudget;
     // The 512-epilogue-thread path has only 3584 registers of headroom at
     // epilogue=112.  Raising epilogue to 120 is not viable without changing
@@ -830,7 +841,12 @@ sm90_fp8_mega_moe_impl(void* y,
         const uint32_t r_0 = warp_idx_in_wg * 16 + row_idx;
         const uint32_t r_1 = r_0 + 8;
 
-        constexpr uint32_t WG_SMEM_CD_L1_STRIDE_N = WG_L1_OUT_BLOCK_N;
+        // When the two N-split warpgroups share a single per-64 SF group they
+        // also stage into ONE shared row-major L1-output tile (stride
+        // L1_OUT_BLOCK_N), each writing its own WG_L1_OUT_BLOCK_N-column half,
+        // so a single combined TMA store matches the host descriptor box.
+        constexpr uint32_t WG_SMEM_CD_L1_STRIDE_N =
+            kSplitNSharesSF ? L1_OUT_BLOCK_N : WG_L1_OUT_BLOCK_N;
         constexpr uint32_t WG_SMEM_CD_L2_STRIDE_N = WG_BLOCK_N;
 
         // Sync with dispatch in the full communication path.
@@ -851,10 +867,15 @@ sm90_fp8_mega_moe_impl(void* y,
             const uint32_t row_base = epilogue_wg_m_idx * WG_BLOCK_M;
             const uint32_t row_offset_r0 = row_base + r_0;
             const uint32_t row_offset_r1 = row_base + r_1;
-            const uint32_t sf_n_block_idx = n_block_idx * kWarpgroupSplitN + epilogue_wg_n_idx;
+            const uint32_t sf_n_block_idx = kSplitNSharesSF ? n_block_idx
+                : (n_block_idx * kWarpgroupSplitN + epilogue_wg_n_idx);
             const uint32_t smem_a_wg_offset = epilogue_wg_m_idx * WG_BLOCK_M * BLOCK_K;
             const uint32_t smem_b_wg_offset = epilogue_wg_n_idx * WG_BLOCK_N * BLOCK_K;
-            const uint32_t smem_cd_l1_wg_offset = epilogue_wg_idx * WG_BLOCK_M * WG_L1_OUT_BLOCK_N;
+            // In the shared-tile case the WG stages into the joint L1-output tile
+            // at its own column offset (row stride L1_OUT_BLOCK_N); otherwise each
+            // WG owns a disjoint contiguous WG_BLOCK_M x WG_L1_OUT_BLOCK_N slice.
+            const uint32_t smem_cd_l1_wg_offset = kSplitNSharesSF ? wg_l1_out_n_offset
+                : (epilogue_wg_idx * WG_BLOCK_M * WG_L1_OUT_BLOCK_N);
             const uint32_t smem_cd_l2_wg_offset = epilogue_wg_idx * WG_BLOCK_M * WG_BLOCK_N;
             const bool valid_r0 = row_offset_r0 < valid_m;
             const bool valid_r1 = row_offset_r1 < valid_m;
@@ -1200,6 +1221,187 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                 }
             } else {
+            // NOTE: the n64-split half-width accumulator pipeline below was
+            // validated NUMERICALLY correct (diff matches) but REGRESSED to
+            // ~875us (vs 484us single-buffer) and still spilled 256B. Root
+            // cause: splitting each m64n128 WGMMA into two m64n64 halves
+            // doubles the WGMMA instruction count, and n64 WGMMA throughput is
+            // not 2x faster than n128 (fixed per-instruction issue overhead),
+            // so the promote-overlap gain is outweighed. Disabled; reduced-
+            // thread decode uses the single-buffer else-branch (REG:255 STACK:0).
+            if constexpr (kNumThreads <= 256u and false) {
+            //   buf0[32] + buf1[32] + final_accum[64] = 128 floats, identical
+            // to the single-buffer footprint (REG:208 STACK:0). The half-width
+            // groups stream as (kb,half) pairs; we issue group g into
+            // buf[parity] then drain the previous group g-1 from buf[parity^1]
+            // with warpgroup_wait<1>, so each promote overlaps the next half's
+            // WGMMA instead of serializing it (the consumer bottleneck).
+            // ================================================================
+            using WGMMA_HALF = typename mma::sm90::FP8MMASelector<WG_BLOCK_N / 2>::type;
+            constexpr uint32_t kHalfAccum = WGMMA_HALF::kNumAccum;   // 32 for N=64
+            constexpr uint32_t kHalfN     = WG_BLOCK_N / 2;          // 64
+            float buf0[kHalfAccum];
+            float buf1[kHalfAccum];
+
+            constexpr uint32_t kL1SFKBlocks   = kHidden / 128;
+            constexpr uint32_t kL2SFKBlocks   = kIntermediateHidden / 128;
+            constexpr uint32_t kL1SFGateBlks  = kIntermediateHidden / 128;
+            constexpr uint32_t kL1SFPerExpert = (kIntermediateHidden * 2 / 128) * kL1SFKBlocks;
+            constexpr uint32_t kL2SFPerExpert = (kHidden / 128) * kL2SFKBlocks;
+
+            // Issue one m64n64 WGMMA group into accumulator ACC for N-half HALF
+            // (B columns [HALF*64, HALF*64+64)), starting at K-sub-offset KBASE
+            // for NK inner WGMMA-K steps. k==0 overwrites (fresh group), k>0
+            // accumulates within the group's K range.
+            #define DG_N64_ISSUE(ACC, HALF, KBASE, NK)                                                \
+                do {                                                                                  \
+                    _Pragma("unroll")                                                                 \
+                    for (uint32_t i = 0; i < kHalfAccum; ++ i) ptx::warpgroup_fence_operand((ACC)[i]); \
+                    ptx::warpgroup_arrive();                                                          \
+                    _Pragma("unroll")                                                                 \
+                    for (uint32_t k = 0; k < (NK); ++ k) {                                            \
+                        auto desc_a = mma::sm90::make_smem_desc(                                      \
+                            smem_a[stage_idx] + smem_a_wg_offset + (KBASE) + k * WGMMA_HALF::K, 1);   \
+                        auto desc_b = mma::sm90::make_smem_desc(                                      \
+                            smem_b[stage_idx] + smem_b_wg_offset + (HALF) * kHalfN * BLOCK_K          \
+                                              + (KBASE) + k * WGMMA_HALF::K, 1);                      \
+                        WGMMA_HALF::wgmma(desc_a, desc_b, (ACC), k);                                  \
+                    }                                                                                 \
+                    ptx::warpgroup_commit_batch();                                                    \
+                    _Pragma("unroll")                                                                 \
+                    for (uint32_t i = 0; i < kHalfAccum; ++ i) ptx::warpgroup_fence_operand((ACC)[i]); \
+                } while (0)
+
+            // Promote a drained L1 half-group into final_accum cols [HALF*64,..)
+            // (gate/up SF alternate per 8-col group => parity (j&1)).
+            #define DG_N64_PROMOTE_L1(ACC, SA0, SA1, GATE, UP, HALF)                                  \
+                _Pragma("unroll")                                                                     \
+                for (uint32_t j = 0; j < kHalfAccum / 4; ++ j) {                                      \
+                    const float sb = (j & 1u) ? (UP) : (GATE);                                        \
+                    const uint32_t o = (HALF) * kHalfAccum + j * 4;                                   \
+                    final_accum[o+0] += (SA0) * sb * (ACC)[j*4+0];                                    \
+                    final_accum[o+1] += (SA0) * sb * (ACC)[j*4+1];                                    \
+                    final_accum[o+2] += (SA1) * sb * (ACC)[j*4+2];                                    \
+                    final_accum[o+3] += (SA1) * sb * (ACC)[j*4+3];                                    \
+                }
+
+            // Promote a drained L2 half-group into final_accum (broadcast SF).
+            #define DG_N64_PROMOTE_L2(ACC, SA0, SA1, L2SF, HALF)                                      \
+                _Pragma("unroll")                                                                     \
+                for (uint32_t j = 0; j < kHalfAccum / 4; ++ j) {                                      \
+                    const uint32_t o = (HALF) * kHalfAccum + j * 4;                                   \
+                    final_accum[o+0] += (SA0) * (L2SF) * (ACC)[j*4+0];                                \
+                    final_accum[o+1] += (SA0) * (L2SF) * (ACC)[j*4+1];                                \
+                    final_accum[o+2] += (SA1) * (L2SF) * (ACC)[j*4+2];                                \
+                    final_accum[o+3] += (SA1) * (L2SF) * (ACC)[j*4+3];                                \
+                }
+
+            if (block_phase == sched::BlockPhase::Linear1) {
+                // ----- L1: 2 half-groups (N-halves) per k_block, full BLOCK_K.
+                // empty_barrier[stage] released when the SECOND half (last
+                // reader of the stage) drains.
+                constexpr uint32_t kL1Steps = BLOCK_K / WGMMA_HALF::K;
+                float c_sa0 = 0.f, c_sa1 = 0.f, c_gate = 0.f, c_up = 0.f;
+                uint32_t c_stage = 0, c_buf = 0, c_half = 0;
+                bool c_last = false, inflight = false;
+                uint32_t parity = 0;
+
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    full_barriers[stage_idx]->wait(phase);
+
+                    const float scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
+                    const float scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
+
+                    const uint32_t gate_n = sf_n_block_idx / 2u;
+                    const uint32_t up_n   = kL1SFGateBlks + gate_n;
+                    const float* base = l1_weights_sf + local_expert_idx * kL1SFPerExpert + k_block_idx;
+                    const float gate_sf = __ldg(base + gate_n * kL1SFKBlocks);
+                    const float up_sf   = __ldg(base + up_n   * kL1SFKBlocks);
+
+                    #pragma unroll
+                    for (uint32_t h = 0; h < 2; ++ h) {
+                        if (parity == 0) { DG_N64_ISSUE(buf0, h, 0u, kL1Steps); }
+                        else             { DG_N64_ISSUE(buf1, h, 0u, kL1Steps); }
+                        if (inflight) {
+                            ptx::warpgroup_wait<1>();
+                            if (c_last && lane_idx == 0)
+                                empty_barriers[c_stage]->arrive();
+                            if (c_buf == 0) { DG_N64_PROMOTE_L1(buf0, c_sa0, c_sa1, c_gate, c_up, c_half); }
+                            else            { DG_N64_PROMOTE_L1(buf1, c_sa0, c_sa1, c_gate, c_up, c_half); }
+                        }
+                        c_sa0 = scale_a_0_lo; c_sa1 = scale_a_1_lo; c_gate = gate_sf; c_up = up_sf;
+                        c_stage = stage_idx; c_buf = parity; c_half = h; c_last = (h == 1);
+                        inflight = true;
+                        parity ^= 1u;
+                    }
+                }
+
+                if (inflight) {
+                    ptx::warpgroup_wait<0>();
+                    if (c_last && lane_idx == 0)
+                        empty_barriers[c_stage]->arrive();
+                    if (c_buf == 0) { DG_N64_PROMOTE_L1(buf0, c_sa0, c_sa1, c_gate, c_up, c_half); }
+                    else            { DG_N64_PROMOTE_L1(buf1, c_sa0, c_sa1, c_gate, c_up, c_half); }
+                }
+            } else {
+                // ----- L2: 4 half-groups per k_block: {K-lo,K-hi} x {N0,N1}.
+                // Each K-half uses its own SFA scale; l2_sf broadcast. The very
+                // last group (K-hi, N1) gates the empty_barrier release.
+                constexpr uint32_t kL2HalfSteps = (BLOCK_K / 2) / WGMMA_HALF::K;
+                float c_sa0 = 0.f, c_sa1 = 0.f, c_l2 = 0.f;
+                uint32_t c_stage = 0, c_buf = 0, c_half = 0;
+                bool c_last = false, inflight = false;
+                uint32_t parity = 0;
+
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    full_barriers[stage_idx]->wait(phase);
+
+                    const float scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r0);
+                    const float scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + 0 * BLOCK_M + row_offset_r1);
+                    const float scale_a_0_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r0);
+                    const float scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + 1 * BLOCK_M + row_offset_r1);
+                    const float l2_sf = __ldg(l2_weights_sf + local_expert_idx * kL2SFPerExpert
+                                                            + sf_n_block_idx * kL2SFKBlocks + k_block_idx);
+
+                    #pragma unroll
+                    for (uint32_t kh = 0; kh < 2; ++ kh) {
+                        const uint32_t kbase = kh * (BLOCK_K / 2u);
+                        const float sa0 = kh ? scale_a_0_hi : scale_a_0_lo;
+                        const float sa1 = kh ? scale_a_1_hi : scale_a_1_lo;
+                        #pragma unroll
+                        for (uint32_t h = 0; h < 2; ++ h) {
+                            if (parity == 0) { DG_N64_ISSUE(buf0, h, kbase, kL2HalfSteps); }
+                            else             { DG_N64_ISSUE(buf1, h, kbase, kL2HalfSteps); }
+                            if (inflight) {
+                                ptx::warpgroup_wait<1>();
+                                if (c_last && lane_idx == 0)
+                                    empty_barriers[c_stage]->arrive();
+                                if (c_buf == 0) { DG_N64_PROMOTE_L2(buf0, c_sa0, c_sa1, c_l2, c_half); }
+                                else            { DG_N64_PROMOTE_L2(buf1, c_sa0, c_sa1, c_l2, c_half); }
+                            }
+                            c_sa0 = sa0; c_sa1 = sa1; c_l2 = l2_sf;
+                            c_stage = stage_idx; c_buf = parity; c_half = h;
+                            c_last = (kh == 1 && h == 1);
+                            inflight = true;
+                            parity ^= 1u;
+                        }
+                    }
+                }
+
+                if (inflight) {
+                    ptx::warpgroup_wait<0>();
+                    if (c_last && lane_idx == 0)
+                        empty_barriers[c_stage]->arrive();
+                    if (c_buf == 0) { DG_N64_PROMOTE_L2(buf0, c_sa0, c_sa1, c_l2, c_half); }
+                    else            { DG_N64_PROMOTE_L2(buf1, c_sa0, c_sa1, c_l2, c_half); }
+                }
+            }
+
+            #undef DG_N64_ISSUE
+            #undef DG_N64_PROMOTE_L1
+            #undef DG_N64_PROMOTE_L2
+
+            } else {
             float accum[kAccumPerThread];
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -1346,6 +1548,7 @@ sm90_fp8_mega_moe_impl(void* y,
                 }
             }
             }
+            }
 
             // Skip epilogue when block is past valid M (still must release via empty)
             if (row_base >= valid_m) {
@@ -1458,6 +1661,29 @@ sm90_fp8_mega_moe_impl(void* y,
                 amax_r0 = math::warp_reduce<4, false>(amax_r0, math::ReduceMax<float>());
                 amax_r1 = math::warp_reduce<4, false>(amax_r1, math::ReduceMax<float>());
 
+                // Phase 2: cross-WG amax. When two N-split warpgroups share one
+                // per-64 SF group, each WG so far only saw its own
+                // WG_L1_OUT_BLOCK_N columns; the true per-row amax spans both
+                // halves. Reduce across both warpgroups through a small smem
+                // scratch (carved from the upper, currently-unused half of the
+                // CD staging region) so BOTH WGs quantize with the SAME SF.
+                if constexpr (kSplitNSharesSF) {
+                    float* amax_scratch = reinterpret_cast<float*>(
+                        reinterpret_cast<uint8_t*>(smem_cd_l1) + SMEM_CD_SIZE / 2);
+                    #pragma unroll
+                    for (uint32_t i = epilogue_thread_idx; i < BLOCK_M; i += kNumEpilogueThreads)
+                        amax_scratch[i] = 0.0f;
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (col_idx == 0) {
+                        atomicMax(reinterpret_cast<unsigned int*>(&amax_scratch[r_0]), __float_as_uint(amax_r0));
+                        atomicMax(reinterpret_cast<unsigned int*>(&amax_scratch[r_1]), __float_as_uint(amax_r1));
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    amax_r0 = amax_scratch[r_0];
+                    amax_r1 = amax_scratch[r_1];
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
+
                 // Compute SF and inverse SF for each row
                 float2 amax_pair = {amax_r0, amax_r1};
                 float2 sf_pair, sf_inv_pair;
@@ -1490,9 +1716,9 @@ sm90_fp8_mega_moe_impl(void* y,
                         const uint32_t p = p_base + q;
                         const uint32_t col = p * 8 + col_idx * 2;
                         auto* p0 = reinterpret_cast<uint16_t*>(
-                            smem_cd_l1_wg + r_0 * WG_L1_OUT_BLOCK_N + col);
+                            smem_cd_l1_wg + r_0 * WG_SMEM_CD_L1_STRIDE_N + col);
                         auto* p1 = reinterpret_cast<uint16_t*>(
-                            smem_cd_l1_wg + r_1 * WG_L1_OUT_BLOCK_N + col);
+                            smem_cd_l1_wg + r_1 * WG_SMEM_CD_L1_STRIDE_N + col);
                         if (valid_r0)
                             *p0 = r0_bits[q];
                         if (valid_r1)
@@ -1502,7 +1728,9 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 // Write SF as float at `[token, n_block_idx]` in L2 acts SF buffer (per-64 layout).
                 // Each row is contributed by lanes col_idx in {0..3}; only col_idx == 0 writes.
-                if (col_idx == 0) {
+                // In the shared-SF split both warpgroups own the same per-64 group and rows, so
+                // only the first N-split warpgroup publishes the SF slot to avoid a write race.
+                if (col_idx == 0 and (not kSplitNSharesSF or epilogue_wg_n_idx == 0)) {
                     auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
                     // SF buffer is (kNumPaddedSFPoolTokens x kIntermediateHidden/64), MN-major:
                     //   addr[k_idx * num_padded_sf_pool_tokens + token_idx]
@@ -1515,8 +1743,13 @@ sm90_fp8_mega_moe_impl(void* y,
                         sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r1] = sf_r1;
                 }
 
-                // Sync the warpgroup before TMA store.
-                ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                // Sync the warpgroup before TMA store. In the shared-tile split
+                // both N-split warpgroups must finish writing their halves of the
+                // joint L1-output tile, so sync across all epilogue threads.
+                if constexpr (kSplitNSharesSF)
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                else
+                    ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
                 // Issue TMA store of the entire tile. Padding rows beyond
                 // `valid_m` are written with stale/garbage FP8 to the L1-output
@@ -1527,15 +1760,30 @@ sm90_fp8_mega_moe_impl(void* y,
                 // in registers (only valid rows are converted to BF16 and
                 // STSM'd into smem). Using TMA for partial tiles is a large
                 // win for low-batch / decode where every tile is partial.
-                if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                    const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N + wg_l1_out_n_offset;
-                    cute::tma_store_fence();
-                    cute::SM90_TMA_STORE_2D::copy(
-                        &tensor_map_l1_output,
-                        smem_cd_l1 + smem_cd_l1_wg_offset,
-                        out_n_idx,
-                        m_idx + row_base);
-                    cute::tma_store_arrive();
+                if constexpr (kSplitNSharesSF) {
+                    // One combined store of the joint L1_OUT_BLOCK_N tile, issued
+                    // by the first N-split warpgroup once both halves are staged.
+                    if (epilogue_wg_n_idx == 0 and warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                        const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
+                        cute::tma_store_fence();
+                        cute::SM90_TMA_STORE_2D::copy(
+                            &tensor_map_l1_output,
+                            smem_cd_l1,
+                            out_n_idx,
+                            m_idx + row_base);
+                        cute::tma_store_arrive();
+                    }
+                } else {
+                    if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                        const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N + wg_l1_out_n_offset;
+                        cute::tma_store_fence();
+                        cute::SM90_TMA_STORE_2D::copy(
+                            &tensor_map_l1_output,
+                            smem_cd_l1 + smem_cd_l1_wg_offset,
+                            out_n_idx,
+                            m_idx + row_base);
+                        cute::tma_store_arrive();
+                    }
                 }
                 __syncwarp();
                 ptx::tma_store_wait<0>();
@@ -1545,7 +1793,16 @@ sm90_fp8_mega_moe_impl(void* y,
                 // 512-thread CTA barrier that is otherwise needed before the
                 // single bit-mask update.
                 if constexpr (kL2ArrivalCounter) {
-                    if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                    if constexpr (kSplitNSharesSF) {
+                        // The combined tile counts for both N-split warpgroups; the
+                        // storing warpgroup publishes all kWarpgroupSplitN arrivals
+                        // after its TMA store has drained.
+                        if (epilogue_wg_n_idx == 0 and warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                            ptx::red_add_rel(
+                                reinterpret_cast<uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx)),
+                                kWarpgroupSplitN);
+                        }
+                    } else if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
                         ptx::red_add_rel(
                             reinterpret_cast<uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx)), 1);
                     }
@@ -1558,6 +1815,12 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
+                // In the shared-tile split only the first warpgroup issues and
+                // drains the combined TMA store; gate the other warpgroup so it
+                // cannot overwrite the joint smem tile in the next block until
+                // that store has drained.
+                if constexpr (kSplitNSharesSF)
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             } else {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
                 constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
@@ -1609,18 +1872,23 @@ sm90_fp8_mega_moe_impl(void* y,
                 // Scatter to remote ranks via NVLink (one row per warp-pair)
                 // Each warpgroup-warp covers 8 unique rows x 2 (r_0 + r_1 doubled by warps)
                 // Lane group of 16 within a warp -> 1 row.
+                // Each lane copies `cols_per_lane` BF16 (= cols_per_lane*2 bytes) as one
+                // vector. WG_BLOCK_N=128 -> 8 BF16 = uint4; WG_BLOCK_N=64 -> 4 BF16 = uint2.
+                using ScatterVec = std::conditional_t<(WG_BLOCK_N <= 64), uint2, uint4>;
+                DG_STATIC_ASSERT(cols_per_lane * sizeof(nv_bfloat16) == sizeof(ScatterVec),
+                                 "Scatter vector width must match cols_per_lane");
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
                     const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
                     const uint32_t m_idx_in_block = row_base + row_in_wg;
                     if (m_idx_in_block >= valid_m) break;
 
-                    // Read 8 BF16s (= 16 bytes = 1 uint4) from smem
+                    // Read cols_per_lane BF16 (= one ScatterVec) from smem
                     auto smem_ptr = smem_cd_l2
                         + smem_cd_l2_wg_offset
                         + row_in_wg * WG_BLOCK_N
                         + lane_in_row * cols_per_lane;
-                    const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
+                    const auto packed = *reinterpret_cast<ScatterVec*>(smem_ptr);
 
                     const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
                     const uint32_t dst_rank_idx = src_metadata.rank_idx;
@@ -1628,9 +1896,9 @@ sm90_fp8_mega_moe_impl(void* y,
                     const uint32_t dst_topk_idx = src_metadata.topk_idx;
                     const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                            .get_data_buffer(dst_token_idx);
-                    auto dst_ptr = math::advance_ptr<uint4>(
+                    auto dst_ptr = math::advance_ptr<ScatterVec>(
                         dst_token.get_base_ptr(),
-                        (n_idx + wg_n_offset) * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
+                        (n_idx + wg_n_offset) * sizeof(nv_bfloat16) + lane_in_row * sizeof(ScatterVec));
                     *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                 }
 
