@@ -214,8 +214,6 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
 
     // Dispatch implementation
     const auto arch_major = device_runtime->get_arch_major();
-    if (arch_major == 12)
-        DG_HOST_ASSERT(next_n <= 2 and "SM120 paged MQA currently supports next_n <= 2");
     if (is_varlen) {
         const auto& indices_tensor = indices.value();
         DG_HOST_ASSERT((arch_major == 10 or arch_major == 12) and next_n == 1 and (block_kv == 64 or block_kv == 32));
@@ -371,8 +369,6 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         DG_HOST_ASSERT(indices_tensor.is_contiguous());
         DG_HOST_ASSERT(indices_tensor.scalar_type() == torch::kInt);
     }
-    if (arch_major == 12)
-        DG_HOST_ASSERT(next_n <= 2 and "SM120 paged MQA currently supports next_n <= 2");
 
     // Check schedule metadata. SM90 next_n=4 uses a 2-CTA cluster per task, so
     // schedule_meta carries one entry per cluster instead of per SM.

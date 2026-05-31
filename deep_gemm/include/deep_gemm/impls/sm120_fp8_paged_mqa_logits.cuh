@@ -148,7 +148,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
 
     // Scheduler
     static constexpr bool kPadOddN = (not kIsVarlen) and (kNextN % 2 == 1) and (kNextN >= 3);
-    static constexpr uint32_t kNumNextNAtoms = kPadOddN ? (kNextN + kNextNAtom - 1) / kNextNAtom + 1 : (kNextN + kNextNAtom - 1) / kNextNAtom;
+    static constexpr uint32_t kNumNextNAtoms = math::constexpr_ceil_div(kNextN, kNextNAtom);
     auto scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_KV, kNumGroups, kNumNextNAtoms>(
         blockIdx.x, batch_size, context_lens, schedule_meta, indices);
     DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
@@ -181,7 +181,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
             }
         };
 
-        uint32_t q_idx = batch_size, kv_idx, num_kv;
+        uint32_t q_idx = batch_size * kNumNextNAtoms, kv_idx, num_kv;
         uint32_t next_q_idx, next_kv_idx, next_num_kv;
         bool fetched_next_task;
 
@@ -244,7 +244,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
         const uint32_t a_row = (lane_idx & 7) + ((lane_idx >> 3) & 1) * 8;
 
         using Scheduler = decltype(scheduler);
-        uint32_t q_idx = batch_size, kv_idx;
+        uint32_t q_idx = batch_size * kNumNextNAtoms, kv_idx;
         uint32_t next_q_idx, next_kv_idx, next_num_kv;
         uint32_t q_stage_idx, q_phase;
         bool is_paired_atom = false;
@@ -338,6 +338,11 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
                     compute_and_store(cute::Int<kNextNAtom>{});
                 else
                     compute_and_store(cute::Int<1>{});
+            } else if constexpr (kPadOddN) {
+                if (q_idx % kNumNextNAtoms == kNumNextNAtoms - 1)
+                    compute_and_store(cute::Int<1>{});
+                else
+                    compute_and_store(cute::Int<kNextNAtom>{});
             } else {
                 compute_and_store(cute::Int<kNextNAtom>{});
             }
