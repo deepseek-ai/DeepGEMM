@@ -16,9 +16,12 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
-    __shared__ uint32_t varlen_atom_token_start[kAlignedBatchSize];
-    __shared__ uint32_t varlen_atom_context_len[kAlignedBatchSize];
-    __shared__ uint32_t varlen_num_atoms_shared;
+    // Use dynamic shared memory to support large batch sizes
+    extern __shared__ uint32_t smem_pool[];
+    uint32_t* const varlen_atom_token_start = smem_pool;
+    uint32_t* const varlen_atom_context_len = smem_pool + kAlignedBatchSize;
+    uint32_t* const prefix_sum = smem_pool + 2 * kAlignedBatchSize;
+    uint32_t* const varlen_num_atoms_shared = smem_pool + 3 * kAlignedBatchSize;
     uint32_t num_items;
 
     if constexpr (kIsVarlen) {
@@ -31,10 +34,10 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
                 t += is_paired ? 2 : 1;
                 ++ atom_count;
             }
-            varlen_num_atoms_shared = atom_count;
+            *varlen_num_atoms_shared = atom_count;
         }
         __syncwarp();
-        num_items = varlen_num_atoms_shared;
+        num_items = *varlen_num_atoms_shared;
     } else {
         num_items = batch_size;
     }
@@ -54,7 +57,6 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
         num_segs[k] = math::ceil_div(context_len, SPLIT_KV);
     }
 
-    __shared__ uint32_t prefix_sum[kAlignedBatchSize];
     uint32_t sum = 0;
     #pragma unroll
     for (uint32_t k = 0; k < kAlignedBatchSize / 32; ++ k) {

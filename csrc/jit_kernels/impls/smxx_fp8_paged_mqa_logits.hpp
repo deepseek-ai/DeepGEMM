@@ -61,8 +61,8 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     const int aligned_batch_size = align(batch_size, 32);
     const int split_kv = block_kv * num_math_warpgroups;
     
-    // Calculate shared memory size
-    const int smem_size = aligned_batch_size * static_cast<int>(sizeof(int));
+    // Shared memory: prefix_sum[kAlignedBatchSize] + varlen_atom_token_start/context_len[kAlignedBatchSize] + varlen_num_atoms
+    const int smem_size = (3 * aligned_batch_size + 1) * static_cast<int>(sizeof(int));
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
     DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
 
