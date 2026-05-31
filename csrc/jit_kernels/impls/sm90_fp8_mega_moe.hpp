@@ -18,10 +18,8 @@ namespace deep_gemm {
 // SM90 (Hopper) FP8 MegaMoE host runtime
 // ----------------------------------------------------------------------------
 // This is the SM90 counterpart of `SM100FP8FP4MegaMoERuntime`. The kernel
-// itself lives in `deep_gemm/impls/sm90_fp8_mega_moe.cuh` and is currently a
-// skeleton: dispatch/combine paths are intended to be portable from the SM100
-// version, while the GEMM (TMA load + WGMMA + epilogue) is being implemented
-// in a follow-up step.
+// itself lives in `deep_gemm/impls/sm90_fp8_mega_moe.cuh` and uses the same
+// dispatch/combine contract with an SM90 FP8 TMA/WGMMA implementation.
 //
 // Differences from SM100 path:
 //   * Activations and weights are both FP8 (e4m3); no FP4.
@@ -49,6 +47,7 @@ public:
         bool l1_dual_k_accum;
         bool l2_nmajor_schedule;
         bool l1_nmajor_schedule;
+        bool one_warp_cleanup;
         int split_phase_mode;
         MegaMoESM90Config config;
 
@@ -91,10 +90,11 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}, {}, {},
         {},
         {}, {},
+        {},
+        {},
         {},
         {},
         {},
@@ -129,6 +129,7 @@ static void __instantiate_kernel() {{
     args.l1_dual_k_accum ? "true" : "false",
     args.l2_nmajor_schedule ? "true" : "false",
     args.l1_nmajor_schedule ? "true" : "false",
+    args.one_warp_cleanup ? "true" : "false",
     args.split_phase_mode);
     }
 
@@ -201,8 +202,8 @@ static void sm90_fp8_mega_moe(
     // must use no shared-memory swizzle. Later L2 TMA loads may still swizzle
     // from this row-major global buffer into their own SMEM tile.
     // The default TMA store is issued per warpgroup, each writing a WG_BLOCK_M
-    // row tile. The split-N experiment has two WGs produce different N halves
-    // of the same M rows, then one TMA store writes the full 64x128 post-SwiGLU tile.
+    // row tile. In split-N mode, two WGs produce different N halves of the same
+    // M rows, then one TMA store writes the full 64x128 post-SwiGLU tile.
     const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
     const bool split_n_warpgroups_h =
         config.block_m == 64 and config.block_n == 256 and num_epilogue_warpgroups_h == 2;
@@ -234,6 +235,15 @@ static void sm90_fp8_mega_moe(
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
+    const bool direct_l2_scatter_default = get_sm90_moe_direct_l2_scatter_default(
+        num_experts_per_rank, num_tokens, num_topk,
+        intermediate_hidden, config.block_m, config.block_n);
+    const bool l2_nmajor_schedule_default = get_sm90_moe_l2_nmajor_schedule_default(
+        num_experts_per_rank, num_tokens, num_topk,
+        intermediate_hidden, config.block_m, config.block_n);
+    const bool one_warp_cleanup_default = get_sm90_moe_one_warp_cleanup_default(
+        num_experts_per_rank, num_tokens, num_topk,
+        intermediate_hidden, config.block_m, config.block_n);
     const SM90FP8MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -243,12 +253,19 @@ static void sm90_fp8_mega_moe(
         .fast_math = fast_math,
         .async_l1_tma_store = get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0,
         .split_sfa_tma = get_env<int>("DG_SM90_MOE_SPLIT_SFA_TMA", 0) != 0,
-        .direct_l2_scatter = get_env<int>("DG_SM90_MOE_DIRECT_L2_SCATTER", 0) != 0,
+        .direct_l2_scatter = get_env<int>(
+            "DG_SM90_MOE_DIRECT_L2_SCATTER",
+            direct_l2_scatter_default ? 1 : 0) != 0,
         .l2_dual_accum = get_env<int>("DG_SM90_MOE_L2_DUAL_ACCUM", 0) != 0,
         .phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0,
         .l1_dual_k_accum = get_env<int>("DG_SM90_MOE_L1_DUAL_K", 0) != 0,
-        .l2_nmajor_schedule = get_env<int>("DG_SM90_MOE_L2_NMAJOR", 0) != 0,
+        .l2_nmajor_schedule = get_env<int>(
+            "DG_SM90_MOE_L2_NMAJOR",
+            l2_nmajor_schedule_default ? 1 : 0) != 0,
         .l1_nmajor_schedule = get_env<int>("DG_SM90_MOE_L1_NMAJOR", 0) != 0,
+        .one_warp_cleanup = get_env<int>(
+            "DG_SM90_MOE_ONE_WARP_CLEANUP",
+            one_warp_cleanup_default ? 1 : 0) != 0,
         .split_phase_mode = 0,
         .config = config,
         .y = y.data_ptr(),
@@ -275,8 +292,7 @@ static void sm90_fp8_mega_moe(
         SM90FP8MegaMoERuntime::launch(runtime, split_args);
     };
 
-    const bool split_l1_l2 = get_env<int>(
-        "DG_SM90_MOE_SPLIT_L1_L2", num_max_tokens_per_rank >= 1024 ? 1 : 0) != 0;
+    const bool split_l1_l2 = get_env<int>("DG_SM90_MOE_SPLIT_L1_L2", 1) != 0;
     if (split_l1_l2) {
         launch_with_split_mode(1, "sm90_fp8_mega_moe_split_l1");
         launch_with_split_mode(2, "sm90_fp8_mega_moe_split_l2");

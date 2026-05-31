@@ -207,17 +207,18 @@ def _quantize_grouped_fp8_block_128_128(
     g, n, k = w.shape
     assert n % 128 == 0 and k % 128 == 0, f"weight 的 N={n}, K={k} 都必须是 128 的倍数"
 
-    # 把 (N, K) 切成 (N/128, 128, K/128, 128)，最后一维和倒数第三维就是 128×128 子块内部
-    w_view = w.view(g, n // 128, 128, k // 128, 128).float()
-
-    # 子块内 absmax → scale = amax / 448，clamp(1e-4) 避免全 0 子块
-    amax = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4)  # (G, N/128, K/128)
-    sf = amax / FP8_E4M3_MAX
-
-    # 量化：每个元素除以所属子块的 sf 后转 FP8
-    # sf 形状 (G, N/128, K/128)，需在 N-内 (axis -3) 和 K-内 (axis -1) 都补维度
-    w_fp8 = (w_view / sf.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn)
-    return w_fp8.view(g, n, k).contiguous(), sf.contiguous()
+    chunk_g = 4
+    w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fn)
+    sf = torch.empty((g, n // 128, k // 128), dtype=torch.float, device=w.device)
+    for start in range(0, g, chunk_g):
+        end = min(start + chunk_g, g)
+        w_view = w[start:end].view(end - start, n // 128, 128, k // 128, 128).float()
+        sf_chunk = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4) / FP8_E4M3_MAX
+        w_fp8[start:end].copy_(
+            (w_view / sf_chunk.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn).view(end - start, n, k)
+        )
+        sf[start:end].copy_(sf_chunk)
+    return w_fp8, sf.contiguous()
 
 
 # ============================================================================
@@ -958,6 +959,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         intermediate_hidden,
     )
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    use_eplb_hint = bool(eplb_replica_for)
+    use_skew_hint = args.score_powerlaw_alpha > 0.0
+    use_masked_hint = args.masked_ratio > 0.0
 
     def run_fused():
         # NOTE: 跟 SM100 test_mega_moe.py 的处理一致 —— DG_COMM_KERNEL_DEBUG=1 时
@@ -967,17 +971,43 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         sym_buffer.topk_idx[:num_tokens].copy_(topk_idx)
         sym_buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
-        deep_gemm.fp8_mega_moe(
-            y_fused,
-            transformed_l1,
-            transformed_l2,
-            sym_buffer,
-            cumulative_local_expert_recv_stats=cum_stats_fused,
-            recipe=(128, 128, 128),
-            activation="swiglu",
-            activation_clamp=clamp_arg,
-            fast_math=bool(args.fast_math),
-        )
+        old_eplb_hint = os.environ.get("DG_SM90_MOE_EPLB_HINT")
+        old_skew_hint = os.environ.get("DG_SM90_MOE_SKEW_HINT")
+        old_masked_hint = os.environ.get("DG_SM90_MOE_MASKED_HINT")
+        if use_eplb_hint:
+            os.environ["DG_SM90_MOE_EPLB_HINT"] = "1"
+        if use_skew_hint:
+            os.environ["DG_SM90_MOE_SKEW_HINT"] = "1"
+        if use_masked_hint:
+            os.environ["DG_SM90_MOE_MASKED_HINT"] = "1"
+        try:
+            deep_gemm.fp8_mega_moe(
+                y_fused,
+                transformed_l1,
+                transformed_l2,
+                sym_buffer,
+                cumulative_local_expert_recv_stats=cum_stats_fused,
+                recipe=(128, 128, 128),
+                activation="swiglu",
+                activation_clamp=clamp_arg,
+                fast_math=bool(args.fast_math),
+            )
+        finally:
+            if use_eplb_hint:
+                if old_eplb_hint is None:
+                    os.environ.pop("DG_SM90_MOE_EPLB_HINT", None)
+                else:
+                    os.environ["DG_SM90_MOE_EPLB_HINT"] = old_eplb_hint
+            if use_skew_hint:
+                if old_skew_hint is None:
+                    os.environ.pop("DG_SM90_MOE_SKEW_HINT", None)
+                else:
+                    os.environ["DG_SM90_MOE_SKEW_HINT"] = old_skew_hint
+            if use_masked_hint:
+                if old_masked_hint is None:
+                    os.environ.pop("DG_SM90_MOE_MASKED_HINT", None)
+                else:
+                    os.environ["DG_SM90_MOE_MASKED_HINT"] = old_masked_hint
         return y_fused
 
     # ---- 打印 config ----
@@ -1095,6 +1125,32 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, (
         f"fused 输出 shape/dtype 异常: shape={y.shape}, dtype={y.dtype}"
     )
+    if args.check_split_vs_one_kernel:
+        old_split_env = os.environ.get("DG_SM90_MOE_SPLIT_L1_L2")
+        try:
+            os.environ["DG_SM90_MOE_SPLIT_L1_L2"] = "1"
+            y_split = run_fused().detach().clone()
+            torch.cuda.synchronize()
+            os.environ["DG_SM90_MOE_SPLIT_L1_L2"] = "0"
+            y_one_kernel = run_fused().detach().clone()
+            torch.cuda.synchronize()
+        finally:
+            if old_split_env is None:
+                os.environ.pop("DG_SM90_MOE_SPLIT_L1_L2", None)
+            else:
+                os.environ["DG_SM90_MOE_SPLIT_L1_L2"] = old_split_env
+        diff = (y_split.float() - y_one_kernel.float()).abs()
+        denom = y_one_kernel.float().abs().mean().clamp_min(1e-12)
+        dist_print(
+            "Output diff (split two-kernel vs one-kernel):", once_in_node=True
+        )
+        dist_print(
+            f" > max_abs={diff.max().item():.6e}, "
+            f"mean_abs={diff.mean().item():.6e}, "
+            f"mean_abs/mean_ref={diff.mean().div(denom).item():.6e}",
+            once_in_node=True,
+        )
+        dist_print(once_in_node=True)
     if ep_buffer is not None:
         out_b = run_baseline()
         assert out_b.shape == (num_tokens, hidden) and out_b.dtype == torch.bfloat16, (
@@ -1150,30 +1206,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_m_tiles = 0
         max_expert_tokens = 0
 
-    # ---- NSYS external profiler multi-iter ----
-    # Under DG_USE_NVIDIA_TOOLS=1, bench_kineto returns a sentinel and does not
-    # run its internal torch.profiler loop.  Keep this explicit loop so nsys
-    # captures multiple steady-state mega_moe kernels, matching decode_t256/t512.
-    _nsys_iters = int(os.environ.get("NSYS_ITERS", "0"))
-    if _nsys_iters > 0:
-        for _it in range(_nsys_iters):
-            torch.cuda.synchronize()
-            if ep_buffer is not None:
-                ep_buffer.barrier(use_comm_stream=False)
-            else:
-                dist.barrier()
-            torch.cuda._sleep(int(2e7))  # ~10ms gap between iters
-            if ep_buffer is not None:
-                ep_buffer.barrier(use_comm_stream=False)
-            else:
-                dist.barrier()
-            run_fused()
-        torch.cuda.synchronize()
-        if ep_buffer is not None:
-            ep_buffer.barrier(use_comm_stream=False)
-        else:
-            dist.barrier()
-
     # ---- benchmark ----
     # fused：bench_kineto 抓 sm90_fp8_mega_moe_impl 的 GPU 段（不含 host overhead）
     if phase_profile_enabled:
@@ -1192,7 +1224,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         ),
         with_multiple_kernels=os.environ.get(
             "DG_SM90_MOE_SPLIT_L1_L2",
-            "1" if args.num_max_tokens_per_rank >= 1024 else "0",
+            "1",
         ) != "0",
     )
     if phase_profile_enabled:
@@ -1209,17 +1241,27 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         phase_end.record()
         torch.cuda.synchronize()
         phase_event_us = phase_start.elapsed_time(phase_end) * 1000.0
-        raw_i32 = cum_stats_fused[num_experts_per_rank:num_experts_per_rank + 64].detach().cpu().tolist()
+        raw_i32 = cum_stats_fused[num_experts_per_rank:num_experts_per_rank + phase_profile_extra].detach().cpu().tolist()
         def _u64(slot: int) -> int:
             lo = raw_i32[slot * 2] & 0xffffffff
             hi = raw_i32[slot * 2 + 1] & 0xffffffff
             return lo | (hi << 32)
-        names = ("dispatch_total", "dispatch_pull", "math_loop", "combine_barrier", "combine_reduce", "gemm_core", "l1_epilogue", "l2_epilogue")
+        names = (
+            "dispatch_total",
+            "dispatch_pull",
+            "math_loop",
+            "combine_barrier",
+            "combine_reduce",
+            "gemm_core",
+            "l1_epilogue",
+            "l2_epilogue",
+        )
+        num_profile_metrics = len(names)
         pieces = []
         for idx, name in enumerate(names):
             total = _u64(idx)
-            max_cycles = _u64(8 + idx)
-            count = _u64(16 + idx)
+            max_cycles = _u64(num_profile_metrics + idx)
+            count = _u64(2 * num_profile_metrics + idx)
             avg_us = (total / count / 1000.0) if count else 0.0
             max_us = max_cycles / 1000.0
             pieces.append(f"{name}:avg={avg_us:.1f}us,max={max_us:.1f}us,n={count},ns={total}/{max_cycles}")
@@ -1462,7 +1504,7 @@ if __name__ == "__main__":
         "--num-redundant-experts",
         type=int,
         default=0,
-        help="benchmark-only EPLB simulation: reserve physical expert slots as hot-expert replicas",
+        help="EPLB replica simulation: reserve physical expert slots as hot-expert replicas",
     )
     parser.add_argument(
         "--replica-dispatch",
@@ -1506,6 +1548,12 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="非 0 时打印 fused 与 legacy-per128 baseline 的输出差异（预期非 bitwise）",
+    )
+    parser.add_argument(
+        "--check-split-vs-one-kernel",
+        type=int,
+        default=0,
+        help="非 0 时打印 split two-kernel 与 one-kernel fused 的输出差异",
     )
     parser.add_argument(
         "--dump-profile-traces",

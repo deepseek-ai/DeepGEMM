@@ -36,11 +36,17 @@ from deep_gemm.testing import bench_kineto, get_arch_major
 def _quantize_grouped_fp8_block_128_128(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     g, n, k = w.shape
     assert n % 128 == 0 and k % 128 == 0
-    w_view = w.view(g, n // 128, 128, k // 128, 128).float()
-    amax = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4)
-    sf = amax / 448.0
-    w_fp8 = (w_view / sf.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn)
-    return w_fp8.view(g, n, k).contiguous(), sf.contiguous()
+    chunk_g = 4
+    w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fn)
+    sf = torch.empty((g, n // 128, k // 128), dtype=torch.float, device=w.device)
+    for start in range(0, g, chunk_g):
+        end = min(start + chunk_g, g)
+        w_view = w[start:end].view(end - start, n // 128, 128, k // 128, 128).float()
+        sf_chunk = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4) / 448.0
+        w_fp8[start:end].copy_(
+            (w_view / sf_chunk.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn).view(end - start, n, k))
+        sf[start:end].copy_(sf_chunk)
+    return w_fp8, sf.contiguous()
 
 
 def _generate_skewed_scores(num_tokens: int, num_experts: int, num_topk: int,
@@ -104,6 +110,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
     )
 
     cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
+    use_skew_hint = args.skew_alpha > 0.0
 
     def run_fused():
         buffer.x[:num_tokens].copy_(x_fp8)
@@ -111,14 +118,24 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_w)
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.fp8_mega_moe(
-            y, transformed_l1, transformed_l2, buffer,
-            cumulative_local_expert_recv_stats=cum_stats,
-            recipe=(128, 128, 128),
-            activation='swiglu',
-            activation_clamp=10.0,
-            fast_math=True,
-        )
+        old_skew_hint = os.environ.get('DG_SM90_MOE_SKEW_HINT')
+        if use_skew_hint:
+            os.environ['DG_SM90_MOE_SKEW_HINT'] = '1'
+        try:
+            deep_gemm.fp8_mega_moe(
+                y, transformed_l1, transformed_l2, buffer,
+                cumulative_local_expert_recv_stats=cum_stats,
+                recipe=(128, 128, 128),
+                activation='swiglu',
+                activation_clamp=10.0,
+                fast_math=True,
+            )
+        finally:
+            if use_skew_hint:
+                if old_skew_hint is None:
+                    os.environ.pop('DG_SM90_MOE_SKEW_HINT', None)
+                else:
+                    os.environ['DG_SM90_MOE_SKEW_HINT'] = old_skew_hint
         return y
 
     run_fused()
@@ -126,7 +143,9 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
     t_fused = bench_kineto(run_fused, 'sm90_fp8_mega_moe',
                            barrier=lambda: dist.barrier(),
                            num_tests=args.num_tests,
-                           suppress_kineto_output=True)
+                           suppress_kineto_output=True,
+                           with_multiple_kernels=os.environ.get(
+                               'DG_SM90_MOE_SPLIT_L1_L2', '1') != '0')
 
     # Local expert count distribution
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)

@@ -6,6 +6,10 @@
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 
+#ifndef DG_NVLINK_BARRIER_TIMEOUT_PRINTF
+#define DG_NVLINK_BARRIER_TIMEOUT_PRINTF 0
+#endif
+
 namespace deep_gemm::comm {
 
 CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
@@ -67,9 +71,11 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             const auto start_clock = clock64();
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
+#if DG_NVLINK_BARRIER_TIMEOUT_PRINTF
                     printf("DeepGEMM NVLink barrier timeout (30s): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
-                    DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+#endif
+                    DG_TRAP_ONLY_DEVICE_ASSERT(false and "NVLink barrier timeout");
                 }
             }
         }

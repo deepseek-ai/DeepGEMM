@@ -4,7 +4,7 @@ Mirrors ``tests/test_mega_moe.py``'s ``--ncu-profile-only`` /
 ``--local-rank-idx`` interface so the same ``scripts/run_ncu_mega_moe.sh``
 pattern can drive it for SM90.
 
-In normal (non-NCU) mode it sweeps a list of ``num_tokens`` values (default:
+In normal (non-NCU) mode it runs a list of ``num_tokens`` values (default:
 1, 2, 4, 8, 16, 32) and reports per-call kernel time via the same
 ``bench_kineto`` helper used by the SM100 perf test, plus a rough TFLOPS /
 HBM GB/s figure useful for tracking optimisation deltas.
@@ -31,11 +31,17 @@ from deep_gemm.testing import bench_kineto, calc_diff, get_arch_major
 def _quantize_grouped_fp8_block_128_128(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     g, n, k = w.shape
     assert n % 128 == 0 and k % 128 == 0
-    w_view = w.view(g, n // 128, 128, k // 128, 128).float()
-    amax = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4)
-    sf = amax / 448.0
-    w_fp8 = (w_view / sf.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn)
-    return w_fp8.view(g, n, k).contiguous(), sf.contiguous()
+    chunk_g = 4
+    w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fn)
+    sf = torch.empty((g, n // 128, k // 128), dtype=torch.float, device=w.device)
+    for start in range(0, g, chunk_g):
+        end = min(start + chunk_g, g)
+        w_view = w[start:end].view(end - start, n // 128, 128, k // 128, 128).float()
+        sf_chunk = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4) / 448.0
+        w_fp8[start:end].copy_(
+            (w_view / sf_chunk.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn).view(end - start, n, k))
+        sf[start:end].copy_(sf_chunk)
+    return w_fp8, sf.contiguous()
 
 
 def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
@@ -79,6 +85,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
     phase_profile_enabled = os.environ.get('DG_SM90_MOE_PHASE_PROFILE', '0') != '0'
     phase_profile_ints = 64 if phase_profile_enabled else 0
     cum_stats = torch.zeros(num_experts_per_rank + phase_profile_ints, dtype=torch.int, device='cuda')
+    use_masked_hint = args.masked_ratio > 0
 
     # Stage inputs once; bench-loop re-copies them each call (bench helper expects
     # an idempotent ``fn``).
@@ -88,14 +95,24 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_w)
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.fp8_mega_moe(
-            y, transformed_l1, transformed_l2, buffer,
-            cumulative_local_expert_recv_stats=cum_stats,
-            recipe=(128, 128, 128),
-            activation='swiglu',
-            activation_clamp=activation_clamp,
-            fast_math=fast_math,
-        )
+        old_masked_hint = os.environ.get('DG_SM90_MOE_MASKED_HINT')
+        if use_masked_hint:
+            os.environ['DG_SM90_MOE_MASKED_HINT'] = '1'
+        try:
+            deep_gemm.fp8_mega_moe(
+                y, transformed_l1, transformed_l2, buffer,
+                cumulative_local_expert_recv_stats=cum_stats,
+                recipe=(128, 128, 128),
+                activation='swiglu',
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
+        finally:
+            if use_masked_hint:
+                if old_masked_hint is None:
+                    os.environ.pop('DG_SM90_MOE_MASKED_HINT', None)
+                else:
+                    os.environ['DG_SM90_MOE_MASKED_HINT'] = old_masked_hint
         return y
 
     if args.ncu_profile_only:
@@ -114,24 +131,12 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         cum_stats.zero_()
         torch.cuda.synchronize()
         dist.barrier()
-    # NSYS MULTI-ITER (aichenf): N timed iters with barrier+sleep between them.
-    # bench_kineto returns 1 under DG_USE_NVIDIA_TOOLS=1, but this loop puts
-    # multiple mega_moe instances on the nsys timeline so we can measure variance.
-    import os as _os
-    _nsys_iters = int(_os.environ.get('NSYS_ITERS', '0'))
-    if _nsys_iters > 0:
-        for _it in range(_nsys_iters):
-            torch.cuda.synchronize()
-            dist.barrier()
-            torch.cuda._sleep(int(2e7))  # 10ms gap between iters
-            dist.barrier()
-            run_fused()
-        torch.cuda.synchronize()
-        dist.barrier()
     t_fused = bench_kineto(run_fused, 'sm90_fp8_mega_moe',
                            barrier=lambda: dist.barrier(),
                            num_tests=args.num_tests,
-                           suppress_kineto_output=True)
+                           suppress_kineto_output=True,
+                           with_multiple_kernels=os.environ.get(
+                               'DG_SM90_MOE_SPLIT_L1_L2', '1') != '0')
 
     # Count tokens that landed on this rank for stats
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -161,13 +166,18 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         )
         if phase_profile_enabled:
             torch.cuda.synchronize()
-            profile = cum_stats[num_experts_per_rank:num_experts_per_rank + 48].view(torch.int64).cpu().tolist()
             names = [
                 'dispatch_total', 'dispatch_pull', 'math_loop', 'combine_barrier',
                 'combine_reduce', 'gemm_core', 'l1_epilogue', 'l2_epilogue',
             ]
+            num_profile_metrics = len(names)
+            profile = cum_stats[
+                num_experts_per_rank:num_experts_per_rank + phase_profile_ints
+            ].view(torch.int64).cpu().tolist()
             for i, name in enumerate(names):
-                total, max_v, count = profile[i], profile[8 + i], profile[16 + i]
+                total = profile[i]
+                max_v = profile[num_profile_metrics + i]
+                count = profile[2 * num_profile_metrics + i]
                 avg = float(total) / count if count else 0.0
                 dist_print(
                     f'   phase {name:16s} avg={avg:10.0f} max={max_v:10d} count={count}',
@@ -231,7 +241,7 @@ if __name__ == '__main__':
     parser.add_argument('--local-rank-idx', type=int, default=None)
 
     parser.add_argument('--batches', type=int, nargs='+', default=None,
-                        help='List of num_tokens to sweep (default: 1 2 4 8 16 32)')
+                        help='List of num_tokens to benchmark (default: 1 2 4 8 16 32)')
     parser.add_argument('--hidden', type=int, default=7168)
     parser.add_argument('--intermediate-hidden', type=int, default=2048)
     parser.add_argument('--num-experts', type=int, default=256)
