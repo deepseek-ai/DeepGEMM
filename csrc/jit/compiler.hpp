@@ -201,11 +201,17 @@ public:
 
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
-        const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
+        device_runtime->set_support_arch_family(nvcc_major > 12 or nvcc_minor >= 9);
+        const auto arch = device_runtime->get_arch(false);
+        // SM120a requires -gencode (--gpu-architecture makes ptxas fall back to sm_120,
+        // losing block_scale and other arch-specific features)
+        const auto arch_flag = device_runtime->get_arch_major() == 12
+            ? fmt::format("-gencode=arch=compute_{},code=sm_{}", arch, arch)
+            : fmt::format("--gpu-architecture=sm_{}", arch);
+        flags = fmt::format("{} -I{} {} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, library_include_path.c_str(), arch_flag);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
@@ -276,7 +282,8 @@ public:
 
         // Override the compiler flags
         // Only NVRTC >= 12.9 supports arch-specific family suffix
-        const auto arch = device_runtime->get_arch(false, major > 12 or minor >= 9);
+        device_runtime->set_support_arch_family(major > 12 or minor >= 9);
+        const auto arch = device_runtime->get_arch(false);
         flags = fmt::format("{} {}--gpu-architecture=sm_{} -default-device {} --device-int128",
                             flags, include_dirs, arch, pch_flags);
     }

@@ -14,6 +14,7 @@ namespace deep_gemm {
 class DeviceRuntime {
     int num_sms = 0, tc_util = 0;
     bool enable_pdl = false;
+    bool support_arch_family = false;
     std::shared_ptr<cudaDeviceProp> cached_prop;
 
     // cuBLASLt utils
@@ -85,13 +86,27 @@ public:
         return {prop->major, prop->minor};
     }
 
-    std::string get_arch(const bool& number_only = false,
-                         const bool& support_arch_family = false) {
+    // Set by the active JIT compiler at construction (NVCC / NVRTC >= 12.9).
+    void set_support_arch_family(const bool& value) {
+        support_arch_family = value;
+    }
+
+    bool get_support_arch_family() const {
+        return support_arch_family;
+    }
+
+    std::string get_arch(const bool& number_only = false) {
         const auto [major, minor] = get_arch_pair();
         if (major == 10 and minor != 1) {
             if (number_only)
                 return "100";
             return support_arch_family ? "100f" : "100a";
+        }
+        // SM12.1 reuses the SM120 family cubin when `sm_<NN>f` is available.
+        if (major == 12 and (minor != 1 or support_arch_family)) {
+            if (number_only)
+                return "120";
+            return support_arch_family ? "120f" : "120a";
         }
         return std::to_string(major * 10 + minor) + (number_only ? "" : "a");
     }

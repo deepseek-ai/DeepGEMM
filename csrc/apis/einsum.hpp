@@ -12,8 +12,11 @@
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm100_bmk_bnk_mn.hpp"
+#include "../jit_kernels/impls/sm120_bmk_bnk_mn.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 #endif
 
@@ -51,6 +54,8 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
     const auto arch_major = device_runtime->get_arch_major();
     if (arch_major == 9) {
         sm90_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
+    } else if (arch_major == 12) {
+        sm120_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
     } else if (arch_major == 10) {
         sm100_bmn_bnk_mn_gemm(a, b, d, s, m, n, k);
     } else {
@@ -74,6 +79,8 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
         cublaslt_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 9) {
         sm90_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
+    } else if (arch_major == 12) {
+        sm120_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
         sm100_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else {
@@ -97,6 +104,8 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
         cublaslt_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 9) {
         sm90_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
+    } else if (arch_major == 12) {
+        sm120_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
         sm100_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else {
@@ -162,13 +171,59 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     if (batch_size == 0 or gemm::early_return(m, n, k, d, c))
         return;
 
-    // Transform scaling factors
+    // AB-swap small-M decode path. Mirrors TRT-LLM's runGemmSwapAB
+    // (cpp/include/tensorrt_llm/deep_gemm/fp8_gemm.cuh): SM120 1d1d has
+    // BLOCK_M ≥ 64, so M_orig ≤ 32 wastes lanes. Swapping A↔B moves the
+    // small dim to N where BLOCK_N can shrink to {16, 32}. The swap runs
+    // BEFORE the SF layout transform so transform_sf_pair_into_required_layout
+    // sees operands in their post-swap roles. The kernel writes back into the
+    // caller's (B, M_orig, N_orig) buffer directly via runtime stride_cd_m/n
+    // (no temp buffer); see sm120_fp8_fp4_bmm for the stride remap.
+    const auto arch_major = device_runtime->get_arch_major();
+    constexpr int kSwapAbMMax = 32;
+    const bool swap_ab_eligible =
+        arch_major == 12 and m >= 1 and m <= kSwapAbMMax
+        and major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K
+        and d.stride(-1) == 1    // d's innermost dim must be contiguous
+        and not c.has_value();   // swap's strided/transposed output is incompatible with
+                                 // the batched accumulation epilogue (both the REDUCE_ADD
+                                 // TMA-store path and the direct-store path mishandle the
+                                 // batch offset + swapped strides). Mirrors the dense GEMM
+                                 // swap exclusion in gemm.hpp.
+
+    if (swap_ab_eligible) {
+        // Swap the recipe's gran_mn entries too: (gran_mn_a, gran_mn_b, gran_k)
+        // describes the original A/B roles, so after operand swap the per-tensor
+        // granularities must follow. Without this, asymmetric recipes
+        // like (1, 128, 128) trip the SF layout shape check.
+        const auto eff_recipe = recipe.has_value()
+            ? recipe.value()
+            : get_default_recipe(sfa.scalar_type(), sfb.scalar_type());
+        const auto& [ga, gb, gk] = eff_recipe;
+        std::optional<std::tuple<int, int, int>> swap_recipe = std::nullopt;
+        std::optional<std::tuple<int, int>> swap_recipe_a = std::make_tuple(gb, gk);
+        std::optional<std::tuple<int, int>> swap_recipe_b = std::make_tuple(ga, gk);
+        const auto [transformed_sfa_swap, transformed_sfb_swap, gran_k_a_swap, gran_k_b_swap]
+            = layout::transform_sf_pair_into_required_layout(
+                sfb, sfa, /*m=*/n, /*n=*/m, k, swap_recipe,
+                swap_recipe_a, swap_recipe_b, batch_size, batch_size, false);
+        sm120_fp8_fp4_bmm(
+            b, transformed_sfa_swap, a, transformed_sfb_swap, c, d,
+            batch_size, /*m=*/n, /*n=*/m, k,
+            gran_k_a_swap, gran_k_b_swap,
+            major_b, major_a, compiled_dims,
+            /*swap_ab=*/true);
+        return;
+    }
+
+    // Transform scaling factors (non-swap path)
     const auto [transformed_sfa, transformed_sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
         sfa, sfb, m, n, k, recipe, std::nullopt, std::nullopt, batch_size, batch_size, false);
 
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
-    if (arch_major == 10) {
+    if (arch_major == 12) {
+        sm120_fp8_fp4_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+    } else if (arch_major == 10) {
         sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
     } else {
         const auto major_sfb = get_major_type_ab(sfb);
@@ -193,21 +248,36 @@ static void fp8_einsum(const std::string& expr,
         const auto perm_d = d.permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk");
-    } else if (expr == "bhd,hdr->bhr" and arch_major == 10) {
+    } else if (expr == "bhd,hdr->bhr") {
         // (batch_size, m, n, k): (h, b, r, d)
         const auto perm_a = a.first.permute({1, 0, 2});
         const auto perm_sfa = a.second.permute({1, 0, 2});
-        const auto perm_b = b.first.permute({0, 2, 1});
-        const auto perm_sfb = b.second.permute({0, 2, 1});
+        auto perm_b = b.first.permute({0, 2, 1});
+        auto perm_sfb = b.second.permute({0, 2, 1});
+        // SM120: B is MN-major after permute. Kernel has scalar-load MN-major path
+        // (kBKMajor=false) but it's 3x slower than K-major ldmatrix due to 8 individual
+        // ld.shared.u8 per fragment. .contiguous() is faster for typical einsum sizes.
+        if (arch_major == 12) {
+            perm_b = perm_b.contiguous();
+        }
         const auto perm_d = d.permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk");
-    } else if (expr == "bhd,bhr->hdr" and arch_major == 10) {
+    } else if (expr == "bhd,bhr->hdr") {
         // (batch_size, m, n, k): (h, d, r, b)
-        const auto perm_a = a.first.permute({1, 2, 0});
-        const auto perm_sfa = a.second.permute({1, 2, 0});
-        const auto perm_b = b.first.permute({1, 2, 0});
-        const auto perm_sfb = b.second.permute({1, 2, 0});
+        auto perm_a = a.first.permute({1, 2, 0});
+        auto perm_sfa = a.second.permute({1, 2, 0});
+        auto perm_b = b.first.permute({1, 2, 0});
+        auto perm_sfb = b.second.permute({1, 2, 0});
+        // SM120: both A and B are MN-major after permute. .contiguous() to K-major is
+        // needed because (1) kernel scalar-load MN-major path is 3x slower than ldmatrix,
+        // and (2) MN-major A is not supported (would need ldmatrix.trans for A operand).
+        // SF-data alignment is preserved: .contiguous() copies FP8 bytes without changing
+        // logical element values, and SF transform reads from the permuted SF view independently.
+        if (arch_major == 12) {
+            perm_a = perm_a.contiguous();
+            perm_b = perm_b.contiguous();
+        }
         fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn");
     } else {
         DG_HOST_UNREACHABLE(fmt::format("Unsupported einsum expression: {}", expr));

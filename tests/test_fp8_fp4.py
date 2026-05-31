@@ -11,7 +11,7 @@ from deep_gemm.testing import (
 )
 
 from generators import (
-    KernelType, get_ue8m0_usage, layout_masked_to_psum, align,
+    KernelType, MajorTypeAB, get_ue8m0_usage, layout_masked_to_psum, align,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
     get_mk_alignment_for_contiguous_layout
@@ -31,6 +31,11 @@ def test_gemm() -> None:
         disable_ue8m0_cast = not use_ue8m0
         recipe, recipe_a, recipe_b = quant_config.get_recipes(is_wgrad=(kernel_type.is_1d1d() and accumulate))
 
+        # SM120 mixed FP8xFP4 K-major requires K % 128 == 0 (16U4_ALIGN16B TMA constraint)
+        is_mixed_fp4 = (quant_config.is_fp4_a != quant_config.is_fp4_b) if hasattr(quant_config, 'is_fp4_a') else False
+        if is_mixed_fp4 and get_arch_major() == 12 and k % 128 != 0:
+            continue
+
         for test_alias in (False, True):
             a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0, quant_config=quant_config)
             func_name = f'fp8_fp4_gemm_{major_opt.lower() if test_alias else "nt"}'
@@ -46,8 +51,16 @@ def test_gemm() -> None:
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0, quant_config=quant_config)
         t = bench_kineto(lambda: deep_gemm.fp8_fp4_gemm_nt(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast, recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
                          'gemm_', suppress_kineto_output=True)
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a[0], b[0], d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True) \
-                              if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0)
+        a_k = a[0].contiguous() if not major_a.is_k_major() else a[0]
+        b_k = b[0].contiguous() if not major_b.is_k_major() else b[0]
+        # On SM120 (consumer Blackwell) cuBLAS picks either an nvjet GEMM kernel or
+        # falls back to a legacy sm89_xmma FP8 kernel depending on shape; match both,
+        # plus the split-K reduce kernel. (SM90/SM100 use nvjet and never the sm89
+        # fallback, so 'xmma' simply matches nothing there.)
+        cublas_nvjet, cublas_xmma, split_k_t = \
+            bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a_k, b_k, d, c=c), ('nvjet', 'xmma', 'reduce'), suppress_kineto_output=True) \
+            if not quant_config.is_fp4_a and not quant_config.is_fp4_b else (0, 0, 0)
+        cublas_t = cublas_nvjet + cublas_xmma
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
@@ -176,9 +189,9 @@ def test_m_grouped_gemm_masked() -> None:
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
 
-    k_grouped_fp8_gemm_contiguous = deep_gemm.k_grouped_fp8_gemm_nt_contiguous if get_arch_major() == 9 \
-                                    else deep_gemm.k_grouped_fp8_gemm_tn_contiguous
     for num_groups, m, n, major_a, major_b, ks, expected_k_per_group, gran_k in enumerate_k_grouped_contiguous(torch.float8_e4m3fn):
+        k_grouped_fp8_gemm_contiguous = deep_gemm.k_grouped_fp8_gemm_nt_contiguous if major_a == MajorTypeAB.KMajor \
+                                        else deep_gemm.k_grouped_fp8_gemm_tn_contiguous
         recipe = (1, 1, gran_k)
         use_ue8m0 = get_ue8m0_usage(KernelType.Kernel1D1D)
 

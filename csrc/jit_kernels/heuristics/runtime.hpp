@@ -44,14 +44,21 @@ public:
         return mk_alignment_for_contiguous_layout;
     }
 
-    static int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) {
-        if (device_runtime->get_arch_major() != 10)
+    static int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m,
+                                                                    const std::optional<int>& num_groups = std::nullopt) {
+        const auto arch_major = device_runtime->get_arch_major();
+        if (arch_major != 10 and arch_major != 12)
             return kLegacyMKAlignmentForContiguousLayout;
 
-        int block_m = 240, mma_step = 16;
+        // SM120: kMWarps=4, MMA_M=16, valid BLOCK_M must be multiple of 64
+        int block_m = arch_major == 12 ? 128 : 240;
+        int min_block_m = arch_major == 12 ? 64 : 32;
+        int mma_step = arch_major == 12 ? 64 : 16;
         if (expected_m.has_value()) {
-            // Reduce `block_m` while ensuring it covers `m`
-            for (; block_m > 32 and block_m - mma_step >= expected_m.value(); block_m -= mma_step);
+            int per_expert_m = expected_m.value();
+            if (num_groups.has_value() and num_groups.value() > 0)
+                per_expert_m = (per_expert_m + num_groups.value() - 1) / num_groups.value();
+            for (; block_m > min_block_m and block_m - mma_step >= per_expert_m; block_m -= mma_step);
         }
         return block_m;
     }
