@@ -205,14 +205,17 @@ static void sm90_fp8_mega_moe(
     // this tile in plain row-major SMEM before the TMA store. Later L2 TMA
     // loads may still swizzle from this row-major global buffer into their own
     // SMEM tile.
-    // The TMA store is issued *per warpgroup*, each writing a `WG_BLOCK_M`
-    // (= block_m / num_epilogue_warpgroups) row tile from its own SMEM offset.
-    // The descriptor outer-box dim therefore must be `WG_BLOCK_M`, not block_m.
+    // The usual TMA store is issued per warpgroup, each writing a `WG_BLOCK_M`
+    // row tile from its own SMEM offset. The m64n128 2-WG split-N decode path is
+    // different: both warpgroups stage one joint 64-column L1-output tile and a
+    // single warpgroup issues the combined store, so the descriptor must cover
+    // the full block_m x (block_n / 2) tile.
     const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
     const bool split_n_warpgroups =
-        config.block_m == 64 and config.block_n % 128 == 0 and
-        num_epilogue_warpgroups_h == config.block_n / 128 and
-        num_epilogue_warpgroups_h > 1;
+        config.block_m == 64 and num_epilogue_warpgroups_h > 1 and
+        config.block_n % num_epilogue_warpgroups_h == 0 and
+        (config.block_n / num_epilogue_warpgroups_h == 64 or
+         config.block_n / num_epilogue_warpgroups_h == 128);
     const bool split_mn_warpgroups =
         config.block_m == 128 and config.block_n == 256 and num_epilogue_warpgroups_h == 4;
     const int wg_split_m = split_n_warpgroups ? 1 :
@@ -223,11 +226,16 @@ static void sm90_fp8_mega_moe(
     const int wg_block_m = config.block_m / wg_split_m;
     const int wg_block_n = config.block_n / wg_split_n;
     const int wg_l1_out_block_n = wg_block_n / 2;
+    const bool split_n_shares_sf =
+        split_n_warpgroups and wg_l1_out_block_n < kL2ActsSFGranK;
     const int l1_output_swizzle_mode = 0;
-    const int l1_output_box_m = wg_block_m;
+    const int l1_output_box_n =
+        split_n_shares_sf ? config.block_n / 2 : wg_l1_out_block_n;
+    const int l1_output_box_m =
+        split_n_shares_sf ? config.block_m : wg_block_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_max_pool_tokens,
-                                                       wg_l1_out_block_n, l1_output_box_m,
+                                                       l1_output_box_n, l1_output_box_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
                                                        l1_output_swizzle_mode);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
