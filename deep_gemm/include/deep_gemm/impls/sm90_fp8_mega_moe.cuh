@@ -74,7 +74,11 @@ template <
     bool kL2NMajorScheduleRequested = false,
     bool kL1NMajorScheduleRequested = false,
     bool kOneWarpCleanupRequested = false,
+    uint32_t kL2MSwizzleGroupRequested = 0,
+    uint32_t kL1MSwizzleGroupRequested = 0,
     uint32_t kSplitPhaseMode = 0,
+    uint32_t kExpertRangeStart = 0,
+    uint32_t kExpertRangeEnd = 0,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -120,6 +124,8 @@ sm90_fp8_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_N == 64 or BLOCK_N == 128 or BLOCK_N == 256, "BLOCK_N must be 64/128/256 for this SM90 path");
     DG_STATIC_ASSERT(BLOCK_K == 128, "BLOCK_K is fixed to 128 (per-128 SF)");
     DG_STATIC_ASSERT(kSplitPhaseMode <= 2, "Invalid SM90 MegaMoE split phase mode");
+    DG_STATIC_ASSERT(kExpertRangeStart <= (kExpertRangeEnd == 0 ? kNumExpertsPerRank : kExpertRangeEnd), "Invalid expert range");
+    DG_STATIC_ASSERT((kExpertRangeEnd == 0 ? kNumExpertsPerRank : kExpertRangeEnd) <= kNumExpertsPerRank, "Expert range exceeds local experts");
 
     // =====================================================================
     // Thread / warp identification
@@ -197,15 +203,16 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr uint32_t WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2; // post-SwiGLU per-WG N
     constexpr bool kRunOnlyLinear1 = kSplitPhaseMode == 1;
     constexpr bool kRunOnlyLinear2 = kSplitPhaseMode == 2;
+    constexpr uint32_t kEffectiveExpertRangeEnd = kExpertRangeEnd == 0 ? kNumExpertsPerRank : kExpertRangeEnd;
     constexpr bool kAsyncL1TMAStore =
-        kAsyncL1TMAStoreRequested && (!kUseMMASync) &&
+        kAsyncL1TMAStoreRequested && (!kRunOnlyLinear2) && (!kUseMMASync) &&
         (!kSplitNWarpgroups) && kNumEpilogueWarpgroups == 1;
     constexpr bool kSplitSFATMA = kSplitSFATMARequested && (!kUseMMASync);
-    constexpr bool kDirectL2Scatter = kDirectL2ScatterRequested && (!kUseMMASync) &&
+    constexpr bool kDirectL2Scatter = kDirectL2ScatterRequested && (!kRunOnlyLinear1) && (!kUseMMASync) &&
         (!kSerialNWarpgroups) && WG_BLOCK_N == 128;
-    constexpr bool kL2DualAccum = kL2DualAccumRequested && (!kUseMMASync) &&
+    constexpr bool kL2DualAccum = kL2DualAccumRequested && (!kRunOnlyLinear1) && (!kUseMMASync) &&
         (!kSplitNWarpgroups) && (!kSerialNWarpgroups) && WG_BLOCK_N == 128;
-    constexpr bool kL1DualKAccum = kL1DualKAccumRequested && (!kUseMMASync) &&
+    constexpr bool kL1DualKAccum = kL1DualKAccumRequested && (!kRunOnlyLinear2) && (!kUseMMASync) &&
         (!kSplitNWarpgroups) && (!kSerialNWarpgroups) && WG_BLOCK_N == 128 &&
         (kHidden / BLOCK_K) % 2 == 0;
     using L1WGMMA   = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
@@ -231,9 +238,9 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr uint32_t kSharedMemoryAlignment = 1024;
     extern __shared__ __align__(kSharedMemoryAlignment) uint8_t smem_buffer[];
 
-    constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
+    constexpr uint32_t SMEM_EXPERT_COUNT_SIZE = kRunOnlyLinear2 ? 0u :
         math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
-    constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
+    constexpr uint32_t SMEM_SEND_BUFFER_SIZE = kRunOnlyLinear2 ? 0u :
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
@@ -242,7 +249,8 @@ sm90_fp8_mega_moe_impl(void* y,
     // the second L2 half cannot start immediately after 16 floats in M16 decode.
     constexpr uint32_t kL2SFAHalfStride =
         math::constexpr_align<uint32_t>(BLOCK_M * sizeof(float), 128u) / sizeof(float);
-    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = 2 * kL2SFAHalfStride * sizeof(float);
+    constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
+        (kRunOnlyLinear1 ? kL2SFAHalfStride : 2u * kL2SFAHalfStride) * sizeof(float);
     // Block (128, 128) weight SF: 1 float per (BLOCK_N, BLOCK_K) tile for L2,
     // 2 floats (gate/up) for L1. Loaded by math warpgroup directly from global,
     // so no SMEM is needed.
@@ -253,9 +261,9 @@ sm90_fp8_mega_moe_impl(void* y,
     constexpr uint32_t SMEM_CD_ACCUM_SIZE = kUseMMASync
         ? math::constexpr_align<uint32_t>(BLOCK_M * BLOCK_N * sizeof(float), kSharedMemoryAlignment)
         : 0u;
-    constexpr uint32_t SMEM_CD_L1_SIZE =
+    constexpr uint32_t SMEM_CD_L1_SIZE = kRunOnlyLinear2 ? 0u :
         kNumEpilogueWarpgroups * WG_BLOCK_M * WG_L1_OUT_BLOCK_N * sizeof(cutlass::float_e4m3_t);
-    constexpr uint32_t SMEM_CD_L2_SIZE = kDirectL2Scatter ? 0u :
+    constexpr uint32_t SMEM_CD_L2_SIZE = (kRunOnlyLinear1 || kDirectL2Scatter) ? 0u :
         kNumEpilogueWarpgroups * WG_BLOCK_M * WG_BLOCK_N * sizeof(nv_bfloat16);
     constexpr uint32_t SMEM_CD_L1_ASYNC_ELEMS =
         kNumEpilogueWarpgroups * WG_BLOCK_M * L1_OUT_BLOCK_N;
@@ -314,10 +322,12 @@ sm90_fp8_mega_moe_impl(void* y,
     // Initialization
     // =====================================================================
     if (warp_idx == 0) {
-        // Clean expert-count shared memory
-        #pragma unroll
-        for (uint32_t i = lane_idx; i < kNumExperts; i += 32)
-            ptx::st_shared(smem_expert_count + i, 0u);
+        if constexpr (!kRunOnlyLinear2) {
+            // Clean expert-count shared memory
+            #pragma unroll
+            for (uint32_t i = lane_idx; i < kNumExperts; i += 32)
+                ptx::st_shared(smem_expert_count + i, 0u);
+        }
     } else if (warp_idx == 1) {
         // Init dispatch m-barriers
         #pragma unroll
@@ -358,7 +368,9 @@ sm90_fp8_mega_moe_impl(void* y,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks, kClusterSize, kL2NMajorScheduleRequested, kL1NMajorScheduleRequested>(workspace);
+        kNumSMs, kNumRanks, kClusterSize, kL2NMajorScheduleRequested, kL1NMajorScheduleRequested,
+        kL2MSwizzleGroupRequested, kL1MSwizzleGroupRequested,
+        kExpertRangeStart, kEffectiveExpertRangeEnd>(workspace);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -892,9 +904,10 @@ sm90_fp8_mega_moe_impl(void* y,
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
                     // TMA load B (weight SF is now loaded directly by math warps from global)
+                    const uint32_t num_tma_multicast_b = (kClusterSize > 1 and scheduler.is_b_multicast_valid) ? kClusterSize : 1u;
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
                         tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx],
-                        k_idx, n_idx, kClusterSize);
+                        k_idx, n_idx, num_tma_multicast_b);
 
                     full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
                 }
@@ -993,8 +1006,9 @@ sm90_fp8_mega_moe_impl(void* y,
                 if (lane_idx == 0)
                     empty_barriers[s]->arrive();
             } else {
+                const auto target_cta = scheduler.is_peer_cta_alive ? lane_idx : cute::block_rank_in_cluster();
                 if (lane_idx < kClusterSize)
-                    empty_barriers[s]->arrive(lane_idx);
+                    empty_barriers[s]->arrive(target_cta);
             }
         };
 
@@ -2384,9 +2398,12 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
         if (epilogue_warp_idx == 0 and lane_idx == 0)
             phase_profile_record(kProfileCombineBarrier, combine_barrier_end - combine_barrier_start);
 
-        // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
-        // dispatch may now safely clean workspace state.
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        // Fused mode overlaps dispatch cleanup with combine reduce. In split K2,
+        // delay the cleanup sync until the combine loads are issued so K2's
+        // epilogue-side memory traffic does not fight the reducer.
+        if constexpr (!kRunOnlyLinear2) {
+            ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        }
         const unsigned long long combine_reduce_start = phase_profile_clock();
 
         constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
@@ -2496,6 +2513,9 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
         const unsigned long long combine_reduce_end = phase_profile_clock();
         if (epilogue_warp_idx == 0 and lane_idx == 0)
             phase_profile_record(kProfileCombineReduce, combine_reduce_end - combine_reduce_start);
+        if constexpr (kRunOnlyLinear2) {
+            ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        }
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

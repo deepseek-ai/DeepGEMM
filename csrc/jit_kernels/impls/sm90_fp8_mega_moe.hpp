@@ -48,7 +48,11 @@ public:
         bool l2_nmajor_schedule;
         bool l1_nmajor_schedule;
         bool one_warp_cleanup;
+        int l2_m_swizzle_group;
+        int l1_m_swizzle_group;
         int split_phase_mode;
+        int expert_range_start;
+        int expert_range_end;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -104,6 +108,10 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
+        {},
+        {},
         {}
     >);
 }};
@@ -130,7 +138,11 @@ static void __instantiate_kernel() {{
     args.l2_nmajor_schedule ? "true" : "false",
     args.l1_nmajor_schedule ? "true" : "false",
     args.one_warp_cleanup ? "true" : "false",
-    args.split_phase_mode);
+    args.l2_m_swizzle_group,
+    args.l1_m_swizzle_group,
+    args.split_phase_mode,
+    args.expert_range_start,
+    args.expert_range_end);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -266,7 +278,11 @@ static void sm90_fp8_mega_moe(
         .one_warp_cleanup = get_env<int>(
             "DG_SM90_MOE_ONE_WARP_CLEANUP",
             one_warp_cleanup_default ? 1 : 0) != 0,
+        .l2_m_swizzle_group = get_env<int>("DG_SM90_MOE_L2_M_SWIZZLE_GROUP", 0),
+        .l1_m_swizzle_group = get_env<int>("DG_SM90_MOE_L1_M_SWIZZLE_GROUP", 0),
         .split_phase_mode = 0,
+        .expert_range_start = get_env<int>("DG_SM90_MOE_EXPERT_RANGE_START", 0),
+        .expert_range_end = get_env<int>("DG_SM90_MOE_EXPERT_RANGE_END", 0),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -287,6 +303,53 @@ static void sm90_fp8_mega_moe(
     const auto launch_with_split_mode = [&](const int split_phase_mode, const char* kernel_name) {
         auto split_args = args;
         split_args.split_phase_mode = split_phase_mode;
+        if (split_phase_mode != 0 and get_env<int>("DG_SM90_MOE_SPLIT_PHASE_CONFIG", 1) != 0) {
+            split_args.config = get_mega_moe_config_sm90(
+                num_ranks, num_experts, num_experts_per_rank,
+                num_max_tokens_per_rank, num_tokens, num_topk,
+                hidden, intermediate_hidden, num_padded_sf_pool_tokens,
+                split_phase_mode);
+            split_args.launch_args = LaunchArgs(
+                num_sms,
+                split_args.config.num_dispatch_threads + split_args.config.num_non_epilogue_threads + split_args.config.num_epilogue_threads,
+                split_args.config.smem_size, split_args.config.cluster_size);
+
+            const auto& phase_config = split_args.config;
+            split_args.tensor_map_l1_acts = make_tma_2d_desc(
+                l1_acts, hidden, phase_config.num_max_pool_tokens,
+                phase_config.block_k, phase_config.block_m,
+                static_cast<int>(l1_acts.stride(-2)), phase_config.swizzle_acts_mode);
+            split_args.tensor_map_l1_acts_sf = make_tma_sf_desc(
+                cute::UMMA::Major::MN, l1_acts_sf,
+                phase_config.num_padded_sf_pool_tokens, hidden,
+                phase_config.block_m, kGranK, 1, 0);
+            split_args.tensor_map_l1_weights = make_tma_2d_desc(
+                l1_weights, hidden, num_experts_per_rank * intermediate_hidden * 2,
+                phase_config.block_k, phase_config.block_n,
+                static_cast<int>(l1_weights.stride(-2)), phase_config.swizzle_weights_mode);
+
+            const int phase_num_epilogue_warpgroups = phase_config.num_epilogue_threads / 128;
+            const bool phase_split_n_warpgroups =
+                phase_config.block_m == 64 and phase_config.block_n == 256 and phase_num_epilogue_warpgroups == 2;
+            const int phase_wg_block_m = phase_split_n_warpgroups
+                ? phase_config.block_m : phase_config.block_m / phase_num_epilogue_warpgroups;
+            split_args.tensor_map_l1_output = make_tma_2d_desc(
+                l2_acts, intermediate_hidden, phase_config.num_max_pool_tokens,
+                phase_config.block_n / 2, phase_wg_block_m,
+                static_cast<int>(l2_acts.stride(-2)), 0);
+            split_args.tensor_map_l2_acts = make_tma_2d_desc(
+                l2_acts, intermediate_hidden, phase_config.num_max_pool_tokens,
+                phase_config.block_k, phase_config.block_m,
+                static_cast<int>(l2_acts.stride(-2)), phase_config.swizzle_acts_mode);
+            split_args.tensor_map_l2_acts_sf = make_tma_sf_desc(
+                cute::UMMA::Major::MN, l2_acts_sf,
+                phase_config.num_padded_sf_pool_tokens, intermediate_hidden,
+                phase_config.block_m, kL2ActsSFGranK, 1, 0);
+            split_args.tensor_map_l2_weights = make_tma_2d_desc(
+                l2_weights, intermediate_hidden, num_experts_per_rank * hidden,
+                phase_config.block_k, phase_config.block_n,
+                static_cast<int>(l2_weights.stride(-2)), phase_config.swizzle_weights_mode);
+        }
         const auto code = SM90FP8MegaMoERuntime::generate(split_args);
         const auto runtime = compiler->build(kernel_name, code);
         SM90FP8MegaMoERuntime::launch(runtime, split_args);
@@ -294,8 +357,12 @@ static void sm90_fp8_mega_moe(
 
     const bool split_l1_l2 = get_env<int>("DG_SM90_MOE_SPLIT_L1_L2", 1) != 0;
     if (split_l1_l2) {
-        launch_with_split_mode(1, "sm90_fp8_mega_moe_split_l1");
-        launch_with_split_mode(2, "sm90_fp8_mega_moe_split_l2");
+        const int split_only_phase = get_env<int>("DG_SM90_MOE_SPLIT_ONLY_PHASE", 0);
+        DG_HOST_ASSERT(split_only_phase >= 0 and split_only_phase <= 2);
+        if (split_only_phase == 0 or split_only_phase == 1)
+            launch_with_split_mode(1, "sm90_fp8_mega_moe_split_l1");
+        if (split_only_phase == 0 or split_only_phase == 2)
+            launch_with_split_mode(2, "sm90_fp8_mega_moe_split_l2");
     } else {
         launch_with_split_mode(0, "sm90_fp8_mega_moe");
     }
