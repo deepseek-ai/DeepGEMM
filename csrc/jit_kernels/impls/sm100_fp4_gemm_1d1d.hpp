@@ -328,18 +328,18 @@ static void sm100_m_grouped_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, con
                                                      const torch::Tensor& d,
                                                      const torch::Tensor& grouped_layout,
                                                      const int& num_groups, const int& m, const int& n, const int& k,
+                                                     const int& expected_m_per_group,
                                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                      const std::string& compiled_dims) {
     constexpr int gran_k = 32;
     const auto desc = make_fp4_desc(GemmType::MGroupedContiguous, m, n, k, num_groups,
                                     major_a, major_b, d.scalar_type(),
                                     false, compiled_dims);
-    // For m-grouped contiguous, derive useful-per-group row count from m_indices
-    // (count of valid rows / num_groups). Drives swap_ab gating for sparse MoE.
-    const auto useful_m = (grouped_layout >= 0).sum().item<int64_t>();
-    const int useful_per_group = num_groups > 0 ? static_cast<int>(useful_m) / num_groups : 0;
+    // Caller-provided useful-per-group hint drives swap_ab gating. Dense layouts
+    // (no -1 padding) get m/num_groups; sparse MoE callers pass the actual
+    // per-group useful row count. No device tensor inspection on the host.
     const auto layout = pick_fp4_layout(GemmType::MGroupedContiguous, m, n, k, num_groups,
-                                        device_runtime->get_num_sms(), useful_per_group);
+                                        device_runtime->get_num_sms(), expected_m_per_group);
     auto config = GemmConfig{
         .layout = layout,
         .storage_config = SM100ArchSpec::get_storage_config(desc, layout),

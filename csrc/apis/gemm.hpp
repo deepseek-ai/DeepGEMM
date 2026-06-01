@@ -215,8 +215,14 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         if (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4) {
             DG_HOST_ASSERT(not use_psum_layout);
+            // FP4xFP4 swap_ab gating wants useful-per-group rows. Caller passes
+            // expected_m_for_psum_layout when known (sparse MoE); fall back to
+            // m/num_groups for dense layouts.
+            const int expected_m_per_group = expected_m_for_psum_layout.value_or(
+                num_groups > 0 ? m / num_groups : 0);
             sm100_m_grouped_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
-                                                     num_groups, m, n, k, major_a, major_b, compiled_dims);
+                                                     num_groups, m, n, k, expected_m_per_group,
+                                                     major_a, major_b, compiled_dims);
         } else {
             sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                          num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
