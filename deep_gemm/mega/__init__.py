@@ -183,31 +183,3 @@ def fp8_mega_moe(y: torch.Tensor,
         fast_math
     )
 
-
-def w4a8_mega_moe(y: torch.Tensor,
-                  l1_weights: Tuple[torch.Tensor, torch.Tensor],
-                  l2_weights: Tuple[torch.Tensor, torch.Tensor],
-                  sym_buffer: SymmBuffer,
-                  cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-                  recipe: Tuple[int, int, int] = (128, 128, 128),
-                  activation: str = 'swiglu',
-                  activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
-    """SM90 (Hopper) W4A8 MegaMoE entry — Phase 0 scaffold.
-
-    Accepts the same FP8 weights + per-128 float SF as ``fp8_mega_moe`` and
-    dispatches to the W4A8 runtime (currently a verbatim FP8 copy under a
-    different name; subsequent phases will switch to packed MXFP4 + E8M0).
-    """
-    _C.w4a8_mega_moe(
-        y,
-        l1_weights, l2_weights,
-        cumulative_local_expert_recv_stats,
-        sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe,
-        activation, activation_clamp,
-        fast_math
-    )

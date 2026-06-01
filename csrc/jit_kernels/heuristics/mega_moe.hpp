@@ -406,9 +406,7 @@ static Sm90MoeHeuristicPolicy get_sm90_moe_heuristic_policy(
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& num_tokens,
-    const int& split_phase_mode = 0) {
-    DG_HOST_ASSERT(split_phase_mode >= 0 and split_phase_mode <= 2);
+    const int& num_tokens) {
     // Keep mma.sync decode variants opt-in; the default path uses M64 CTAs.
     const int num_experts_per_rank = num_experts / num_ranks;
     const float expected_tokens_per_expert =
@@ -417,21 +415,8 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
         ? get_env<int>("DG_SM90_MOE_MMA_SYNC_M")
         : (get_env<int>("DG_SM90_MOE_MMA_SYNC") != 0 ? 16 : 0);
     DG_HOST_ASSERT(requested_mma_m == 0 or requested_mma_m == 16 or requested_mma_m == 32);
-    const bool split_linear1_only = split_phase_mode == 1;
-    const bool split_linear2_only = split_phase_mode == 2;
-    int forced_block_m = 0;
-    int forced_epilogue_warpgroups = 0;
-    if (split_linear1_only) {
-        forced_block_m = get_env<int>("DG_SM90_MOE_L1_FORCE_BLOCK_M");
-        forced_epilogue_warpgroups = get_env<int>("DG_SM90_MOE_L1_FORCE_EPILOGUE_WG");
-    } else if (split_linear2_only) {
-        forced_block_m = get_env<int>("DG_SM90_MOE_L2_FORCE_BLOCK_M");
-        forced_epilogue_warpgroups = get_env<int>("DG_SM90_MOE_L2_FORCE_EPILOGUE_WG");
-    }
-    if (forced_block_m == 0)
-        forced_block_m = get_env<int>("DG_SM90_MOE_FORCE_BLOCK_M");
-    if (forced_epilogue_warpgroups == 0)
-        forced_epilogue_warpgroups = get_env<int>("DG_SM90_MOE_FORCE_EPILOGUE_WG");
+    const int forced_block_m = get_env<int>("DG_SM90_MOE_FORCE_BLOCK_M");
+    const int forced_epilogue_warpgroups = get_env<int>("DG_SM90_MOE_FORCE_EPILOGUE_WG");
     DG_HOST_ASSERT(forced_block_m == 0 or forced_block_m == 64 or forced_block_m == 128);
     DG_HOST_ASSERT(forced_epilogue_warpgroups == 0 or
                    forced_epilogue_warpgroups == 1 or
@@ -439,19 +424,13 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const bool use_mma_sync_decode =
         requested_mma_m > 0 and expected_tokens_per_expert <= static_cast<float>(requested_mma_m);
     const bool use_bn256_split_n =
-        (get_env<int>("DG_SM90_MOE_BN256_2WG", get_sm90_moe_split_l1_l2_default() ? 1 : 0) != 0 or
-         (split_linear1_only and get_env<int>("DG_SM90_MOE_L1_BN256_2WG") != 0) or
-         (split_linear2_only and get_env<int>("DG_SM90_MOE_L2_BN256_2WG") != 0)) and
+        get_env<int>("DG_SM90_MOE_BN256_2WG", get_sm90_moe_split_l1_l2_default() ? 1 : 0) != 0 and
         forced_block_m != 128 and not use_mma_sync_decode;
     const bool use_bn256_seq_n =
-        (get_env<int>("DG_SM90_MOE_BN256_SEQ") != 0 or
-         (split_linear1_only and get_env<int>("DG_SM90_MOE_L1_BN256_SEQ") != 0) or
-         (split_linear2_only and get_env<int>("DG_SM90_MOE_L2_BN256_SEQ") != 0)) and
+        get_env<int>("DG_SM90_MOE_BN256_SEQ") != 0 and
         forced_block_m != 128 and not use_mma_sync_decode;
     const bool use_b_stationary_2wg =
-        (get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0 or
-         (split_linear1_only and get_env<int>("DG_SM90_MOE_L1_B_STATIONARY_2WG") != 0)) and
-        not split_linear2_only and not use_mma_sync_decode;
+        get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0 and not use_mma_sync_decode;
     DG_HOST_ASSERT(not (use_bn256_split_n and use_bn256_seq_n));
     DG_HOST_ASSERT(not (use_b_stationary_2wg and (use_bn256_split_n or use_bn256_seq_n)));
     const int block_m = forced_block_m > 0
@@ -526,18 +505,13 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& block_m, const int& block_n, const int& block_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const bool& direct_l2_scatter_default = false,
-    const int& default_num_stages = 0,
-    const int& split_phase_mode = 0) {
+    const int& default_num_stages = 0) {
     constexpr int kSmemAlignment = 1024;
-    DG_HOST_ASSERT(split_phase_mode >= 0 and split_phase_mode <= 2);
-    const bool split_linear1_only = split_phase_mode == 1;
-    const bool split_linear2_only = split_phase_mode == 2;
 
-    // Dispatch region. Split K2 does not pull remote tokens, so its dynamic
-    // shared memory does not need expert-count scratch or dispatch buffers.
-    const int smem_expert_count_size = split_linear2_only ? 0 : align(
+    // Dispatch region (same as SM100)
+    const int smem_expert_count_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
-    const int smem_send_buffers_size = split_linear2_only ? 0 : align(
+    const int smem_send_buffers_size = align(
         static_cast<int>(layout::Buffer(layout::Data(hidden), num_dispatch_warps, 1).get_num_bytes()),
         kSmemAlignment);
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
@@ -552,19 +526,16 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int wg_block_m = split_n_warpgroups ? block_m : block_m / num_epilogue_warpgroups;
     const int wg_block_n = (split_n_warpgroups or serial_n_warpgroups) ? block_n / 2 : block_n;
     const int smem_cd_accum = (block_m == 16 or block_m == 32) ? align(block_m * block_n * static_cast<int>(sizeof(float)), kSmemAlignment) : 0;
-    const int smem_cd_l1 = split_linear2_only ? 0 :
-        num_epilogue_warpgroups * wg_block_m * (wg_block_n / 2);  // 1 byte/elem (FP8)
-    const bool direct_l2_scatter = (not split_linear1_only) and
-                                   get_env<int>(
+    const int smem_cd_l1 = num_epilogue_warpgroups * wg_block_m * (wg_block_n / 2);  // 1 byte/elem (FP8)
+    const bool direct_l2_scatter = get_env<int>(
                                        "DG_SM90_MOE_DIRECT_L2_SCATTER",
                                        direct_l2_scatter_default ? 1 : 0) != 0 and
                                    block_m != 16 and block_m != 32 and
                                    not serial_n_warpgroups and wg_block_n == 128;
-    const bool async_l1_tma_store = (not split_linear2_only) and
-                                    get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0 and
+    const bool async_l1_tma_store = get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0 and
                                     block_m != 16 and block_m != 32 and
                                     not split_n_warpgroups and num_epilogue_warpgroups == 1;
-    const int smem_cd_l2 = (split_linear1_only or direct_l2_scatter) ? 0 :
+    const int smem_cd_l2 = direct_l2_scatter ? 0 :
         num_epilogue_warpgroups * wg_block_m * wg_block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd_l1_async = async_l1_tma_store ?
         2 * num_epilogue_warpgroups * wg_block_m * (block_n / 2) : 0;
@@ -576,8 +547,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     //   * SFB is loaded directly from global by the math warpgroup (block-(128,128)
     //     weight quantization), so no SMEM is reserved for it.
     const int smem_sfa_half_stride_bytes = align(block_m * static_cast<int>(sizeof(float)), 128);
-    const int smem_sfa_per_stage = split_linear1_only
-        ? smem_sfa_half_stride_bytes : 2 * smem_sfa_half_stride_bytes;
+    const int smem_sfa_per_stage = 2 * smem_sfa_half_stride_bytes;
     const int smem_sfb_per_stage = 0;
 
     // Per-stage: A tile + B tile + SFA tile + SFB tile
@@ -602,13 +572,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int preferred_num_stages = default_num_stages > 0
         ? std::min(default_num_stages, max_num_stages)
         : (prefer_bn256_split ? std::min(4, max_num_stages) : 0);
-    int forced_num_stages = 0;
-    if (split_linear1_only)
-        forced_num_stages = get_env<int>("DG_SM90_MOE_L1_NUM_STAGES");
-    else if (split_linear2_only)
-        forced_num_stages = get_env<int>("DG_SM90_MOE_L2_NUM_STAGES");
-    if (forced_num_stages == 0)
-        forced_num_stages = get_env<int>("DG_SM90_MOE_NUM_STAGES");
+    const int forced_num_stages = get_env<int>("DG_SM90_MOE_NUM_STAGES");
     const int num_stages = forced_num_stages > 0
         ? forced_num_stages
         : (preferred_num_stages > 0 ? preferred_num_stages : max_num_stages);
@@ -621,40 +585,21 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int& num_ranks, const int& num_experts, const int& num_experts_per_rank,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const int& num_padded_sf_pool_tokens,
-    const int& split_phase_mode = 0) {
-    DG_HOST_ASSERT(split_phase_mode >= 0 and split_phase_mode <= 2);
-    const bool split_linear1_only = split_phase_mode == 1;
-    const bool split_linear2_only = split_phase_mode == 2;
+    const int& num_padded_sf_pool_tokens) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, split_phase_mode);
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
     const bool use_bn256_split_n =
-        (get_env<int>("DG_SM90_MOE_BN256_2WG", get_sm90_moe_split_l1_l2_default() ? 1 : 0) != 0 or
-         (split_linear1_only and get_env<int>("DG_SM90_MOE_L1_BN256_2WG") != 0) or
-         (split_linear2_only and get_env<int>("DG_SM90_MOE_L2_BN256_2WG") != 0)) and
+        get_env<int>("DG_SM90_MOE_BN256_2WG", get_sm90_moe_split_l1_l2_default() ? 1 : 0) != 0 and
         block_m == 64;
     const bool use_bn256_seq_n =
-        (get_env<int>("DG_SM90_MOE_BN256_SEQ") != 0 or
-         (split_linear1_only and get_env<int>("DG_SM90_MOE_L1_BN256_SEQ") != 0) or
-         (split_linear2_only and get_env<int>("DG_SM90_MOE_L2_BN256_SEQ") != 0)) and
-        block_m == 64;
+        get_env<int>("DG_SM90_MOE_BN256_SEQ") != 0 and block_m == 64;
     DG_HOST_ASSERT(not (use_bn256_split_n and use_bn256_seq_n));
-    int forced_block_n = 0;
-    if (split_linear1_only)
-        forced_block_n = get_env<int>("DG_SM90_MOE_L1_FORCE_BLOCK_N");
-    else if (split_linear2_only)
-        forced_block_n = get_env<int>("DG_SM90_MOE_L2_FORCE_BLOCK_N");
-    if (forced_block_n == 0)
-        forced_block_n = get_env<int>("DG_SM90_MOE_FORCE_BLOCK_N");
-    DG_HOST_ASSERT(forced_block_n == 0 or forced_block_n == 128 or forced_block_n == 256);
-    const int block_n = forced_block_n > 0 ? forced_block_n : ((use_bn256_split_n or use_bn256_seq_n) ? 256 : 128);
-    DG_HOST_ASSERT((not use_bn256_split_n) or block_n == 256);
+    const int block_n = (use_bn256_split_n or use_bn256_seq_n) ? 256 : 128;
     DG_HOST_ASSERT((not use_bn256_split_n) or num_epilogue_threads == 256);
     const int block_k = 128;
     // Default remains cluster_size=1; the opt-in cluster path uses B multicast
     // across adjacent M blocks.
-    const bool use_b_stationary_2wg = get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0 or
-                                      (split_linear1_only and get_env<int>("DG_SM90_MOE_L1_B_STATIONARY_2WG") != 0);
+    const bool use_b_stationary_2wg = get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0;
     const bool use_cluster_bcast_b = get_env<int>("DG_SM90_MOE_CLUSTER_BCAST_B") != 0 or use_b_stationary_2wg;
     DG_HOST_ASSERT((not use_cluster_bcast_b) or
                    ((block_m == 64 and block_n == 128 and num_epilogue_threads == 128) or
@@ -666,19 +611,9 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int swizzle_weights_mode = (block_m == 16 or block_m == 32) ? 0 : 128;
 
     const int num_sms = device_runtime->get_num_sms();
-    int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
+    const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms);
-    int forced_phase_experts_per_wave = 0;
-    if (split_linear1_only)
-        forced_phase_experts_per_wave = get_env<int>("DG_SM90_MOE_L1_EXPERTS_PER_WAVE");
-    else if (split_linear2_only)
-        forced_phase_experts_per_wave = get_env<int>("DG_SM90_MOE_L2_EXPERTS_PER_WAVE");
-    if (forced_phase_experts_per_wave > 0) {
-        DG_HOST_ASSERT(forced_phase_experts_per_wave <= num_experts_per_rank);
-        DG_HOST_ASSERT(num_experts_per_rank % forced_phase_experts_per_wave == 0);
-        num_experts_per_wave = forced_phase_experts_per_wave;
-    }
 
     const bool split_sfa_tma = get_env<int>("DG_SM90_MOE_SPLIT_SFA_TMA", 0) != 0;
     const bool prefer_compact_frontend = get_sm90_moe_split_l1_l2_default() and block_n == 256 and not split_sfa_tma;
@@ -712,8 +647,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         block_m, block_n, block_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
         direct_l2_scatter_default,
-        default_num_stages,
-        split_phase_mode);
+        default_num_stages);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,
@@ -727,8 +661,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
 
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoESM90Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, split_phase_mode={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk, split_phase_mode);
+            "MegaMoESM90Config(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;
