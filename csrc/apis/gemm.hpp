@@ -596,6 +596,8 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
     cublaslt_gemm_nt(a.transpose(0, 1), b, d, c);
 }
 
+#if 0
+
 static void register_apis(pybind11::module_& m) {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
@@ -711,5 +713,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("cublaslt_gemm_tt", &cublaslt_gemm_tt,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
 }
+
+#endif
 
 } // namespace deep_gemm::gemm

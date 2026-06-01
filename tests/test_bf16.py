@@ -39,7 +39,7 @@ def test_gemm() -> None:
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
 
         t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), 'bf16_gemm', suppress_kineto_output=True)
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
+        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c), ('nvjet', 'reduce'), suppress_kineto_output=True)
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:7.1f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
@@ -194,11 +194,11 @@ def test_cublaslt_gemm() -> None:
         acc_opt    = f'acc={int(accumulate)}'
 
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
-        deep_gemm.cublaslt_gemm_nt(a, b, d, c=c)
+        deep_gemm.cublaslt_gemm_nt(a, b, d, c)
         diff = calc_diff(d, ref_d)
         assert diff < 6e-7, f'{diff=}, ({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})'
 
-        t_nvjet, t_gemv, t_gemm = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
+        t_nvjet, t_gemv, t_gemm = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c), ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
         t = t_nvjet + t_gemv + t_gemm
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:5.0f} us | '

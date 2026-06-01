@@ -82,8 +82,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         assert intermediate_hidden % 128 == 0
         assert l1_weights.shape[2] % 128 == 0 and l2_weights.shape[2] % 128 == 0
 
-        # Cast inputs to FP8 with per-32 UE8M0 SF
-        x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        # Cast inputs to FP8 (or FP4 under DG_USE_FP4_ACTS) with per-32 UE8M0 SF.
+        # Stream A0.0b: when the flag is on, the symm buffer's `x` slot is sized
+        # for packed E2M1 (`hidden/2` bytes/token), so we must quantize at the
+        # source to match.
+        if os.environ.get('DG_USE_FP4_ACTS', '0') != '0':
+            x = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        else:
+            x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
 
         # Cast grouped BF16 weights to FP4 with MN-major SF
         # TODO: merge with `cast_fp8_fp4_with_major`

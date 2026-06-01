@@ -22,6 +22,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumSMs, uint32_t kNumRanks,
+          uint32_t kClusterSize = 2,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -34,11 +35,13 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     DG_STATIC_ASSERT(kNumExpertsPerRank % kNumExpertsPerWave == 0, "Invalid wave config");
 
-    // NOTES: N block counts must be even so that 2 adjacent CTAs in a cluster
-    // always land on the same m_block_idx with n_block_idx differing by 1
-    DG_STATIC_ASSERT(kNumSMs % 2 == 0, "Number of SMs must be even for 2-CTA cluster");
-    DG_STATIC_ASSERT(kNumL1BlockNs % 2 == 0, "L1 N block count must be even for 2-CTA cluster");
-    DG_STATIC_ASSERT(kNumL2BlockNs % 2 == 0, "L2 N block count must be even for 2-CTA cluster");
+    // For 2-CTA clusters, neighbour SMs share the same m_block_idx with adjacent
+    // n_block_idx; the asserts below guarantee that pairing is always possible.
+    // SM90 / single-CTA paths set kClusterSize = 1 and do not need this.
+    DG_STATIC_ASSERT(kClusterSize == 1 or kClusterSize == 2, "Invalid cluster size");
+    DG_STATIC_ASSERT(kClusterSize == 1 or kNumSMs % 2 == 0, "Number of SMs must be even for 2-CTA cluster");
+    DG_STATIC_ASSERT(kClusterSize == 1 or kNumL1BlockNs % 2 == 0, "L1 N block count must be even for 2-CTA cluster");
+    DG_STATIC_ASSERT(kClusterSize == 1 or kNumL2BlockNs % 2 == 0, "L2 N block count must be even for 2-CTA cluster");
 
     // Arrival counts
     const layout::Workspace& workspace;
@@ -117,12 +120,14 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
-            m_block_idx = block_idx / kNumL1BlockNs;
-            if (m_block_idx < num_m_blocks)
+            const auto num_blocks = num_m_blocks * kNumL1BlockNs;
+            if (block_idx < num_blocks) {
+                m_block_idx = block_idx / kNumL1BlockNs;
                 return true;
+            }
 
             // Current expert is fully assigned, move to the next
-            block_idx -= num_m_blocks * kNumL1BlockNs;
+            block_idx -= num_blocks;
             advance_expert_idx();
         }
         return false;
@@ -132,13 +137,14 @@ struct MegaMoEScheduler {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
-            if (block_idx < num_m_blocks * kNumL2BlockNs) {
+            const auto num_blocks = num_m_blocks * kNumL2BlockNs;
+            if (block_idx < num_blocks) {
                 m_block_idx = block_idx / kNumL2BlockNs;
                 return true;
             }
 
             // Current expert is fully assigned, move to the next
-            block_idx -= num_m_blocks * kNumL2BlockNs;
+            block_idx -= num_blocks;
             advance_expert_idx();
         }
         return false;
@@ -204,8 +210,8 @@ struct MegaMoEScheduler {
         // Initialize current expert with 0
         set_expert_idx(0);
 
-        // Iterate over all blocks
-        // TODO: add swizzle within expert waves for better L2 cache utilization
+        // Iterate over all blocks in expert-major order. This keeps scheduling
+        // deterministic and avoids changing the cross-rank work partitioning.
         while (true) {
             CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
             if (block_phase == BlockPhase::None)
@@ -214,6 +220,27 @@ struct MegaMoEScheduler {
             func(block_phase, current_local_expert_idx,
                  block_phase == BlockPhase::Linear2 ? kNumL2BlockKs : kNumL1BlockKs,
                  m_block_idx, n_block_idx);
+        }
+    }
+
+    template <typename L1Func, typename L2Func>
+    CUTLASS_DEVICE void for_each_block_split(L1Func&& l1_func, L2Func&& l2_func) {
+        // Same scheduling order as `for_each_block`, but the phase-specific
+        // call sites let hot kernels instantiate separate L1/L2 bodies.
+        fetch_expert_recv_count();
+
+        set_expert_idx(0);
+
+        while (true) {
+            CUTE_TIE_DECL(get_next_block(), block_phase, current_local_expert_idx, m_block_idx, n_block_idx);
+            if (block_phase == BlockPhase::None)
+                break;
+
+            if (block_phase == BlockPhase::Linear1) {
+                l1_func(current_local_expert_idx, kNumL1BlockKs, m_block_idx, n_block_idx);
+            } else {
+                l2_func(current_local_expert_idx, kNumL2BlockKs, m_block_idx, n_block_idx);
+            }
         }
     }
 };

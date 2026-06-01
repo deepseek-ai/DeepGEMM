@@ -139,8 +139,7 @@ _C: Module = _load_module()
 # ---------------------------------------------------------------------------
 set_num_sms = _C.set_num_sms
 get_num_sms = _C.get_num_sms
-# set_compile_mode = _C.set_compile_mode
-# get_compile_mode = _C.get_compile_mode
+# set_compile_mode / get_compile_mode are not exported on this branch.
 set_tc_util = _C.set_tc_util
 get_tc_util = _C.get_tc_util
 
@@ -251,7 +250,6 @@ try:
         (a, a_sf), (b, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
         return _C.m_grouped_fp8_fp4_gemm_nt_masked(a, a_sf, b, b_sf, d, masked_m, expected_m, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast)
 
-    m_grouped_fp8_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
     bf16_m_grouped_gemm_nt_masked = None
 
@@ -263,10 +261,8 @@ from .mega import (
     SymmBuffer,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
-    transform_weights_for_mega_moe_sm90,
     fp8_fp4_mega_moe,
     mega_moe_pre_dispatch,
-    fp8_mega_moe,
 )
 
 # Some utils
@@ -274,16 +270,30 @@ from . import testing
 from . import utils
 from .utils import *
 
-# Legacy Triton kernels for A100
-try:
-    from . import legacy
-except Exception as e:
-    print(f'Failed to load legacy DeepGEMM A100 Triton kernels: {e}')
-
 # Initialize CPP modules
 _C.init(
     os.path.dirname(os.path.abspath(__file__)),
     _find_cuda_home()
 )
 
-__version__ = '2.5.0'
+def _read_version() -> str:
+    version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'VERSION')
+    try:
+        with open(version_file, 'r') as f:
+            return f.read().strip()
+    except OSError:
+        return '0.0.0.dev0'
+
+__version__ = _read_version()
+
+# Allow `import deep_gemm.<name>` to resolve top-level public symbols, mirroring
+# `from deep_gemm import <name>`. Without this, Python's import machinery only
+# resolves submodules — top-level callables defined here are otherwise
+# inaccessible via the dotted-import form.
+import sys as _sys
+import types as _types
+for _name, _val in list(globals().items()):
+    if _name.startswith('_') or _val is None or isinstance(_val, _types.ModuleType):
+        continue
+    _sys.modules.setdefault(f'{__name__}.{_name}', _val)
+del _sys, _types, _name, _val
