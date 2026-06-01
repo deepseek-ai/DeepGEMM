@@ -26,7 +26,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumGroups,
           uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleCDMode,
-          uint32_t kNumStages, uint32_t kNumLastStages,
+          uint32_t kNumStages,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
@@ -39,7 +39,6 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                         const __grid_constant__ cute::TmaDescriptor tensor_map_c,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
@@ -129,8 +128,6 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
         cute::prefetch_tma_descriptor(&tensor_map_d);
-        if constexpr (kWithAccumulation)
-            cute::prefetch_tma_descriptor(&tensor_map_c);
     }
 
     // D/A/B shared memory
@@ -187,11 +184,13 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         }
         cutlass::arch::fence_view_async_shared();
         cutlass::arch::fence_barrier_init();
-    } 
-    else if (threadIdx.x >= 32 and threadIdx.x < 64) {
+    } else if (threadIdx.x >= 32 and threadIdx.x < 64) {
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
+
+    // Wait for primary kernel completion
+    cudaGridDependencySynchronize();
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;

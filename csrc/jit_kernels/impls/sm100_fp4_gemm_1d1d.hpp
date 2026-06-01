@@ -15,23 +15,23 @@
 
 namespace deep_gemm {
 
-// FP4xFP4 (MXFP4) GEMM via SM100_MMA_MXF4_SS instruction.
-// Distinct from main's sm100_fp8_fp4_gemm_1d1d (MXF8F6F4 path) — this is the
-// FP4-specialized hardware path, used when both A and B are kPackedFP4.
+// FP4xFP4 (MXFP4) GEMM via SM100_MMA_MXF4_SS. Distinct from the MXF8F6F4
+// path in sm100_fp8_fp4_gemm_1d1d.hpp; used when both A and B are kPackedFP4.
+// GemmDesc carries logical FP4 K; this kernel template takes K and BLOCK_K in
+// packed int32 units (8 FP4 / int32, 4 bytes). The wrapper converts at JIT
+// instantiation and runtime launch.
 class SM100FP4Gemm1D1DRuntime final: public LaunchRuntime<SM100FP4Gemm1D1DRuntime> {
 public:
     struct Args {
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
         LaunchArgs launch_args;
-        int num_last_stages;
 
         void* grouped_layout;
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_sfa;
         CUtensorMap tensor_map_sfb;
-        CUtensorMap tensor_map_c;
         CUtensorMap tensor_map_d;
     };
 
@@ -48,7 +48,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {}, {},
-        {}, {},
+        {},
         {}, {},
         {}, {},
         {},
@@ -60,15 +60,14 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
-        // FP4: my .cuh expects SHAPE_K in int32 count (= FP4_count / 8).
-        // main's desc.k is FP4 logical count.
+        // SHAPE_K in packed int32 (= FP4_count / 8)
         get_compiled_dim(args.gemm_desc.k / 8, 'k', args.gemm_desc.compiled_dims),
         args.gemm_config.layout.block_m, args.gemm_config.layout.block_n,
-        // FP4: BLOCK_K in int32 count (main's heuristic gives bytes for int8 pack).
+        // BLOCK_K in packed int32 (Layout.block_k is in bytes for int8-packed FP4)
         args.gemm_config.layout.block_k / 4,
         args.gemm_desc.num_groups,
         args.gemm_config.storage_config.swizzle_a_mode, args.gemm_config.storage_config.swizzle_b_mode, args.gemm_config.storage_config.swizzle_cd_mode,
-        args.gemm_config.pipeline_config.num_stages, args.num_last_stages,
+        args.gemm_config.pipeline_config.num_stages,
         args.gemm_config.launch_config.num_non_epilogue_threads, args.gemm_config.launch_config.num_epilogue_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms,
@@ -78,65 +77,46 @@ static void __instantiate_kernel() {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        // FP4: my .cuh expects shape_k in int32 count (= FP4_count / 8) at runtime as well.
-        // Note: must be non-const (launch_kernel takes &args, can't bind const* to void*).
+        // shape_k in packed int32 (must be a non-const local — launch_kernel takes
+        // &args internally and a const& cannot bind to void*).
         int shape_k_int32 = args.gemm_desc.k / 8;
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, shape_k_int32,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
-            args.tensor_map_c, args.tensor_map_d));
+            args.tensor_map_d));
     }
 };
 
-// Helper: compute num_last_stages from k / block_k / num_stages.
-// desc.k is FP4 logical count; main's heuristic block_k is in bytes (int8 elem of packed FP4 tensor).
-// 1 byte = 2 FP4, so K_per_block_fp4 = block_k_bytes * 2.
-static int compute_num_last_stages_fp4(int k, int block_k_bytes, int num_stages) {
-    const int num_k_blocks = ceil_div(k, block_k_bytes * 2);
-    const int rem = num_k_blocks % num_stages;
-    return rem == 0 ? num_stages : rem;
-}
-
-// My MXF4 kernel allocates 2x SF smem per stage (2 packed int32 per row to cover the
-// full BLOCK_K_FP4=256 of 8 SFs) than main's heuristic assumes (1 packed int32 per
-// row, covering only 128 FP4). Cap num_stages so total smem fits SM100's 232448-byte
-// capacity. Returns {new_num_stages, new_smem_size}.
-// Note: this is a v0 workaround. Phase 2: align main's heuristic SF computation with
-// my kernel's actual usage so num_stages selection is correct upstream.
+// Cap num_stages so SM100's 232448-byte smem capacity fits the FP4 SF smem
+// footprint (sf_packed_k_per_stage = block_k_bytes / 64), which the shared
+// SM100ArchSpec heuristic underestimates by 2x.
 static std::pair<int, int> recompute_stages_for_fp4(const GemmConfig& config, int block_m, int block_n, int k_fp4) {
     constexpr int smem_capacity = 232448;
     constexpr int sf_block_align = 128;
     const int sf_block_m = (block_m + sf_block_align - 1) / sf_block_align * sf_block_align;
     const int sf_block_n = (block_n + sf_block_align - 1) / sf_block_align * sf_block_align;
 
-    // Match fea-fp4 kernel's actual smem usage:
-    //   A per stage: load_block_m * block_k_bytes
-    //   B per stage: load_block_n * block_k_bytes
-    //   SFA/B per stage: sf_block_mn * sf_packed_k_per_stage * 4
-    // where sf_packed_k_per_stage = block_k_bytes / 64 (since BLOCK_K_FP4 / VS / 4 = block_k_int32 / 4 = block_k_bytes / 16 / 4 / 4 ... wait simpler: block_k_int32/4)
-    // Kernel: BLOCK_K_FP4 = block_k_int32 * 8; SF_K_PER_STAGE = BLOCK_K_FP4 / 32;
-    //         SF_PACKED_K_PER_STAGE = SF_K_PER_STAGE / 4 = block_k_int32 / 16.
-    // In bytes: block_k_bytes / 64.
+    // Per-stage smem footprint (matches the kernel's actual allocation):
+    //   A: load_block_m * block_k_bytes,  B: load_block_n * block_k_bytes
+    //   SFA/B: sf_block_mn * sf_packed_k_per_stage * 4
+    // sf_packed_k_per_stage = block_k_bytes / 64 (BLOCK_K_FP4 / VS / 4).
     const int sf_packed_k_per_stage = config.layout.block_k / 64;
     const int per_stage = config.storage_config.load_block_m * config.layout.block_k
                         + config.storage_config.load_block_n * config.layout.block_k
                         + sf_block_m * sf_packed_k_per_stage * 4
                         + sf_block_n * sf_packed_k_per_stage * 4;
 
-    // Fixed extras (CD smem + barriers + tmem_ptr, conservative estimate)
-    // CD smem (must match kernel's SMEM_CD_SIZE_PER_STAGE × kNumTMAStoreStages=2):
-    //   swap_ab: STORE_BLOCK_M(=16) * STORE_BLOCK_N(=block_n) * sizeof(cd_dtype)
-    //   non-swap: STORE_BLOCK_M(=block_m) * kSwizzleCDMode
-    // cd_dtype size: assume fp32 (4 bytes); bf16 epilogue is TODO so we can't reach it here.
+    // CD smem (matches kernel's SMEM_CD_SIZE_PER_STAGE × kNumTMAStoreStages=2);
+    // FP4xFP4 epilogue is fp32-only (4-byte cd elements).
     int cd_size;
     if (config.layout.swap_ab) {
         constexpr int store_block_m_swap = 16;
-        cd_size = store_block_m_swap * block_n * 4 * 2;  // fp32, 2 stages
+        cd_size = store_block_m_swap * block_n * 4 * 2;
     } else {
         cd_size = config.storage_config.store_block_m * config.storage_config.swizzle_cd_mode * 2;
     }
-    const int barriers = 12 * 8 * 4 + 4 * 8 * 2 + 8;  // ~ 416 bytes max
+    const int barriers = 12 * 8 * 4 + 4 * 8 * 2 + 8;
     const int tmem_ptr = 4;
     const int fixed_extras = cd_size + barriers + tmem_ptr;
 
@@ -147,21 +127,13 @@ static std::pair<int, int> recompute_stages_for_fp4(const GemmConfig& config, in
     return {new_num_stages, new_smem_size};
 }
 
-// Pick the FP4-optimal Layout (block_m=128 fixed, wave-aware block_n, B-multicast for
-// large M, swap_ab for sparse m-grouped). Mirrors fea-fp4's `get_best_fp4_config` but
-// returns main's nested Layout struct.
-//
-// Constants (FP4 MXF4 path):
-//   block_m = 128 (UMMA_M for MXF4)
-//   block_k = 128 bytes (= 32 int32 = 256 FP4 per K block)
-//   sf_pk   = 2  (SF_PACKED_K_PER_STAGE; from block_k_int32/16)
-//
-// block_n is chosen by wave count + composite score = est_stages^2 * bn,
-// with 2-epi-stage tiebreak for multi-wave cases. swap_ab is enabled for
-// MGroupedContiguous when expected_m_per_group < BLOCK_M (sparse MoE).
-//
-// expected_m_per_group: useful per-group row count (m_indices >= 0 sum/G).
-// Pass INT_MAX to disable swap_ab gating (default for Normal / non-grouped).
+// FP4xFP4 Layout selector:
+//   block_m = 128 (UMMA_M for MXF4); block_k = 128 bytes (32 packed int32 = 256 FP4).
+//   block_n: pick by wave count + composite score = est_stages^2 * bn, with a
+//   2-epi-stage tiebreak when waves >= 2 (TMEM double-buffer needs >= 2 tiles/SM).
+//   cluster_m=2, cluster_n=1 (B-multicast) when M >= 512 for Normal/KGroupedContiguous.
+//   swap_ab: enabled for MGroupedContiguous when expected_m_per_group < BLOCK_M
+//   (sparse MoE); forces block_n=128 + cluster=1 per kernel asserts.
 static Layout pick_fp4_layout(const GemmType& gemm_type,
                               const int& m, const int& n, const int& k,
                               const int& num_groups, const int& num_sms,
@@ -172,7 +144,8 @@ static Layout pick_fp4_layout(const GemmType& gemm_type,
     constexpr int sf_block_m_cols = (128 / 32) * sf_pk;  // 8
     constexpr int smem_capacity = 232448;
 
-    // BLOCK_N legality (mirrors fea-fp4's is_fp4_block_n_legal)
+    // BLOCK_N legality: only TMEM column budget; B-tensor OOB is handled by TMA
+    // store-drop, and SFB smem padding is zero-filled before warp transpose.
     auto is_legal = [&](int bn) {
         if (bn % 16 != 0 || bn < 16 || bn > 256) return false;
         const int sf_block_n = (bn + 127) / 128 * 128;
@@ -226,7 +199,8 @@ static Layout pick_fp4_layout(const GemmType& gemm_type,
     }
 
     // Multicast: B-multicast (cluster_m=2, cluster_n=1) when M >= 512 for Normal / KGrouped.
-    // For m-grouped, fea-fp4 keeps cluster=1 (m_indices iteration breaks multi-CTA M-distribution).
+    // m-grouped types use cluster=1: multi-CTA M-distribution is incompatible
+    // with m_indices iteration in the kernel scheduler.
     int cluster_m = 1, cluster_n = 1;
     const bool can_multicast = (m >= 512)
                            && (ceil_div(m, block_m) % 2 == 0)
@@ -294,15 +268,14 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
     config.pipeline_config.num_stages = new_stages;
     config.pipeline_config.smem_size = new_smem;
 
-    // View FP4-packed-int8 tensors as int32 (8 FP4 per int32). Same memory layout,
-    // different dtype tag -- makes the TMA descriptor use INT32 (not 16U4_ALIGN16B
-    // unpacked-smem), which matches my kernel's int32-packed smem expectation.
+    // View FP4-packed-int8 tensors as int32 (8 FP4 per int32). Same memory
+    // layout, different dtype tag — the TMA descriptor then uses INT32 (not
+    // 16U4_ALIGN16B unpacked-smem), matching the kernel's int32-packed smem.
     const auto a_int32 = a.view(torch::kInt);
     const auto b_int32 = b.view(torch::kInt);
     const int k_int32 = k / 8;
     const int block_k_int32 = config.layout.block_k / 4;
 
-    const auto cd = c.value_or(d);
     const auto tensor_map_a = make_tma_a_desc(major_a, a_int32, m, k_int32,
                                               config.storage_config.load_block_m,
                                               block_k_int32,
@@ -318,16 +291,12 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
                                                config.storage_config.store_block_n,
                                                static_cast<int>(d.stride(-2)), 1,
                                                config.storage_config.swizzle_cd_mode);
-    const auto tensor_map_c = make_tma_cd_desc(cd, m, n,
-                                               config.storage_config.store_block_m,
-                                               config.storage_config.store_block_n,
-                                               static_cast<int>(cd.stride(-2)), 1,
-                                               config.storage_config.swizzle_cd_mode);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, gran_k, 1, 0);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                  config.layout.block_n, gran_k, 1, 0);
 
+    // Pre-merge C into D for accumulation; the kernel has no separate C path.
     if (c.has_value()) {
         if (c->data_ptr() == d.data_ptr()) {
             DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
@@ -342,13 +311,11 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   config.layout.get_cluster_size()),
-        .num_last_stages = compute_num_last_stages_fp4(k, config.layout.block_k, config.pipeline_config.num_stages),
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_c = tensor_map_c,
         .tensor_map_d = tensor_map_d
     };
     const auto code = SM100FP4Gemm1D1DRuntime::generate(args);
@@ -415,13 +382,11 @@ static void sm100_m_grouped_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, con
         .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   config.layout.get_cluster_size()),
-        .num_last_stages = compute_num_last_stages_fp4(k, config.layout.block_k, config.pipeline_config.num_stages),
         .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_c = tensor_map_d,
         .tensor_map_d = tensor_map_d
     };
     const auto code = SM100FP4Gemm1D1DRuntime::generate(args);
@@ -442,9 +407,8 @@ static void sm100_m_grouped_fp4_gemm_masked_1d1d(const torch::Tensor& a, const t
                                     major_a, major_b, d.scalar_type(),
                                     false, compiled_dims,
                                     /*expected_m=*/expected_m, /*expected_num_groups=*/num_groups);
-    // m-grouped masked: pass expected_m as per-group hint (fea-fp4 invariant);
-    // swap_ab heuristic itself only activates for MGroupedContiguous per fea-fp4 v0
-    // (masked + swap_ab had NaN issues unresolved upstream).
+    // m-grouped masked: pass expected_m as per-group hint; swap_ab gating
+    // inside pick_fp4_layout only activates for MGroupedContiguous.
     const auto layout = pick_fp4_layout(GemmType::MGroupedMasked, m, n, k, num_groups,
                                         device_runtime->get_num_sms(), expected_m);
     auto config = GemmConfig{
@@ -489,13 +453,11 @@ static void sm100_m_grouped_fp4_gemm_masked_1d1d(const torch::Tensor& a, const t
         .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   config.layout.get_cluster_size()),
-        .num_last_stages = compute_num_last_stages_fp4(k, config.layout.block_k, config.pipeline_config.num_stages),
         .grouped_layout = masked_m.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_c = tensor_map_d,
         .tensor_map_d = tensor_map_d
     };
     const auto code = SM100FP4Gemm1D1DRuntime::generate(args);
