@@ -21,44 +21,6 @@ using namespace deep_gemm::math;
 using namespace deep_gemm::ptx;
 using namespace deep_gemm::utils;
 
-// E2M1 FP4 到 float 的转换函数
-// E2M1 格式: 4 bits = SEEM (S=符号 1bit, E=指数 2bits, M=尾数 1bit)
-__device__ __forceinline__ float fp4_e2m1_to_float(uint32_t fp4_bits) {
-    constexpr float E2M1_LUT[16] = {
-         0.0f,   0.5f,   1.0f,   1.5f,   2.0f,   3.0f,   4.0f,   6.0f,  // 正数 (S=0)
-        -0.0f,  -0.5f,  -1.0f,  -1.5f,  -2.0f,  -3.0f,  -4.0f,  -6.0f   // 负数 (S=1)
-    };
-    return E2M1_LUT[fp4_bits & 0xF];
-}
-
-// UE8M0 scale 1.0f packed as 4 bytes per 32-bit TMEM word.
-// SM100 MXF4 block-scaled MMA UE8M0 scale factor.
-// The bias is determined empirically; see DG_SF_BYTE env var testing.
-__device__ __forceinline__ uint32_t pack_ue8m0_scale_factor_word(uint8_t byte_val) {
-    return uint32_t(byte_val) | (uint32_t(byte_val) << 8) | (uint32_t(byte_val) << 16) | (uint32_t(byte_val) << 24);
-}
-__device__ __forceinline__ uint32_t pack_ue8m0_2x_scale_factor_one_word() {
-    return pack_ue8m0_scale_factor_word(0x7Fu);  // Will be tested with different values
-}
-
-// Swizzle-aware shared memory index for reading TMA-loaded data.
-// TMA stores data with bank-group XOR swizzle: physical_bank = logical_bank ^ (row % num_banks).
-// swizzle_mode: kSwizzleAMode or kSwizzleBMode (bytes, e.g. 128)
-// row: M or N row index, k: K column index, block_k: elements per row
-template <uint32_t swizzle_mode>
-__device__ __forceinline__ uint32_t swizzled_smem_k_major_idx(uint32_t row, uint32_t k, uint32_t block_k) {
-    constexpr uint32_t kElemBytes = sizeof(uint32_t);
-    constexpr uint32_t kBankBytes = 16;
-    constexpr uint32_t kElemsPerBank = kBankBytes / kElemBytes;            // 4
-    constexpr uint32_t kNumBanks = swizzle_mode / kBankBytes;             // e.g. 8 for 128B
-    uint32_t bank = k / kElemsPerBank;
-    uint32_t in_bank = k % kElemsPerBank;
-    uint32_t swizzled_bank = bank ^ (row % kNumBanks);
-    return row * block_k + swizzled_bank * kElemsPerBank + in_bank;
-}
-
-// SM100 FP4 GEMM 1D1D kernel实现
-// 支持 MXF4 block-scaled 矩阵乘法
 template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
@@ -79,20 +41,18 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_c,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
-    
-    // ========== 基础配置和类型定义 ==========
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
     if constexpr (kWithAccumulation)
         DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
 
-    // ========== 核心配置参数 ==========
+    // MMA configs
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t kNumMWaves = BLOCK_M / LAYOUT_AD_M;
     constexpr uint32_t kNumTMAStoreStages = 2;
-    
-    // ========== MXF4 配置 ==========
+
+    // MXFP4 / SF configs
     constexpr uint32_t kNumSFAStagesPerLoad = 1;
     constexpr uint32_t kNumSFBStagesPerLoad = 1;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
@@ -102,43 +62,32 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t UMMA_K_FP4 = 64;
     constexpr uint32_t SF_K_PER_STAGE = BLOCK_K_FP4 / MXF4_VS;
     constexpr uint32_t SF_PACKED_K_PER_STAGE = SF_K_PER_STAGE / 4;
-    
+
     DG_STATIC_ASSERT(BLOCK_M % LAYOUT_AD_M == 0 and 2 % kNumMWaves == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_K == 16 or BLOCK_K == 32, "FP4 BLOCK_K must be 16 or 32 int32");
 
-    // ========== 动态形状处理 ==========
+    // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
-    // shape_k debug disabled
-    // FP4 packed: shape_k 是 int32 个数，每个 int32 有 8 个 FP4。
-    // 1 个 scale 覆盖 MXF4_VS=32 个 FP4 (=4 个 int32)，
-    // 每个 uint32 打包 4 个 scale → 1 个 packed group = 4*32 = 128 FP4。
-    const uint32_t total_scales_k =
-    ceil_div(shape_k * FP4_ELEMS_PER_INT32,
-             MXF4_VS);  // MXF4_VS 是 uint32_t，OK
-
-    const uint32_t total_packed_k =
-        ceil_div(total_scales_k,
-                uint32_t(4));  // 把 4 也变成 uint32_t
-    
+    const uint32_t total_scales_k = ceil_div(shape_k * FP4_ELEMS_PER_INT32, MXF4_VS);
+    const uint32_t total_packed_k = ceil_div(total_scales_k, uint32_t(4));
     const uint32_t shape_sfa_k = total_packed_k;
     const uint32_t shape_sfb_k = total_packed_k;
 
-    // ========== 线程和warp信息 ==========
+    // Utils
     bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto lane_idx = get_lane_idx();
 
-    // ========== 共享内存分配 ==========
+    // Align to 1024 bytes for swizzle-128B
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
-    // ========== 块大小计算 ==========
+    // Load/store block sizes
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
-    // Swap-AB epilogue: STORE_BLOCK_M = 16 (fine-grained M slices to skip padding rows),
-    //                   STORE_BLOCK_N = BLOCK_N (write entire N at once).
-    // Non-swap (existing): STORE_BLOCK_M = BLOCK_M, STORE_BLOCK_N derived from swizzle.
+    // Swap-AB: STORE_BLOCK_M=16 (fine-grained M slices to skip padding rows), STORE_BLOCK_N=BLOCK_N.
+    // Non-swap: STORE_BLOCK_M=BLOCK_M, STORE_BLOCK_N derived from swizzle.
     constexpr uint32_t STORE_BLOCK_M = kSwapAB ? 16u : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N = kSwapAB ? BLOCK_N : kSwizzleCDMode / sizeof(cd_dtype_t);
 
@@ -147,12 +96,9 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
     // Swap-AB requires BLOCK_N = LAYOUT_AD_M (= 128) so UMMA_M after swap stays = 128.
     DG_STATIC_ASSERT(not kSwapAB or BLOCK_N == LAYOUT_AD_M, "kSwapAB requires BLOCK_N = LAYOUT_AD_M");
-    // Swap-AB initial implementation: no multicast (cluster_n=1, cluster_m=1) for simplicity.
     DG_STATIC_ASSERT(not kSwapAB or kNumMulticast == 1, "kSwapAB initial impl: no multicast");
 
-    // ========== 共享内存大小计算 ==========
-    // Swap-AB: per-stage SMEM = STORE_BLOCK_M (small) × STORE_BLOCK_N (= BLOCK_N) × sizeof(D)
-    // Non-swap: per-stage SMEM = STORE_BLOCK_M × kSwizzleCDMode (= STORE_BLOCK_N * sizeof(D))
+    // Shared memory sizes
     constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = kSwapAB
         ? STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t)
         : STORE_BLOCK_M * kSwizzleCDMode;
@@ -163,11 +109,11 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t SF_BLOCK_N = constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = SF_BLOCK_M * SF_PACKED_K_PER_STAGE * sizeof(uint32_t);
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = SF_BLOCK_N * SF_PACKED_K_PER_STAGE * sizeof(uint32_t);
-    
+
     DG_STATIC_ASSERT(SMEM_CD_SIZE % 1024 == 0, "Shared memory must be aligned to 1024 bytes");
     DG_STATIC_ASSERT(kNumTMAStoreStages >= 1, "Invalid number of TMA stages");
 
-    // ========== 张量内存配置 ==========
+    // Tensor memory size and offsets
     constexpr uint32_t kNumSFATmemCols = (SF_BLOCK_M / 32) * SF_PACKED_K_PER_STAGE;
     constexpr uint32_t kNumSFBTmemCols = (SF_BLOCK_N / 32) * SF_PACKED_K_PER_STAGE;
     constexpr uint32_t kNumEpilogueStages = (2 * kNumMWaves * BLOCK_N + kNumSFATmemCols + kNumSFBTmemCols) > 512 ? 1 : 2;
@@ -176,7 +122,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr uint32_t kTmemStartColOfSFA = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFB = kNumAccumTmemCols + kNumSFATmemCols;
 
-    // ========== TMA描述符预取 ==========
+    // Prefetch TMA descriptors at the very beginning
     if (threadIdx.x == 0) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
@@ -187,23 +133,24 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
             cute::prefetch_tma_descriptor(&tensor_map_c);
     }
 
-    // ========== 共享内存指针设置 ==========
+    // D/A/B shared memory
     cd_dtype_t* smem_cd[kNumTMAStoreStages];
     uint32_t* smem_sfa[kNumStages];
     uint32_t* smem_sfb[kNumStages];
     uint32_t* smem_a_packed[kNumStages];
     uint32_t* smem_b_packed[kNumStages];
-     
+
     #pragma unroll
     for (uint32_t i = 0; i < kNumTMAStoreStages; ++ i)
         smem_cd[i] = reinterpret_cast<cd_dtype_t*>(smem_buffer + i * SMEM_CD_SIZE_PER_STAGE);
-    
+
     #pragma unroll
     for (uint32_t i = 0; i < kNumStages; ++ i) {
         smem_a_packed[i] = reinterpret_cast<uint32_t*>(smem_buffer + SMEM_CD_SIZE + i * SMEM_A_PACKED_SIZE_PER_STAGE);
         smem_b_packed[i] = reinterpret_cast<uint32_t*>(smem_buffer + SMEM_CD_SIZE + kNumStages * SMEM_A_PACKED_SIZE_PER_STAGE + i * SMEM_B_PACKED_SIZE_PER_STAGE);
     }
-    
+
+    // SFA/SFB shared memory
     auto sf_start_ptr = smem_buffer + SMEM_CD_SIZE + kNumStages * (SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE);
     #pragma unroll
     for (uint32_t i = 0; i < kNumStages; ++ i) {
@@ -211,7 +158,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         smem_sfb[i] = reinterpret_cast<uint32_t*>(sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE + i * SMEM_SFB_SIZE_PER_STAGE);
     }
 
-    // ========== 屏障初始化 ==========
+    // Barriers and tensor memory pointer
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer +
         SMEM_CD_SIZE +
         kNumStages * (SMEM_A_PACKED_SIZE_PER_STAGE + SMEM_B_PACKED_SIZE_PER_STAGE) +
@@ -246,15 +193,15 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
     }
     kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
 
-    // ========== 块调度器初始化 ==========
+    // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(shape_m, shape_n, shape_k, grouped_layout);
 
-    // ========== K维度迭代控制 ==========
+    // K-loop driver
     struct DivisibleK {};
     struct NotDivisibleK {};
     uint32_t phase = 0;
-    
+
     auto launch_k_iterations = [&](const auto& func) {
         const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
         const uint32_t num_iterations = ceil_div(current_shape_k, kNumStages * BLOCK_K);
@@ -586,7 +533,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
             });
         }
     } else if (warp_idx >= kNumNonEpilogueThreads / 32) {
-        // ========== Epilogue warp组 ==========
+        // Epilogue warps
         const auto epilogue_thread_idx = threadIdx.x - kNumNonEpilogueThreads;
         const auto epilogue_warp_idx = warp_idx - (kNumNonEpilogueThreads / 32);
 
@@ -719,15 +666,6 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                 DG_STATIC_ASSERT(kNumEpilogueThreads == 128, "Epilogue threads not enough");
                 DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
 
-                // Per cute::make_tmem_warp_partitioner (copy_traits_sm100.hpp): four epilogue warps read
-                // four 32-row M bands; stride is 32 * TMEM::DP<T> (datapath), not +32 on column index.
-                constexpr uint32_t kTmemDpStride =
-                static_cast<uint32_t>(cute::TMEM::DP<cd_dtype_t>{});
-            // M-wave 间步进：128 行 × DP步进（DP 方向，不是列方向）
-                constexpr uint32_t kTmemMWaveStride      = 128u * kTmemDpStride;
-                // epilogue warp 在一个 wave 内的 band 步进（DP 方向）
-                constexpr uint32_t kTmemWarpRowBandStride = 32u * kTmemDpStride;
-                
                 #pragma unroll
                 for (uint32_t w = 0; w < kNumMWaves; ++ w) {
                     constexpr uint32_t kNumStores = BLOCK_N / STORE_BLOCK_N;
@@ -752,19 +690,8 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
                             auto col = kHasShortcut ? (i) : (bank_group_index % 8);
                             col ^= row % (kSwizzleCDMode / 16);
 
-                            // uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N  // 列：stage
-                            // + s * STORE_BLOCK_N                        // 列：N tile
-                            // + i * kNumElemsPerBankGroup                // 列：bank group
-                            // + w * kTmemMWaveStride                     // DP：M-wave ← 关键修改
-                            // + epilogue_warp_idx * kTmemWarpRowBandStride; // DP：warp band
-                            // uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N  // stage 列偏移
-                            //                     + w * BLOCK_N                              // M-wave 列偏移（每个 wave 占 BLOCK_N 列）
-                            //                     + s * STORE_BLOCK_N                        // N tile 列偏移
-                            //                     + i * kNumElemsPerBankGroup;               // bank group 列偏移
                             uint32_t tmem_addr = accum_stage_idx * kNumMWaves * BLOCK_N + w * BLOCK_N + s * STORE_BLOCK_N
-                            + i * kNumElemsPerBankGroup;
-                            // Match sm100_bf16_gemm.cuh / mma.cuh: each epilogue warp reads its 32-row TMEM band (DP stride).
-                            // tmem_addr += epilogue_warp_idx * kTmemWarpRowBandStride;
+                                                 + i * kNumElemsPerBankGroup;
                             auto smem_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]) +
                                             epilogue_warp_idx * 32 * kSwizzleCDMode +
                                             row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
