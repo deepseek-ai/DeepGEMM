@@ -110,8 +110,9 @@ def fp4_reference(a_packed, b_packed, m, n, sf_a=None, sf_b=None):
 def run_kernel(a_packed, b_packed, sf_a, sf_b, m, n, recipe=(1, 1, 32)):
     """Call FP4 GEMM kernel via main's fp8_fp4_gemm_nt (kPackedFP4=int8 triggers my MXF4 path).
     recipe gran_k=32 matches FP4 VS=32 SF granularity.
+    NOTE: kernel hardcodes FP32 output — bf16 epilogue branch is a missing TODO.
     """
-    d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
+    d = torch.empty((m, n), device='cuda', dtype=torch.float32)
     deep_gemm.fp8_fp4_gemm_nt((a_packed, sf_a), (b_packed, sf_b), d, c=None,
                               recipe_a=(1, 32), recipe_b=(1, 32),
                               disable_ue8m0_cast=False)
