@@ -34,11 +34,17 @@ from deep_gemm.testing import bench_kineto, get_arch_major
 def _quantize_grouped_fp8_block_128_128(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     g, n, k = w.shape
     assert n % 128 == 0 and k % 128 == 0
-    w_view = w.view(g, n // 128, 128, k // 128, 128).float()
-    amax = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4)
-    sf = amax / 448.0
-    w_fp8 = (w_view / sf.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn)
-    return w_fp8.view(g, n, k).contiguous(), sf.contiguous()
+    chunk_g = 4
+    w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fn)
+    sf = torch.empty((g, n // 128, k // 128), dtype=torch.float, device=w.device)
+    for start in range(0, g, chunk_g):
+        end = min(start + chunk_g, g)
+        w_view = w[start:end].view(end - start, n // 128, 128, k // 128, 128).float()
+        sf_chunk = w_view.abs().amax(dim=(-1, -3)).clamp(1e-4) / 448.0
+        w_fp8[start:end].copy_(
+            (w_view / sf_chunk.unsqueeze(-1).unsqueeze(-3)).to(torch.float8_e4m3fn).view(end - start, n, k))
+        sf[start:end].copy_(sf_chunk)
+    return w_fp8, sf.contiguous()
 
 
 def _make_global_bias(num_experts: int, alpha: float, gain: float, seed: int):
@@ -153,7 +159,12 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         (l1_w_fp8, l1_w_sf), (l2_w_fp8, l2_w_sf),
     )
 
-    cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
+    phase_profile_enabled = os.environ.get('DG_SM90_MOE_PHASE_PROFILE', '0') != '0'
+    phase_profile_ints = 64 if phase_profile_enabled else 0
+    cum_stats = torch.zeros(num_experts_per_rank + phase_profile_ints, dtype=torch.int, device='cuda')
+    use_eplb_hint = bool(replica_for)
+    use_skew_hint = global_bias is not None
+    use_masked_hint = args.masked_ratio > 0
 
     def run_fused():
         buffer.x[:num_tokens].copy_(x_fp8)
@@ -161,22 +172,54 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_w)
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.fp8_mega_moe(
-            y, transformed_l1, transformed_l2, buffer,
-            cumulative_local_expert_recv_stats=cum_stats,
-            recipe=(128, 128, 128),
-            activation='swiglu',
-            activation_clamp=activation_clamp,
-            fast_math=fast_math,
-        )
+        old_eplb_hint = os.environ.get('DG_SM90_MOE_EPLB_HINT')
+        old_skew_hint = os.environ.get('DG_SM90_MOE_SKEW_HINT')
+        old_masked_hint = os.environ.get('DG_SM90_MOE_MASKED_HINT')
+        if use_eplb_hint:
+            os.environ['DG_SM90_MOE_EPLB_HINT'] = '1'
+        if use_skew_hint:
+            os.environ['DG_SM90_MOE_SKEW_HINT'] = '1'
+        if use_masked_hint:
+            os.environ['DG_SM90_MOE_MASKED_HINT'] = '1'
+        try:
+            deep_gemm.fp8_mega_moe(
+                y, transformed_l1, transformed_l2, buffer,
+                cumulative_local_expert_recv_stats=cum_stats,
+                recipe=(128, 128, 128),
+                activation='swiglu',
+                activation_clamp=activation_clamp,
+                fast_math=fast_math,
+            )
+        finally:
+            if use_eplb_hint:
+                if old_eplb_hint is None:
+                    os.environ.pop('DG_SM90_MOE_EPLB_HINT', None)
+                else:
+                    os.environ['DG_SM90_MOE_EPLB_HINT'] = old_eplb_hint
+            if use_skew_hint:
+                if old_skew_hint is None:
+                    os.environ.pop('DG_SM90_MOE_SKEW_HINT', None)
+                else:
+                    os.environ['DG_SM90_MOE_SKEW_HINT'] = old_skew_hint
+            if use_masked_hint:
+                if old_masked_hint is None:
+                    os.environ.pop('DG_SM90_MOE_MASKED_HINT', None)
+                else:
+                    os.environ['DG_SM90_MOE_MASKED_HINT'] = old_masked_hint
         return y
 
     run_fused()
     dist.barrier()
+    if phase_profile_enabled:
+        cum_stats.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
     t_fused = bench_kineto(run_fused, 'sm90_fp8_mega_moe',
                            barrier=lambda: dist.barrier(),
                            num_tests=args.num_tests,
-                           suppress_kineto_output=True)
+                           suppress_kineto_output=True,
+                           with_multiple_kernels=os.environ.get(
+                               'DG_SM90_MOE_SPLIT_L1_L2', '1') != '0')
 
     # Per-rank token receive counts + per-local-expert distribution
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -205,6 +248,28 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
     gather_buf = [torch.zeros_like(info) for _ in range(num_ranks)]
     dist.all_gather(gather_buf, info, group=group)
 
+    phase_gather_buf = None
+    phase_names = [
+        'dispatch_total', 'dispatch_pull', 'math_loop', 'combine_barrier',
+        'combine_reduce', 'gemm_core', 'l1_epilogue', 'l2_epilogue',
+    ]
+    if phase_profile_enabled:
+        torch.cuda.synchronize()
+        num_profile_metrics = len(phase_names)
+        profile = cum_stats[
+            num_experts_per_rank:num_experts_per_rank + phase_profile_ints
+        ].view(torch.int64)
+        phase_values = []
+        for i in range(num_profile_metrics):
+            total = float(profile[i].item())
+            max_v = float(profile[num_profile_metrics + i].item())
+            count = float(profile[2 * num_profile_metrics + i].item())
+            avg = total / count if count else 0.0
+            phase_values.extend([avg, max_v, count])
+        phase_info = torch.tensor(phase_values, device='cuda', dtype=torch.float64)
+        phase_gather_buf = [torch.zeros_like(phase_info) for _ in range(num_ranks)]
+        dist.all_gather(phase_gather_buf, phase_info, group=group)
+
     if rank_idx == 0 and print_perf:
         all_t = [g[0].item() for g in gather_buf]
         all_recv = [int(g[1].item()) for g in gather_buf]
@@ -230,6 +295,22 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
               f't[mean/max/min]us={t_mean*1e6:7.1f}/{t_max*1e6:7.1f}/{t_min*1e6:7.1f}  '
               f'TFLOPS_agg={tflops_agg:6.1f}  TFLOPS_mean={tflops_mean:6.1f}',
               flush=True)
+        if phase_gather_buf is not None:
+            phase_by_rank = [g.cpu().tolist() for g in phase_gather_buf]
+            for i, name in enumerate(phase_names):
+                avg_values = [rank_values[3 * i] for rank_values in phase_by_rank]
+                max_values = [rank_values[3 * i + 1] for rank_values in phase_by_rank]
+                count_values = [rank_values[3 * i + 2] for rank_values in phase_by_rank]
+                avg_mean = sum(avg_values) / len(avg_values)
+                avg_max = max(avg_values)
+                max_max = max(max_values)
+                count_max = max(count_values)
+                print(
+                    f'   phase {name:16s} avg_mean={avg_mean:10.0f} '
+                    f'avg_max={avg_max:10.0f} max={max_max:10.0f} '
+                    f'count_max={count_max:8.0f}',
+                    flush=True,
+                )
 
     dist.barrier()
     buffer.destroy()
@@ -292,7 +373,7 @@ if __name__ == '__main__':
     parser.add_argument('--skew-seed', type=int, default=0,
                         help='Seed for the global hot/cold expert permutation')
     parser.add_argument('--num-redundant-experts', type=int, default=0,
-                        help='Benchmark-only EPLB simulation: reserve physical expert slots as hot-expert replicas')
+                        help='EPLB replica simulation: reserve physical expert slots as hot-expert replicas')
     parser.add_argument('--replica-dispatch', choices=('hash', 'static'), default='hash',
                         help='Replica remap model: token-level hash or SGLang static source-rank approximation')
 
