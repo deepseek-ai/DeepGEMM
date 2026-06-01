@@ -11,9 +11,8 @@ from generators import (
 
 
 # FP4xFP4 (MXFP4): both operands packed FP4 (E2M1) with VS=32 UE8M0 scales.
-# Routes through deep_gemm.fp8_fp4_gemm_nt / m_grouped_fp8_fp4_gemm_* APIs and
-# dispatches to the SM100_MMA_MXF4_SS path in sm100_fp4_gemm_1d1d.cuh.
-# NOTE: the kernel currently only supports FP32 output (bf16 epilogue is a TODO).
+# Dispatches to the SM100_MMA_MXF4_SS path; the API rejects bf16 D so we
+# always allocate fp32 D below.
 FP4_FP4 = QuantConfig((32, 32, True, True))
 
 
@@ -62,9 +61,8 @@ def test_m_grouped_gemm_contiguous() -> None:
                 num_groups, expected_m_per_group, n, k,
                 MajorTypeAB.KMajor, MajorTypeAB.KMajor,
                 use_ue8m0=True, quant_config=FP4_FP4)
-            # Re-generate with bf16 disabled-cast path to get a proper fp32 reference.
-            # generate_m_grouped_contiguous hardcodes bf16 d/ref; we allocate fp32 ourselves
-            # and cast the ref for the diff check.
+            # generate_m_grouped_contiguous returns bf16 d/ref; allocate fp32 d for
+            # the FP4xFP4 API and cast the reference for calc_diff.
             d = torch.empty_like(d_bf16, dtype=out_dtype)
             ref_d = _ref_bf16.to(out_dtype)
             deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(

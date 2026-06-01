@@ -100,6 +100,10 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         }
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         if (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4) {
+            // FP4xFP4 path reinterprets int8 packed tensors as int32 for TMA; requires
+            // contiguous K-major layout and packed-int32-aligned K.
+            DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+            DG_HOST_ASSERT(k % 8 == 0);
             sm100_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k,
                                 major_a, major_b, compiled_dims);
         } else {
@@ -215,11 +219,12 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         if (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4) {
             DG_HOST_ASSERT(not use_psum_layout);
-            // FP4xFP4 swap_ab gating wants useful-per-group rows. Caller passes
-            // expected_m_for_psum_layout when known (sparse MoE); fall back to
-            // m/num_groups for dense layouts.
-            const int expected_m_per_group = expected_m_for_psum_layout.value_or(
-                num_groups > 0 ? m / num_groups : 0);
+            DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+            DG_HOST_ASSERT(k % 8 == 0);
+            // swap_ab gating uses m/num_groups as the per-group estimate (accurate
+            // for dense layouts; sparse MoE without a hint conservatively skips
+            // swap_ab).
+            const int expected_m_per_group = num_groups > 0 ? m / num_groups : 0;
             sm100_m_grouped_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, expected_m_per_group,
                                                      major_a, major_b, compiled_dims);
@@ -294,6 +299,8 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
                                             num_groups, m, n, k, expected_m, major_a, major_b, major_sfb, compiled_dims);
     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
         if (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4) {
+            DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+            DG_HOST_ASSERT(k % 8 == 0);
             sm100_m_grouped_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m,
                                                  major_a, major_b, compiled_dims);

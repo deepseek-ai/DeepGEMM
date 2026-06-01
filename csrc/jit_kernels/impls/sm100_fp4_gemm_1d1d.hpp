@@ -139,7 +139,7 @@ static Layout pick_fp4_layout(const GemmType& gemm_type,
                               const int& num_groups, const int& num_sms,
                               const int& expected_m_per_group = INT_MAX) {
     constexpr int block_m = 128;
-    constexpr int block_k_bytes = 128;  // 32 int32; matches main's block_k convention
+    constexpr int block_k_bytes = 128;  // 32 packed int32 = 256 FP4 elements per K block
     constexpr int sf_pk = 2;             // block_k_int32 / 16 = 32/16
     constexpr int sf_block_m_cols = (128 / 32) * sf_pk;  // 8
     constexpr int smem_capacity = 232448;
@@ -296,15 +296,8 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                  config.layout.block_n, gran_k, 1, 0);
 
-    // Pre-merge C into D for accumulation; the kernel has no separate C path.
-    if (c.has_value()) {
-        if (c->data_ptr() == d.data_ptr()) {
-            DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
-        } else {
-            d.copy_(c.value());
-        }
-    }
-
+    // C is merged into D by the API's early_return() pre-launch; the kernel
+    // has no separate C load path.
     const SM100FP4Gemm1D1DRuntime::Args args = {
         .gemm_desc = desc,
         .gemm_config = config,

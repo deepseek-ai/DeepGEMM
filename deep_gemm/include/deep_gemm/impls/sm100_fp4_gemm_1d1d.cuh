@@ -221,14 +221,13 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         accum_stage_idx == 0 ? func(0) : func(1);
     };
 
-    // ========== Warp dispatch (FP8-style: independent loops per warp) ==========
-    // Warp 0: TMA load producer
-    // Warp 1: MMA consumer (+ UTCCP SF copy to TMEM)
-    // Warp 2: SF transpose (SMEM warp transpose for UTCCP)
-    // Warp 3+: Epilogue
-
+    // Dispatch warps into different roles:
+    //   warp 0   : TMA load producer
+    //   warp 1   : MMA consumer + UTCCP SF copy to TMEM
+    //   warp 2   : SF SMEM warp transpose for UTCCP
+    //   warp 3+  : Epilogue
     if (warp_idx == 0) {
-        // ========== Warp 0: TMA load ==========
+        // TMA load warp
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             launch_k_iterations([&](uint32_t k_iter, auto type, bool is_last_iter, uint32_t num_last_stages) {
                 constexpr bool kHasDivisibleStages = cute::is_same_v<decltype(type), DivisibleK>;
@@ -297,7 +296,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
             });
         }
     } else if (warp_idx == 1 and is_leader_cta) {
-        // ========== Warp 1: UTCCP SF copy + MMA ==========
+        // MMA + UTCCP SF copy warp
         constexpr uint32_t UMMA_M = LAYOUT_AD_M * (kIsMulticastOnA ? 1 : kNumMulticast);
         // Swap-AB: UMMA_N becomes BLOCK_M (the original M dim now plays N role in MMA).
         constexpr uint32_t UMMA_N = kSwapAB ? BLOCK_M : BLOCK_N * (kIsMulticastOnA ? kNumMulticast : 1);
@@ -463,7 +462,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
             });
         }
     } else if (warp_idx == 2) {
-        // ========== Warp 2: SF transpose ==========
+        // SF transpose warp
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
             uint32_t values[4];
@@ -542,14 +541,10 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
         constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
 
       if constexpr (kSwapAB) {
-        // =================================================================
-        // Swap-AB epilogue:
-        //   TMEM holds D^T (BLOCK_N rows × BLOCK_M cols).
-        //   Per accum stage covers cols [accum_stage_idx*BLOCK_M, +BLOCK_M) of TMEM.
-        //   STORE_BLOCK_M=16: each `s` iter covers 16 cols of TMEM (= 16 of D's M).
-        //   num_stores = effective_m / 16 → padding cols are skipped entirely.
-        //   STORE_BLOCK_N = BLOCK_N: each TMA store covers entire BLOCK_N at once.
-        // =================================================================
+        // Swap-AB epilogue: TMEM holds D^T (BLOCK_N rows x BLOCK_M cols); each
+        // accum stage covers BLOCK_M TMEM cols. STORE_BLOCK_M=16 lets the loop
+        // skip 16-row M slices that are entirely padding (effective_m / 16),
+        // while STORE_BLOCK_N=BLOCK_N stores the full N tile per iteration.
         constexpr uint32_t kNumSwizzleAtomRows = 8;
         constexpr uint32_t STORE_BLOCK_N_ATOM = kSwizzleCDMode / sizeof(cd_dtype_t);
         constexpr uint32_t kNumWarpsPerAtom = STORE_BLOCK_N_ATOM / 32;
@@ -650,7 +645,7 @@ sm100_fp4_gemm_1d1d_impl(int* grouped_layout,
             });
         }
       } else {
-        // ===== Existing non-swap epilogue (unchanged) =====
+
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             dispatch_accum_stage_idx(scheduler.current_iter % kNumEpilogueStages, [&](uint32_t accum_stage_idx) {
                 auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
