@@ -161,8 +161,8 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     torch::Tensor logits;
     int aligned_seq_len = align(seq_len, block_q), stride_logits;
     if (max_seqlen_k == 0) {
-        // Logits stride must be 16-byte aligned
-        stride_logits = align(seq_len_kv + block_kv, 8);
+        // Logits stride must be 128-byte aligned
+        stride_logits = align(seq_len_kv + block_kv, 64);
         logits = torch::empty({aligned_seq_len, stride_logits}, q_fp.options().dtype(logits_dtype));
         logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, seq_len_kv)});
     } else {

@@ -3,6 +3,8 @@
 #include <cuda/std/cstdint>
 #include <cuda_bf16.h>
 
+#include <deep_gemm/common/exception.cuh>
+
 namespace deep_gemm::ptx {
 
 // Compatibility: 256 bits LD/ST instructions
@@ -45,6 +47,18 @@ struct SM90_U32x2_STSM_N {
         const uint32_t src[2] = {*reinterpret_cast<uint32_t*>(&src_0), *reinterpret_cast<uint32_t*>(&src_1)};
         asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16 [%0], {%1, %2};\n"
                      :: "l"(__cvta_generic_to_shared(smem_dst)), "r"(src[0]), "r"(src[1]));
+    }
+};
+
+template <typename dtype_t>
+struct SM90_U32x2_STSM_T {
+    CUTLASS_DEVICE static void
+    copy(dtype_t src_0, dtype_t src_1, void* smem_dst) {
+        DG_STATIC_ASSERT(sizeof(dtype_t) == sizeof(uint32_t), "Invalid dtype");
+        const uint32_t src[2] = {*reinterpret_cast<uint32_t*>(&src_0), *reinterpret_cast<uint32_t*>(&src_1)};
+        asm volatile("stmatrix.sync.aligned.x2.m8n8.shared.b16.trans [%0], {%1, %2};\n"
+                     :: "l"(__cvta_generic_to_shared(smem_dst)),
+                        "r"(src[0]), "r"(src[1]));
     }
 };
 
@@ -140,6 +154,7 @@ CUTLASS_DEVICE void st_shared(const __int128_t* ptr, __int128_t val) {
 
 CUTLASS_DEVICE void st_shared_bulk(void* smem_ptr, const uint32_t& num_bytes) {
     // `size` must be 64-bit before PTX ISA 9.0
+    DG_DEVICE_ASSERT(num_bytes % 8 == 0);
     asm volatile("st.bulk.weak.shared::cta [%0], %1, 0;" ::
                  "l"(__cvta_generic_to_shared(smem_ptr)), "l"(static_cast<uint64_t>(num_bytes)));
 }
