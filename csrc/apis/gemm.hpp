@@ -172,7 +172,9 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     const auto [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    // FP4xFP4 my kernel hardcodes fp32 output (bf16 epilogue is TODO).
+    const bool is_fp4_fp4 = (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or (is_fp4_fp4 and d.scalar_type() == torch::kFloat));
     DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
 
     // Layout checks
@@ -256,7 +258,9 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
     DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__ and num_groups == num_groups___);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    // FP4xFP4 my kernel hardcodes fp32 output (bf16 epilogue is TODO).
+    const bool is_fp4_fp4_masked = (a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or (is_fp4_fp4_masked and d.scalar_type() == torch::kFloat));
     DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
 
     // D must be N-major

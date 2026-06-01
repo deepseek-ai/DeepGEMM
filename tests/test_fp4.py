@@ -121,12 +121,12 @@ def run_kernel(a_packed, b_packed, sf_a, sf_b, m, n, recipe=(1, 1, 32)):
 
 
 def pack_fp4_random_3d(num_groups: int, n: int, k_fp4: int, device='cuda'):
-    """生成 [G, N, K_int32] FP4 packed tensor。"""
-    assert k_fp4 % 8 == 0
+    """[G, N, K_byte] FP4 packed as int8 (kPackedFP4): 2 FP4 per byte."""
+    assert k_fp4 % 2 == 0
     raw = torch.randint(0, 16, (num_groups, n, k_fp4), dtype=torch.uint8, device=device)
-    packed = torch.zeros(num_groups, n, k_fp4 // 8, dtype=torch.int32, device=device)
-    for i in range(8):
-        packed += (raw[:, :, i::8].to(torch.int32) << (i * 4))
+    packed = torch.zeros(num_groups, n, k_fp4 // 2, dtype=torch.int8, device=device)
+    packed |= (raw[:, :, 0::2].to(torch.int8) & 0x0F)
+    packed |= (raw[:, :, 1::2].to(torch.int8) & 0x0F) << 4
     return packed
 
 
@@ -162,25 +162,25 @@ def fp4_reference_grouped(a_packed, b_packed_grouped, m_indices,
     return c
 
 
-def run_kernel_grouped(a_packed, b_packed, sf_a, sf_b, m_indices, m, n, recipe=(1, 1, 128)):
-    """调用 m_grouped_fp8_gemm_nt_contiguous 的 FP4 路径 (int32 dtype 触发)。"""
-    duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
+def run_kernel_grouped(a_packed, b_packed, sf_a, sf_b, m_indices, m, n, recipe=None):
+    """Call m_grouped_fp8_fp4_gemm_nt_contiguous with FP4 path (kPackedFP4 int8 triggers)."""
     d = torch.empty((m, n), device='cuda', dtype=torch.float32)
-    deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
         (a_packed, sf_a), (b_packed, sf_b), d, m_indices,
-        recipe=recipe, disable_ue8m0_cast=duc,
+        recipe_a=(1, 32), recipe_b=(1, 32),
+        disable_ue8m0_cast=False,
     )
     torch.cuda.synchronize()
     return d
 
 
 def pack_fp4_random_3d_ga(num_groups: int, max_m: int, k_fp4: int, device='cuda'):
-    """生成 [G, max_M, K_int32] FP4 packed tensor (A side for masked variant)."""
-    assert k_fp4 % 8 == 0
+    """[G, max_M, K_byte] FP4 packed as int8 (kPackedFP4) for masked variant."""
+    assert k_fp4 % 2 == 0
     raw = torch.randint(0, 16, (num_groups, max_m, k_fp4), dtype=torch.uint8, device=device)
-    packed = torch.zeros(num_groups, max_m, k_fp4 // 8, dtype=torch.int32, device=device)
-    for i in range(8):
-        packed += (raw[:, :, i::8].to(torch.int32) << (i * 4))
+    packed = torch.zeros(num_groups, max_m, k_fp4 // 2, dtype=torch.int8, device=device)
+    packed |= (raw[:, :, 0::2].to(torch.int8) & 0x0F)
+    packed |= (raw[:, :, 1::2].to(torch.int8) & 0x0F) << 4
     return packed
 
 
@@ -215,13 +215,13 @@ def fp4_reference_masked(a_3d, b_3d, masked_m_cpu, max_m, n, num_groups,
 
 
 def run_kernel_grouped_masked(a_3d, b_3d, sf_a_3d, sf_b_3d, masked_m, num_groups,
-                              max_m, n, expected_m, recipe=(1, 1, 128)):
-    """调用 m_grouped_fp8_gemm_nt_masked FP4 路径。"""
-    duc = not get_ue8m0_usage(KernelType.Kernel1D1D)
+                              max_m, n, expected_m, recipe=None):
+    """Call m_grouped_fp8_fp4_gemm_nt_masked with FP4 path (kPackedFP4 int8)."""
     d = torch.empty((num_groups, max_m, n), device='cuda', dtype=torch.float32)
-    deep_gemm.m_grouped_fp8_gemm_nt_masked(
+    deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked(
         (a_3d, sf_a_3d), (b_3d, sf_b_3d), d, masked_m, expected_m,
-        recipe=recipe, disable_ue8m0_cast=duc,
+        recipe_a=(1, 32), recipe_b=(1, 32),
+        disable_ue8m0_cast=False,
     )
     torch.cuda.synchronize()
     return d
@@ -492,9 +492,9 @@ def test_m_grouped_contiguous():
         d = torch.empty((m_total, n), device='cuda', dtype=torch.float32)
 
         def fn():
-            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
                 (a, sf_a), (b, sf_b), d, m_indices,
-                recipe=(1, 1, 128), disable_ue8m0_cast=duc,
+                recipe_a=(1, 32), recipe_b=(1, 32), disable_ue8m0_cast=False,
             )
 
         t = bench_kineto(fn, 'sm100_fp4_gemm', suppress_kineto_output=True)
@@ -585,9 +585,9 @@ def test_m_grouped_trtllm_comparable():
                 # rows [start + rows_per_group : start + aligned_per_group) stay -1
 
             # Run kernel
-            deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
                 (a, sf_a), (b, sf_b), d, m_indices,
-                recipe=(1, 1, 128), disable_ue8m0_cast=duc,
+                recipe_a=(1, 32), recipe_b=(1, 32), disable_ue8m0_cast=False,
             )
             torch.cuda.synchronize()
             d_clean = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
@@ -605,9 +605,9 @@ def test_m_grouped_trtllm_comparable():
 
             # Perf
             def fn():
-                deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+                deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
                     (a, sf_a), (b, sf_b), d, m_indices,
-                    recipe=(1, 1, 128), disable_ue8m0_cast=duc,
+                    recipe_a=(1, 32), recipe_b=(1, 32), disable_ue8m0_cast=False,
                 )
             t = bench_kineto(fn, 'sm100_fp4_gemm', suppress_kineto_output=True)
 
