@@ -328,9 +328,10 @@ static void sm100_m_grouped_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, con
     const auto desc = make_fp4_desc(GemmType::MGroupedContiguous, m, n, k, num_groups,
                                     major_a, major_b, d.scalar_type(),
                                     false, compiled_dims);
-    // Caller-provided useful-per-group hint drives swap_ab gating. Dense layouts
-    // (no -1 padding) get m/num_groups; sparse MoE callers pass the actual
-    // per-group useful row count. No device tensor inspection on the host.
+    // swap_ab is gated on expected_m_per_group. The API passes m / num_groups
+    // (a host-side estimate that avoids inspecting m_indices). Accurate for
+    // dense layouts; over-estimates for sparse MoE with -1 padding, which
+    // conservatively disables swap_ab. Acceptable trade-off vs a device sync.
     const auto layout = pick_fp4_layout(GemmType::MGroupedContiguous, m, n, k, num_groups,
                                         device_runtime->get_num_sms(), expected_m_per_group);
     auto config = GemmConfig{
