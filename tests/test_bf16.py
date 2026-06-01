@@ -196,7 +196,9 @@ def test_cublaslt_gemm() -> None:
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
         deep_gemm.cublaslt_gemm_nt(a, b, d, c=c)
         diff = calc_diff(d, ref_d)
-        assert diff < 6e-7, f'{diff=}, ({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})'
+        # BF16 accumulation has lower precision than cuBLASLt's FP32 accumulation
+        threshold = 1e-5 if (accumulate and out_dtype == torch.bfloat16) else 6e-7
+        assert diff < threshold, f'{diff=}, ({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})'
 
         t_nvjet, t_gemv, t_gemm = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
         t = t_nvjet + t_gemv + t_gemm

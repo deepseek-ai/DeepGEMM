@@ -113,7 +113,7 @@ def test_mqa_logits():
                 for compressed_logits, clean_logits in [(False, True), (True, False)]:
                     for seq_len in (2048, 4096):
                         for seq_len_kv in (4096, 8192):
-                            for num_heads, head_dim in [(64, 128)]:
+                            for num_heads, head_dim in [(64, 128), (32, 128)]:
                                 for disable_cp in (False, True):
                                     yield is_fp4, logits_dtype, compressed_logits, clean_logits, seq_len, seq_len_kv, num_heads, head_dim, disable_cp
 
@@ -224,6 +224,18 @@ def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
     return logits
 
 
+def reset_cuda_peak_memory_stats():
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+
+
+def get_cuda_peak_memory_gib():
+    torch.cuda.synchronize()
+    peak_allocated = torch.cuda.max_memory_allocated() / 1024 ** 3
+    peak_reserved = torch.cuda.max_memory_reserved() / 1024 ** 3
+    return peak_allocated, peak_reserved
+
+
 def test_paged_mqa_logits():
 
     # Helper functions
@@ -253,24 +265,30 @@ def test_paged_mqa_logits():
 
     def enumerate_paged_mqa_logits():
         arch_major = get_arch_major()
+        max_kv_pool_tokens = 32 * 1024 * 1024
+        max_varlen_tokens = 16 * 1024
         for is_varlen in ((True, False) if arch_major == 10 else (False, )):
             for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
                 for logits_dtype in (torch.float, torch.bfloat16):
                     for block_kv in ((32, 64) if arch_major == 10 else (64, )):
                         for use_2d_context_lens, clean_logits in [(True, False)]:
-                            for batch_size in (256, ):
+                            for batch_size in (256, 4096):
                                 for next_n in ((1, ) if is_varlen else ((1, 2, 4, 5, 6) if arch_major == 10 else (1, 2))):
                                     for max_tokens_per_batch in ((1, 4, 10) if is_varlen else (1, )):
-                                        for num_heads, head_dim in [(64, 128)]:
+                                        for num_heads, head_dim in [(64, 128), (32, 128)]:
                                             for avg_kv in (8192, 32768):
+                                                if batch_size * avg_kv > max_kv_pool_tokens:
+                                                    continue
+                                                if is_varlen and batch_size * max_tokens_per_batch > max_varlen_tokens:
+                                                    continue
                                                 yield is_varlen, is_fp4, logits_dtype, block_kv, use_2d_context_lens, clean_logits, batch_size, next_n, max_tokens_per_batch, num_heads, head_dim, avg_kv
 
 
     print('Testing FP8/FP4 Paged MQA Logits:')
-    max_model_len = 111 * 1024
-    num_total_blocks = max_model_len * 5
 
     for is_varlen, is_fp4, logits_dtype, block_kv, use_2d_context_lens, clean_logits, batch_size, next_n, max_tokens_per_batch, num_heads, head_dim, avg_kv in enumerate_paged_mqa_logits():
+        reset_cuda_peak_memory_stats()
+
         # Varlen: flatten raw_batch_size sequences with variable tokens into (batch_size, 1, ...)
         raw_batch_size, raw_next_n = batch_size, next_n
         if is_varlen:
@@ -282,7 +300,6 @@ def test_paged_mqa_logits():
 
         # Generate random inputs
         q = torch.randn((batch_size, next_n, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
-        kv_cache = torch.randn((num_total_blocks, block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16)
         weights = torch.randn((batch_size * next_n, num_heads), device='cuda', dtype=torch.float)
         context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (raw_batch_size,), device='cuda', dtype=torch.int)
 
@@ -294,7 +311,10 @@ def test_paged_mqa_logits():
         # Assign block tables (per-sequence, sized by the largest ctx_len within the sequence)
         seq_sum_lens = context_lens.sum().item()
         num_blocks_per_query = ceil_div(max_ctx_len_per_seq, block_kv)
-        block_table = torch.empty((raw_batch_size, num_blocks_per_query.max().item()), device='cuda', dtype=torch.int)
+        max_model_len = num_blocks_per_query.max().item() * block_kv
+        num_total_blocks = num_blocks_per_query.sum().item()
+        kv_cache = torch.randn((num_total_blocks, block_kv, 1, head_dim), device='cuda', dtype=torch.bfloat16)
+        block_table = torch.zeros((raw_batch_size, num_blocks_per_query.max().item()), device='cuda', dtype=torch.int)
         block_idx_pool = torch.randperm(num_total_blocks, device='cuda', dtype=torch.int)
         offset = 0
         for i, num_blocks in enumerate(num_blocks_per_query.tolist()):
@@ -311,6 +331,7 @@ def test_paged_mqa_logits():
 
         # Calculate reference logits
         ref_logits = ref_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, max_model_len, use_2d_context_lens)
+        q_weight_bytes = count_bytes(q, weights)
 
         # Quantize Q and KV cache to FP4 / FP8
         if is_fp4:
@@ -322,6 +343,7 @@ def test_paged_mqa_logits():
             q_in = q.to(torch.float8_e4m3fn), None
             q_simulated = q_in[0].to(torch.bfloat16)
             kv_in, kv_simulated = kv_cache_cast_to_fp8(kv_cache)
+        del q, kv_cache
 
         # Calculate simulated reference logits
         simulated_logits = ref_paged_mqa_logits(q_simulated, kv_simulated, weights, context_lens, block_table, max_model_len, use_2d_context_lens)
@@ -345,6 +367,9 @@ def test_paged_mqa_logits():
             ref_neginf_mask = ~(positions <= limits)
 
         # Run Kernel
+        assert block_table.min().item() >= 0
+        assert block_table.max().item() < num_total_blocks
+        assert context_lens_nextn.max().item() <= max_model_len
         kernel_kwargs = dict(
             q=q_in, kv_cache=kv_in, weights=weights,
             context_lens=context_lens_nextn, block_table=block_table,
@@ -375,14 +400,24 @@ def test_paged_mqa_logits():
         kv_bytes_per_token = head_dim / (2 if is_fp4 else 1) + 4
         # KV is read once per sequence; for varlen sum_lens overcounts (per-token), so use seq_sum_lens
         kv_sum_lens = seq_sum_lens if is_varlen else sum_lens
-        total_bytes = count_bytes(q, weights) + kv_sum_lens * kv_bytes_per_token + (sum_lens * next_n * logits_dtype.itemsize)
+        total_bytes = q_weight_bytes + kv_sum_lens * kv_bytes_per_token + (sum_lens * next_n * logits_dtype.itemsize)
 
+        peak_allocated, peak_reserved = get_cuda_peak_memory_gib()
         t, clean_t = bench_kineto(lambda: deep_gemm.fp8_fp4_paged_mqa_logits(**kernel_kwargs), ('paged_mqa_logits', 'clean_logits'))
         print(f' > FP4={is_fp4}, BF16={logits_dtype == torch.bfloat16}, BLOCK_KV={block_kv}, BSZ={raw_batch_size:3}, NextN={raw_next_n:1}, H={num_heads:2}, D={head_dim:2}, L={avg_kv:6}: '
               f'{tflops_calc / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, {total_bytes / t / 1e9:4.0f} GB/s', end='')
         if is_varlen:
             print(f' | Varlen, MaxTPB={max_tokens_per_batch}, NumTokens={batch_size}', end='')
+        print(f' | mem: alloc={peak_allocated:.2f} GiB, reserved={peak_reserved:.2f} GiB', end='')
         print(f' | clean: {clean_t*1e6:3.0f} us' if clean_logits else '')
+
+        del kernel_kwargs, logits, ref_neginf_mask, positions
+        del q_in, q_simulated, kv_in, kv_simulated, weights, context_lens, context_lens_nextn, block_table
+        if is_fp4:
+            del q_fp4
+        if is_varlen:
+            del tokens_per_seq, indices, offsets_within_seq
+        torch.cuda.empty_cache()
     print()
 
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <string>
 #include <pybind11/functional.h>
 
 #if DG_TENSORMAP_COMPATIBLE
@@ -22,6 +23,7 @@ get_symm_buffer_size_for_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const bool& use_fp8_dispatch, const std::string& activation) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
+    DG_HOST_ASSERT(use_fp8_dispatch);
 
     // Workspace bytes
     const auto workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
@@ -162,14 +164,14 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
+    const auto [num_experts_per_rank, intermediate_hidden_before_act, hidden] =
         check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
     const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
         check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
-    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(intermediate_hidden_before_act == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment

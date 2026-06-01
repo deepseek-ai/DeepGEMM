@@ -114,8 +114,7 @@ static void einsum(const std::string& expr,
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
     if (c.has_value()) {
-        DG_HOST_ASSERT(c->scalar_type() == torch::kFloat);
-        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(d.scalar_type() == c->scalar_type());
     }
 
     // Some hardcoded Einstein sum kernels

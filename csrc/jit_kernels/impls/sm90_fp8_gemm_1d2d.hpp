@@ -48,11 +48,11 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {}
     >);
 }};
 )",
-        // TODO: add CD dtype
         to_string(args.major_sfb),
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
@@ -64,6 +64,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
+        to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type));
     }
 

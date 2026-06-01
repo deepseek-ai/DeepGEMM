@@ -16,12 +16,17 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
-    __shared__ uint32_t varlen_atom_token_start[kAlignedBatchSize];
-    __shared__ uint32_t varlen_atom_context_len[kAlignedBatchSize];
-    __shared__ uint32_t varlen_num_atoms_shared;
+    extern __shared__ uint32_t smem_buffer[];
+    const auto prefix_sum = smem_buffer;
+    const auto get_varlen_atom_token_start = [&]() { return prefix_sum + kAlignedBatchSize; };
+    const auto get_varlen_atom_context_len = [&]() { return prefix_sum + kAlignedBatchSize * 2; };
+    const auto get_varlen_num_atoms_shared = [&]() { return prefix_sum + kAlignedBatchSize * 3; };
     uint32_t num_items;
 
     if constexpr (kIsVarlen) {
+        const auto varlen_atom_token_start = get_varlen_atom_token_start();
+        const auto varlen_atom_context_len = get_varlen_atom_context_len();
+        const auto varlen_num_atoms_shared = get_varlen_num_atoms_shared();
         if (lane_idx == 0) {
             uint32_t t = 0, atom_count = 0;
             while (t < batch_size) {
@@ -31,34 +36,28 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
                 t += is_paired ? 2 : 1;
                 ++ atom_count;
             }
-            varlen_num_atoms_shared = atom_count;
+            *varlen_num_atoms_shared = atom_count;
         }
         __syncwarp();
-        num_items = varlen_num_atoms_shared;
+        num_items = *varlen_num_atoms_shared;
     } else {
         num_items = batch_size;
     }
 
     // Compute num_segs and prefix sum
-    uint32_t num_segs[kAlignedBatchSize / 32];
-    #pragma unroll
+    uint32_t sum = 0;
+    #pragma unroll 16
     for (uint32_t k = 0; k < kAlignedBatchSize / 32; ++ k) {
         const uint32_t q_idx = k * 32 + lane_idx;
         uint32_t context_len;
         if constexpr (kIsVarlen) {
+            const auto varlen_atom_context_len = get_varlen_atom_context_len();
             context_len = (q_idx < num_items ? varlen_atom_context_len[q_idx] : 0);
         } else {
             const uint32_t lens_idx = (is_context_lens_2d ? q_idx * next_n + next_n - 1 : q_idx);
             context_len = (q_idx < batch_size ? context_lens[lens_idx] : 0);
         }
-        num_segs[k] = math::ceil_div(context_len, SPLIT_KV);
-    }
-
-    __shared__ uint32_t prefix_sum[kAlignedBatchSize];
-    uint32_t sum = 0;
-    #pragma unroll
-    for (uint32_t k = 0; k < kAlignedBatchSize / 32; ++ k) {
-        uint32_t x = num_segs[k];
+        uint32_t x = math::ceil_div(context_len, SPLIT_KV);
         #pragma unroll
         for (uint32_t offset = 1; offset < 32; offset <<= 1) {
             const uint32_t y = __shfl_up_sync(0xffffffff, x, offset);
@@ -71,10 +70,14 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
 
     // SM work distribution
     if constexpr (kIsVarlen) {
+        const auto varlen_atom_token_start = get_varlen_atom_token_start();
         const uint32_t total = sum;
         const uint32_t q = total / kNumSMs, r = total % kNumSMs;
+        // NOTES: reversed allocation — first (kNumSMs - r) SMs get `q` segments, last `r` get `q + 1`.
+        // Empty SMs (when total < kNumSMs) land on atom_idx == 0, keeping `refresh_num_kv_and_advance` in-bounds.
+        const uint32_t pivot = kNumSMs - r;
         for (uint32_t sm_idx = lane_idx; sm_idx <= kNumSMs; sm_idx += 32) {
-            uint32_t seg_starts = sm_idx * q + min(sm_idx, r);
+            uint32_t seg_starts = sm_idx * q + (sm_idx > pivot ? sm_idx - pivot : 0);
             uint32_t lo = 0, hi = num_items;
             while (lo < hi) {
                 const uint32_t mid = (lo + hi) / 2;
@@ -95,8 +98,9 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
         const uint32_t num_next_n_atoms = math::ceil_div(next_n, next_n_atom);
         const uint32_t total = sum * num_next_n_atoms;
         const uint32_t q = total / kNumSMs, r = total % kNumSMs;
-        for (uint32_t sm_idx = lane_idx; sm_idx <= kNumSMs; sm_idx += 32) {
-            uint32_t seg_starts = sm_idx * q + min(sm_idx, r);
+        const uint32_t pivot = kNumSMs - r;
+        for (uint32_t sm_idx = lane_idx; sm_idx < kNumSMs; sm_idx += 32) {
+            uint32_t seg_starts = sm_idx * q + (sm_idx > pivot ? sm_idx - pivot : 0);
             uint32_t lo = 0, hi = batch_size;
             while (lo < hi) {
                 const uint32_t mid = (lo + hi) / 2;
@@ -114,6 +118,10 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
 
             schedule_metadata[sm_idx * 2] = q_atom_idx;
             schedule_metadata[sm_idx * 2 + 1] = kv_split_idx;
+        }
+        if (lane_idx == 0) {
+            schedule_metadata[kNumSMs * 2] = batch_size * num_next_n_atoms;
+            schedule_metadata[kNumSMs * 2 + 1] = 0;
         }
     }
 }
@@ -137,6 +145,8 @@ struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
     uint32_t current_q_atom_idx, current_kv_idx;
     uint32_t end_q_atom_idx, end_kv_idx;
     uint32_t current_num_kv;
+    uint32_t current_advance;
+    uint32_t last_advance;
 
     CUTLASS_DEVICE static uint32_t atom_to_token_idx(const uint32_t& q_atom_idx) {
         if constexpr (kIsVarlen) {
@@ -160,16 +170,24 @@ struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
         }
     }
 
-    CUTLASS_DEVICE uint32_t get_num_kv(const uint32_t& q_atom_idx) const {
+    CUTLASS_DEVICE uint32_t get_last_advance() const {
+        return last_advance;
+    }
+
+    // NOTES: varlen path reuses a single `is_paired` check to derive both `current_advance`
+    // and `current_num_kv`, so `indices` is read only once per atom boundary.
+    CUTLASS_DEVICE void refresh_num_kv_and_advance(const uint32_t& q_atom_idx) {
         if constexpr (kIsVarlen) {
             const bool is_paired = (q_atom_idx + 1 < batch_size and
                                     this->indices[q_atom_idx] == this->indices[q_atom_idx + 1]);
+            current_advance = is_paired ? 2 : 1;
             const uint32_t ctx_len = is_paired ? context_lens[q_atom_idx + 1] : context_lens[q_atom_idx];
-            return math::ceil_div(ctx_len, BLOCK_KV);
+            current_num_kv = math::ceil_div(ctx_len, BLOCK_KV);
         } else {
+            current_advance = 1;
             const uint32_t q_idx = q_atom_idx / kNumNextNAtoms;
             const auto lens_idx = (kIsContextLens2D ? q_idx * kNextN + kNextN - 1 : q_idx);
-            return math::ceil_div(context_lens[lens_idx], BLOCK_KV);
+            current_num_kv = math::ceil_div(context_lens[lens_idx], BLOCK_KV);
         }
     }
 
@@ -187,18 +205,8 @@ struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
         current_q_atom_idx = current_pack.x, current_kv_idx = current_pack.y * kNumBlocksPerSplit;
         end_q_atom_idx = end_pack.x, end_kv_idx = end_pack.y * kNumBlocksPerSplit;
 
-        current_num_kv = get_num_kv(current_q_atom_idx);
-    }
-
-    // Advance step in q_atom_idx space when moving to the next atom.
-    // Varlen: 1 or 2 depending on whether consecutive tokens share the same sequence.
-    // Non-varlen: always 1 (one atom unit).
-    CUTLASS_DEVICE uint32_t get_atom_advance(const uint32_t& q_atom_idx, const uint32_t& bound) const {
-        if constexpr (kIsVarlen) {
-            return (q_atom_idx + 1 < bound and this->indices[q_atom_idx] == this->indices[q_atom_idx + 1]) ? 2 : 1;
-        } else {
-            return 1;
-        }
+        // NOTES: unconditional call is safe — reversed metadata allocation ensures `current_q_atom_idx` is always in-bounds.
+        refresh_num_kv_and_advance(current_q_atom_idx);
     }
 
     // Whether num_kv should be refreshed after advancing to q_atom_idx.
@@ -216,6 +224,7 @@ struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
         q_atom_idx = current_q_atom_idx;
         kv_idx = current_kv_idx;
         num_kv = current_num_kv;
+        last_advance = current_advance;
 
         if (current_q_atom_idx == end_q_atom_idx and current_kv_idx == end_kv_idx)
             return false;
@@ -223,9 +232,9 @@ struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
         current_kv_idx += kNumBlocksPerSplit;
         if (current_kv_idx >= current_num_kv) {
             current_kv_idx = 0;
-            current_q_atom_idx += get_atom_advance(current_q_atom_idx, end_q_atom_idx);
+            current_q_atom_idx += current_advance;
             if (should_refresh_num_kv(current_q_atom_idx) and exist_q_atom_idx(current_q_atom_idx)) {
-                current_num_kv = get_num_kv(current_q_atom_idx);
+                refresh_num_kv_and_advance(current_q_atom_idx);
             }
         }
         return true;

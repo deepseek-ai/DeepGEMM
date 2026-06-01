@@ -136,6 +136,9 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
                     n, k = nk_list[i]
                     out_dtype = torch.bfloat16 if i < len(bf16_output_nk) else torch.float
                     yield kernel_type, quant_config, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, out_dtype
+                    # BF16 accumulation: supported on all BF16 GEMMs, and SM100 FP8/FP4 GEMMs
+                    if out_dtype == torch.bfloat16 and (dtype == torch.bfloat16 or get_arch_major() == 10):
+                        yield kernel_type, quant_config, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, out_dtype
 
             # Backward
             for m in m_bwd_list:
