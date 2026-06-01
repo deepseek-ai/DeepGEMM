@@ -50,4 +50,13 @@ CUTLASS_DEVICE void accumulate(float2& a, nv_bfloat162 b) {
 #endif
 }
 
+CUTLASS_DEVICE nv_bfloat162
+cvt_f32x2_to_bf16x2_relu(const float& a, const float& b) {
+    nv_bfloat162 result;
+    asm volatile ("cvt.rn.relu.bf16x2.f32 %0, %1, %2;\n"
+                  : "=r"(*reinterpret_cast<uint32_t*>(&result))
+                  : "f"(b), "f"(a));
+    return result;
+}
+
 } // namespace deep_gemm::ptx
