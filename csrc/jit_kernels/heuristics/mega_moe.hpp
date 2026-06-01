@@ -310,31 +310,25 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens) {
-    // Pick block_m and number of math (epilogue) warpgroups. WGMMA::M = 64 is
-    // the hard floor on Hopper, so each warpgroup needs at least 64 rows;
-    // i.e. (block_m / num_epilogue_warpgroups) >= 64.
+    // Pick block_m and the number of math (epilogue) warpgroups. WGMMA::M = 64
+    // is the hard floor on Hopper, so a warpgroup must either own a full 64-row
+    // M tile or split the tile along N while preserving those 64 rows.
     //
-    // Keep the historical 1-WG path for decode-ish small batches, but use the
-    // 4-WG split-MN BLOCK_M=128/BLOCK_N=256 path once each global expert has
-    // enough routed tokens. On H20, the crossover is already around 64
-    // tokens/expert: below that the extra warpgroups add overhead, while at and
-    // above that point the larger split-MN tile cuts scheduling overhead.
+    // Decode-ish small batches use an m64n128 2-WG split-N tile. Once each
+    // global expert has enough routed tokens, use the 4-WG split-MN
+    // BLOCK_M=128/BLOCK_N=256 path to reduce scheduling overhead.
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
     if (auto_split_mn)
         return {128, 512};
 
-    const int block_m = expected_tokens_per_expert >= 128.0f ? 128 : 64;
-    int num_epilogue_warpgroups = block_m / 64;
-
     // 2-WG split-N for the decode tile (block_m=64, block_n=128). Each math
     // warpgroup owns WG_BLOCK_N=64 of the L1 N dimension so the promote/epilogue
     // work runs in parallel across two warpgroups (cross-WG amax keeps the
-    // per-64 FP8 scale factor exact). Measured ~11-17% faster across b1..b32 on
-    // H20, so it is the default; set DG_SM90_DECODE_SPLIT_N=0 to fall back.
-    if (block_m == 64 and get_env<int>("DG_SM90_DECODE_SPLIT_N", 1) != 0)
-        num_epilogue_warpgroups = 2;
+    // per-64 FP8 scale factor exact).
+    const int block_m = 64;
+    const int num_epilogue_warpgroups = 2;
 
     DG_HOST_ASSERT(std::any_of(
         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
@@ -429,7 +423,7 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     // NOTES: cluster_size=1 for SM90 in this initial implementation. Cluster=2
     // multicast on A is feasible (each pair of CTAs shares m_block, splits N),
     // but the SwiGLU/FP8-quantize epilogue would then need cross-CTA amax
-    // reduction so that one per-128 SF correctly covers both 64-col halves.
+    // reduction so the shared output SF covers both N halves.
     // We defer that optimisation; cluster=1 is correct and self-contained.
     const int cluster_size = 1;
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
@@ -445,12 +439,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     // In the single-WG decode path (num_epilogue_threads == 128) shrink
     // dispatch+loader to 64+64 so the total CTA thread count drops 384 -> 256.
     // That raises the ptxas per-thread register-name ceiling from 65536/384
-    // (~168) to 65536/256 (256) AND frees SMEM for an extra pipeline stage,
-    // which measured ~4-5% faster on H20 (b8 518 -> ~490us) with zero spill.
-    // Enabled by default; set DG_SM90_DECODE_REDUCED_THREADS=0 to opt out.
-    const bool reduce_decode_threads =
-        get_env<int>("DG_SM90_DECODE_REDUCED_THREADS", 1) != 0 and
-        num_epilogue_threads == 128;
+    // (~168) to 65536/256 (256) and frees SMEM for an extra pipeline stage.
+    const bool reduce_decode_threads = num_epilogue_threads == 128;
     // 2-WG split-N decode (block_m=64, num_epilogue_threads=256) also shrinks
     // dispatch+loader to 64+64 so the total CTA thread count is 384 (ceiling
     // ~168) instead of 512 (ceiling 128), leaving register headroom for the
