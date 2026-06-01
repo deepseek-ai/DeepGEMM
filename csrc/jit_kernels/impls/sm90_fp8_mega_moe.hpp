@@ -235,15 +235,6 @@ static void sm90_fp8_mega_moe(
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
-    const bool direct_l2_scatter_default = get_sm90_moe_direct_l2_scatter_default(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, config.block_m, config.block_n);
-    const bool l2_nmajor_schedule_default = get_sm90_moe_l2_nmajor_schedule_default(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, config.block_m, config.block_n);
-    const bool one_warp_cleanup_default = get_sm90_moe_one_warp_cleanup_default(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, config.block_m, config.block_n);
     const SM90FP8MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -255,17 +246,17 @@ static void sm90_fp8_mega_moe(
         .split_sfa_tma = get_env<int>("DG_SM90_MOE_SPLIT_SFA_TMA", 0) != 0,
         .direct_l2_scatter = get_env<int>(
             "DG_SM90_MOE_DIRECT_L2_SCATTER",
-            direct_l2_scatter_default ? 1 : 0) != 0,
+            config.direct_l2_scatter ? 1 : 0) != 0,
         .l2_dual_accum = get_env<int>("DG_SM90_MOE_L2_DUAL_ACCUM", 0) != 0,
         .phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0,
         .l1_dual_k_accum = get_env<int>("DG_SM90_MOE_L1_DUAL_K", 0) != 0,
         .l2_nmajor_schedule = get_env<int>(
             "DG_SM90_MOE_L2_NMAJOR",
-            l2_nmajor_schedule_default ? 1 : 0) != 0,
+            config.l2_nmajor_schedule ? 1 : 0) != 0,
         .l1_nmajor_schedule = get_env<int>("DG_SM90_MOE_L1_NMAJOR", 0) != 0,
         .one_warp_cleanup = get_env<int>(
             "DG_SM90_MOE_ONE_WARP_CLEANUP",
-            one_warp_cleanup_default ? 1 : 0) != 0,
+            config.one_warp_cleanup ? 1 : 0) != 0,
         .split_phase_mode = 0,
         .config = config,
         .y = y.data_ptr(),
