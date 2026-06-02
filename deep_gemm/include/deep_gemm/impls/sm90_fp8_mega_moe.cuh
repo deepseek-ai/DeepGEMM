@@ -64,16 +64,6 @@ struct MegaMoEPhasePolicy {
     static constexpr bool needs_dispatch_pull = runs_linear1;
     static constexpr bool needs_combine = runs_linear2;
 
-    CUTLASS_DEVICE static bool is_linear1_phase(const sched::BlockPhase& block_phase) {
-        if constexpr (is_linear1_only) {
-            (void)block_phase;
-            return true;
-        } else {
-            (void)block_phase;
-            return false;
-        }
-    }
-
     template <typename Scheduler, typename Func>
     CUTLASS_DEVICE static void for_each_selected_block(Scheduler& scheduler, Func&& func) {
         if constexpr (is_linear1_only) {
@@ -356,6 +346,19 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
         SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE +
         kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+
+    constexpr uint32_t kCombineHiddenBytes = kHidden * sizeof(nv_bfloat16);
+    constexpr uint32_t kCombineChunkSlots = 3;
+    constexpr uint32_t kCombineMaxRegistersForBuffer = 128;
+    constexpr uint32_t kCombineNumChunks =
+        (kCombineChunkSlots * kNumEpilogueWarps * kCombineHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE
+         and kHidden <= 32 * kCombineMaxRegistersForBuffer) ? 1 : 2;
+    constexpr uint32_t kCombineChunkBytes = kCombineHiddenBytes / kCombineNumChunks;
+    constexpr uint32_t SMEM_COMBINE_ALIAS_SIZE = MegaMoEPhase::needs_combine
+        ? kCombineChunkSlots * kNumEpilogueWarps * kCombineChunkBytes : 0u;
+    DG_STATIC_ASSERT(kHidden % kCombineNumChunks == 0, "Hidden must be divisible by number of combine chunks");
+    DG_STATIC_ASSERT(SMEM_COMBINE_ALIAS_SIZE <= SMEM_BEFORE_BARRIER_SIZE,
+                     "Combine SMEM alias exceeds the pre-barrier scratch region");
 
     // SMEM pointers
     auto smem_expert_count = reinterpret_cast<uint32_t*>(smem_buffer);
@@ -833,7 +836,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            const bool is_linear1_phase = MegaMoEPhase::is_linear1_phase(block_phase);
+            (void)block_phase;
+            constexpr bool is_linear1_phase = MegaMoEPhase::runs_linear1;
             const auto tensor_map_a_ptr = !is_linear1_phase
                 ? &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = !is_linear1_phase
@@ -906,7 +910,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            const bool is_linear1_phase = MegaMoEPhase::is_linear1_phase(block_phase);
+            (void)block_phase;
+            constexpr bool is_linear1_phase = MegaMoEPhase::runs_linear1;
             const auto tensor_map_b_ptr =
                 !is_linear1_phase ? &tensor_map_l2_weights : &tensor_map_l1_weights;
 
@@ -937,7 +942,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            const bool is_linear1_phase = MegaMoEPhase::is_linear1_phase(block_phase);
+            (void)block_phase;
+            constexpr bool is_linear1_phase = MegaMoEPhase::runs_linear1;
             (void)local_expert_idx;
             (void)n_block_idx;
             const auto tensor_map_sfa_ptr = !is_linear1_phase
@@ -1066,7 +1072,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-            const bool is_linear1_phase = MegaMoEPhase::is_linear1_phase(block_phase);
+            (void)block_phase;
+            constexpr bool is_linear1_phase = MegaMoEPhase::runs_linear1;
             const uint32_t valid_m = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -2366,19 +2373,14 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
         const unsigned long long combine_reduce_start = phase_profile_clock();
 
-        constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
+        constexpr uint32_t kNumHiddenBytes = kCombineHiddenBytes;
         constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
 
-        constexpr uint32_t kNumChunkSlots = 3;
-        constexpr uint32_t kNumMaxRegistersForBuffer = 128;
-        constexpr uint32_t kNumChunks =
-            (kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE
-             and kHidden <= 32 * kNumMaxRegistersForBuffer) ? 1 : 2;
-        constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;
+        constexpr uint32_t kNumChunkSlots = kCombineChunkSlots;
+        constexpr uint32_t kNumChunks = kCombineNumChunks;
+        constexpr uint32_t kNumChunkBytes = kCombineChunkBytes;
         constexpr uint32_t kNumChunkUint4 = kNumChunkBytes / sizeof(uint4);
         constexpr uint32_t kNumUint4PerLane = kNumChunkUint4 / 32;
-        DG_STATIC_ASSERT(kHidden % kNumChunks == 0, "Hidden must be divisible by number of chunks");
-        DG_STATIC_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes / kNumChunks <= SMEM_BEFORE_BARRIER_SIZE, "Hidden is too large");
         DG_STATIC_ASSERT(kNumChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
         DG_STATIC_ASSERT(kNumChunkBytes % sizeof(uint4) == 0, "Combine chunk must be divisible by 16 bytes");
         DG_STATIC_ASSERT(kNumChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements");

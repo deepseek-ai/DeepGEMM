@@ -1,6 +1,6 @@
 """Layered tests for the SM90 (Hopper) MegaMoE kernel.
 
-The fused FP8 SM90 MegaMoE kernel is exercised across a hierarchy of
+The split FP8 SM90 MegaMoE kernel is exercised across a hierarchy of
 scenarios so that each kernel path / heuristic branch / edge case is
 covered with at least one configuration.
 
@@ -9,8 +9,8 @@ Layers
   L1  Smoke           : single tiny config; only verifies the kernel runs
                         and produces an output close to a PyTorch reference.
   L2  Heuristic       : sweeps tokens-per-expert across the bands of
-                        ``get_block_config_for_mega_moe_sm90`` so each
-                        ``{block_m, num_epilogue_warpgroups}`` case is hit.
+                        the SM90 config selector so the main branch buckets
+                        are covered.
   L3  Shape sweep     : sweeps ``hidden``, ``intermediate_hidden`` and
                         ``num_topk`` over divisible-by-128 values.
   L4  Edge cases      : masking ratio, activation clamp (finite vs inf),
@@ -19,10 +19,10 @@ Layers
 
 Notes
 -----
-*   The reference is a pure PyTorch BF16/FP32 simulation of the fused path
+*   The reference is a pure PyTorch BF16/FP32 simulation of the split path
     (dequantize -> matmul -> SwiGLU + clamp + per-row quantize -> matmul ->
     cross-rank scatter -> BF16 reduce).  It is *not* bitwise-identical to
-    the kernel; correctness is checked with ``calc_diff < 0.07``.
+    the kernel; correctness is checked with ``calc_diff < 0.01`` by default.
 *   Because every scenario allocates its own symmetric memory buffer we
     re-`init_dist`/`destroy` once per process at the outer level only,
     and re-create ``SymmBuffer`` per scenario.
@@ -301,7 +301,7 @@ def _run_scenario(
     )
     cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
 
-    # ---- Run fused -----------------------------------------------------------
+    # ---- Run SM90 MegaMoE ----------------------------------------------------
     _trace('copy_inputs')
     buffer.x[:num_tokens].copy_(x_fp8)
     buffer.x_sf[:num_tokens].copy_(x_sf)
@@ -309,7 +309,7 @@ def _run_scenario(
     buffer.topk_weights[:num_tokens].copy_(topk_w)
 
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-    _trace('launch_fused (may JIT-compile, can take minutes)')
+    _trace('launch_sm90 (may JIT-compile, can take minutes)')
     deep_gemm.fp8_mega_moe(
         y_fused, transformed_l1, transformed_l2, buffer,
         cumulative_local_expert_recv_stats=cum_stats,
@@ -318,9 +318,9 @@ def _run_scenario(
         activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
         fast_math=fast_math,
     )
-    _trace('sync_fused')
+    _trace('sync_sm90')
     torch.cuda.synchronize()
-    _trace('fused_done')
+    _trace('sm90_done')
 
     # ---- Reference & check ---------------------------------------------------
     # Use the FP8 weights and their block-(128, 128) SF directly — the dequant
@@ -368,8 +368,8 @@ def _layer1_smoke() -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def _layer2_heuristic_branches(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
-    """Vary tokens / (num_experts * num_topk / num_ranks) so each
-    ``get_block_config_for_mega_moe_sm90`` band fires at least once.
+    """Vary tokens / (num_experts * num_topk / num_ranks) so the selector's
+    main tokens-per-expert buckets fire at least once.
 
     The heuristic decides on ``avg_tokens_per_expert``; we approximate by
     setting ``num_max_tokens_per_rank`` and ``num_topk`` while keeping
@@ -518,8 +518,8 @@ if __name__ == '__main__':
                         help='Layer 5 stress test count')
     parser.add_argument('--filter', type=str, default='',
                         help='Substring filter on scenario names')
-    parser.add_argument('--diff-tol', type=float, default=0.07,
-                        help='calc_diff tolerance (default: 0.07)')
+    parser.add_argument('--diff-tol', type=float, default=0.01,
+                        help='calc_diff tolerance (default: 0.01)')
     parser.add_argument('--fail-fast', action='store_true',
                         help='Stop on first failing scenario')
     args = parser.parse_args()
