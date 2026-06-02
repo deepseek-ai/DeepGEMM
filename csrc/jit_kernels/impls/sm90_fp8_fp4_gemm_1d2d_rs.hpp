@@ -149,7 +149,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}
     >);
 }};
@@ -217,7 +216,6 @@ static void __instantiate_kernel() {{
         "false",
         "false",
         args.small_m_simple_sched ? "true" : "false",
-        args.compact_masked_sched ? "true" : "false",
         args.fuse_scale_b_decode ? "true" : "false",
         "false",
         "false",
