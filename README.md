@@ -148,6 +148,7 @@ The library provides some utility functions besides the above kernels:
 - `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
 - `deep_gemm.set_mk_alignment_for_contiguous_layout` / `get_mk_alignment_for_contiguous_layout`: set/get the group-level M/K alignment for contiguous layout
 - `deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout`: get the theoretical minimum M/K alignment
+- `deep_gemm.get_recommended_mk_alignment_for_contiguous_layout`: get the recommended M/K alignment for a contiguous layout and target shape
 - `deep_gemm.set_ignore_compile_dims`: configure dimensions to ignore during JIT compilation
 - `deep_gemm.set_block_size_multiple_of`: constrain block sizes to be multiples of a given value
 - `deep_gemm.transform_sf_into_required_layout`: transform scaling factors into the required layout

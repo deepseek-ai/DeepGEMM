@@ -55,6 +55,18 @@ public:
         }
         return block_m;
     }
+
+    static int get_recommended_mk_alignment_for_contiguous_layout(const bool& use_psum_layout,
+                                                                  const std::optional<int>& expected_m,
+                                                                  const std::optional<int>& expected_k,
+                                                                  const std::optional<int>& expected_num_groups) {
+        if (device_runtime->get_arch_major() == 9 and not use_psum_layout and
+            expected_m.has_value() and expected_m.value() == 128 and
+            expected_k.has_value() and expected_k.value() <= 256 and
+            expected_num_groups.has_value() and expected_num_groups.value() == 4)
+            return 64;
+        return get_theoretical_mk_alignment_for_contiguous_layout(expected_m);
+    }
 };
 
 static auto heuristics_runtime = LazyInit<HeuristicsRuntime>([](){ return std::make_shared<HeuristicsRuntime>(); });

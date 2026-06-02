@@ -14,6 +14,7 @@ from .._C import (
     set_mk_alignment_for_contiguous_layout,
     get_mk_alignment_for_contiguous_layout,
     get_theoretical_mk_alignment_for_contiguous_layout,
+    get_recommended_mk_alignment_for_contiguous_layout,
 )
 
 # Some alias
