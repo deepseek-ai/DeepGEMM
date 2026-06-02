@@ -36,9 +36,11 @@ except Exception as ex:
     _deep_ep_import_error = ex
 
 
-# 与 deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh 中模板入口同名，
-# bench_kineto 用它从 trace 里挑出 fused mega-MoE 的 GPU 段
-SM90_KERNEL_NAME = "sm90_fp8_mega_moe_impl"
+# 与 deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh 中模板入口前缀同名，
+# bench_kineto 用它从 trace 里汇总 fused 或 split mega-MoE 的 GPU 段
+SM90_KERNEL_NAME_PREFIX = "sm90_fp8_mega_moe"
+SPLIT_VS_ONE_MAX_ABS_REL_TOL = 1e-4
+FUSED_VS_LEGACY_MEAN_ABS_REL_TOL = 7e-2
 
 
 # FP8 e4m3fn 的最大可表示值，量化时用 amax / 448 作为 scale 基准
@@ -1141,16 +1143,26 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 os.environ["DG_SM90_MOE_SPLIT_L1_L2"] = old_split_env
         diff = (y_split.float() - y_one_kernel.float()).abs()
         denom = y_one_kernel.float().abs().mean().clamp_min(1e-12)
+        max_abs = diff.max()
+        mean_abs_rel = diff.mean().div(denom)
+        max_abs_threshold = denom * SPLIT_VS_ONE_MAX_ABS_REL_TOL
         dist_print(
             "Output diff (split two-kernel vs one-kernel):", once_in_node=True
         )
         dist_print(
-            f" > max_abs={diff.max().item():.6e}, "
+            f" > max_abs={max_abs.item():.6e}, "
             f"mean_abs={diff.mean().item():.6e}, "
-            f"mean_abs/mean_ref={diff.mean().div(denom).item():.6e}",
+            f"mean_abs/mean_ref={mean_abs_rel.item():.6e}, "
+            f"max_abs_threshold={max_abs_threshold.item():.6e}",
             once_in_node=True,
         )
         dist_print(once_in_node=True)
+        assert max_abs <= max_abs_threshold, (
+            "split two-kernel output differs from one-kernel output: "
+            f"max_abs={max_abs.item():.6e}, "
+            f"threshold={max_abs_threshold.item():.6e}, "
+            f"mean_ref={denom.item():.6e}"
+        )
     if ep_buffer is not None:
         out_b = run_baseline()
         assert out_b.shape == (num_tokens, hidden) and out_b.dtype == torch.bfloat16, (
@@ -1159,16 +1171,23 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if args.check_output_diff:
             diff = (y.float() - out_b.float()).abs()
             denom = out_b.float().abs().mean().clamp_min(1e-12)
+            mean_abs_rel = diff.mean().div(denom)
             dist_print(
                 "Output diff (fused vs legacy-per128 baseline):", once_in_node=True
             )
             dist_print(
                 f" > max_abs={diff.max().item():.6e}, "
                 f"mean_abs={diff.mean().item():.6e}, "
-                f"mean_abs/mean_ref={diff.mean().div(denom).item():.6e}",
+                f"mean_abs/mean_ref={mean_abs_rel.item():.6e}, "
+                f"threshold={FUSED_VS_LEGACY_MEAN_ABS_REL_TOL:.6e}",
                 once_in_node=True,
             )
             dist_print(once_in_node=True)
+            assert mean_abs_rel <= FUSED_VS_LEGACY_MEAN_ABS_REL_TOL, (
+                "fused output differs from legacy-per128 baseline: "
+                f"mean_abs/mean_ref={mean_abs_rel.item():.6e}, "
+                f"threshold={FUSED_VS_LEGACY_MEAN_ABS_REL_TOL:.6e}"
+            )
 
     # ---- 统计本 rank 实际接收的 token 数与触达的 expert 数 ----
     # 把所有 rank 的 topk_idx 收齐，再把不落在本 rank 持有 expert 范围内的条目
@@ -1207,12 +1226,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         max_expert_tokens = 0
 
     # ---- benchmark ----
-    # fused：bench_kineto 抓 sm90_fp8_mega_moe_impl 的 GPU 段（不含 host overhead）
+    # fused：bench_kineto 抓 sm90_fp8_mega_moe* 的 GPU 段（不含 host overhead）
     if phase_profile_enabled:
         cum_stats_fused.zero_()
     t_fused = bench_kineto(
         run_fused,
-        SM90_KERNEL_NAME,
+        SM90_KERNEL_NAME_PREFIX,
         num_tests=args.num_bench_tests,
         barrier=lambda: ep_buffer.barrier(use_comm_stream=False)
         if ep_buffer is not None

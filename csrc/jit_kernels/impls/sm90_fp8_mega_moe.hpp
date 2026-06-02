@@ -31,6 +31,12 @@ namespace deep_gemm {
 
 class SM90FP8MegaMoERuntime final : public LaunchRuntime<SM90FP8MegaMoERuntime> {
 public:
+    enum class KernelPhase {
+        Fused,
+        Linear1,
+        Linear2
+    };
+
     struct Args {
         // Templated arguments
         int num_max_tokens_per_rank;
@@ -48,7 +54,7 @@ public:
         bool l2_nmajor_schedule;
         bool l1_nmajor_schedule;
         bool one_warp_cleanup;
-        int split_phase_mode;
+        KernelPhase kernel_phase;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -75,13 +81,15 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        const char* kernel_symbol = args.kernel_phase == KernelPhase::Linear1 ? "sm90_fp8_mega_moe_l1_impl" :
+            (args.kernel_phase == KernelPhase::Linear2 ? "sm90_fp8_mega_moe_l2_impl" : "sm90_fp8_mega_moe_impl");
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm90_fp8_mega_moe_impl<
+    auto ptr = reinterpret_cast<void*>(&{}<
         {},
         {}, {},
         {}, {},
@@ -93,7 +101,6 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {},
-        {},
         {},
         {},
         {},
@@ -108,6 +115,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+    kernel_symbol,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
@@ -129,8 +137,7 @@ static void __instantiate_kernel() {{
     args.l1_dual_k_accum ? "true" : "false",
     args.l2_nmajor_schedule ? "true" : "false",
     args.l1_nmajor_schedule ? "true" : "false",
-    args.one_warp_cleanup ? "true" : "false",
-    args.split_phase_mode);
+    args.one_warp_cleanup ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -244,20 +251,14 @@ static void sm90_fp8_mega_moe(
         .fast_math = fast_math,
         .async_l1_tma_store = get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0,
         .split_sfa_tma = get_env<int>("DG_SM90_MOE_SPLIT_SFA_TMA", 0) != 0,
-        .direct_l2_scatter = get_env<int>(
-            "DG_SM90_MOE_DIRECT_L2_SCATTER",
-            config.direct_l2_scatter ? 1 : 0) != 0,
+        .direct_l2_scatter = config.direct_l2_scatter,
         .l2_dual_accum = get_env<int>("DG_SM90_MOE_L2_DUAL_ACCUM", 0) != 0,
         .phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0,
         .l1_dual_k_accum = get_env<int>("DG_SM90_MOE_L1_DUAL_K", 0) != 0,
-        .l2_nmajor_schedule = get_env<int>(
-            "DG_SM90_MOE_L2_NMAJOR",
-            config.l2_nmajor_schedule ? 1 : 0) != 0,
+        .l2_nmajor_schedule = config.l2_nmajor_schedule,
         .l1_nmajor_schedule = get_env<int>("DG_SM90_MOE_L1_NMAJOR", 0) != 0,
-        .one_warp_cleanup = get_env<int>(
-            "DG_SM90_MOE_ONE_WARP_CLEANUP",
-            config.one_warp_cleanup ? 1 : 0) != 0,
-        .split_phase_mode = 0,
+        .one_warp_cleanup = config.one_warp_cleanup,
+        .kernel_phase = SM90FP8MegaMoERuntime::KernelPhase::Fused,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -275,9 +276,10 @@ static void sm90_fp8_mega_moe(
         .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
-    const auto launch_with_split_mode = [&](const int split_phase_mode, const char* kernel_name) {
+    const auto launch_with_phase = [&](const SM90FP8MegaMoERuntime::KernelPhase kernel_phase,
+                                       const char* kernel_name) {
         auto split_args = args;
-        split_args.split_phase_mode = split_phase_mode;
+        split_args.kernel_phase = kernel_phase;
         const auto code = SM90FP8MegaMoERuntime::generate(split_args);
         const auto runtime = compiler->build(kernel_name, code);
         SM90FP8MegaMoERuntime::launch(runtime, split_args);
@@ -285,10 +287,10 @@ static void sm90_fp8_mega_moe(
 
     const bool split_l1_l2 = get_env<int>("DG_SM90_MOE_SPLIT_L1_L2", 1) != 0;
     if (split_l1_l2) {
-        launch_with_split_mode(1, "sm90_fp8_mega_moe_split_l1");
-        launch_with_split_mode(2, "sm90_fp8_mega_moe_split_l2");
+        launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Linear1, "sm90_fp8_mega_moe_l1_impl");
+        launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Linear2, "sm90_fp8_mega_moe_l2_impl");
     } else {
-        launch_with_split_mode(0, "sm90_fp8_mega_moe");
+        launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Fused, "sm90_fp8_mega_moe_impl");
     }
 }
 
