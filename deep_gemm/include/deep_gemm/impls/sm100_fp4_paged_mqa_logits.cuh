@@ -272,11 +272,9 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
             uint32_t values[4];
             #pragma unroll
             for (uint32_t i = 0; i < 4; ++ i)
-                values[i] = ptx::ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
+                values[i] = ptx::ld_shared(smem_ptr + i * 32 + lane_idx);
             __syncwarp();
-            #pragma unroll
-            for (uint32_t i = 0; i < 4; ++ i)
-                ptx::st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
+            ptx::st_shared(smem_ptr + lane_idx * 4, values[0], values[1], values[2], values[3]);
         };
 
         // Make UMMA desc
@@ -382,10 +380,12 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
         // Helper lambda for loading tensor memory
         auto tmem_load = [](auto num_elems_c, const uint32_t& tmem_addr, float* accum) {
             constexpr int N = decltype(num_elems_c)::value;
-            DG_STATIC_ASSERT(N == 32 or N == 64, "Unsupported TMEM load size");
-            using Loader = cute::conditional_t<N == 32,
-                cute::SM100_TMEM_LOAD_32dp32b32x,
-                cute::SM100_TMEM_LOAD_32dp32b64x>;
+            DG_STATIC_ASSERT(N == 16 or N == 32 or N == 64, "Unsupported TMEM load size");
+            using Loader = cute::conditional_t<N == 16,
+                cute::SM100_TMEM_LOAD_32dp32b16x,
+                cute::conditional_t<N == 32,
+                    cute::SM100_TMEM_LOAD_32dp32b32x,
+                    cute::SM100_TMEM_LOAD_32dp32b64x>>;
             [&]<size_t... Is>(cute::index_sequence<Is...>) {
                 Loader::copy(tmem_addr, reinterpret_cast<uint32_t*>(accum)[Is]...);
             }(cute::make_index_sequence<N>{});
@@ -430,7 +430,7 @@ void sm100_fp4_paged_mqa_logits(const uint32_t batch_size,
 
                 // Check if this atom pairs two tokens from the same sequence
                 if constexpr (kIsVarlen) {
-                    is_paired_atom = (scheduler.get_atom_advance(q_atom_idx, batch_size) == 2);
+                    is_paired_atom = (scheduler.get_last_advance() == 2);
                 }
             }
             last_q_atom_idx = q_atom_idx;

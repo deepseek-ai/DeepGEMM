@@ -69,6 +69,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -82,6 +83,7 @@ static void __instantiate_kernel() {{
     args.config.num_max_pool_tokens,
     args.config.num_padded_sf_pool_tokens,
     args.config.num_stages,
+    args.config.num_bytes_per_pull,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
@@ -134,6 +136,7 @@ static void sm100_fp8_fp4_mega_moe(
 
     // Make tensormap
     constexpr int kGranK = 32;
+    const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, config.num_max_pool_tokens,
                                                      config.block_k, config.load_block_m,
@@ -142,7 +145,8 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_padded_sf_pool_tokens, hidden,
                                                         config.sf_block_m, kGranK,
-                                                        1, 0);
+                                                        1, 0, 0, false,
+                                                        sf_smem_outer_dim);
     const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights,
                                                         hidden, num_experts_per_rank * intermediate_hidden * 2,
                                                         config.block_k, config.load_block_n,
@@ -151,10 +155,10 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
                                                            config.block_n, kGranK,
-                                                           num_experts_per_rank, 0);
+                                                           num_experts_per_rank, 0, 0, false,
+                                                        sf_smem_outer_dim);
     // NOTES: L1 output and L2 activations are essentially the same tensor.
-    // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
-    // so the swizzle mode is also halved (128 -> 64).
+    // Post-SwiGLU output N width is `BLOCK_N / 2` per input tile.
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_max_pool_tokens,
                                                        config.block_n / 2, config.store_block_m,
@@ -168,7 +172,8 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
                                                         config.num_padded_sf_pool_tokens, intermediate_hidden,
                                                         config.sf_block_m, kGranK,
-                                                        1, 0);
+                                                        1, 0, 0, false,
+                                                        sf_smem_outer_dim);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights,
                                                         intermediate_hidden, num_experts_per_rank * hidden,
                                                         config.block_k, config.load_block_n,
@@ -177,7 +182,8 @@ static void sm100_fp8_fp4_mega_moe(
     const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
                                                            config.block_n, kGranK,
-                                                           num_experts_per_rank, 0);
+                                                           num_experts_per_rank, 0, 0, false,
+                                                           sf_smem_outer_dim);
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;

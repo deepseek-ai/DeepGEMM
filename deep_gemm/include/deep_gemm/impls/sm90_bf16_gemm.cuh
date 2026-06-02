@@ -11,6 +11,7 @@
 #include <cute/arch/copy_sm90_tma.hpp>
 #include <cute/arch/mma_sm100_desc.hpp>
 
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
@@ -59,6 +60,9 @@ sm90_bf16_gemm_impl(int* grouped_layout,
     using WGMMA = typename mma::sm90::BF16MMASelector<BLOCK_N, kMajorA, kMajorB>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     DG_STATIC_ASSERT(BLOCK_M % WGMMA::M == 0 or BLOCK_M < WGMMA::M, "Invalid block size");
+
+    // C/D type: BF16 and FP32 are supported, with or without accumulation
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
 
     // Overwrite shape constants if the compiler gives
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
@@ -118,7 +122,7 @@ sm90_bf16_gemm_impl(int* grouped_layout,
     }
 
     // Synchronize all threads to make barrier visible in normal memory model
-    (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+    (kNumTMAMulticast > 1) ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Register reconfigurations
     constexpr uint32_t kNumTMARegisters = 48;
@@ -363,9 +367,11 @@ sm90_bf16_gemm_impl(int* grouped_layout,
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
                 if constexpr (kGemmType == GemmType::Batched) {
-                    cute::SM90_TMA_STORE_3D::copy(&tensor_map_cd, smem_ptr,
-                                                  n_block_idx * BLOCK_N + in_block_n_offset,
-                                                  m_idx, scheduler.current_group_idx);
+                    using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                        cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
+                    cute_tma_t::copy(&tensor_map_cd, smem_ptr,
+                                     n_block_idx * BLOCK_N + in_block_n_offset,
+                                     m_idx, scheduler.current_group_idx);
                 } else {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
                         cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;

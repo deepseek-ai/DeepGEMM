@@ -10,6 +10,7 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
 
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
@@ -43,6 +44,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
+          typename cd_dtype_t,
           typename epilogue_type_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
@@ -57,6 +59,9 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     DG_STATIC_ASSERT(
         math::constexpr_ceil_div(BLOCK_N, BLOCK_K) == 1 or
         (math::constexpr_gcd(BLOCK_N, BLOCK_K) == BLOCK_N - BLOCK_K), "Too much B scales in a single block");
+
+    // C/D type: only BF16 without accumulation
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
 
     // Types
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
@@ -136,7 +141,7 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
     }
 
     // Synchronize all threads to make barrier visible in normal memory model
-    (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
+    (kNumTMAMulticast > 1) ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Register reconfigurations
     constexpr uint32_t kNumTMARegisters = 40;

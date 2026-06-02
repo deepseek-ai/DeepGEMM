@@ -32,7 +32,7 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
-    DG_STATIC_ASSERT(kNumExpertsPerRank % kNumExpertsPerWave == 0, "Invalid wave config");
+    DG_STATIC_ASSERT(kNumExpertsPerWave > 0 and kNumExpertsPerWave <= kNumExpertsPerRank, "Invalid wave config");
 
     // NOTES: N block counts must be even so that 2 adjacent CTAs in a cluster
     // always land on the same m_block_idx with n_block_idx differing by 1
@@ -63,7 +63,9 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE uint32_t get_wave_expert_end_idx() const {
-        return math::align(current_local_expert_idx + 1, kNumExpertsPerWave);
+        // Align up to wave boundary, clamped for the last partial wave
+        const auto aligned = math::align(current_local_expert_idx + 1, kNumExpertsPerWave);
+        return cute::min(aligned, kNumExpertsPerRank);
     }
 
     CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
