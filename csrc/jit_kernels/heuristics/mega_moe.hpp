@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -304,7 +306,47 @@ static bool get_sm90_moe_split_l1_l2_default() {
     return get_env<int>("DG_SM90_MOE_SPLIT_L1_L2", 1) != 0;
 }
 
+enum class Sm90MoeDeviceProfile {
+    Generic,
+    H20,
+    H200
+};
+
+static std::string get_sm90_moe_lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+static Sm90MoeDeviceProfile get_sm90_moe_device_profile() {
+    const auto forced = get_sm90_moe_lowercase(
+        get_env<std::string>("DG_SM90_MOE_DEVICE_PROFILE", ""));
+    if (not forced.empty() and forced != "auto") {
+        DG_HOST_ASSERT(forced == "generic" or forced == "h20" or forced == "h200");
+        if (forced == "h20")
+            return Sm90MoeDeviceProfile::H20;
+        if (forced == "h200")
+            return Sm90MoeDeviceProfile::H200;
+        return Sm90MoeDeviceProfile::Generic;
+    }
+
+    const auto device_name = get_sm90_moe_lowercase(device_runtime->get_prop()->name);
+    if (device_name.find("h200") != std::string::npos)
+        return Sm90MoeDeviceProfile::H200;
+    if (device_name.find("h20") != std::string::npos)
+        return Sm90MoeDeviceProfile::H20;
+    return Sm90MoeDeviceProfile::Generic;
+}
+
+struct Sm90MoeProfileConfig {
+    // A zero wave count means "use the generic SM-count based computation".
+    int num_experts_per_wave, num_stages;
+    bool direct_l2_scatter, l2_nmajor_schedule, one_warp_cleanup;
+};
+
 struct Sm90MoeHeuristicPolicy {
+    Sm90MoeDeviceProfile device_profile;
     bool split_l1_l2;
     int num_experts_per_rank, num_topk, intermediate_hidden;
     int block_m, block_n;
@@ -331,9 +373,111 @@ struct Sm90MoeHeuristicPolicy {
         return num_experts_per_rank == 48 and num_topk == 6 and intermediate_hidden == 3072;
     }
 
+    bool h20_main_topk8_profile_config(Sm90MoeProfileConfig& config,
+                                        const bool& direct_l2_scatter_enabled,
+                                        const bool& eplb_hint,
+                                        const bool& skew_hint,
+                                        const bool& masked_hint) const {
+        int wave_override = 0;
+        if (expected_tokens_per_expert == 8.0f or
+            expected_tokens_per_expert == 128.0f or
+            (expected_tokens_per_expert >= 256.0f and expected_tokens_per_expert < 512.0f)) {
+            wave_override = 16;
+        }
+
+        const bool direct_l2_scatter_enabled_by_profile =
+            expected_is_one_of(2, 4, 8, 16, 32, 64, 76, 80, 88, 128) or
+            expected_is_between(64.0f, 80.0f) or
+            expected_is_between(96.0f, 120.0f) or
+            expected_tokens_per_expert >= 144.0f;
+
+        const bool l2_nmajor_schedule_enabled = [&]() {
+            if (expected_tokens_per_expert == 256.0f and eplb_hint)
+                return false;
+            if (expected_tokens_per_expert >= 256.0f and skew_hint)
+                return false;
+            return expected_tokens_per_expert >= 256.0f;
+        }();
+
+        const bool one_warp_cleanup_enabled = expected_tokens_per_expert <= 80.0f;
+        const bool stage5_pipeline_enabled = [&]() {
+            if (not direct_l2_scatter_enabled)
+                return false;
+            const bool hinted_m64 =
+                (eplb_hint or skew_hint or masked_hint) and expected_tokens_per_expert == 64.0f;
+            return expected_is_one_of(2, 4, 16, 32, 128) or
+                   hinted_m64 or
+                   expected_tokens_per_expert >= 192.0f;
+        }();
+
+        config = {
+            wave_override,
+            stage5_pipeline_enabled ? 5 : 4,
+            direct_l2_scatter_enabled_by_profile,
+            l2_nmajor_schedule_enabled,
+            one_warp_cleanup_enabled
+        };
+        return true;
+    }
+
+    bool h200_main_topk8_profile_config(Sm90MoeProfileConfig& config) const {
+        // Calibrated from the H200 0601 sweep. Buckets are keyed by
+        // expected_tokens_per_expert = M * topk / experts_per_rank.
+        // The sweep labels include some requested `d0_s5` rows, but BN256 with
+        // direct L2 scatter disabled is capped at 4 stages by SM90 SMEM limits.
+        if (expected_tokens_per_expert <= 3.0f) {
+            config = {32, 4, true,  true,  false};
+        } else if (expected_tokens_per_expert <= 6.0f) {
+            config = {32, 4, false, true,  true};
+        } else if (expected_tokens_per_expert <= 12.0f) {
+            config = {32, 4, true,  false, true};
+        } else if (expected_tokens_per_expert <= 24.0f) {
+            config = {32, 4, false, true,  true};
+        } else if (expected_tokens_per_expert <= 48.0f) {
+            config = {32, 4, true,  false, true};
+        } else if (expected_tokens_per_expert <= 64.5f) {
+            config = {32, 4, false, true,  true};
+        } else if (expected_tokens_per_expert <= 160.0f) {
+            config = {32, 4, false, true,  false};
+        } else if (expected_tokens_per_expert <= 240.0f) {
+            config = {32, 4, false, true,  false};
+        } else if (expected_tokens_per_expert <= 384.0f) {
+            config = {16, 4, false, true,  false};
+        } else if (expected_tokens_per_expert <= 640.0f) {
+            config = {32, 4, false, true,  true};
+        } else if (expected_tokens_per_expert <= 896.0f) {
+            config = {32, 4, false, true,  false};
+        } else if (expected_tokens_per_expert <= 1536.0f) {
+            config = {32, 4, false, true,  true};
+        } else {
+            config = {32, 4, false, true,  false};
+        }
+        return true;
+    }
+
+    bool device_profile_config(Sm90MoeProfileConfig& config,
+                               const bool& direct_l2_scatter_enabled = false,
+                               const bool& eplb_hint = false,
+                               const bool& skew_hint = false,
+                               const bool& masked_hint = false) const {
+        if (not uses_split_bn256() or not is_main_topk8())
+            return false;
+
+        if (device_profile == Sm90MoeDeviceProfile::H20) {
+            return h20_main_topk8_profile_config(
+                config, direct_l2_scatter_enabled, eplb_hint, skew_hint, masked_hint);
+        }
+        if (device_profile == Sm90MoeDeviceProfile::H200)
+            return h200_main_topk8_profile_config(config);
+        return false;
+    }
+
     int experts_per_wave_override() const {
         if (not (block_m == 64 and block_n == 256))
             return 0;
+        Sm90MoeProfileConfig profile_config;
+        if (device_profile_config(profile_config))
+            return profile_config.num_experts_per_wave;
         if (is_hopper_topk6() and expected_tokens_per_expert >= 8.0f and expected_tokens_per_expert <= 32.0f)
             return 16;
         if (is_main_topk8() and expected_tokens_per_expert == 8.0f)
@@ -348,6 +492,9 @@ struct Sm90MoeHeuristicPolicy {
     bool direct_l2_scatter() const {
         if (not uses_split_bn256())
             return false;
+        Sm90MoeProfileConfig profile_config;
+        if (device_profile_config(profile_config))
+            return profile_config.direct_l2_scatter;
         if (is_main_topk8()) {
             return expected_is_one_of(2, 4, 8, 16, 32, 64, 76, 80, 88, 128) or
                    expected_is_between(64.0f, 80.0f) or
@@ -364,6 +511,9 @@ struct Sm90MoeHeuristicPolicy {
     bool l2_nmajor_schedule(const bool& eplb_hint, const bool& skew_hint) const {
         if (not uses_split_bn256() or not is_main_topk8())
             return false;
+        Sm90MoeProfileConfig profile_config;
+        if (device_profile_config(profile_config, false, eplb_hint, skew_hint))
+            return profile_config.l2_nmajor_schedule;
         if (expected_tokens_per_expert == 256.0f and eplb_hint)
             return false;
         if (expected_tokens_per_expert >= 256.0f and skew_hint)
@@ -374,6 +524,9 @@ struct Sm90MoeHeuristicPolicy {
     bool one_warp_cleanup(const bool& masked_hint) const {
         if (not uses_split_bn256())
             return false;
+        Sm90MoeProfileConfig profile_config;
+        if (device_profile_config(profile_config, false, false, false, masked_hint))
+            return profile_config.one_warp_cleanup;
         if (is_main_topk8() and expected_tokens_per_expert <= 80.0f)
             return true;
         if (is_hopper_topk6() and masked_hint and expected_tokens_per_expert == 64.0f)
@@ -385,6 +538,10 @@ struct Sm90MoeHeuristicPolicy {
                          const bool& eplb_hint,
                          const bool& skew_hint,
                          const bool& masked_hint) const {
+        Sm90MoeProfileConfig profile_config;
+        if (device_profile_config(
+                profile_config, direct_l2_scatter_enabled, eplb_hint, skew_hint, masked_hint))
+            return profile_config.num_stages == 5;
         if (not direct_l2_scatter_enabled)
             return false;
         if (is_main_topk8()) {
@@ -407,6 +564,7 @@ static Sm90MoeHeuristicPolicy get_sm90_moe_heuristic_policy(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n) {
     return {
+        get_sm90_moe_device_profile(),
         get_sm90_moe_split_l1_l2_default(),
         num_experts_per_rank,
         num_topk,
