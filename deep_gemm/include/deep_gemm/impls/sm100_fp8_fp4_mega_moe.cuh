@@ -559,8 +559,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
                 const uint32_t j = i * 32 + lane_idx;
-                if (j < kNumSFUint32)
-                    local_sf_ptr[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = remote_sf_ptr[j];
+                if (j < kNumSFUint32) {
+                    const uint64_t sf_offset =
+                        static_cast<uint64_t>(j) * kNumPaddedSFPoolTokens + sf_pool_token_idx;
+                    local_sf_ptr[sf_offset] = remote_sf_ptr[j];
+                }
             }
             __syncwarp();
 
@@ -1055,7 +1058,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (warp_idx_in_wg % 2 == 0 and lane_idx < 4) {
                             const uint32_t k_idx = n_block_idx * (BLOCK_N / kGranK / 2) + warp_idx_in_wg / 2;
                             const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
-                            const uint32_t mn_stride = kNumPaddedSFPoolTokens * sizeof(uint32_t);
+                            const uint64_t mn_stride = static_cast<uint64_t>(kNumPaddedSFPoolTokens) * sizeof(uint32_t);
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
                             // NOTES: consecutive tokens (t, t + 1) are in the same 32-group, so `sf_idx` differs by 4
                             // NOTES: originally there was:
@@ -1069,10 +1072,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             __builtin_assume(token_base_idx < BLOCK_M);
                             const auto sf_pool_token_idx = scheduler.get_current_pool_block_offset() * SF_BLOCK_M
                                 + m_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
-                            const auto sf_addr = k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
+                            const uint64_t sf_addr = static_cast<uint64_t>(k_uint_idx) * mn_stride +
+                                static_cast<uint64_t>(sf_pool_token_idx) * sizeof(uint32_t) + byte_idx;
                             sf_base_ptr[sf_addr] =
                                 (*reinterpret_cast<const uint32_t*>(&sf.x) >> 23);
-                            sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] =
+                            sf_base_ptr[sf_addr + 4ull * sizeof(uint32_t)] =
                                 (*reinterpret_cast<const uint32_t*>(&sf.y) >> 23);
                         }
                         __syncwarp();
