@@ -17,6 +17,9 @@ deep_gemm/include/cutlass
 /.clang*
 /.cache
 
+# Local Codex skills and agent configuration
+/.codex/
+
 # Generated stub files
 stubs/
 

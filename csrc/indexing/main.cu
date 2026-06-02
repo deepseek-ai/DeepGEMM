@@ -20,6 +20,7 @@
 // Hyperconnection kernels
 #include <deep_gemm/impls/sm90_tf32_hc_prenorm_gemm.cuh>
 #include <deep_gemm/impls/sm100_tf32_hc_prenorm_gemm.cuh>
+#include <deep_gemm/impls/sm120_tf32_hc_prenorm_gemm.cuh>
 
 // Layout kernels
 #include <deep_gemm/impls/smxx_layout.cuh>

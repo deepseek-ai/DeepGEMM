@@ -88,6 +88,11 @@ public:
     std::string get_arch(const bool& number_only = false,
                          const bool& support_arch_family = false) {
         const auto [major, minor] = get_arch_pair();
+        if (major == 12) {
+            if (number_only)
+                return "120";
+            return support_arch_family ? "120f" : "120";
+        }
         if (major == 10 and minor != 1) {
             if (number_only)
                 return "100";
