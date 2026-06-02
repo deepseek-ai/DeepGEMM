@@ -323,10 +323,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kSharedMemoryAlignment = 1024;
     extern __shared__ __align__(kSharedMemoryAlignment) uint8_t smem_buffer[];
 
-    constexpr uint32_t SMEM_EXPERT_COUNT_SIZE = MegaMoEPhase::needs_dispatch_pull ?
-        math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment) : 0u;
-    constexpr uint32_t SMEM_SEND_BUFFER_SIZE = MegaMoEPhase::needs_dispatch_pull ?
-        math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment) : 0u;
+    // Combine reuses the pre-barrier SMEM region, so split L2 keeps this
+    // dispatch scratch capacity even though it does not run dispatch pull.
+    constexpr uint32_t SMEM_EXPERT_COUNT_SIZE =
+        math::constexpr_align<uint32_t>(kNumExperts * sizeof(uint32_t), kSharedMemoryAlignment);
+    constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
+        math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // SFA per-stage must be sized for the larger of L1 (BLOCK_M floats) and L2
