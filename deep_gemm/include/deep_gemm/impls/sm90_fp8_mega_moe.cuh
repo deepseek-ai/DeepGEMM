@@ -51,33 +51,26 @@ namespace deep_gemm {
 // ============================================================================
 
 enum class MegaMoEPhaseKind {
-    Fused,
     Linear1,
     Linear2
 };
 
 template <MegaMoEPhaseKind kKind>
 struct MegaMoEPhasePolicy {
-    static constexpr bool is_fused = kKind == MegaMoEPhaseKind::Fused;
     static constexpr bool is_linear1_only = kKind == MegaMoEPhaseKind::Linear1;
     static constexpr bool is_linear2_only = kKind == MegaMoEPhaseKind::Linear2;
-    static constexpr bool runs_linear1 = is_fused or is_linear1_only;
-    static constexpr bool runs_linear2 = is_fused or is_linear2_only;
+    static constexpr bool runs_linear1 = is_linear1_only;
+    static constexpr bool runs_linear2 = is_linear2_only;
     static constexpr bool needs_dispatch_pull = runs_linear1;
     static constexpr bool needs_combine = runs_linear2;
-    static constexpr bool signals_l1_ready = is_fused;
-    static constexpr bool waits_for_l2_arrival_mask = is_fused;
-    static constexpr bool cleans_l1_dispatch_state = is_fused;
 
     CUTLASS_DEVICE static bool is_linear1_phase(const sched::BlockPhase& block_phase) {
         if constexpr (is_linear1_only) {
             (void)block_phase;
             return true;
-        } else if constexpr (is_linear2_only) {
+        } else {
             (void)block_phase;
             return false;
-        } else {
-            return block_phase == sched::BlockPhase::Linear1;
         }
     }
 
@@ -90,20 +83,17 @@ struct MegaMoEPhasePolicy {
                     func(sched::BlockPhase::Linear1, local_expert_idx,
                          num_k_blocks, m_block_idx, n_block_idx);
                 });
-        } else if constexpr (is_linear2_only) {
+        } else {
             scheduler.template for_each_phase_block<sched::BlockPhase::Linear2>(
                 [&](const uint32_t& local_expert_idx, const uint32_t& num_k_blocks,
                     const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
                     func(sched::BlockPhase::Linear2, local_expert_idx,
                          num_k_blocks, m_block_idx, n_block_idx);
                 });
-        } else {
-            scheduler.for_each_block(func);
         }
     }
 };
 
-using MegaMoEFusedPhase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Fused>;
 using MegaMoELinear1Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear1>;
 using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
 
@@ -557,34 +547,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
                 }
 
-                if constexpr (MegaMoEPhase::cleans_l1_dispatch_state) {
-                    if constexpr (kOneWarpCleanupRequested) {
-                        if (warp_idx == 0) {
-                            for (uint32_t j = lane_idx; j < kNumRanks; j += 32)
-                                *workspace.get_expert_recv_count_ptr(j, i) = 0;
-                            __syncwarp();
-                        }
-                    } else {
-                        for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
-                            *workspace.get_expert_recv_count_ptr(j, i) = 0;
-                        __syncwarp();
-                    }
-                }
-
                 if constexpr (kOneWarpCleanupRequested) {
                     if (warp_idx == 0) {
                         for (uint32_t j = lane_idx; j < num_recv_m_blocks; j += 32) {
                             *workspace.get_l1_arrival_count_ptr(cleanup_pool_block_offset + j) = 0;
-                            if constexpr (MegaMoEPhase::cleans_l1_dispatch_state)
-                                *workspace.get_l2_arrival_mask_ptr(cleanup_pool_block_offset + j) = 0;
                         }
                         __syncwarp();
                     }
                 } else {
                     for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
                         *workspace.get_l1_arrival_count_ptr(cleanup_pool_block_offset + j) = 0;
-                        if constexpr (MegaMoEPhase::cleans_l1_dispatch_state)
-                            *workspace.get_l2_arrival_mask_ptr(cleanup_pool_block_offset + j) = 0;
                     }
                     __syncwarp();
                 }
@@ -878,13 +850,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                     const auto expected = valid_m;
                     while (ptx::ld_acq(ptr) != expected);
-                } else if constexpr (MegaMoEPhase::waits_for_l2_arrival_mask) {
-                    const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                    // Each L1 N block sets one bit; total bits = L1_SHAPE_N / BLOCK_N.
-                    constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-                    const uint64_t expected = (kNumL1BlockNs >= 64)
-                        ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
-                    while (ptx::ld_acq_gpu(ptr) != expected);
                 }
             }
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -987,12 +952,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                     const auto expected = valid_m;
                     while (ptx::ld_acq(ptr) != expected);
-                } else if constexpr (MegaMoEPhase::waits_for_l2_arrival_mask) {
-                    const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                    constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-                    const uint64_t expected = (kNumL1BlockNs >= 64)
-                        ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
-                    while (ptx::ld_acq_gpu(ptr) != expected);
                 }
             }
 
@@ -1045,8 +1004,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
         uint32_t async_l1_store_stage = 0;
         bool async_l1_store_pending[2] = {false, false};
-        uint32_t async_l1_store_pool[2] = {0, 0};
-        uint32_t async_l1_store_n[2] = {0, 0};
 
         const auto arrive_empty_barrier = [&](const uint32_t& s) {
             if constexpr (kClusterSize == 1) {
@@ -1058,21 +1015,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             }
         };
 
-        const auto notify_l1_ready = [&](const uint32_t& ready_pool_block_idx,
-                                         const uint32_t& ready_n_block_idx) {
-            if constexpr (MegaMoEPhase::signals_l1_ready) {
-                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                    ptx::red_or_rel_gpu(
-                        workspace.get_l2_arrival_mask_ptr(ready_pool_block_idx),
-                        1ull << ready_n_block_idx);
-                }
-                __syncwarp();
-            } else {
-                (void)ready_pool_block_idx;
-                (void)ready_n_block_idx;
-            }
-        };
-
         const auto drain_async_l1_store_stage = [&](const uint32_t& store_stage) {
             if constexpr (kAsyncL1TMAStore) {
                 if (async_l1_store_pending[store_stage]) {
@@ -1080,8 +1022,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     // for <=1 outstanding store makes the older buffer reusable.
                     ptx::tma_store_wait<1>();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    notify_l1_ready(async_l1_store_pool[store_stage],
-                                    async_l1_store_n[store_stage]);
                     async_l1_store_pending[store_stage] = false;
                 }
             }
@@ -1092,14 +1032,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 if (async_l1_store_pending[0] or async_l1_store_pending[1]) {
                     ptx::tma_store_wait<0>();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    if (async_l1_store_pending[0]) {
-                        notify_l1_ready(async_l1_store_pool[0], async_l1_store_n[0]);
-                        async_l1_store_pending[0] = false;
-                    }
-                    if (async_l1_store_pending[1]) {
-                        notify_l1_ready(async_l1_store_pool[1], async_l1_store_n[1]);
-                        async_l1_store_pending[1] = false;
-                    }
+                    async_l1_store_pending[0] = false;
+                    async_l1_store_pending[1] = false;
                 }
             }
         };
@@ -1639,7 +1573,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     __syncwarp();
                     ptx::tma_store_wait<0>();
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    notify_l1_ready(pool_block_idx, n_block_idx);
                 } else {
                     constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
                     #pragma unroll
@@ -2228,15 +2161,9 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                     if constexpr (kAsyncL1TMAStore) {
                         ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                         async_l1_store_pending[l1_store_stage] = true;
-                        async_l1_store_pool[l1_store_stage] = pool_block_idx;
-                        async_l1_store_n[l1_store_stage] = n_block_idx;
                         async_l1_store_stage ^= 1u;
                     } else {
                         ptx::tma_store_wait<0>();
-                        if constexpr (MegaMoEPhase::signals_l1_ready) {
-                            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                            notify_l1_ready(pool_block_idx, n_block_idx);
-                        }
                     }
                 } else {
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
@@ -2254,15 +2181,9 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                     if constexpr (kAsyncL1TMAStore) {
                         ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                         async_l1_store_pending[l1_store_stage] = true;
-                        async_l1_store_pool[l1_store_stage] = pool_block_idx;
-                        async_l1_store_n[l1_store_stage] = n_block_idx;
                         async_l1_store_stage ^= 1u;
                     } else {
                         ptx::tma_store_wait<0>();
-                        if constexpr (MegaMoEPhase::signals_l1_ready) {
-                            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                            notify_l1_ready(pool_block_idx, n_block_idx);
-                        }
                     }
                 }
                 const unsigned long long block_epilogue_end = phase_profile_clock();
@@ -2557,13 +2478,6 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only supports sm_90");
 #endif
-}
-
-template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
-CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
-sm90_fp8_mega_moe_impl(DG_SM90_FP8_MOE_KERNEL_ARGS_DECL) {
-    sm90_fp8_mega_moe_core<DG_SM90_FP8_MOE_CORE_TEMPLATE_ARGS(MegaMoEFusedPhase)>(
-        DG_SM90_FP8_MOE_KERNEL_ARGS);
 }
 
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>

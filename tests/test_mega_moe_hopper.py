@@ -1,16 +1,17 @@
 """
-H200 (SM90 / Hopper) mega-MoE: fused kernel + 同管线 baseline 性能对比。
+H200 (SM90 / Hopper) mega-MoE: split L1/L2 kernel + 同管线 baseline 性能对比。
 
 结构对齐 tests/test_mega_moe.py（B 系列 SM100 FP4 路径），但所有路径都换成 H200 FP8：
-  * fused：调用 `deep_gemm.fp8_mega_moe`（kernel symbol `sm90_fp8_mega_moe_impl`），
+  * split SM90：调用 `deep_gemm.fp8_mega_moe`
+              （kernel symbols `sm90_fp8_mega_moe_l1_impl` + `sm90_fp8_mega_moe_l2_impl`），
            使用 `transform_weights_for_mega_moe_sm90` 处理过的权重 + SymmBuffer。
   * baseline：DeepEP dispatch + 2 个 grouped FP8 GEMM + Triton SwiGLU + DeepEP combine，
               使用未变换的权重。由于当前 SM90 grouped GEMM 只支持 L2 activation
-              per-128-K SFA，而 fused SM90 mega-MoE 的 L1 epilogue 为避免跨 CTA
+              per-128-K SFA，而 SM90 split mega-MoE 的 L1 epilogue 为避免跨 CTA
               同步使用 per-64-K SFA，所以该 baseline 是同管线 legacy 参照，
               不是 bitwise apples-to-apples correctness oracle。
-  * 性能输出涵盖：TFLOPS / overlap TFLOPS / HBM GB/s / NVL GB/s / fused us /
-                  reduction us / `t_baseline / t_fused` legacy 比。
+  * 性能输出涵盖：TFLOPS / overlap TFLOPS / HBM GB/s / NVL GB/s / SM90 us /
+                  reduction us / `t_baseline / t_sm90` legacy 比。
 """
 
 import argparse
@@ -37,10 +38,9 @@ except Exception as ex:
 
 
 # 与 deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh 中模板入口前缀同名，
-# bench_kineto 用它从 trace 里汇总 fused 或 split mega-MoE 的 GPU 段
+# bench_kineto 用它从 trace 里汇总 split mega-MoE 的 L1/L2 GPU 段
 SM90_KERNEL_NAME_PREFIX = "sm90_fp8_mega_moe"
-SPLIT_VS_ONE_MAX_ABS_REL_TOL = 1e-4
-FUSED_VS_LEGACY_MEAN_ABS_REL_TOL = 7e-2
+SM90_VS_LEGACY_MEAN_ABS_REL_TOL = 7e-2
 
 
 # FP8 e4m3fn 的最大可表示值，量化时用 amax / 448 作为 scale 基准
@@ -49,7 +49,7 @@ FP8_E4M3_MAX = 448.0
 # 否则编译期 NameError。宿主 Python 侧仍用上面的普通 float 做 torch 运算。
 _FP8_E4M3_MAX_TL = tl.constexpr(448.0)
 L1_ACT_SF_GRAN = 128
-FUSED_L2_ACT_SF_GRAN = 64
+SM90_L2_ACT_SF_GRAN = 64
 BASELINE_L2_ACT_SF_GRAN = 128
 WEIGHT_SF_GRAN_MN = 128
 WEIGHT_SF_GRAN_K = 128
@@ -59,7 +59,7 @@ WEIGHT_SF_GRAN_K = 128
 # 模块 1：Triton SwiGLU + FP8 量化内核
 # ----------------------------------------------------------------------------
 # baseline 的 L2 仍走 DeepGEMM SM90 grouped FP8 GEMM，所以 activation SFA 只能按
-# per-128-K 输入；但 scale 数值采用 fused epilogue 同款 UE8M0/power-of-two 规则，
+# per-128-K 输入；但 scale 数值采用 SM90 epilogue 同款 UE8M0/power-of-two 规则，
 # 避免再额外引入 exact-FP32-scale 差异。
 # 输入  x        : (M, 2*H) bf16，内层是 [gate_part | up_part]
 # 输入  topk_w   : (M,)     fp32，可选
@@ -377,13 +377,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         f"num_experts={num_experts} 必须能被 num_ranks={num_ranks} 整除"
     )
 
-    # SM90 fused kernel 的形状约束（来自 csrc/apis/mega.hpp::fp8_mega_moe）：
+    # SM90 mega-MoE kernel 的形状约束（来自 csrc/apis/mega.hpp::fp8_mega_moe）：
     #   * H、IH 必须是 128 的倍数（L1 input per-128-K SF + block-(128,128) weight SF）
     #   * IH/64 ≤ 64 → IH ≤ 4096（l2_arrival_mask 是 uint64，每 bit 对应 64 列）
     assert hidden % 128 == 0
     assert intermediate_hidden % 128 == 0
     assert intermediate_hidden // 64 <= 64, (
-        f"SM90 fused kernel 要求 intermediate_hidden <= 4096, 当前 {intermediate_hidden}"
+        f"SM90 mega-MoE kernel 要求 intermediate_hidden <= 4096, 当前 {intermediate_hidden}"
     )
 
     # ---- 创建 BF16 输入：token 与两层 weight ----
@@ -918,13 +918,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
         topk_weights.masked_fill_(topk_idx < 0, 0)
 
-    # 累计接收统计：fused 与 baseline 各持一份避免相互覆盖
+    # 累计接收统计：SM90 与 baseline 各持一份避免相互覆盖
     phase_profile_enabled = os.environ.get("DG_SM90_MOE_PHASE_PROFILE", "0") not in ("", "0")
     phase_profile_extra = 64 if phase_profile_enabled else 0
-    cum_stats_fused = torch.zeros(
+    cum_stats_sm90 = torch.zeros(
         (num_experts_per_rank + phase_profile_extra,), dtype=torch.int, device="cuda"
     )
-    cum_stats_baseline = cum_stats_fused.clone()
+    cum_stats_baseline = cum_stats_sm90.clone()
 
     # ---- BF16 → FP8 量化 ----
     # x_fp8 是元组：(token_fp8 (M, hidden), token_sf (M, hidden//128) fp32 行主序)
@@ -938,12 +938,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     l1_weights = _quantize_grouped_fp8_block_128_128(l1_weights_bf16)
     l2_weights = _quantize_grouped_fp8_block_128_128(l2_weights_bf16)
 
-    # fused 路径：FP8 weight 上做 gate/up gran-8 N-轴 interleave；SF 不变
+    # SM90 路径：FP8 weight 上做 gate/up gran-8 N-轴 interleave；SF 不变
     transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
         l1_weights, l2_weights
     )
 
-    # SwiGLU clamp：finite → 传给 fused/triton；inf → None（关闭 clamp，与 SM90 fused 一致）
+    # SwiGLU clamp：finite -> 传给 SM90/triton；inf -> None（关闭 clamp，与 SM90 一致）
     clamp_arg = args.activation_clamp if math.isfinite(args.activation_clamp) else None
     run_baseline_enabled = args.run_baseline or bool(args.check_output_diff)
 
@@ -951,7 +951,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
 
-    # ---- 分配 fused 的 SymmBuffer 与输出 buffer ----
+    # ---- 分配 SM90 的 SymmBuffer 与输出 buffer ----
     sym_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group,
         num_experts,
@@ -960,12 +960,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         hidden,
         intermediate_hidden,
     )
-    y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    y_sm90 = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     use_eplb_hint = bool(eplb_replica_for)
     use_skew_hint = args.score_powerlaw_alpha > 0.0
     use_masked_hint = args.masked_ratio > 0.0
 
-    def run_fused():
+    def run_sm90():
         # NOTE: 跟 SM100 test_mega_moe.py 的处理一致 —— DG_COMM_KERNEL_DEBUG=1 时
         # kernel 出口会把 sym_buffer 整块清零，所以每次都要重新拷输入
         sym_buffer.x[:num_tokens].copy_(x_fp8[0])
@@ -984,11 +984,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             os.environ["DG_SM90_MOE_MASKED_HINT"] = "1"
         try:
             deep_gemm.fp8_mega_moe(
-                y_fused,
+                y_sm90,
                 transformed_l1,
                 transformed_l2,
                 sym_buffer,
-                cumulative_local_expert_recv_stats=cum_stats_fused,
+                cumulative_local_expert_recv_stats=cum_stats_sm90,
                 recipe=(128, 128, 128),
                 activation="swiglu",
                 activation_clamp=clamp_arg,
@@ -1010,10 +1010,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     os.environ.pop("DG_SM90_MOE_MASKED_HINT", None)
                 else:
                     os.environ["DG_SM90_MOE_MASKED_HINT"] = old_masked_hint
-        return y_fused
+        return y_sm90
 
     # ---- 打印 config ----
-    dist_print("Config (H200 fused mega-MoE):", once_in_node=True)
+    dist_print("Config (H200 split SM90 mega-MoE):", once_in_node=True)
     dist_print(f" > Tokens: {num_tokens}/{num_max_tokens_per_rank}", once_in_node=True)
     dist_print(
         f" > Hidden: {hidden}, Intermediate: {intermediate_hidden}", once_in_node=True
@@ -1024,7 +1024,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     dist_print(f" > Masked ratio: {args.masked_ratio}", once_in_node=True)
     dist_print(
-        f" > Activation SF: fused L2 per-{FUSED_L2_ACT_SF_GRAN} UE8M0, "
+        f" > Activation SF: SM90 L2 per-{SM90_L2_ACT_SF_GRAN} UE8M0, "
         f"baseline L2 per-{BASELINE_L2_ACT_SF_GRAN} UE8M0 "
         f"(SM90 grouped GEMM constraint)",
         once_in_node=True,
@@ -1038,10 +1038,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     dist_print(once_in_node=True)
 
-    # 与社区版 test_mega_moe.py 对齐：NCU 模式只跑 fused kernel，避免 baseline 噪声。
+    # 与社区版 test_mega_moe.py 对齐：NCU 模式只跑 SM90 mega-MoE kernel，避免 baseline 噪声。
     if args.ncu_profile_only:
-        dist_print("Run fused SM90 mega-MoE kernel:", once_in_node=True)
-        y = run_fused()
+        dist_print("Run split SM90 mega-MoE kernel:", once_in_node=True)
+        y = run_sm90()
         torch.cuda.synchronize()
         assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16
         dist_print(" > Done, exiting", once_in_node=True)
@@ -1065,7 +1065,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # ----------------------------------------------------------------
     # baseline 主体：dispatch → L1 GEMM → SwiGLU+量化 → L2 GEMM → combine
-    # 与 fused 用同一份 (FP8 weight, FP32 block-(128,128) SF) —— 但是 **未变换**
+    # 与 SM90 用同一份 (FP8 weight, FP32 block-(128,128) SF) —— 但是 **未变换**
     # 的版本（baseline grouped GEMM 不需要 gate/up interleave）
     # ----------------------------------------------------------------
     def run_baseline():
@@ -1097,9 +1097,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
 
         # Triton SwiGLU + FP8 量化（含 topk 权重乘法）
-        # 注意：fused SM90 mega-MoE 的 L2 activation SFA 是 per-64-K；
+        # 注意：SM90 split mega-MoE 的 L2 activation SFA 是 per-64-K；
         # 当前 DeepGEMM SM90 grouped GEMM 只支持 per-128-K SFA，所以性能 baseline
-        # 只能用 per-128-K，但 scale 数值采用 fused 同款 UE8M0/power-of-two。
+        # 只能用 per-128-K，但 scale 数值采用 SM90 同款 UE8M0/power-of-two。
         l1_y = swiglu_apply_weight_to_fp8_triton(
             x=l1_y,
             topk_weights=recv_topk_weights,
@@ -1122,47 +1122,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # DeepEP combine：把每个 token 在 topk 个 expert 上的输出汇聚回源 rank
         return ep_buffer.combine(l2_y, handle=handle)[0]
 
-    # ---- 跑一次确保不报错（fused + 可选 baseline）----
-    y = run_fused()
+    # ---- 跑一次确保不报错（SM90 split + 可选 baseline）----
+    y = run_sm90()
     assert y.shape == (num_tokens, hidden) and y.dtype == torch.bfloat16, (
-        f"fused 输出 shape/dtype 异常: shape={y.shape}, dtype={y.dtype}"
+        f"SM90 split 输出 shape/dtype 异常: shape={y.shape}, dtype={y.dtype}"
     )
-    if args.check_split_vs_one_kernel:
-        old_split_env = os.environ.get("DG_SM90_MOE_SPLIT_L1_L2")
-        try:
-            os.environ["DG_SM90_MOE_SPLIT_L1_L2"] = "1"
-            y_split = run_fused().detach().clone()
-            torch.cuda.synchronize()
-            os.environ["DG_SM90_MOE_SPLIT_L1_L2"] = "0"
-            y_one_kernel = run_fused().detach().clone()
-            torch.cuda.synchronize()
-        finally:
-            if old_split_env is None:
-                os.environ.pop("DG_SM90_MOE_SPLIT_L1_L2", None)
-            else:
-                os.environ["DG_SM90_MOE_SPLIT_L1_L2"] = old_split_env
-        diff = (y_split.float() - y_one_kernel.float()).abs()
-        denom = y_one_kernel.float().abs().mean().clamp_min(1e-12)
-        max_abs = diff.max()
-        mean_abs_rel = diff.mean().div(denom)
-        max_abs_threshold = denom * SPLIT_VS_ONE_MAX_ABS_REL_TOL
-        dist_print(
-            "Output diff (split two-kernel vs one-kernel):", once_in_node=True
-        )
-        dist_print(
-            f" > max_abs={max_abs.item():.6e}, "
-            f"mean_abs={diff.mean().item():.6e}, "
-            f"mean_abs/mean_ref={mean_abs_rel.item():.6e}, "
-            f"max_abs_threshold={max_abs_threshold.item():.6e}",
-            once_in_node=True,
-        )
-        dist_print(once_in_node=True)
-        assert max_abs <= max_abs_threshold, (
-            "split two-kernel output differs from one-kernel output: "
-            f"max_abs={max_abs.item():.6e}, "
-            f"threshold={max_abs_threshold.item():.6e}, "
-            f"mean_ref={denom.item():.6e}"
-        )
     if ep_buffer is not None:
         out_b = run_baseline()
         assert out_b.shape == (num_tokens, hidden) and out_b.dtype == torch.bfloat16, (
@@ -1173,20 +1137,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             denom = out_b.float().abs().mean().clamp_min(1e-12)
             mean_abs_rel = diff.mean().div(denom)
             dist_print(
-                "Output diff (fused vs legacy-per128 baseline):", once_in_node=True
+                "Output diff (SM90 split vs legacy-per128 baseline):", once_in_node=True
             )
             dist_print(
                 f" > max_abs={diff.max().item():.6e}, "
                 f"mean_abs={diff.mean().item():.6e}, "
                 f"mean_abs/mean_ref={mean_abs_rel.item():.6e}, "
-                f"threshold={FUSED_VS_LEGACY_MEAN_ABS_REL_TOL:.6e}",
+                f"threshold={SM90_VS_LEGACY_MEAN_ABS_REL_TOL:.6e}",
                 once_in_node=True,
             )
             dist_print(once_in_node=True)
-            assert mean_abs_rel <= FUSED_VS_LEGACY_MEAN_ABS_REL_TOL, (
-                "fused output differs from legacy-per128 baseline: "
+            assert mean_abs_rel <= SM90_VS_LEGACY_MEAN_ABS_REL_TOL, (
+                "SM90 split output differs from legacy-per128 baseline: "
                 f"mean_abs/mean_ref={mean_abs_rel.item():.6e}, "
-                f"threshold={FUSED_VS_LEGACY_MEAN_ABS_REL_TOL:.6e}"
+                f"threshold={SM90_VS_LEGACY_MEAN_ABS_REL_TOL:.6e}"
             )
 
     # ---- 统计本 rank 实际接收的 token 数与触达的 expert 数 ----
@@ -1226,11 +1190,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         max_expert_tokens = 0
 
     # ---- benchmark ----
-    # fused：bench_kineto 抓 sm90_fp8_mega_moe* 的 GPU 段（不含 host overhead）
+    # split SM90：bench_kineto 抓 sm90_fp8_mega_moe* 的 GPU 段（不含 host overhead）
     if phase_profile_enabled:
-        cum_stats_fused.zero_()
-    t_fused = bench_kineto(
-        run_fused,
+        cum_stats_sm90.zero_()
+    t_sm90 = bench_kineto(
+        run_sm90,
         SM90_KERNEL_NAME_PREFIX,
         num_tests=args.num_bench_tests,
         barrier=lambda: ep_buffer.barrier(use_comm_stream=False)
@@ -1241,13 +1205,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             if args.dump_profile_traces
             else None
         ),
-        with_multiple_kernels=os.environ.get(
-            "DG_SM90_MOE_SPLIT_L1_L2",
-            "1",
-        ) != "0",
+        with_multiple_kernels=True,
     )
     if phase_profile_enabled:
-        cum_stats_fused.zero_()
+        cum_stats_sm90.zero_()
         torch.cuda.synchronize()
         if ep_buffer is not None:
             ep_buffer.barrier(use_comm_stream=False)
@@ -1256,11 +1217,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         phase_start = torch.cuda.Event(enable_timing=True)
         phase_end = torch.cuda.Event(enable_timing=True)
         phase_start.record()
-        run_fused()
+        run_sm90()
         phase_end.record()
         torch.cuda.synchronize()
         phase_event_us = phase_start.elapsed_time(phase_end) * 1000.0
-        raw_i32 = cum_stats_fused[num_experts_per_rank:num_experts_per_rank + phase_profile_extra].detach().cpu().tolist()
+        raw_i32 = cum_stats_sm90[num_experts_per_rank:num_experts_per_rank + phase_profile_extra].detach().cpu().tolist()
         def _u64(slot: int) -> int:
             lo = raw_i32[slot * 2] & 0xffffffff
             hi = raw_i32[slot * 2 + 1] & 0xffffffff
@@ -1302,7 +1263,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # 端到端 TFLOPS：3 个 matmul（L1 gate、L1 up、L2），每个 2*M*N*K，M=num_recv_tokens
     tflops = safe_div(
-        2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused
+        2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_sm90
     )
 
     # HBM 字节估算（SM90: weight 是 FP8 = 1B/elem，与 SM100 FP4=0.5B 不同）
@@ -1322,7 +1283,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     l1_input_sf_bytes = num_recv_tokens * (hidden // L1_ACT_SF_GRAN) * 4
     l2_act_sf_bytes = (
-        num_recv_tokens * (intermediate_hidden // FUSED_L2_ACT_SF_GRAN) * 4
+        num_recv_tokens * (intermediate_hidden // SM90_L2_ACT_SF_GRAN) * 4
     )
     num_hbm_bytes = (
         l1_weight_bytes
@@ -1337,17 +1298,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         + l2_act_sf_bytes  # L2 输入读 (FP8 + SF)
         + num_recv_tokens * hidden * 2  # L2 输出写 (BF16)
     )
-    hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
+    hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_sm90)
 
     # NVLink 字节：dispatch 拉 token + input SF + topk weight，combine 写回 BF16
     num_nvlink_bytes = num_recv_tokens * (hidden + hidden // 32 + 4 + hidden * 2)
-    nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_fused)
+    nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, t_sm90)
 
     # combine reduction 串行下界（解析估计；6.5e12 = HBM 串行 reduction 经验吞吐 B/s）
     t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
 
-    # overlap 校正：扣掉 fused 中无法重叠的串行 reduction 段后估计稳态吞吐
-    approx_factor = t_fused / max(t_fused - t_reduction, 1e-12)
+    # overlap 校正：扣掉 SM90 中无法重叠的串行 reduction 段后估计稳态吞吐
+    approx_factor = t_sm90 / max(t_sm90 - t_reduction, 1e-12)
 
     # baseline 用同一份 FLOPs / HBM 字节，时间换成 t_baseline
     tflops_baseline = safe_div(
@@ -1367,7 +1328,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     ) -> str:
         reduction = f"{reduction_us:13.1f}" if reduction_us is not None else f"{'-':>13}"
         speedup_text = (
-            f"{speedup:6.2f}x {'fused faster' if speedup > 1 else 'baseline faster'}"
+            f"{speedup:6.2f}x {'SM90 faster' if speedup > 1 else 'baseline faster'}"
             if speedup is not None else
             f"{'-':>21}"
         )
@@ -1391,8 +1352,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     )
     dist_print(
         fmt_perf_line(
-            "[fused]",
-            t_fused,
+            "[sm90]",
+            t_sm90,
             tflops * approx_factor,
             hbm_gbs * approx_factor,
             nvlink_gbs * approx_factor,
@@ -1400,7 +1361,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         )
     )
     if ep_buffer is not None:
-        speedup = safe_div(t_baseline, t_fused)
+        speedup = safe_div(t_baseline, t_sm90)
         dist_print(
             fmt_perf_line(
                 "[baseline]",
@@ -1433,14 +1394,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="H200 mega-MoE: fused (deep_gemm.fp8_mega_moe) vs DeepEP+grouped-FP8 baseline"
+        description="H200 mega-MoE: split SM90 deep_gemm.fp8_mega_moe vs DeepEP+grouped-FP8 baseline"
     )
 
     # 资源
     parser.add_argument(
         "--ncu-profile-only",
         action="store_true",
-        help="只运行一次 fused SM90 kernel，便于 NCU/Nsight 采样",
+        help="只运行一次 split SM90 kernel，便于 NCU/Nsight 采样",
     )
     parser.add_argument(
         "--num-processes", type=int, default=8, help="spawn 出来的进程数（一卡一进程）"
@@ -1453,7 +1414,7 @@ if __name__ == "__main__":
     )
 
     # 模型形状
-    # 注：SM90 fused kernel 要求 intermediate_hidden ≤ 4096
+    # 注：SM90 mega-MoE kernel 要求 intermediate_hidden <= 4096
     parser.add_argument("--num-max-tokens-per-rank", type=int, default=8192)
     parser.add_argument(
         "--num-tokens",
@@ -1535,7 +1496,7 @@ if __name__ == "__main__":
         "--fast-math",
         type=int,
         default=1,
-        help="fused 内 SwiGLU 是否启用 fast-math（0/1）",
+        help="SM90 kernel 内 SwiGLU 是否启用 fast-math（0/1）",
     )
 
     # 测时
@@ -1543,7 +1504,7 @@ if __name__ == "__main__":
         "--num-bench-tests",
         type=int,
         default=30,
-        help="bench_kineto 抓 fused 时的迭代数",
+        help="bench_kineto 抓 SM90 split kernel 时的迭代数",
     )
     parser.add_argument(
         "--num-warmup", type=int, default=5, help="baseline cuda events warmup"
@@ -1566,19 +1527,13 @@ if __name__ == "__main__":
         "--check-output-diff",
         type=int,
         default=0,
-        help="非 0 时打印 fused 与 legacy-per128 baseline 的输出差异（预期非 bitwise）",
-    )
-    parser.add_argument(
-        "--check-split-vs-one-kernel",
-        type=int,
-        default=0,
-        help="非 0 时打印 split two-kernel 与 one-kernel fused 的输出差异",
+        help="非 0 时打印 SM90 split 与 legacy-per128 baseline 的输出差异（预期非 bitwise）",
     )
     parser.add_argument(
         "--dump-profile-traces",
         type=str,
         default="",
-        help="非空时把 fused 的 Chrome trace 写到该目录（每 rank 一份）",
+        help="非空时把 SM90 split kernel 的 Chrome trace 写到该目录（每 rank 一份）",
     )
 
     args = parser.parse_args()

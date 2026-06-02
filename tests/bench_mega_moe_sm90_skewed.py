@@ -112,7 +112,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
     cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
     use_skew_hint = args.skew_alpha > 0.0
 
-    def run_fused():
+    def run_sm90():
         buffer.x[:num_tokens].copy_(x_fp8)
         buffer.x_sf[:num_tokens].copy_(x_sf)
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
@@ -138,14 +138,13 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
                     os.environ['DG_SM90_MOE_SKEW_HINT'] = old_skew_hint
         return y
 
-    run_fused()
+    run_sm90()
     dist.barrier()
-    t_fused = bench_kineto(run_fused, 'sm90_fp8_mega_moe',
-                           barrier=lambda: dist.barrier(),
-                           num_tests=args.num_tests,
-                           suppress_kineto_output=True,
-                           with_multiple_kernels=os.environ.get(
-                               'DG_SM90_MOE_SPLIT_L1_L2', '1') != '0')
+    t_sm90 = bench_kineto(run_sm90, 'sm90_fp8_mega_moe',
+                          barrier=lambda: dist.barrier(),
+                          num_tests=args.num_tests,
+                          suppress_kineto_output=True,
+                          with_multiple_kernels=True)
 
     # Local expert count distribution
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -174,7 +173,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         nonzero = 0
 
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
-    tflops = safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused)
+    tflops = safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_sm90)
     num_hbm_bytes = (
         num_touched_experts * intermediate_hidden * 2 * hidden +
         num_touched_experts * hidden * intermediate_hidden +
@@ -183,12 +182,12 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         num_recv_tokens * intermediate_hidden +
         num_recv_tokens * hidden * 2
     )
-    hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
+    hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_sm90)
 
     dist_print(
         f' tokens={num_tokens:5d}  recv={num_recv_tokens:6d}  nz_exp={nonzero:3d}/{num_experts_per_rank}  '
         f'max/mean={skew_max_mean:.2f}  '
-        f'{t_fused * 1e6:7.1f} us  {tflops:6.1f} TFLOPS  {hbm_gbs:6.0f} GB/s  (rank{rank_idx})',
+        f'{t_sm90 * 1e6:7.1f} us  {tflops:6.1f} TFLOPS  {hbm_gbs:6.0f} GB/s  (rank{rank_idx})',
         once_in_node=True,
     )
 

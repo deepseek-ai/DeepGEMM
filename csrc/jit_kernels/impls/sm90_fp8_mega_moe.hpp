@@ -32,7 +32,6 @@ namespace deep_gemm {
 class SM90FP8MegaMoERuntime final : public LaunchRuntime<SM90FP8MegaMoERuntime> {
 public:
     enum class KernelPhase {
-        Fused,
         Linear1,
         Linear2
     };
@@ -82,7 +81,7 @@ public:
 
     static std::string generate_impl(const Args& args) {
         const char* kernel_symbol = args.kernel_phase == KernelPhase::Linear1 ? "sm90_fp8_mega_moe_l1_impl" :
-            (args.kernel_phase == KernelPhase::Linear2 ? "sm90_fp8_mega_moe_l2_impl" : "sm90_fp8_mega_moe_impl");
+            "sm90_fp8_mega_moe_l2_impl";
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
@@ -258,7 +257,7 @@ static void sm90_fp8_mega_moe(
         .l2_nmajor_schedule = config.l2_nmajor_schedule,
         .l1_nmajor_schedule = get_env<int>("DG_SM90_MOE_L1_NMAJOR", 0) != 0,
         .one_warp_cleanup = config.one_warp_cleanup,
-        .kernel_phase = SM90FP8MegaMoERuntime::KernelPhase::Fused,
+        .kernel_phase = SM90FP8MegaMoERuntime::KernelPhase::Linear1,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -285,13 +284,8 @@ static void sm90_fp8_mega_moe(
         SM90FP8MegaMoERuntime::launch(runtime, split_args);
     };
 
-    const bool split_l1_l2 = get_env<int>("DG_SM90_MOE_SPLIT_L1_L2", 1) != 0;
-    if (split_l1_l2) {
-        launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Linear1, "sm90_fp8_mega_moe_l1_impl");
-        launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Linear2, "sm90_fp8_mega_moe_l2_impl");
-    } else {
-        launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Fused, "sm90_fp8_mega_moe_impl");
-    }
+    launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Linear1, "sm90_fp8_mega_moe_l1_impl");
+    launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Linear2, "sm90_fp8_mega_moe_l2_impl");
 }
 
 } // namespace deep_gemm

@@ -166,7 +166,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
     use_skew_hint = global_bias is not None
     use_masked_hint = args.masked_ratio > 0
 
-    def run_fused():
+    def run_sm90():
         buffer.x[:num_tokens].copy_(x_fp8)
         buffer.x_sf[:num_tokens].copy_(x_sf)
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
@@ -208,18 +208,17 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
                     os.environ['DG_SM90_MOE_MASKED_HINT'] = old_masked_hint
         return y
 
-    run_fused()
+    run_sm90()
     dist.barrier()
     if phase_profile_enabled:
         cum_stats.zero_()
         torch.cuda.synchronize()
         dist.barrier()
-    t_fused = bench_kineto(run_fused, 'sm90_fp8_mega_moe',
-                           barrier=lambda: dist.barrier(),
-                           num_tests=args.num_tests,
-                           suppress_kineto_output=True,
-                           with_multiple_kernels=os.environ.get(
-                               'DG_SM90_MOE_SPLIT_L1_L2', '1') != '0')
+    t_sm90 = bench_kineto(run_sm90, 'sm90_fp8_mega_moe',
+                          barrier=lambda: dist.barrier(),
+                          num_tests=args.num_tests,
+                          suppress_kineto_output=True,
+                          with_multiple_kernels=True)
 
     # Per-rank token receive counts + per-local-expert distribution
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
@@ -243,7 +242,7 @@ def _run_one_config(args, num_tokens, num_max_tokens_per_rank,
         local_max_mean = 0.0
 
     # Cross-rank aggregation
-    info = torch.tensor([t_fused, float(num_recv_tokens), float(num_touched_experts),
+    info = torch.tensor([t_sm90, float(num_recv_tokens), float(num_touched_experts),
                          local_max_mean], device='cuda', dtype=torch.float64)
     gather_buf = [torch.zeros_like(info) for _ in range(num_ranks)]
     dist.all_gather(gather_buf, info, group=group)

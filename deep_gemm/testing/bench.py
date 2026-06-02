@@ -136,12 +136,10 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
         for line in prof_lines:
             if any(name in line for name in kernel_names):
                 phase = '?'
-                if 'sm90_fp8_mega_moe_impl<' in line:
-                    template_args = line.split('sm90_fp8_mega_moe_impl<', 1)[1].split('>(void', 1)[0]
-                    args = [arg.strip() for arg in template_args.split(',')]
-                    if len(args) > 29:
-                        phase_arg = args[29]
-                        phase = {'1u': 'l1', '2u': 'l2', '0u': 'one'}.get(phase_arg, phase_arg)
+                if 'sm90_fp8_mega_moe_l1_impl<' in line:
+                    phase = 'l1'
+                elif 'sm90_fp8_mega_moe_l2_impl<' in line:
+                    phase = 'l2'
                 fields = line.split()
                 cuda_time = fields[-2] if len(fields) >= 2 else 'unknown'
                 count = fields[-1] if fields else 'unknown'

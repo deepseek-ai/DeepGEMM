@@ -302,10 +302,6 @@ struct MegaMoESM90Config {
     }
 };
 
-static bool get_sm90_moe_split_l1_l2_default() {
-    return get_env<int>("DG_SM90_MOE_SPLIT_L1_L2", 1) != 0;
-}
-
 enum class Sm90MoeDeviceProfile {
     Generic,
     H20,
@@ -347,7 +343,6 @@ struct Sm90MoeProfileConfig {
 
 struct Sm90MoeHeuristicPolicy {
     Sm90MoeDeviceProfile device_profile;
-    bool split_l1_l2;
     int num_experts_per_rank, num_topk, intermediate_hidden;
     int block_m, block_n;
     float expected_tokens_per_expert;
@@ -362,7 +357,7 @@ struct Sm90MoeHeuristicPolicy {
     }
 
     bool uses_split_bn256() const {
-        return split_l1_l2 and block_m == 64 and block_n == 256;
+        return block_m == 64 and block_n == 256;
     }
 
     bool is_main_topk8() const {
@@ -379,8 +374,7 @@ struct Sm90MoeHeuristicPolicy {
                                         const bool& skew_hint,
                                         const bool& masked_hint) const {
         int wave_override = 0;
-        if (expected_tokens_per_expert == 8.0f or
-            expected_tokens_per_expert == 128.0f or
+        if (expected_tokens_per_expert == 128.0f or
             (expected_tokens_per_expert >= 256.0f and expected_tokens_per_expert < 512.0f)) {
             wave_override = 16;
         }
@@ -480,8 +474,6 @@ struct Sm90MoeHeuristicPolicy {
             return profile_config.num_experts_per_wave;
         if (is_hopper_topk6() and expected_tokens_per_expert >= 8.0f and expected_tokens_per_expert <= 32.0f)
             return 16;
-        if (is_main_topk8() and expected_tokens_per_expert == 8.0f)
-            return 16;
         if (is_main_topk8() and expected_tokens_per_expert == 128.0f)
             return 16;
         if (is_main_topk8() and expected_tokens_per_expert >= 256.0f and expected_tokens_per_expert < 512.0f)
@@ -565,7 +557,6 @@ static Sm90MoeHeuristicPolicy get_sm90_moe_heuristic_policy(
     const int& intermediate_hidden, const int& block_m, const int& block_n) {
     return {
         get_sm90_moe_device_profile(),
-        get_sm90_moe_split_l1_l2_default(),
         num_experts_per_rank,
         num_topk,
         intermediate_hidden,
@@ -596,7 +587,7 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const bool use_mma_sync_decode =
         requested_mma_m > 0 and expected_tokens_per_expert <= static_cast<float>(requested_mma_m);
     const bool use_bn256_split_n =
-        get_env<int>("DG_SM90_MOE_BN256_2WG", get_sm90_moe_split_l1_l2_default() ? 1 : 0) != 0 and
+        get_env<int>("DG_SM90_MOE_BN256_2WG", 1) != 0 and
         forced_block_m != 128 and not use_mma_sync_decode;
     const bool use_bn256_seq_n =
         get_env<int>("DG_SM90_MOE_BN256_SEQ") != 0 and
@@ -737,8 +728,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // Select the retained stage count for the current shape.
     const int max_num_stages = (smem_capacity - smem_fixed) /
                                (smem_per_stage + smem_barriers_per_stage);
-    const bool split_l1_l2 = get_sm90_moe_split_l1_l2_default();
-    const bool prefer_bn256_split = split_l1_l2 and block_n == 256;
+    const bool prefer_bn256_split = block_n == 256;
     const int preferred_num_stages = default_num_stages > 0
         ? std::min(default_num_stages, max_num_stages)
         : (prefer_bn256_split ? std::min(4, max_num_stages) : 0);
@@ -849,7 +839,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens) {
-    const bool split_l1_l2 = get_sm90_moe_split_l1_l2_default();
     const bool extra_modes = get_env<int>("DG_SM90_MOE_SEARCH_EXTRA_MODES", 1) != 0;
     const bool extra_block_shapes = get_env<int>("DG_SM90_MOE_SEARCH_BLOCK_SHAPES", 0) != 0;
     const float expected_tokens_per_expert =
@@ -871,7 +860,7 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
     const bool use_b_stationary_2wg =
         get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0 and not use_mma_sync_decode;
     const bool use_bn256_split_n_env =
-        get_env<int>("DG_SM90_MOE_BN256_2WG", split_l1_l2 ? 1 : 0) != 0 and
+        get_env<int>("DG_SM90_MOE_BN256_2WG", 1) != 0 and
         forced_block_m != 128 and not use_mma_sync_decode;
     const bool use_bn256_seq_n_env =
         get_env<int>("DG_SM90_MOE_BN256_SEQ") != 0 and
@@ -947,7 +936,7 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                 const int swizzle_weights_mode = (block_m == 16 or block_m == 32) ? 0 : 128;
 
                 const bool prefer_compact_frontend =
-                    split_l1_l2 and block_n == 256 and not split_sfa_tma;
+                    block_n == 256 and not split_sfa_tma;
                 const bool compact_frontend = get_env<int>("DG_SM90_MOE_COMPACT_FRONTEND",
                                                            prefer_compact_frontend ? 1 : 0) != 0;
                 const int forced_dispatch_warps = get_env<int>("DG_SM90_MOE_DISPATCH_WARPS", -1);
