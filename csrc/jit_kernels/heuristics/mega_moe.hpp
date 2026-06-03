@@ -302,10 +302,10 @@ struct MegaMoESM90Config {
     }
 };
 
-enum class Sm90MoeDeviceProfile {
+enum class Sm90MoeRuntimeProfile {
     Generic,
-    H20,
-    H200
+    LowSm,
+    HighSm
 };
 
 static std::string get_sm90_moe_lowercase(std::string value) {
@@ -315,24 +315,24 @@ static std::string get_sm90_moe_lowercase(std::string value) {
     return value;
 }
 
-static Sm90MoeDeviceProfile get_sm90_moe_device_profile() {
+static Sm90MoeRuntimeProfile get_sm90_moe_runtime_profile() {
     const auto forced = get_sm90_moe_lowercase(
         get_env<std::string>("DG_SM90_MOE_DEVICE_PROFILE", ""));
     if (not forced.empty() and forced != "auto") {
-        DG_HOST_ASSERT(forced == "generic" or forced == "h20" or forced == "h200");
-        if (forced == "h20")
-            return Sm90MoeDeviceProfile::H20;
-        if (forced == "h200")
-            return Sm90MoeDeviceProfile::H200;
-        return Sm90MoeDeviceProfile::Generic;
+        DG_HOST_ASSERT(forced == "generic" or forced == "low_sm" or forced == "high_sm");
+        if (forced == "low_sm")
+            return Sm90MoeRuntimeProfile::LowSm;
+        if (forced == "high_sm")
+            return Sm90MoeRuntimeProfile::HighSm;
+        return Sm90MoeRuntimeProfile::Generic;
     }
 
-    const auto device_name = get_sm90_moe_lowercase(device_runtime->get_prop()->name);
-    if (device_name.find("h200") != std::string::npos)
-        return Sm90MoeDeviceProfile::H200;
-    if (device_name.find("h20") != std::string::npos)
-        return Sm90MoeDeviceProfile::H20;
-    return Sm90MoeDeviceProfile::Generic;
+    const int num_sms = device_runtime->get_num_sms();
+    if (num_sms <= 80)
+        return Sm90MoeRuntimeProfile::LowSm;
+    if (num_sms >= 100)
+        return Sm90MoeRuntimeProfile::HighSm;
+    return Sm90MoeRuntimeProfile::Generic;
 }
 
 struct Sm90MoeProfileConfig {
@@ -342,7 +342,7 @@ struct Sm90MoeProfileConfig {
 };
 
 struct Sm90MoeHeuristicPolicy {
-    Sm90MoeDeviceProfile device_profile;
+    Sm90MoeRuntimeProfile runtime_profile;
     int num_experts_per_rank, num_topk, intermediate_hidden;
     int block_m, block_n;
     float expected_tokens_per_expert;
@@ -368,11 +368,11 @@ struct Sm90MoeHeuristicPolicy {
         return num_experts_per_rank == 48 and num_topk == 6 and intermediate_hidden == 3072;
     }
 
-    bool h20_main_topk8_profile_config(Sm90MoeProfileConfig& config,
-                                        const bool& direct_l2_scatter_enabled,
-                                        const bool& eplb_hint,
-                                        const bool& skew_hint,
-                                        const bool& masked_hint) const {
+    bool low_sm_main_topk8_profile_config(Sm90MoeProfileConfig& config,
+                                          const bool& direct_l2_scatter_enabled,
+                                          const bool& eplb_hint,
+                                          const bool& skew_hint,
+                                          const bool& masked_hint) const {
         int wave_override = 0;
         if (expected_tokens_per_expert == 128.0f or
             (expected_tokens_per_expert >= 256.0f and expected_tokens_per_expert < 512.0f)) {
@@ -414,11 +414,8 @@ struct Sm90MoeHeuristicPolicy {
         return true;
     }
 
-    bool h200_main_topk8_profile_config(Sm90MoeProfileConfig& config) const {
-        // Calibrated from the H200 0601 sweep. Buckets are keyed by
-        // expected_tokens_per_expert = M * topk / experts_per_rank.
-        // The sweep labels include some requested `d0_s5` rows, but BN256 with
-        // direct L2 scatter disabled is capped at 4 stages by SM90 SMEM limits.
+    bool high_sm_main_topk8_profile_config(Sm90MoeProfileConfig& config) const {
+        // Profile buckets keyed by expected_tokens_per_expert.
         if (expected_tokens_per_expert <= 3.0f) {
             config = {32, 4, true,  true,  false};
         } else if (expected_tokens_per_expert <= 6.0f) {
@@ -457,12 +454,12 @@ struct Sm90MoeHeuristicPolicy {
         if (not uses_bn256_main_tile() or not is_main_topk8())
             return false;
 
-        if (device_profile == Sm90MoeDeviceProfile::H20) {
-            return h20_main_topk8_profile_config(
+        if (runtime_profile == Sm90MoeRuntimeProfile::LowSm) {
+            return low_sm_main_topk8_profile_config(
                 config, direct_l2_scatter_enabled, eplb_hint, skew_hint, masked_hint);
         }
-        if (device_profile == Sm90MoeDeviceProfile::H200)
-            return h200_main_topk8_profile_config(config);
+        if (runtime_profile == Sm90MoeRuntimeProfile::HighSm)
+            return high_sm_main_topk8_profile_config(config);
         return false;
     }
 
@@ -556,7 +553,7 @@ static Sm90MoeHeuristicPolicy get_sm90_moe_heuristic_policy(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n) {
     return {
-        get_sm90_moe_device_profile(),
+        get_sm90_moe_runtime_profile(),
         num_experts_per_rank,
         num_topk,
         intermediate_hidden,
@@ -675,8 +672,7 @@ static void append_unique_moe_candidate(std::vector<T>& values, const T& value) 
 
 static std::vector<int> get_sm90_moe_bool_candidates(
     const std::string& env_name,
-    const bool& default_value,
-    const bool& allow_alternative) {
+    const bool& default_value) {
     const int forced = get_env<int>(env_name, -1);
     DG_HOST_ASSERT(forced == -1 or forced == 0 or forced == 1);
     std::vector<int> values;
@@ -685,8 +681,6 @@ static std::vector<int> get_sm90_moe_bool_candidates(
         return values;
     }
     append_unique_moe_candidate(values, default_value ? 1 : 0);
-    if (allow_alternative)
-        append_unique_moe_candidate(values, default_value ? 0 : 1);
     return values;
 }
 
@@ -729,10 +723,7 @@ static Sm90MoeConfigInfo get_sm90_moe_config_info(
     const int num_last_blocks = num_blocks % num_sms;
     const int last_wave_util = num_last_blocks == 0 ? num_sms : num_last_blocks;
 
-    // This cost model intentionally mirrors DeepGEMM's style: enumerate legal
-    // candidates, rank them with cheap shape-derived estimates, and use a small
-    // empirical calibration layer for modes whose cost is dominated by dispatch /
-    // combine details not captured by the block-count model.
+    // Rank legal selector candidates with cheap shape-derived estimates.
     int empirical_penalty = 0;
     if (config.direct_l2_scatter != empirical_direct_l2_scatter)
         empirical_penalty += 1000000;
@@ -765,8 +756,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens) {
-    const bool extra_modes = get_env<int>("DG_SM90_MOE_SEARCH_EXTRA_MODES", 1) != 0;
-    const bool extra_block_shapes = get_env<int>("DG_SM90_MOE_SEARCH_BLOCK_SHAPES", 0) != 0;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
 
@@ -799,8 +788,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
         append_unique_moe_candidate(block_m_candidates, requested_mma_m);
     } else {
         append_unique_moe_candidate(block_m_candidates, 64);
-        if (extra_block_shapes)
-            append_unique_moe_candidate(block_m_candidates, 128);
     }
 
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
@@ -821,12 +808,8 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
         if (block_m == 64 and not use_mma_sync_decode and
             use_bn256_split_n_env) {
             append_unique_moe_candidate(block_n_candidates, 256);
-            if (extra_block_shapes)
-                append_unique_moe_candidate(block_n_candidates, 128);
         } else {
             append_unique_moe_candidate(block_n_candidates, 128);
-            if (extra_block_shapes and block_m == 64 and not use_mma_sync_decode)
-                append_unique_moe_candidate(block_n_candidates, 256);
         }
 
         for (const int& block_n: block_n_candidates) {
@@ -870,8 +853,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                     append_unique_moe_candidate(dispatch_warp_candidates, forced_dispatch_warps);
                 } else {
                     append_unique_moe_candidate(dispatch_warp_candidates, compact_frontend ? 2 : 4);
-                    if (extra_block_shapes and not compact_frontend)
-                        append_unique_moe_candidate(dispatch_warp_candidates, 2);
                 }
 
                 for (const int& num_dispatch_warps: dispatch_warp_candidates) {
@@ -900,27 +881,19 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
 
                     auto direct_candidates = get_sm90_moe_bool_candidates(
                         "DG_SM90_MOE_DIRECT_L2_SCATTER",
-                        direct_l2_scatter_default and direct_l2_scatter_legal,
-                        extra_modes and direct_l2_scatter_legal);
+                        direct_l2_scatter_default and direct_l2_scatter_legal);
                     auto l2_nmajor_candidates = get_sm90_moe_bool_candidates(
                         "DG_SM90_MOE_L2_NMAJOR",
-                        l2_nmajor_schedule_default,
-                        extra_modes and policy.uses_bn256_main_tile() and policy.is_main_topk8());
+                        l2_nmajor_schedule_default);
                     auto cleanup_candidates = get_sm90_moe_bool_candidates(
                         "DG_SM90_MOE_ONE_WARP_CLEANUP",
-                        one_warp_cleanup_default,
-                        extra_modes and policy.uses_bn256_main_tile());
+                        one_warp_cleanup_default);
 
                     const int default_epw = get_num_experts_per_wave_for_mega_moe_sm90(
                         num_experts_per_rank, num_tokens, num_topk,
                         intermediate_hidden, block_m, block_n, num_sms);
                     std::vector<int> experts_per_wave_candidates;
                     append_unique_moe_candidate(experts_per_wave_candidates, default_epw);
-                    if (get_env<int>("DG_SM90_MOE_EXPERTS_PER_WAVE") <= 0 and extra_modes) {
-                        if (16 <= num_experts_per_rank and num_experts_per_rank % 16 == 0)
-                            append_unique_moe_candidate(experts_per_wave_candidates, 16);
-                        append_unique_moe_candidate(experts_per_wave_candidates, num_experts_per_rank);
-                    }
 
                     for (const int& direct_value: direct_candidates) {
                         const bool direct_l2_scatter = direct_value != 0;
@@ -937,10 +910,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                             append_unique_moe_candidate(stage_candidates, forced_num_stages);
                         } else {
                             append_unique_moe_candidate(stage_candidates, empirical_stage);
-                            if (extra_modes) {
-                                append_unique_moe_candidate(stage_candidates, 4);
-                                append_unique_moe_candidate(stage_candidates, 5);
-                            }
                         }
 
                         for (const int& requested_num_stages: stage_candidates) {
@@ -996,8 +965,6 @@ static Sm90MoeConfigInfo get_best_mega_moe_config_info_sm90(
     Sm90MoeConfigInfo best {
         std::numeric_limits<int64_t>::max(), 0, 0, 0, 0, candidates[0]
     };
-    std::vector<Sm90MoeConfigInfo> infos;
-    infos.reserve(candidates.size());
     for (const auto& candidate: candidates) {
         const auto policy = get_sm90_moe_heuristic_policy(
             num_experts_per_rank, num_tokens, num_topk,
@@ -1025,24 +992,8 @@ static Sm90MoeConfigInfo get_best_mega_moe_config_info_sm90(
             empirical_one_warp_cleanup,
             empirical_num_stages,
             empirical_num_experts_per_wave);
-        infos.emplace_back(info);
         if (info.score < best.score)
             best = info;
-    }
-
-    if (get_env<int>("DG_SM90_MOE_PRINT_SEARCH", 0) > 0) {
-        const auto key = fmt::format(
-            "Sm90MoeConfigSearch(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
-        static std::unordered_set<std::string> printed;
-        if (printed.count(key) == 0) {
-            std::cout << key << ": selected " << best << std::endl;
-            if (get_env<int>("DG_SM90_MOE_PRINT_SEARCH", 0) > 1) {
-                for (const auto& info: infos)
-                    std::cout << "  candidate " << info << std::endl;
-            }
-            printed.insert(key);
-        }
     }
     return best;
 }
