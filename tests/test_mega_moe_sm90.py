@@ -8,11 +8,9 @@ Layers
 ------
   L1  Smoke           : single tiny config; only verifies the kernel runs
                         and produces an output close to a PyTorch reference.
-  L2  Heuristic       : sweeps tokens-per-expert across the bands of
-                        the SM90 config selector so the main branch buckets
-                        are covered.
-  L3  Shape sweep     : sweeps ``hidden``, ``intermediate_hidden`` and
-                        ``num_topk`` over divisible-by-128 values.
+  L2  Heuristic       : covers tokens-per-expert bands of the SM90 selector.
+  L3  Shape coverage  : covers divisible-by-128 ``hidden``,
+                        ``intermediate_hidden`` and ``num_topk`` values.
   L4  Edge cases      : masking ratio, activation clamp (finite vs inf),
                         ``fast_math`` 0/1, ``num_tokens`` boundaries.
   L5  Stress          : ``--num-correctness-tests`` repeated random configs.
@@ -89,6 +87,10 @@ def _dequant_per_token_per_128_k(x_fp8: torch.Tensor, sf: torch.Tensor) -> torch
     assert k % 128 == 0
     w_view = x_fp8.float().view(m, k // 128, 128)
     return (w_view * sf.unsqueeze(-1)).view(m, k)
+
+
+def _stable_name_seed(name: str) -> int:
+    return sum((i + 1) * ord(ch) for i, ch in enumerate(name)) % 1000
 
 
 # ----------------------------------------------------------------------------
@@ -258,8 +260,9 @@ def _run_scenario(
             print(f'[rank{rank_idx}] {name} :: {stage}', flush=True)
 
     _trace('begin')
-    torch.manual_seed(rank_idx * 1000 + abs(hash(name)) % 1000)
-    random.seed(rank_idx * 1000 + abs(hash(name)) % 1000)
+    seed = rank_idx * 1000 + _stable_name_seed(name)
+    torch.manual_seed(seed)
+    random.seed(seed)
 
     # ---- Inputs (bf16) -------------------------------------------------------
     x_bf = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -276,7 +279,6 @@ def _run_scenario(
         topk_idx.masked_fill_(rand_mask < masked_ratio, -1)
         topk_w.masked_fill_(topk_idx < 0, 0)
 
-    # Quantize x to FP8 with per-128 K float SF (SM90 format)
     # Quantize x to FP8 with per-128 K float SF (SM90 format)
     x_fp8, x_sf = per_token_cast_to_fp8(x_bf, use_ue8m0=False, gran_k=128,
                                         use_packed_ue8m0=False)
@@ -368,25 +370,24 @@ def _layer1_smoke() -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def _layer2_heuristic_branches(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
-    """Vary tokens / (num_experts * num_topk / num_ranks) so the selector's
-    main tokens-per-expert buckets fire at least once.
-
-    The heuristic decides on ``avg_tokens_per_expert``; we approximate by
-    setting ``num_max_tokens_per_rank`` and ``num_topk`` while keeping
-    ``num_experts`` fixed.  The bands are at 64.5 / 96.5 / 192.5.
-    """
+    """Cover generic heuristic bands and the main topk8 profile selector."""
     base = dict(hidden=1024, intermediate_hidden=1024,
                 num_experts=8 * num_ranks, num_topk=2)
     out: List[Tuple[str, Dict[str, Any]]] = []
-    # tokens-per-rank settings chosen to hit (small / mid / large) bands
     for tokens, label in [(64, 'small'), (256, 'midA'), (512, 'midB'), (2048, 'large')]:
         cfg = dict(base)
         cfg.update(num_max_tokens_per_rank=tokens, num_tokens=tokens)
         out.append((f'L2.heur.{label}.t{tokens}', cfg))
+    profile_base = dict(hidden=512, intermediate_hidden=2048,
+                        num_experts=32 * num_ranks, num_topk=8)
+    for tokens in (16, 64, 260, 1024):
+        cfg = dict(profile_base)
+        cfg.update(num_max_tokens_per_rank=tokens, num_tokens=tokens)
+        out.append((f'L2.profile_topk8.t{tokens}', cfg))
     return out
 
 
-def _layer3_shape_sweep(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+def _layer3_shape_cases(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     out: List[Tuple[str, Dict[str, Any]]] = []
     base_experts = 8 * num_ranks
     for hidden in (512, 2048):
@@ -471,7 +472,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if 2 in args.layers:
         layers += _layer2_heuristic_branches(num_ranks)
     if 3 in args.layers:
-        layers += _layer3_shape_sweep(num_ranks)
+        layers += _layer3_shape_cases(num_ranks)
     if 4 in args.layers:
         layers += _layer4_edges(num_ranks)
     if 5 in args.layers:

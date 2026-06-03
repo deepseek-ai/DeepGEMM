@@ -153,7 +153,6 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math
     )
 
-
 def fp8_mega_moe(y: torch.Tensor,
                  l1_weights: Tuple[torch.Tensor, torch.Tensor],
                  l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -182,4 +181,3 @@ def fp8_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
-
