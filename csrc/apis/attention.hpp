@@ -144,7 +144,15 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     auto [_seq_len, _num_heads] = get_shape<2>(weights);
     DG_HOST_ASSERT(seq_len == _seq_len and num_heads == _num_heads);
     DG_HOST_ASSERT(weights.stride(1) == 1);
-    DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat);
+    // The `weights` dtype explicitly selects the MQA-logits accumulation precision:
+    //   - FP16 weights -> SM100 2-CTA kernel with an FP16 MMA accumulator: the Q*K score and the
+    //     per-head weighted-sum reduction are both accumulated in FP16; only the final per-(token,kv)
+    //     kv_scale multiply is promoted to FP32 before the output cast. Faster, but FP16's smaller
+    //     range can overflow, so the caller must scale inputs. Requires SM100 and seq_len % 4 == 0.
+    //   - FP32 weights -> generic kernel with an FP32 score accumulator, valid for any seq_len.
+    const bool weights_is_f16 = (weights.scalar_type() == torch::kFloat16);
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat or weights_is_f16);
+    DG_HOST_ASSERT(not (is_fp4 and weights_is_f16) and "FP16 weights are not supported with FP4 inputs");
 
     // Check cu_seq_len_k_start
     DG_HOST_ASSERT(cu_seq_len_k_start.size(0) == seq_len);
@@ -164,9 +172,17 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
 
     torch::Tensor logits;
     int aligned_seq_len = align(seq_len, block_q), stride_logits;
+    const auto arch_major = device_runtime->get_arch_major();
+    if (weights_is_f16) {
+        // FP16 weights select the SM100 2-CTA FP16 kernel, which tiles the query dimension
+        // in `block_q * 2` chunks (no per-row bound check), so the output is padded accordingly
+        DG_HOST_ASSERT(arch_major == 10 and "FP16 weights MQA logits requires SM100 (arch 10)");
+        DG_HOST_ASSERT(seq_len % 4 == 0 and "FP16 weights MQA logits requires seq_len % 4 == 0");
+        aligned_seq_len = align(seq_len, block_q * 2);
+    }
     if (max_seqlen_k == 0) {
-        // Logits stride must be 16-byte aligned
-        stride_logits = align(seq_len_kv + block_kv, 8);
+        // Logits stride must be 128-byte aligned
+        stride_logits = align(seq_len_kv + block_kv, 64);
         logits = torch::empty({aligned_seq_len, stride_logits}, q_fp.options().dtype(logits_dtype));
         logits = logits.index({torch::indexing::Slice(0, seq_len), torch::indexing::Slice(0, seq_len_kv)});
     } else {
@@ -177,13 +193,16 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     }
 
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
     if (is_fp4 and arch_major == 10) {
         sm100_fp4_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                              seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
     } else if (is_fp4 and arch_major == 12) {
         sm120_fp4_mqa_logits(q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                              seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
+    } else if (not is_fp4 and weights_is_f16) {
+        // FP16 weights -> FP16 MMA accumulator (Q*K score + per-head reduction in FP16); see note above
+        sm100_fp8_mqa_logits_f16_weights(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
     } else if (not is_fp4 and (arch_major == 9 or arch_major == 10 or arch_major == 12)) {
         smxx_fp8_mqa_logits(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                             seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);

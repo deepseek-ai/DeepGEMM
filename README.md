@@ -94,7 +94,7 @@ Take the non-paged version `fp8_mqa_logits` as an example. It has 6 inputs:
 
 - `q`, E4M3 tensor with shape `[seq_len, num_heads, head_dim]`
 - `kv`, E4M3 tensor (shaped as `[seq_len_kv, head_dim]`) with float SF (shaped as `[seq_len_kv]`)
-- `weights`, float tensor with shape `[seq_len, num_heads]`
+- `weights`, FP32 or FP16 tensor with shape `[seq_len, num_heads]`. The `weights` dtype explicitly selects the accumulation precision: passing **FP16** weights on SM100 selects a faster kernel (`sm100_fp8_mqa_logits_f16_weights`) whose MMA accumulator is FP16 — the Q·K score and the per-head weighted-sum reduction are both accumulated in FP16, and only the final per-`(token, kv)` `kv_scale` multiply is promoted to FP32 before the output cast. It requires `seq_len % 4 == 0`, and FP16's smaller range can overflow, so scale inputs accordingly. Passing **FP32** weights uses the generic kernel, which accumulates the score in FP32 and supports any `seq_len`
 - `cu_seq_len_k_start` and `cu_seq_len_k_end`, int tensor with shape `[seq_len]`
 - `clean_logits`, whether to clean the unfilled logits into `-inf`
 

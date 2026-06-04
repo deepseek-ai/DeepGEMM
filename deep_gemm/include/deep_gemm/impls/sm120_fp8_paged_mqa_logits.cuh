@@ -192,7 +192,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
         uint32_t kv_block_idx_storage;
 
         while (fetched_next_task) {
-            const auto next_advance = scheduler.get_atom_advance(next_q_idx, batch_size);
+            const auto next_advance = scheduler.get_last_advance();
             bool prefetch_q = (q_idx != next_q_idx and scheduler.exist_q_atom_idx(next_q_idx + next_advance));
 
             if (q_idx != next_q_idx)
@@ -259,7 +259,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
                 full_q_barriers[q_stage_idx]->wait(q_phase);
 
                 if constexpr (kIsVarlen) {
-                    is_paired_atom = (scheduler.get_atom_advance(next_q_idx, batch_size) == 2);
+                    is_paired_atom = (scheduler.get_last_advance() == 2);
                 }
             }
 

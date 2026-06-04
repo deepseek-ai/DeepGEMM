@@ -82,6 +82,7 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+        case torch::kFloat16:       return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
 #if CUDA_VERSION >= 12080
         case kPackedFP4:            return fp4_unpacked_smem ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
                                                              : CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
@@ -251,7 +252,8 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                                     const int& block_mn, const int& gran_k,
                                     const int& num_groups,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
-                                    const bool& allow_tf32 = false) {
+                                    const bool& allow_tf32 = false,
+                                    const int& smem_outer_dim = 1) {
     DG_HOST_ASSERT(major == cute::UMMA::Major::MN);
 
     // TODO: maybe swizzle SF as well
@@ -260,7 +262,7 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
     shape_mn = get_tma_aligned_size(shape_mn, static_cast<int>(t.element_size()));
     return make_tma_2d_desc(t,
                             shape_mn, ceil_div(shape_k, gran_k * (t.scalar_type() == torch::kFloat ? 1 : 4)) * num_groups,
-                            block_mn, 1,
+                            block_mn, smem_outer_dim,
                             shape_mn,
                             swizzle_mode, swizzle_base,
                             allow_tf32);

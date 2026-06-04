@@ -32,6 +32,9 @@ struct SymBuffer {
 
     template <typename ptr_t>
     CUTLASS_DEVICE ptr_t map(const ptr_t& ptr, const uint32_t& dst_rank_idx) const {
+        if constexpr (kNumRanks == 1)
+            return ptr;
+
         int64_t mapped_ptr = offsets[dst_rank_idx] + reinterpret_cast<int64_t>(ptr);
         return *reinterpret_cast<ptr_t*>(&mapped_ptr);
     }
