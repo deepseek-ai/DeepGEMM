@@ -207,7 +207,10 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
-        .max_gran_k = std::max(gran_k_a, gran_k_b)
+        .max_gran_k = std::max(gran_k_a, gran_k_b),
+        // AB-swap writes a transposed output (stride_cd_n != 1); the TMA-store
+        // epilogue cannot express that, so force the strided-store epilogue.
+        .cd_n_contiguous = !swap_ab
     };
 
     GemmConfig config;
@@ -609,7 +612,10 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
-        .max_gran_k = std::max(gran_k_a, gran_k_b)
+        .max_gran_k = std::max(gran_k_a, gran_k_b),
+        // AB-swap writes a transposed output (stride_cd_n != 1); the TMA-store
+        // epilogue cannot express that, so force the strided-store epilogue.
+        .cd_n_contiguous = !swap_ab
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 

@@ -27,6 +27,13 @@ struct GemmDesc {
     // k-blocks.  Split-K partitions must start at this boundary.
     int max_gran_k = 128;
 
+    // Whether the C/D output's N dimension is contiguous in global memory.
+    // The SM120 TMA-store epilogue writes via a tensor map that assumes a
+    // contiguous-N output; the AB-swap path produces a transposed output
+    // (stride_cd_n != 1) the descriptor cannot express, so it must fall back to
+    // the strided-store epilogue (swizzle_cd_mode = 0). Defaults to true.
+    bool cd_n_contiguous = true;
+
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }

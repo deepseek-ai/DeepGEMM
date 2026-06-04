@@ -142,7 +142,10 @@ struct SM120ArchSpec {
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
         const int cd_size = c10::elementSize(desc.cd_dtype);
-        const auto swizzle_mode_cd = (layout.block_n * cd_size >= 128) ? 128 : 0;
+        // The TMA-store epilogue assumes a contiguous-N output; a transposed
+        // (AB-swap) output cannot be expressed by its tensor map, so disable it
+        // and fall back to the strided-store epilogue.
+        const auto swizzle_mode_cd = (desc.cd_n_contiguous and layout.block_n * cd_size >= 128) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
