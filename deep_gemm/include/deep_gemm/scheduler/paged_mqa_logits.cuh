@@ -110,7 +110,7 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
             }
             const uint32_t q_idx = lo;
             const uint32_t offset_in_q = (q_idx == 0 ? seg_starts : seg_starts - prefix_sum[q_idx - 1] * num_next_n_atoms);
-            const uint32_t num_segs_q = (q_idx == 0 ? prefix_sum[0] : prefix_sum[q_idx] - prefix_sum[q_idx - 1]);
+            const uint32_t num_segs_q = (q_idx == 0 ? prefix_sum[0] : (q_idx >= batch_size ? 0u : prefix_sum[q_idx] - prefix_sum[q_idx - 1]));
             const uint32_t atom_idx = num_segs_q > 0 ? offset_in_q / num_segs_q : 0;
             const uint32_t kv_split_idx = num_segs_q > 0 ? offset_in_q % num_segs_q : 0;
             const uint32_t q_atom_idx = q_idx * num_next_n_atoms + atom_idx;
