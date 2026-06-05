@@ -70,9 +70,14 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     // Shared memory: prefix_sum[kAlignedBatchSize] plus varlen atom metadata when needed.
     const int num_smem_ints = is_varlen ? 3 * aligned_batch_size + 1 : aligned_batch_size;
     const int smem_size = num_smem_ints * static_cast<int>(sizeof(int));
-    DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
-    DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
+    // Assert against the running arch's capacity only. SM120's 99 KB limit must not
+    // gate SM90/SM100 (228 KB), which legitimately use more for large (e.g. varlen)
+    // batches — the unconditional SM120 assert false-failed metadata launch on SM100.
+    const int meta_arch_major = device_runtime->get_arch_major();
+    const int meta_smem_cap = (meta_arch_major == 12) ? SM120ArchSpec::smem_capacity
+                            : (meta_arch_major == 10) ? SM100ArchSpec::smem_capacity
+                            : SM90ArchSpec::smem_capacity;
+    DG_HOST_ASSERT(smem_size <= meta_smem_cap);
 
     // Launch
     const SMXXPagedMQALogitsMetadataRuntime::Args& args = {
