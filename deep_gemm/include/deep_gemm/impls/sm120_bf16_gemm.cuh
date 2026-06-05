@@ -168,9 +168,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
     };
 
-    // =====================================================================
     // PRODUCER WARP GROUP (TMA warps, 40 regs)
-    // =====================================================================
     if (warp_idx >= kNumMathWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kTMARegisters>();
 
@@ -239,9 +237,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             }
         }
     }
-    // =====================================================================
     // CONSUMER WARP GROUPS (math warps, 232 regs)
-    // =====================================================================
     else {
         cutlass::arch::warpgroup_reg_alloc<kMMARegisters>();
 
@@ -346,7 +342,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     empty_barriers[stage]->arrive();
             }
 
-            // ======== EPILOGUE ========
+            // Epilogue
             constexpr bool kEpilogueGroupOffset = not is_m_grouped_contiguous(kGemmType);
             const uint32_t m_base = scheduler.template get_global_idx<kEpilogueGroupOffset>(shape_m, BLOCK_M, m_block_idx);
             const uint32_t n_base = n_block_idx * BLOCK_N;

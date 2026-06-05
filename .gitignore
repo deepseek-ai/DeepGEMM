@@ -22,8 +22,3 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
-
-docs_internal/
-benchmarks/
-ncu_reports/
-internal/

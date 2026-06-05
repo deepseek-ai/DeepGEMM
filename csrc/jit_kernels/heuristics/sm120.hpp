@@ -21,8 +21,6 @@ struct SM120ArchSpec {
         const int expected_m = desc.get_expected_m();
 
         // BLOCK_M candidates: {64, 128} valid for both FP8 and BF16 (kNWarps=2, kMWarps=4).
-        // CRITICAL: BLOCK_M must not exceed runtime_align for grouped contiguous GEMM,
-        // otherwise tiles straddle expert boundaries causing wrong results.
         const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
         const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
 
@@ -142,9 +140,7 @@ struct SM120ArchSpec {
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
         const int cd_size = c10::elementSize(desc.cd_dtype);
-        // The TMA-store epilogue assumes a contiguous-N output; a transposed
-        // (AB-swap) output cannot be expressed by its tensor map, so disable it
-        // and fall back to the strided-store epilogue.
+        // cd_n_contiguous gates the TMA-store epilogue (off for AB-swap transposed output).
         const auto swizzle_mode_cd = (desc.cd_n_contiguous and layout.block_n * cd_size >= 128) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
@@ -227,17 +223,12 @@ struct SM120ArchSpec {
         const auto num_m_blocks = ceil_div(desc.get_expected_m(), layout.block_m);
         const auto num_n_blocks = ceil_div(desc.get_expected_n(), layout.block_n);
         const auto num_blocks = num_m_blocks * num_n_blocks * desc.get_expected_num_groups();
-        const auto num_waves = ceil_div(num_blocks, desc.num_sms);
         const auto num_last_blocks = num_blocks % desc.num_sms;
         const auto last_wave_util = num_last_blocks == 0 ? desc.num_sms : num_last_blocks;
 
-        // TMA-bound latency model (empirically validated on SM120a):
-        //   block_time = k_blocks * (tma_bytes_per_kblock * kCyPerTmaByte + kSyncPerKBlock) + kBlockOverheadCy
-        //   total_latency = num_waves * block_time
-        // The kernel is TMA-bound for most tile configs. The discrete num_waves
-        // (ceil division) dominates the BM=64 vs BM=128 decision.
-        // kSyncPerKBlock captures per-kblock barrier overhead (mbarrier ~137 cy).
-        // More pipeline stages reduce effective stall: kSyncPerKBlock / sqrt(stages).
+        // TMA-bound latency model (empirically tuned on SM120a). Discrete num_waves
+        // (ceil division) dominates the BM=64 vs BM=128 choice; more pipeline stages
+        // reduce per-kblock barrier stall (modeled as kSyncBaseCy / sqrt(stages)).
         static constexpr double kCyPerTmaByte = 0.07;     // ~35 GB/s per SM
         static constexpr double kSyncBaseCy = 120.0;      // per-kblock barrier overhead
         static constexpr double kBlockOverheadCy = 2000;   // epilogue + scheduling
@@ -260,17 +251,14 @@ struct SM120ArchSpec {
 
         const double tma_per_kb = tma_bytes_per_kb * kCyPerTmaByte + sync_per_kb;
 
-        // Account for split-K when evaluating tile candidates: if the tile produces
-        // too few blocks, split-K will divide K across more blocks. Model this by
-        // computing the effective k_blocks per partition and total waves.
+        // Account for split-K: too few blocks → it divides K across more partitions.
         const int split_k = (desc.gemm_type == GemmType::Normal) ? get_split_k_factor(desc, layout) : 1;
         const int k_blocks_eff = (split_k > 1) ? k_blocks / split_k : k_blocks;
         const int total_blocks = num_blocks * split_k;
         const auto num_waves_eff = ceil_div(total_blocks, desc.num_sms);
 
         const double block_time = k_blocks_eff * tma_per_kb + kBlockOverheadCy;
-        // Split-K adds reduction overhead: reduce kernel launch + workspace write/read.
-        // Empirically ~2-3 us on SM120a, modeled as fixed + per-element cost.
+        // Split-K reduction overhead (~2-3 us on SM120a): fixed launch + per-element.
         const double reduce_fixed_cy = 5000.0;
         const double reduce_per_elem_cy = 0.01;
         const double reduce_overhead = (split_k > 1)

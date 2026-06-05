@@ -112,9 +112,7 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
     cudaGridDependencySynchronize();
 
-    // =====================================================================
     // PRODUCER (TMA warps)
-    // =====================================================================
     if (warp_idx >= kNumMathWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kTMARegisters>();
 
@@ -144,9 +142,7 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
             }
         }
     }
-    // =====================================================================
     // CONSUMER (math warps)
-    // =====================================================================
     else {
         cutlass::arch::warpgroup_reg_alloc<kMMARegisters>();
 
@@ -235,7 +231,7 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 empty_barriers[stage_idx]->arrive();
         }
 
-        // ======== sqr_sum reduction and write ========
+        // sqr_sum reduction and write
         const float reduced_sum_0 = math::warp_reduce_sum<4>(sqr_sum_acc_0);
         const float reduced_sum_1 = math::warp_reduce_sum<4>(sqr_sum_acc_1);
 
@@ -251,7 +247,7 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
             }
         }
 
-        // ======== D epilogue: direct store FP32 ========
+        // D epilogue: direct store FP32
         // D fragment: d0=D[g, t*2], d1=D[g, t*2+1], d2=D[g+8, t*2], d3=D[g+8, t*2+1]
         const int64_t d_split_offset = static_cast<int64_t>(k_split_idx) * shape_m * SHAPE_N;
 

@@ -146,7 +146,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
             sm120_fp8_fp4_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
                                     eff_m, eff_n, k, gran_k_a, gran_k_b,
                                     eff_major_b, eff_major_a, compiled_dims,
-                                    std::nullopt, std::nullopt, true);
+                                    std::nullopt, true);
         } else {
             sm120_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                     eff_major_a, eff_major_b, compiled_dims);
@@ -832,31 +832,6 @@ static void register_apis(pybind11::module_& m) {
           py::arg("ks_tensor"), py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "mn");
 #endif
-
-    // SM120 explicit tile config benchmark (same interface as fp8_fp4_gemm_nt + tile override)
-    m.def("sm120_fp8_gemm_bench", [](const std::pair<torch::Tensor, torch::Tensor>& a,
-                                      const std::pair<torch::Tensor, torch::Tensor>& b,
-                                      const torch::Tensor& d,
-                                      std::optional<std::tuple<int, int, int>> recipe,
-                                      std::optional<std::tuple<int, int>> recipe_a,
-                                      std::optional<std::tuple<int, int>> recipe_b,
-                                      const int& block_m, const int& block_n, const int& block_k) {
-        const auto major_a = get_major_type_ab(a.first);
-        const auto major_b = get_major_type_ab(b.first);
-        const auto [m, k] = check_ab_fp8_fp4(a.first, major_a, device_runtime->get_arch_major());
-        const auto [n, k_] = check_ab_fp8_fp4(b.first, major_b, device_runtime->get_arch_major());
-        const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, false);
-        const auto override_layout = Layout{0, block_m, block_n, block_k, 1, 1};
-        sm120_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d,
-                                m, n, k, gran_k_a, gran_k_b, major_a, major_b,
-                                "nk", std::nullopt, override_layout);
-    },
-          py::arg("a"), py::arg("b"), py::arg("d"),
-          py::arg("recipe") = std::nullopt,
-          py::arg("recipe_a") = std::nullopt,
-          py::arg("recipe_b") = std::nullopt,
-          py::arg("block_m") = 128, py::arg("block_n") = 128, py::arg("block_k") = 128);
 
     // cuBLASLt GEMMs
     m.def("cublaslt_gemm_nt", &cublaslt_gemm_nt,

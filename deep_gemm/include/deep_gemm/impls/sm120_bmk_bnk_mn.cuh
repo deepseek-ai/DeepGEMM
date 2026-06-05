@@ -109,9 +109,7 @@ sm120_bmn_bnk_mn_gemm_impl(const uint32_t shape_s,
 
     cudaGridDependencySynchronize();
 
-    // =====================================================================
     // PRODUCER WARP GROUP (TMA warps, 40 regs)
-    // =====================================================================
     if (warp_idx >= kNumMathWarps) {
         cutlass::arch::warpgroup_reg_dealloc<40>();
 
@@ -135,9 +133,7 @@ sm120_bmn_bnk_mn_gemm_impl(const uint32_t shape_s,
             }
         }
     }
-    // =====================================================================
     // CONSUMER WARP GROUPS (math warps, 232 regs)
-    // =====================================================================
     else {
         cutlass::arch::warpgroup_reg_alloc<232>();
 
@@ -206,7 +202,7 @@ sm120_bmn_bnk_mn_gemm_impl(const uint32_t shape_s,
                 empty_barriers[stage_idx]->arrive();
         }
 
-        // ======== EPILOGUE: atomicAdd to FP32 output ========
+        // Epilogue: atomicAdd to FP32 output
         #pragma unroll
         for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
             #pragma unroll

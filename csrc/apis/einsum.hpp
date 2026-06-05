@@ -253,9 +253,7 @@ static void fp8_einsum(const std::string& expr,
         const auto perm_sfa = a.second.permute({1, 0, 2});
         auto perm_b = b.first.permute({0, 2, 1});
         auto perm_sfb = b.second.permute({0, 2, 1});
-        // SM120: B is MN-major after permute. Kernel has scalar-load MN-major path
-        // (kBKMajor=false) but it's 3x slower than K-major ldmatrix due to 8 individual
-        // ld.shared.u8 per fragment. .contiguous() is faster for typical einsum sizes.
+        // SM120: B is MN-major after permute; .contiguous() to K-major (scalar MN-major path ~3x slower).
         if (arch_major == 12) {
             perm_b = perm_b.contiguous();
         }
@@ -268,11 +266,7 @@ static void fp8_einsum(const std::string& expr,
         auto perm_sfa = a.second.permute({1, 2, 0});
         auto perm_b = b.first.permute({1, 2, 0});
         auto perm_sfb = b.second.permute({1, 2, 0});
-        // SM120: both A and B are MN-major after permute. .contiguous() to K-major is
-        // needed because (1) kernel scalar-load MN-major path is 3x slower than ldmatrix,
-        // and (2) MN-major A is not supported (would need ldmatrix.trans for A operand).
-        // SF-data alignment is preserved: .contiguous() copies FP8 bytes without changing
-        // logical element values, and SF transform reads from the permuted SF view independently.
+        // SM120: A/B MN-major after permute; force K-major (MN-major A unsupported, scalar path ~3x slower).
         if (arch_major == 12) {
             perm_a = perm_a.contiguous();
             perm_b = perm_b.contiguous();

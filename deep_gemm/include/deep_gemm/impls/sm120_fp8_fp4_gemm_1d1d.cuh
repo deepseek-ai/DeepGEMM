@@ -209,9 +209,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
     };
 
-    // =====================================================================
     // PRODUCER WARP GROUP (TMA warps, 40 regs)
-    // =====================================================================
     if (warp_idx >= kNumMathWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kTMARegisters>();
 
@@ -320,9 +318,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             }
         }
     }
-    // =====================================================================
     // CONSUMER WARP GROUPS (math warps, 232 regs)
-    // =====================================================================
     else {
         cutlass::arch::warpgroup_reg_alloc<kMMARegisters>();
 
@@ -362,12 +358,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             static constexpr uint32_t kSFTileKBlocks = kUseSFMajorLoop ? kNumSFAStagesPerLoad : 1;
 
             if constexpr (kUseSFMajorLoop) {
-            // ================================================================
             // SF-MAJOR PATH: gran_k >= BLOCK_K
             // Load SF packed int32 into registers once per kSFTileKBlocks K-blocks,
             // extract bytes with compile-time index via cute::for_each.
             // SwizzleContext hoisted outside K-block loop (loop-invariant).
-            // ================================================================
             uint32_t sf_packed_a[kMTilesPerWarp];
             uint32_t sf_packed_b[kNTilesPerWarp];
             const uint32_t num_full_sf_tiles = num_k_blocks / kSFTileKBlocks;
@@ -791,10 +785,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             } // SF-major tail kb loop
 
             } else { // !kUseSFMajorLoop
-            // ================================================================
             // ORIGINAL PATH: gran_k < BLOCK_K (per-K-step SF loading)
             // Flat K-block loop with runtime sf_byte, no SF caching.
-            // ================================================================
             for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
                 CUTE_TIE_DECL(get_pipeline(iter_idx++), stage, phase);
 
@@ -1114,7 +1106,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             }
             } // else (!kUseSFMajorLoop) — original path
 
-            // ======== EPILOGUE ========
+            // Epilogue
             if constexpr (kSplitKFactor > 1) {
                 // Split-K: write FP32 partials to workspace
                 const uint32_t m_base_sk = m_block_idx * BLOCK_M;

@@ -154,10 +154,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     smem_size += num_kv_stages * smem_kv_size_per_stage;
     smem_size += num_q_stages * smem_weight_size_per_stage;
     smem_size += num_kv_stages * kv_scale_size_per_stage;
-    // SM90/SM100 kernels allocate an extra mbarrier pair per math warp-group; the
-    // SM120 kernel does not. Omitting this term under-allocated SMEM on SM90/SM100
-    // and caused an out-of-bounds __shared__ write (CUDA_ERROR_ILLEGAL_ADDRESS) at
-    // large configs, e.g. seq_len_kv=130560 on SM100.
+    // SM90/SM100 allocate an extra mbarrier pair per math warp-group; SM120 does not.
     const int math_warpgroup_barriers = (arch_major == 12) ? 0 : (num_math_threads / 128) * 2;
     smem_size += (num_q_stages * 2 + num_kv_stages * 2 + math_warpgroup_barriers) * 8;
     smem_size += 4;

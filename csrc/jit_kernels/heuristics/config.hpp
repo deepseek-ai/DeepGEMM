@@ -23,15 +23,10 @@ struct GemmDesc {
     std::string compiled_dims;
 
     // SF granularity for split-K alignment: max(gran_k_a, gran_k_b).
-    // Kernel packs 4 UE8M0 bytes per int32, spanning (4 * max_gran_k / block_k)
-    // k-blocks.  Split-K partitions must start at this boundary.
     int max_gran_k = 128;
 
-    // Whether the C/D output's N dimension is contiguous in global memory.
-    // The SM120 TMA-store epilogue writes via a tensor map that assumes a
-    // contiguous-N output; the AB-swap path produces a transposed output
-    // (stride_cd_n != 1) the descriptor cannot express, so it must fall back to
-    // the strided-store epilogue (swizzle_cd_mode = 0). Defaults to true.
+    // False for AB-swap (transposed, stride_cd_n != 1) output: the TMA-store epilogue
+    // cannot express it, so the kernel falls back to the strided-store epilogue.
     bool cd_n_contiguous = true;
 
     // Shape for heuristic generation

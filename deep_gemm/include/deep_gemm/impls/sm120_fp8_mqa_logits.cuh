@@ -179,7 +179,7 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     cudaGridDependencySynchronize();
 
     if (threadIdx.x >= kNumMathThreads) {
-        // === TMA WARPS ===
+        // TMA warps
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
         if (not is_tma_load_warp)
             return;
@@ -224,7 +224,7 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             }
         }
     } else {
-        // === MATH WARPS ===
+        // Math warps
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
         const auto& thread_idx = threadIdx.x % kNumMathThreads;

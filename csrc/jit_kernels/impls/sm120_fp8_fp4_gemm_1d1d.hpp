@@ -189,7 +189,6 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                     const std::string& compiled_dims,
                                     const std::optional<std::string>& epilogue_type = std::nullopt,
-                                    const std::optional<Layout>& override_layout = std::nullopt,
                                     const bool swap_ab = false) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
@@ -208,24 +207,11 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .max_gran_k = std::max(gran_k_a, gran_k_b),
-        // AB-swap writes a transposed output (stride_cd_n != 1); the TMA-store
-        // epilogue cannot express that, so force the strided-store epilogue.
-        .cd_n_contiguous = !swap_ab
+        .cd_n_contiguous = !swap_ab  // strided-store epilogue (AB-swap output is transposed)
     };
 
-    GemmConfig config;
-    if (override_layout.has_value()) {
-        const auto& layout = override_layout.value();
-        const auto storage_config = SM120ArchSpec::get_storage_config(desc, layout);
-        const auto pipeline_config = SM120ArchSpec::get_pipeline_config(desc, layout, storage_config);
-        const auto launch_config = SM120ArchSpec::get_launch_config(desc, layout);
-        DG_HOST_ASSERT(pipeline_config.num_stages >= 2);
-        config = {layout, storage_config, pipeline_config, launch_config};
-    } else {
-        config = get_best_config<SM120ArchSpec>(desc);
-    }
-    if (!override_layout.has_value())
-        config.split_k_factor = SM120ArchSpec::get_split_k_factor(desc, config.layout);
+    auto config = get_best_config<SM120ArchSpec>(desc);
+    config.split_k_factor = SM120ArchSpec::get_split_k_factor(desc, config.layout);
 
     const auto cd = c.value_or(d);
     const bool fp4_unpacked = !is_fp4;
@@ -593,9 +579,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                               const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                               const std::string& compiled_dims,
                               const bool swap_ab = false) {
-    // SM120 FP8 BMM currently requires K-major operands. MN-major B has a verified
-    // scalar-load kernel path (kBKMajor=false) but is 3x slower than K-major ldmatrix.
-    // Callers use .contiguous() to ensure K-major layout.
+    // Requires K-major operands; callers .contiguous() (MN-major scalar path is ~3x slower).
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     const bool is_fp4 = (a.scalar_type() == kPackedFP4);
@@ -613,9 +597,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .max_gran_k = std::max(gran_k_a, gran_k_b),
-        // AB-swap writes a transposed output (stride_cd_n != 1); the TMA-store
-        // epilogue cannot express that, so force the strided-store epilogue.
-        .cd_n_contiguous = !swap_ab
+        .cd_n_contiguous = !swap_ab  // strided-store epilogue (AB-swap output is transposed)
     };
     const auto config = get_best_config<SM120ArchSpec>(desc);
 

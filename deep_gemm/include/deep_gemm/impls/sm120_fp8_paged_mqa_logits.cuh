@@ -162,7 +162,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     uint32_t q_iter_idx = 0, kv_iter_idx = 0;
 
     if (warp_idx >= kNumMathThreads / 32) {
-        // === TMA WARPS ===
+        // TMA warps
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
         if (kv_group_idx >= kNumGroups)
             return;
@@ -233,7 +233,7 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
             fetched_next_task = scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv);
         }
     } else {
-        // === MATH WARPS ===
+        // Math warps
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
         const uint32_t warp_in_group = warp_idx % kWarpsPerGroup;

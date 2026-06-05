@@ -10,9 +10,7 @@
 
 namespace deep_gemm::sm120 {
 
-// ============================================================================
 // Swizzle: uses CuTe Swizzle<B,M,S> for position-independent swizzle math.
-// ============================================================================
 // TMA writes with hardware swizzle (B128, B64, B32). The XOR pattern uses
 // physical SMEM address bits. With 128B-aligned base (guaranteed by __align__(1024)),
 // the swizzle becomes position-independent.
@@ -47,9 +45,7 @@ __device__ __forceinline__ int swizzle(int row, int col_byte, int row_stride) {
     return CuTeSwizzle<swizzle_bytes>::apply(flat) - row * row_stride;
 }
 
-// ============================================================================
 // ldmatrix wrappers
-// ============================================================================
 
 __device__ __forceinline__ void ldmatrix_x4(
     uint32_t& d0, uint32_t& d1, uint32_t& d2, uint32_t& d3, void* smem) {
@@ -85,9 +81,7 @@ __device__ __forceinline__ void ldmatrix_m8n16_x2_b4x16_p64(
          : "memory");
 }
 
-// ============================================================================
 // Fragment loaders: pre-computed swizzle variants (fast path)
-// ============================================================================
 
 // Load B fragment from MN-major SMEM B[BLOCK_K, BLOCK_N] via ldmatrix.trans.x2
 // MN-major: rows=K, cols=N(bf16 contiguous). .trans reads columns (N-contiguous).
@@ -107,7 +101,6 @@ __device__ __forceinline__ void load_b_fragment_trans_x2(
     ldmatrix_x2_trans(frag[0], frag[1], addr);
 }
 
-// ============================================================================
 
 // Load A fragment using pre-computed SwizzleContext
 // ctx must be initialized with the A row for this lane: (lane&7) + ((lane>>3)&1)*8 + m_tile*16
@@ -178,9 +171,7 @@ __device__ __forceinline__ void load_b_fragment_b4x16_p64(
     ldmatrix_m8n16_x2_b4x16_p64(frag[0], frag[1], addr);
 }
 
-// ============================================================================
 // Fragment loaders: legacy (full address computation each call)
-// ============================================================================
 
 template <int swizzle_bytes>
 __device__ __forceinline__ void* ldmatrix_a_addr(
@@ -232,9 +223,7 @@ __device__ __forceinline__ void load_b_fragment_x4(
     ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], addr);
 }
 
-// ============================================================================
 // Scale factor loading
-// ============================================================================
 
 __device__ __forceinline__ uint32_t load_sf(const char* smem_sf, int idx) {
     return *reinterpret_cast<const uint32_t*>(smem_sf + idx * sizeof(int32_t));

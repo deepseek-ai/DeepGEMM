@@ -40,8 +40,6 @@ try:
         m_grouped_fp8_fp4_gemm_nt_contiguous,
         m_grouped_fp8_fp4_gemm_nn_contiguous,
         m_grouped_fp8_fp4_gemm_nt_masked,
-        # SM120 benchmark
-        sm120_fp8_gemm_bench,
         # FP8 GEMMs
         fp8_gemm_nt, fp8_gemm_nn,
         fp8_gemm_tn, fp8_gemm_tt,
