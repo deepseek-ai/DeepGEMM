@@ -647,6 +647,24 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         const char* value = std::getenv(name);
         return (value != nullptr and value[0] != '\0') ? std::atoi(value) : default_value;
     };
+    // BM=64 fast-path 是否启用（函数作用域统一判据，供三处共用：layout 选择 /
+    // bm32_skew_layout(stages) / bm32_skew_fast_path(device 三件套总闸)）。
+    //   两个触发源：
+    //   (1) DG_W4_PATHB_BM64_FASTPATH=1：手动强制（对照实验用）。
+    //   (2) DG_W4_PATHB_BM64_AUTO=1（默认开）+ 高置信子集 max_hint>=128 且
+    //       active<=8：自动触发，抓“少数活跃组 + 大 max_m”（MTP verify spec-len
+    //       命中形态）。详见 layout 选择处 bm64_fastpath 的长注释。
+    //   (3) DG_W4_PATHB_BM64_FORCE_ALL=1：无条件全部走 BM=64 fast-path
+    //       （用于在线业务峰值吞吐 A/B 对照，绕开 hint 判据；hint 在生产 cuda graph
+    //       下恒为 None 时，是验证“假设拿到 hint 全命中”的速度上界）。
+    //   注意：必须同时让 stages / fast-path 总闸认账，否则 layout.block_m=64 却
+    //   走通用慢路径会退化 ~2x（见 DG_W4_PATHB_BM64 非 fastpath 的坑）。
+    const bool bm64_fastpath_enabled =
+        env_int("DG_W4_PATHB_BM64_FORCE_ALL", 0) != 0 or
+        env_int("DG_W4_PATHB_BM64_FASTPATH", 0) != 0 or
+        (env_int("DG_W4_PATHB_BM64_AUTO", 1) != 0 and
+         masked_m_max_hint.value_or(0) >= 128 and
+         active_groups_hint.value_or(static_cast<int>(desc.num_groups)) <= 8);
     // W4 masked 启发式：以 weight HBM 带宽为主要瓶颈，需要足够的 pipeline stages
     // 来隐藏 TMA B 的延迟。在 expected_m 较小时（典型 MoE 场景），优先选择能让
     // stages 数最深的 (BM, BN) 组合，并兼顾 wave 利用率。
@@ -746,8 +764,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
             //   挡在 fast-path 外，强制走 path-B 通用 cache_sfb_k32 路径，W4 GB/s
             //   只有 627（vs fast-path 命中时 1500-3000+ GB/s），speedup 0.43-0.56x。
             //   device fast-path 三件套（quad_reduce / direct_load / compact_sched）
-            //   实际 BN-agnostic，仅硬约束 BM==32 + gran_k_b==32，groups=24 满足
-            //   kNumGroups<=32、n=6144 满足 BN={128,256} 整除 ⇒ 物理可命中。
+            //   实际 BN-agnostic，仅硬约束 BM==32 + gran_k_b==32，冗余专家场景
+            //   kNumGroups<=36 也可按同一路径处理。
             //   实测：g24+n=6144+k=7168 整张表 0.43-0.56x → 0.71-0.81x；
             //         g24+n=7168+k=3072 整张表 0.30-0.54x → 0.45-0.79x；
             //         默认 dsv4 形状 (g32+n∈{4096,7168}+k∈{2048,4096,7168}) 不变。
@@ -838,10 +856,61 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                 //   保留 env 入口仅做对照实验，生产环境永不开启。
                 const bool bm64_hint =
                     dsv4_shape and env_int("DG_W4_PATHB_BM64", 0) != 0;
+                // BM=64 fast-path 实验路径（默认关，env DG_W4_PATHB_BM64_FASTPATH=1）：
+                //   与 DG_W4_PATHB_BM64 不同——后者刻意让 device 落回通用
+                //   cache_sfb_k32 路径；本开关**保持** fast-path 三件套
+                //   (kK32QuadReduce / kScaleBDirectLoad / kCompactMaskedSched) 开启，
+                //   仅把 host BM 从 32 抬到 64，验证“weight 解码次数减半 + grid 减半”
+                //   能否吃掉 max_m>=64 差场景。
+                //   依赖：device 端 swap_AB 下 WGMMA N=BLOCK_M=64 指令已存在
+                //   (FP8MMASelectorRS<64> = MMA_64x64x32_RS_TN)，scale 寻址 BM-agnostic。
+                //   BM=64 强制 BN=128，避免 A-smem 叠加 BN=256 把 stages 压崩。
+                //
+                //   实测结论（DG_W4_PATHB_BM64_FASTPATH=1 vs 默认 BM=32，ncu 对照，
+                //   g24 N=6144 K=7168 / N=7168 K=3072 skew benchmark）：**全面退化，已证伪**。
+                //     uniform_17   784us/0.75x → 1391us/0.43x  (max_m=17)
+                //     uniform_32   775us/0.77x → 1387us/0.42x  (max_m=32)
+                //     dense_tail_hot17 767/0.77x → 1381/0.43x
+                //     uniform_64  1541us/0.38x → 1390us/0.43x  (唯一微升)
+                //     one_hot_512  542us/0.58x → 542us/0.58x   (完全无变化)
+                //   ncu 四项硬指标 BM32 vs BM64 **逐字节相同**：
+                //     Registers/Thread 168=168, Dyn SMEM 149984=149984,
+                //     Grid (78,1,1)=(78,1,1), Achieved Occupancy 14.0%≈13.9%。
+                //   证伪根因（结构性，非实现 bug；正确性 OK diff=0、无 spill）：
+                //     1. persistent kernel grid 恒 = num_sms，BLOCK_M 不影响 grid。
+                //     2. swap_AB 下 WGMMA 形状 / kNumAccum / WAVE_BLOCK_M 全由
+                //        BLOCK_N 决定，BLOCK_M 加倍不动寄存器、不动 smem。
+                //     3. M-tile 数 = ceil(max_m/BM)。DSV4 真实 max_m 多 <=32，
+                //        BM 32→64 时 tile 数不减，但每 tile WGMMA 覆盖 64 行、
+                //        ~47 行是 padding 空算 → 工作量翻倍、收益为零 → 耗时近翻倍。
+                //     4. 仅 max_m=64 时 tile 2→1 抵消 padding 才微升；max_m 更大
+                //        (one_hot_512 active=1) 瓶颈不在 tile 数，故毫无变化。
+                //   结论：当前 DSV4 负载 (max_m 集中 17-64) 下 BM=64 是负优化。
+                //   保留 env 入口仅做对照实验，生产环境永不开启。
+                //   真正受益方向见下方思路 2（active=1 大 max_m 时跨 m_block 复用
+                //   weight decode），不受 padding 问题影响。
+                // BM=64 fast-path **自动触发规则**（默认开，env 可关）：
+                //   前述 DG_W4_PATHB_BM64_FASTPATH 手动实验证明，BM 32→64 让
+                //   M-tile 数 ceil(m/32)→ceil(m/64) 减半，仅当“每活跃组平均
+                //   token 数”够大（每组 m>=64，padding 占比可忽略）才净赚；组小则
+                //   tile 数不减、padding 翻倍纯亏。判别量本应是 sum_m/active，但
+                //   host API 只有 max_hint / active（拿不到 sum_m，且不能同步读
+                //   device 上的 masked_m）。
+                //   折中：用高置信子集 `max_hint>=128 且 active<=8`（少数活跃组 +
+                //   大 max_m，正是 MTP verify 的 spec-len 命中形态）触发，刻意避开
+                //   max_m=64 / 多活跃组的模糊带（uniform_64 赢、dense_tail_hot64
+                //   亏，二者 host 信号 (max_hint=64,active=24) 撞车无法区分）。
+                //   实测（g24 N6144/7168 与 g32 N4096，BM64+pair vs 默认 quad）两族
+                //   shape 一致：命中子集 one_hot_128/384、mtp_384/512_hot、
+                //   one_hot_512、mtp_768_hot512 等普降 5~26%，被避开的
+                //   dense_tail/uniform/eight_hot 无一受损。
+                //   BM=64 下 quad 4 累加器会 spill 爆炸，故命中时**必须**配
+                //   pair_reduce（见下方 k32_pair_reduce 联动）。
+                const bool bm64_fastpath = dsv4_shape and bm64_fastpath_enabled;
                 if (real_hot_present and not fuse_decode_hint and
                     not bm64_hint and
                     env_int("DG_W4_PATHB_FAST_PATH", 1) != 0) {
-                    layout.block_m = 32;
+                    layout.block_m = bm64_fastpath ? 64 : 32;
                     // H1: 同时满足 max_m > 32 + active*max_m >= 1024 时走 BN=256，
                     // grid 减半。门槛公式来自 skewed masked benchmark 实测：
                     //   * eight_hot_64 (8×64=512)、four_hot_64 (4×64=256)、
@@ -895,7 +964,9 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                         masked_m_max_hint.has_value() and
                         (bn256_baseline or bn256_big_shape) and
                         env_int("DG_W4_PATHB_BN256", 1) != 0;
-                    layout.block_n = bn256_eligible ? 256 : 128;
+                    // BM=64 fast-path 强制 BN=128：A-smem 已随 BM 翻倍，再叠加
+                    // BN=256 会把 B-tile + A-tile 占用一起推高，stages 被压崩。
+                    layout.block_n = (bm64_fastpath or not bn256_eligible) ? 128 : 256;
                     // H2: cluster_n=2（A 多播）实测**全军退化**，默认关闭。
                     // 退化数据（DG_W4_PATHB_CLUSTER_N=1 vs 默认）：
                     //   BN=256 路径 ~9-10% 退化（mtp_512: 201→220, dense_tail_hot64:
@@ -967,6 +1038,16 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         }
     }
     if (not block_m_override and not block_n_override) {
+        // DG_W4_PATHB_BM64_FORCE_ALL=1 时，把 BLOCK_N 强制锁到 128（与 BM=64
+        // fast-path 联动）。动机：BM=64 fast-path 下 final_accum 寄存器量
+        // ∝ BLOCK_N/64，BN=256 → 4 份 tile 累加器逼出 168reg/thread、occupancy
+        // 14%；BN=128 砍半 final_accum，腾出寄存器预算给更多 warp，对大 batch /
+        // 高 active 场景 occupancy 上限更高。属于在线吞吐对照实验的联动开关，
+        // 不影响 hint 判据自身路径。
+        if (env_int("DG_W4_PATHB_BM64_FORCE_ALL", 0) != 0 and
+            bm64_fastpath_enabled and layout.block_m == 64) {
+            layout.block_n = 128;
+        }
         DG_HOST_ASSERT(layout.block_m == 8 or layout.block_m == 16 or layout.block_m == 32 or
                        layout.block_m == 64 or layout.block_m == 128);
         DG_HOST_ASSERT(layout.block_n == 64 or layout.block_n == 128 or layout.block_n == 256);
@@ -1043,10 +1124,12 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
             static_cast<int64_t>(desc.k) >= 4096 and static_cast<int64_t>(desc.n) <= 4096)
             chosen_stages = std::min(chosen_stages, 6);
         const bool bm32_skew_layout = gran_k_b == 32 and
-            config.layout.block_m == 32 and
+            (config.layout.block_m == 32 or
+             (config.layout.block_m == 64 and bm64_fastpath_enabled)) and
             (config.layout.block_n == 128 or config.layout.block_n == 256) and
             static_cast<int64_t>(desc.m) >= 1024 and
-            ((desc.num_groups == 32 and
+            ((static_cast<int64_t>(desc.num_groups) >= 8 and
+              static_cast<int64_t>(desc.num_groups) <= 36 and
               (static_cast<int64_t>(desc.n) == 4096 or
                static_cast<int64_t>(desc.n) == 7168) and
               (static_cast<int64_t>(desc.k) == 2048 or
@@ -1057,7 +1140,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
              // 放开到 g>=8 + n∈{4096,6144,7168} + k∈{2048,3072,4096,7168}
              (env_int("DG_W4_PATHB_FAST_PATH_RELAX", 1) != 0 and
               static_cast<int64_t>(desc.num_groups) >= 8 and
-              static_cast<int64_t>(desc.num_groups) <= 32 and
+              static_cast<int64_t>(desc.num_groups) <= 36 and
               (static_cast<int64_t>(desc.n) == 4096 or
                static_cast<int64_t>(desc.n) == 6144 or
                static_cast<int64_t>(desc.n) == 7168) and
@@ -1108,10 +1191,12 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
                                                config.storage_config.swizzle_cd_mode);
 
     const bool bm32_skew_fast_path = gran_k_b == 32 and
-        config.layout.block_m == 32 and
+        (config.layout.block_m == 32 or
+         (config.layout.block_m == 64 and bm64_fastpath_enabled)) and
         (config.layout.block_n == 128 or config.layout.block_n == 256) and
         static_cast<int64_t>(desc.m) >= 1024 and
-        ((desc.num_groups == 32 and
+        ((static_cast<int64_t>(desc.num_groups) >= 8 and
+          static_cast<int64_t>(desc.num_groups) <= 36 and
           (static_cast<int64_t>(desc.n) == 4096 or
            static_cast<int64_t>(desc.n) == 7168) and
           (static_cast<int64_t>(desc.k) == 2048 or
@@ -1120,11 +1205,12 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
            static_cast<int64_t>(desc.k) == 7168)) or
          // FAST_PATH_RELAX 扩展（DG_W4_PATHB_FAST_PATH_RELAX=1 **默认开启**），
          // 与 bm32_skew_layout / dsv4_shape 同步生效。device fast-path 三件套
-         // (quad_reduce / direct_load / compact_sched) 仅硬约束 BM==32 + g<=32，
+         // (quad_reduce / direct_load / compact_sched) 仅硬约束 BM==32，g<=36
+         // 冗余专家场景按同一路径处理，
          // 与 N/K 数值无关，物理可命中。
          (env_int("DG_W4_PATHB_FAST_PATH_RELAX", 1) != 0 and
           static_cast<int64_t>(desc.num_groups) >= 8 and
-          static_cast<int64_t>(desc.num_groups) <= 32 and
+          static_cast<int64_t>(desc.num_groups) <= 36 and
           (static_cast<int64_t>(desc.n) == 4096 or
            static_cast<int64_t>(desc.n) == 6144 or
            static_cast<int64_t>(desc.n) == 7168) and
@@ -1144,6 +1230,15 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         get_major_type_ab(sfb) == cute::UMMA::Major::MN and
         env_int("DG_W4_PATHB_FUSE_DECODE", 0) != 0;
     const bool scale_b_packed_ue8m0 = fuse_scale_b_decode;
+    // 思路2 性能探针：把 scale_a 从 promote 内移除（device kScaleAStub 置 scale_a=1
+    // 并跳过 SFA 的 TMA load），用于测 fuse_scale_b_decode 单累加器 + scale_a 后移到
+    // silu_and_mul 的速度上界。开启后结果数值错误，仅做性能对照。默认关。
+    const bool scale_a_stub = env_int("DG_W4_SCALE_A_STUB", 0) != 0;
+    // 思路2 串行依赖实验：双缓冲预解码（staged_pair_a_regs，issue k 时预取 k+2），
+    // 让 decode 与 WGMMA 多重叠一级，代价 +8 reg/线程。仅在 fuse_scale_b_decode 开启
+    // 时有意义，用于测"解 issue 串行依赖"能否补回 fuse 路径在大 M 的退化。默认关。
+    const bool fuse_predecode_pair =
+        fuse_scale_b_decode and env_int("DG_W4_FUSE_PREDECODE_PAIR", 0) != 0;
     // fuse_scale_b_decode 一旦开启，所有 fast-path / direct-load / e8m0 / bf16
     // 互斥关闭——device 那边 static_assert 会拒绝同时开启。
     const bool scale_b_direct_load =
@@ -1152,6 +1247,37 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
     const bool k32_quad_reduce =
         gran_k_b == 32 and (expected_m <= 16 or bm32_skew_fast_path) and
         not fuse_scale_b_decode;
+    // 杠杆3 / BM=64 联动：把 4 累加器 quad-reduce（峰值 64 float，在
+    // __launch_bounds__(384,1) 的 168reg 硬上限下触发 local spill）退化为已存在的
+    // 2 累加器串行 pair-reduce（峰值 32 float）降低寄存器峰值活跃量。仅改单线程内
+    // 累加器生命周期、不动线程模型/barrier，数值 bit 级等价。
+    // 两种启用：
+    //   (A) BM=32 下**单独**开 pair（DG_W4_K32_PAIR_REDUCE=1）：已证伪——ncu spill
+    //       223680→134016(-40%) 但 wall-clock 反而 +10~25%（串行累加拉长依赖链，
+    //       spill 不在 BM=32 关键路径上）。默认关。
+    //   (B) BM=64 fast-path 命中时**必须**配 pair（自动，下面 block_m==64 分支）：
+    //       BM=64 让 kNumAccum 32→quad 4 份 = 128 fp32，spill 爆炸退化 ~2x；pair
+    //       2 份 = 64 fp32 受控。BM=64 靠 M-tile 数减半换吞吐，pair 是其必要前提。
+    //       实测高置信子集（max_hint>=128 且 active<=8）净降 5~26%。
+    const bool k32_pair_reduce =
+        k32_quad_reduce and
+        ((config.layout.block_m == 64 and bm64_fastpath_enabled) or
+         env_enabled("DG_W4_K32_PAIR_REDUCE"));
+    // 杠杆3 续（已证伪，默认关）：pair-reduce 之上把长驻 final_accum 从 fp32 改 bf16
+    // 存储（nv_bfloat162）再减半长驻寄存器、继续压 spill（ncu 134016→6480，-97% vs
+    // quad）。精度无损（W4 diff 0.0001/0.0000）。但 wall-clock 仍慢于 quad baseline
+    // （随 pair-reduce 一起退化，叠加 bf16 promote 反而更长依赖链）。默认关，需
+    // DG_W4_K32_BF16_FINAL_ACCUM=1 显式开启复现。
+    const bool k32_bf16_final_accum =
+        k32_pair_reduce and env_enabled("DG_W4_K32_BF16_FINAL_ACCUM");
+    // 杠杆3 续2（已证伪，默认关）：把长驻 final_accum 整体搬进 smem_d（kDirectStore
+    // + kFinalAccumScratch），final_accum_regs 缩成 1 元素。实测 spill 虽归零，但
+    // (1) 寄存器仍顶 168（launch_bounds 硬顶，省下的 reg 没还给 occupancy，Block
+    // Limit Registers 仍为 1）；(2) DirectStore 逐元素非合并写 gmem 严重拖累大
+    // max_m：one_hot_256 0.77x→0.50x、one_hot_512 0.49x→0.29x。净负收益，仅保留
+    // 开关供复现，默认关。需 DG_W4_K32_FINAL_ACCUM_SMEM=1 显式开启。
+    const bool k32_final_accum_smem =
+        k32_pair_reduce and env_enabled("DG_W4_K32_FINAL_ACCUM_SMEM");
     // RS baseline for direct E8M0 B scales: keep scale products in split form by default.
     // The exponent-adjust path is experimental and can regress some small-M shapes.
     const bool scale_b_pow2_promote =
@@ -1177,7 +1303,7 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         gran_k_b == 32 and expected_m <= 16 and
         ((static_cast<int64_t>(desc.k) >= 4096 and static_cast<int64_t>(desc.n) <= 4096) or
          (static_cast<int64_t>(desc.num_groups) >= 8 and
-          static_cast<int64_t>(desc.num_groups) <= 32 and
+          static_cast<int64_t>(desc.num_groups) <= 36 and
           (static_cast<int64_t>(desc.n) == 4096 or
            static_cast<int64_t>(desc.n) == 6144 or
            static_cast<int64_t>(desc.n) == 7168) and
@@ -1248,6 +1374,9 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .scale_b_direct_load = scale_b_direct_load,
         .scale_b_pow2_promote = scale_b_pow2_promote,
         .k32_quad_reduce = k32_quad_reduce,
+        .k32_pair_reduce = k32_pair_reduce,
+        .k32_bf16_final_accum = k32_bf16_final_accum,
+        .k32_final_accum_smem = k32_final_accum_smem,
         .k32_quad_split_promote = k32_quad_split_promote,
         .k32_quad_scale_b_inline = k32_quad_scale_b_inline,
         .k32_quad_scale_b_prefetch = k32_quad_scale_b_prefetch,
@@ -1256,6 +1385,8 @@ static void sm90_m_grouped_fp8_fp4_gemm_masked_1d1d_fused(
         .small_m_simple_sched = small_m_simple_sched,
         .compact_masked_sched = compact_masked_sched,
         .fuse_scale_b_decode = fuse_scale_b_decode,
+        .scale_a_stub = scale_a_stub,
+        .fuse_predecode_pair = fuse_predecode_pair,
         .scale_b_packed_ue8m0 = scale_b_packed_ue8m0,
         .scale_b_gran_k = static_cast<uint32_t>(gran_k_b),
         .b_is_int4_sym = b_is_int4_sym,
