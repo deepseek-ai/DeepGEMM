@@ -36,8 +36,23 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
-    // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    // (BF16, 1, 32/128) on SM90 SFB fast path: path-A (k128) 与 path-B fast-path (k32)
+    // 都支持 bf16 sfb，体积砍半。tensor 已由调用方按 MN-major + tma_aligned_mn=align(N,8)
+    // 构造，这里跳过 fp32 only 的 transpose，直接复用 align 路径。
+    if (sf.scalar_type() == torch::kBFloat16 and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and arch_major == 9)
+        return get_mn_major_tma_aligned_tensor(sf);
+    // (UInt8/E8M0, 1, 32) on SM90 SFB fast path：path-B 专用，每元素 1B 即 fp32 的
+    // 8 位指数。tensor 已由调用方按 MN-major + tma_aligned_mn=align(N,16) 构造。
+    if (sf.scalar_type() == torch::kUInt8 and gran_mn == 1 and gran_k == 32 and arch_major == 9)
+        return get_mn_major_tma_aligned_tensor(sf);
+
+    // (FP32, 1, 32/128) on SM90: transform to TMA-aligned and MN-major
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and
+        (arch_major == 9 or disable_ue8m0_cast))
+        return get_mn_major_tma_aligned_tensor(sf);
+
+    // (INT packed UE8M0, 1, 32/128) on SM90: transform to TMA-aligned and MN-major.
+    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and (gran_k == 32 or gran_k == 128) and arch_major == 9)
         return get_mn_major_tma_aligned_tensor(sf);
 
     // (FP32, 128, 128) on SM90: no need to transform, check SFB requirements

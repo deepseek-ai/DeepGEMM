@@ -141,3 +141,84 @@ def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128
     group_idx = torch.arange(n, device=packed.device) // gran_k
     x_restored = x_dequantized * sf[:, group_idx]
     return x_restored
+
+
+# ---------------------------------------------------------------------------
+# INT4 symmetric (signed [-8, 7]) helpers used by sm90 INT4-A8 path.
+# 4-bit two's-complement codes: 0..7 -> 0..7, 8..15 -> -8..-1.
+# Two nibbles are packed into one int8 byte, low nibble first.
+#
+# All 16 INT4 sym values are exactly representable in FP8 E4M3, so we provide
+# a lossless INT4 -> packed E4M3 byte converter that lets us drive the existing
+# FP8xFP8 fused kernel with INT4-quantised B for end-to-end accuracy testing
+# while a dedicated INT4-A8 fused kernel is being landed.
+# ---------------------------------------------------------------------------
+
+def _int4_sym_decode(nibble: torch.Tensor) -> torch.Tensor:
+    """Map low-4-bit two's-complement nibble to signed int in [-8, 7]."""
+    nib = (nibble & 0x0F).to(torch.int32)
+    return torch.where(nib >= 8, nib - 16, nib)
+
+
+def per_token_cast_to_int4_sym(x: torch.Tensor, gran_k: int = 128
+                               ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-(row, K-block) symmetric INT4 quantisation.
+
+    Returns (packed, sf):
+      packed: int8 tensor of shape (m, n // 2), two nibbles per byte (low first).
+      sf:     fp32 tensor of shape (m, n // gran_k), absmax / 7.
+    """
+    assert x.dim() == 2
+    m, n = x.shape
+    assert n % 2 == 0
+    padded_n = align(n, gran_k)
+    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, padded_n // gran_k, gran_k)
+    x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
+    sf = x_amax / 7.0
+    x_scaled = x_view.float() * (1.0 / sf.unsqueeze(2))
+    # Round-half-to-even and clamp to int4 sym range.
+    q = torch.round(x_scaled).clamp_(-8, 7).to(torch.int8).view(m, padded_n)
+    # Pack two nibbles per byte; mask with 0x0F first to drop the sign extension.
+    q2 = q.view(m, padded_n // 2, 2)
+    packed = ((q2[:, :, 0] & 0x0F) | ((q2[:, :, 1] & 0x0F) << 4)).to(torch.int8)
+    return packed[:, : n // 2].contiguous(), sf
+
+
+def cast_back_from_int4_sym(packed: torch.Tensor, sf: torch.Tensor,
+                            gran_k: int = 128) -> torch.Tensor:
+    """Dequantise INT4-sym packed weights back to fp32."""
+    m, n2 = packed.shape
+    n = n2 * 2
+    lo = _int4_sym_decode(packed)
+    hi = _int4_sym_decode(packed >> 4)
+    unpacked = torch.empty((m, n), dtype=torch.float, device=packed.device)
+    unpacked[:, 0::2] = lo.float()
+    unpacked[:, 1::2] = hi.float()
+    group_idx = torch.arange(n, device=packed.device) // gran_k
+    return unpacked * sf[:, group_idx]
+
+
+# Lossless 16-entry LUT: INT4 sym (4-bit two's-complement) -> FP8 E4M3 byte.
+# Verified: every signed int in [-8, 7] is exactly representable in E4M3, so
+# casting q.float().to(torch.float8_e4m3fn) round-trips identically.
+def int4_sym_to_e4m3_bytes(packed_int4: torch.Tensor) -> torch.Tensor:
+    """Convert packed INT4-sym (2 nibbles / byte) to unpacked E4M3 bytes.
+
+    Args:
+        packed_int4: int8 tensor (..., n // 2). Low nibble is element 2*i,
+                     high nibble is element 2*i+1.
+    Returns:
+        torch.float8_e4m3fn tensor (..., n) with byte-identical encoding to
+        a fresh fp32 -> fp8_e4m3 cast of the dequantised integer values.
+    """
+    assert packed_int4.dtype == torch.int8
+    *prefix, n2 = packed_int4.shape
+    n = n2 * 2
+    lo = _int4_sym_decode(packed_int4)
+    hi = _int4_sym_decode(packed_int4 >> 4)
+    unpacked = torch.empty((*prefix, n), dtype=torch.int32, device=packed_int4.device)
+    unpacked[..., 0::2] = lo
+    unpacked[..., 1::2] = hi
+    return unpacked.float().to(torch.float8_e4m3fn)
