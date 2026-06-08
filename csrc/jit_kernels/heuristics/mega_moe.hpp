@@ -604,26 +604,21 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
 
     // C/D output region: max of L1 FP8 (single-buffered, BLOCK_N/2 post-SwiGLU)
     // and L2 BF16, then 1024-byte aligned (matches kernel's SMEM_CD_SIZE).
-    // The mma.sync decode path additionally stages one BLOCK_M x BLOCK_N FP32
-    // accumulator tile in SMEM for logical-row epilogue mapping.
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
     const bool split_n_warpgroups = block_m == 64 and block_n == 256 and num_epilogue_warpgroups == 2;
     const bool serial_n_warpgroups = false;
     const int wg_block_m = split_n_warpgroups ? block_m : block_m / num_epilogue_warpgroups;
     const int wg_block_n = (split_n_warpgroups or serial_n_warpgroups) ? block_n / 2 : block_n;
-    const int smem_cd_accum = (block_m == 16 or block_m == 32) ? align(block_m * block_n * static_cast<int>(sizeof(float)), kSmemAlignment) : 0;
     const int smem_cd_l1 = num_epilogue_warpgroups * wg_block_m * (wg_block_n / 2);  // 1 byte/elem (FP8)
     const bool direct_l2_scatter = direct_l2_scatter_enabled and
-                                   block_m != 16 and block_m != 32 and
                                    not serial_n_warpgroups and wg_block_n == 128;
     const bool async_l1_tma_store = get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0 and
-                                    block_m != 16 and block_m != 32 and
                                     not split_n_warpgroups and num_epilogue_warpgroups == 1;
     const int smem_cd_l2 = direct_l2_scatter ? 0 :
         num_epilogue_warpgroups * wg_block_m * wg_block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd_l1_async = async_l1_tma_store ?
         2 * num_epilogue_warpgroups * wg_block_m * (block_n / 2) : 0;
-    const int smem_cd = smem_cd_accum + align(std::max(std::max(smem_cd_l1, smem_cd_l2), smem_cd_l1_async), kSmemAlignment);
+    const int smem_cd = align(std::max(std::max(smem_cd_l1, smem_cd_l2), smem_cd_l1_async), kSmemAlignment);
 
     // SF on SM90:
     //   * SFA per stage must hold the larger of L1 (BLOCK_M floats, per-128 K)
@@ -756,13 +751,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens) {
-    const float expected_tokens_per_expert =
-        static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
-
-    const int requested_mma_m = get_env<int>("DG_SM90_MOE_MMA_SYNC_M") > 0
-        ? get_env<int>("DG_SM90_MOE_MMA_SYNC_M")
-        : (get_env<int>("DG_SM90_MOE_MMA_SYNC") != 0 ? 16 : 0);
-    DG_HOST_ASSERT(requested_mma_m == 0 or requested_mma_m == 16 or requested_mma_m == 32);
     const int forced_block_m = get_env<int>("DG_SM90_MOE_FORCE_BLOCK_M");
     const int forced_epilogue_warpgroups = get_env<int>("DG_SM90_MOE_FORCE_EPILOGUE_WG");
     DG_HOST_ASSERT(forced_block_m == 0 or forced_block_m == 64 or forced_block_m == 128);
@@ -770,13 +758,11 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                    forced_epilogue_warpgroups == 1 or
                    forced_epilogue_warpgroups == 2);
 
-    const bool use_mma_sync_decode =
-        requested_mma_m > 0 and expected_tokens_per_expert <= static_cast<float>(requested_mma_m);
     const bool use_b_stationary_2wg =
-        get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0 and not use_mma_sync_decode;
+        get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0;
     const bool use_bn256_split_n_env =
         get_env<int>("DG_SM90_MOE_BN256_2WG", 1) != 0 and
-        forced_block_m != 128 and not use_mma_sync_decode;
+        forced_block_m != 128;
     DG_HOST_ASSERT(not (use_b_stationary_2wg and use_bn256_split_n_env));
 
     std::vector<int> block_m_candidates;
@@ -784,8 +770,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
         append_unique_moe_candidate(block_m_candidates, forced_block_m);
     } else if (use_b_stationary_2wg) {
         append_unique_moe_candidate(block_m_candidates, 128);
-    } else if (use_mma_sync_decode) {
-        append_unique_moe_candidate(block_m_candidates, requested_mma_m);
     } else {
         append_unique_moe_candidate(block_m_candidates, 64);
     }
@@ -805,8 +789,7 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
         );
 
         std::vector<int> block_n_candidates;
-        if (block_m == 64 and not use_mma_sync_decode and
-            use_bn256_split_n_env) {
+        if (block_m == 64 and use_bn256_split_n_env) {
             append_unique_moe_candidate(block_n_candidates, 256);
         } else {
             append_unique_moe_candidate(block_n_candidates, 128);
@@ -824,8 +807,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
             for (const int& num_epilogue_warpgroups: epilogue_wg_candidates) {
                 if (block_m % num_epilogue_warpgroups != 0)
                     continue;
-                if ((block_m == 16 or block_m == 32) and num_epilogue_warpgroups != 1)
-                    continue;
                 if (block_m == 128 and num_epilogue_warpgroups != 2)
                     continue;
                 if (block_m == 64 and block_n == 256 and num_epilogue_warpgroups != 2)
@@ -837,8 +818,8 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                          (block_m == 128 and block_n == 128 and num_epilogue_threads == 256)))
                     continue;
                 const int cluster_size = use_cluster_bcast_b ? 2 : 1;
-                const int swizzle_acts_mode = (block_m == 16 or block_m == 32) ? 0 : 128;
-                const int swizzle_weights_mode = (block_m == 16 or block_m == 32) ? 0 : 128;
+                const int swizzle_acts_mode = 128;
+                const int swizzle_weights_mode = 128;
 
                 const bool prefer_compact_frontend =
                     block_n == 256 and not split_sfa_tma;
@@ -875,9 +856,8 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                     const bool one_warp_cleanup_default = policy.one_warp_cleanup(
                         get_env<int>("DG_SM90_MOE_MASKED_HINT", 0) != 0);
                     const bool direct_l2_scatter_legal =
-                        block_m != 16 and block_m != 32 and
-                        ((block_m == 64 and block_n == 256 and num_epilogue_warpgroups == 2) or
-                         block_n == 128);
+                        (block_m == 64 and block_n == 256 and num_epilogue_warpgroups == 2) or
+                        block_n == 128;
 
                     auto direct_candidates = get_sm90_moe_bool_candidates(
                         "DG_SM90_MOE_DIRECT_L2_SCATTER",
