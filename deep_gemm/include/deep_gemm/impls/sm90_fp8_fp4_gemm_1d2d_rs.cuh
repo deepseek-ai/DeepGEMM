@@ -686,7 +686,11 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kScaleBGranK = 128,
           uint32_t kScaleKGroup = 1,
           uint32_t kLaunchBoundsMinBlocks = 1,
-          uint32_t kMathRegCap = 0>
+          uint32_t kMathRegCap = 0,
+          bool kBIsInt4Sym = false,
+          bool kScaleBBF16 = false,
+          bool kScaleBE8M0 = false,
+          bool kReorderMaskedByMaxM = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, kLaunchBoundsMinBlocks) void
 sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layout,
                             nv_bfloat16* gmem_d_ptr,
@@ -708,6 +712,10 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                      "DG_W4_SCALE_K_GROUP does not support per-32 FP4 scaling");
     DG_STATIC_ASSERT(kScaleKGroup == 1 or kScaleKGroup == 2 or kScaleKGroup == 4,
                      "DG_W4_SCALE_K_GROUP only supports 1/2/4");
+    DG_STATIC_ASSERT(not kBIsInt4Sym, "RS-mode FP8xFP4 kernel does not support INT4-sym B");
+    DG_STATIC_ASSERT(not (kScaleBBF16 and kScaleBE8M0), "Scale-B cannot be both BF16 and E8M0");
+    DG_STATIC_ASSERT((not kScaleBBF16 and not kScaleBE8M0) or (kScaleBDirectLoad and kScaleBGranK == 32),
+                     "Compressed Scale-B dtypes are only supported by direct-load per-32 path");
     DG_STATIC_ASSERT(kFuseScaleBDecodeAssumeExp == 0 or kFuseScaleBDecodeAssumeExp == 5 or
                      kFuseScaleBDecodeAssumeExp == 6,
                      "DG_W4_FUSE_SCALE_B_DECODE_ASSUME_EXP only supports 0/5/6");
@@ -741,9 +749,13 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
         (BLOCK_M < WGMMA::M ? WGMMA::M : BLOCK_M) * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_SFA_SIZE_PER_STAGE =
         math::constexpr_align(SMEM_SFA_SIZE_PER_STAGE, 128u);
+    static constexpr uint32_t SCALE_B_ELEMENT_SIZE =
+        kScaleBE8M0 ? static_cast<uint32_t>(sizeof(uint8_t)) :
+        (kScaleBBF16 ? static_cast<uint32_t>(sizeof(nv_bfloat16)) :
+                       static_cast<uint32_t>(sizeof(float)));
     const uint32_t shape_k_scales_a = math::ceil_div(shape_k, BLOCK_K);
     const uint32_t shape_k_scales_b = math::ceil_div(shape_k, kScaleBGranK);
-    const uint32_t aligned_shape_n_sfb = math::align<uint32_t>(shape_n, 16u / sizeof(float));
+    const uint32_t aligned_shape_n_sfb = math::align<uint32_t>(shape_n, 16u / SCALE_B_ELEMENT_SIZE);
     // SFB cache aliases smem_d when it fits. Small-M tiles may not have enough
     // smem_d capacity, so they fall back to a separate SFB region.
     const uint32_t smem_sfb_bytes = kScaleBGranK == 32 ?
@@ -1145,14 +1157,30 @@ sm90_fp8_fp4_gemm_1d2d_rs_impl(int8_t* gmem_b_ptr, float* sfb, int* grouped_layo
                     return 1.0f;
                 if constexpr (kScaleBDirectLoad and kScaleBGranK == 32) {
                     if constexpr (kMajorSFB == cute::UMMA::Major::MN) {
-                        const float* sfb_base = sfb +
-                            current_group_idx * aligned_shape_n_sfb * shape_k_scales_b;
-                        const float* ptr = sfb_base + k_block_idx * aligned_shape_n_sfb + n_idx;
-                        return *ptr;
+                        const uint32_t offset =
+                            current_group_idx * aligned_shape_n_sfb * shape_k_scales_b +
+                            k_block_idx * aligned_shape_n_sfb + n_idx;
+                        if constexpr (kScaleBE8M0) {
+                            const auto* sfb_u8 = reinterpret_cast<const uint8_t*>(sfb);
+                            return __uint_as_float(static_cast<uint32_t>(sfb_u8[offset]) << 23);
+                        } else if constexpr (kScaleBBF16) {
+                            const auto* sfb_bf16 = reinterpret_cast<const nv_bfloat16*>(sfb);
+                            return __bfloat162float(sfb_bf16[offset]);
+                        } else {
+                            return sfb[offset];
+                        }
                     } else {
-                        const float* ptr = sfb + current_group_idx * shape_n * shape_k_scales_b +
-                                           n_idx * shape_k_scales_b + k_block_idx;
-                        return *ptr;
+                        const uint32_t offset = current_group_idx * shape_n * shape_k_scales_b +
+                                                n_idx * shape_k_scales_b + k_block_idx;
+                        if constexpr (kScaleBE8M0) {
+                            const auto* sfb_u8 = reinterpret_cast<const uint8_t*>(sfb);
+                            return __uint_as_float(static_cast<uint32_t>(sfb_u8[offset]) << 23);
+                        } else if constexpr (kScaleBBF16) {
+                            const auto* sfb_bf16 = reinterpret_cast<const nv_bfloat16*>(sfb);
+                            return __bfloat162float(sfb_bf16[offset]);
+                        } else {
+                            return sfb[offset];
+                        }
                     }
                 } else if constexpr (kScaleBGranK == 32) {
                     const uint32_t n_off = n_idx - n_block_idx * BLOCK_N;

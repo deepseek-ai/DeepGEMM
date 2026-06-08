@@ -31,6 +31,22 @@ public:
         bool scale_b_direct_load;
         bool scale_b_pow2_promote;
         bool k32_quad_reduce;
+        // 杠杆3：把 quad-reduce（4 累加器，峰值 64 float→spill）退化为已存在的
+        // 2 累加器串行 pair-reduce（峰值 32 float），消除寄存器 spill。保持
+        // pingpong + scale_b_direct_load，仅改单线程内累加器生命周期，数值等价。
+        // 由 DG_W4_K32_PAIR_REDUCE=1 开启，默认关。
+        bool k32_pair_reduce;
+        // 杠杆3 续：pair-reduce 下进一步把长驻的 final_accum 从 fp32 改 bf16
+        // 存储（nv_bfloat162），每线程长驻寄存器减半，继续压低残留 spill。
+        // 代价是 promote 累加用 bf16，大 K 有精度风险，需 diff 验证。
+        // 仅 pair-reduce 生效，由 DG_W4_K32_BF16_FINAL_ACCUM=1 开启，默认关。
+        bool k32_bf16_final_accum;
+        // 杠杆3 续2：把长驻的 final_accum 整体搬进 smem_d（kDirectStore +
+        // kFinalAccumScratch），final_accum_regs 数组缩成 1 个元素，长驻寄存器
+        // 再砍一大块。DirectStore 路径自包含、逐元素写 gmem、不走 STSM+TMA、无
+        // store-barrier，故不会 hang。仅 pair-reduce 生效，由
+        // DG_W4_K32_FINAL_ACCUM_SMEM=1 开启，默认关。
+        bool k32_final_accum_smem;
         bool k32_quad_split_promote;
         bool k32_quad_scale_b_inline;
         bool k32_quad_scale_b_prefetch;
@@ -42,6 +58,18 @@ public:
         // 与 scale_b_direct_load / k32_quad_reduce / e8m0/bf16/pow2/compact_sched 互斥
         // （host 决策侧保证），路径走 path-B 通用 cache_sfb_k32 + LUT decode。
         bool fuse_scale_b_decode;
+        // 思路2 性能探针（DG_W4_SCALE_A_STUB）：把 scale_a 从 promote 内彻底移除
+        // （device 端 kScaleAStub 置 scale_a=1 并跳过 SFA 的 TMA load），用于验证
+        // "fuse_scale_b_decode 单累加器 + scale_a 后移到 silu_and_mul" 完整方案的
+        // 速度上界。注意：开启后结果数值错误（scale_a 未参与），仅做性能对照，
+        // 不可用于生产。配合 fuse_scale_b_decode 一起测才有意义。
+        bool scale_a_stub;
+        // 思路2 串行依赖实验（DG_W4_FUSE_PREDECODE_PAIR）：fuse_scale_b_decode 默认
+        // 1 级预取（decode k+1 重叠 WGMMA k）下，WGMMA k+1 仍卡 decode k+1。本开关
+        // 改走双缓冲预解码（staged_pair_a_regs[2][4]，issue k 时预取 k+2），让 decode
+        // 与 WGMMA 多重叠一级，代价 +8 reg/线程。仅在 fuse_scale_b_decode 开启时有效，
+        // 用于测"解 issue 串行依赖"能否补回 fuse 路径在大 M 的退化。默认关。
+        bool fuse_predecode_pair;
         // 配合 fuse_scale_b_decode：sfb 物理布局是 [groups, K/32/4, N]（MN-major + 4 个
         // e8m0 打包成 1 个 int32），体积 = fp32 的 1/4。需 sfb.scalar_type() == kInt。
         bool scale_b_packed_ue8m0;
@@ -149,7 +177,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}
     >);
 }};
@@ -174,7 +201,7 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.gemm_type),
         get_default_epilogue_type(std::nullopt),
         "false",
-        "false",
+        args.scale_a_stub ? "true" : "false",
         "false",
         "false",
         "false",
@@ -185,6 +212,7 @@ static void __instantiate_kernel() {{
         "false",
         "false",
         "false",
+        args.k32_final_accum_smem ? "true" : "false",
         "false",
         "false",
         "false",
@@ -197,33 +225,31 @@ static void __instantiate_kernel() {{
         "false",
         "false",
         "false",
-        "false",
-        "false",
+        args.k32_bf16_final_accum ? "true" : "false",
         "false",
         "false",
         "false",
         "false",
         "false",
         args.k32_quad_reduce ? "true" : "false",
-        "false",
-        args.k32_quad_reduce ? "true" : "false",
+        args.k32_pair_reduce ? "true" : "false",
+        (args.k32_quad_reduce and not args.k32_pair_reduce) ? "true" : "false",
         args.k32_quad_split_promote ? "true" : "false",
         args.k32_quad_scale_b_inline ? "true" : "false",
         args.k32_quad_scale_b_prefetch ? "true" : "false",
         args.k32_quad_scale_b_vec4 ? "true" : "false",
         args.k32_quad_pair4x2_promote ? "true" : "false",
         "false",
-        "false",
+        args.k32_final_accum_smem ? "true" : "false",
         "false",
         "false",
         args.small_m_simple_sched ? "true" : "false",
-        args.compact_masked_sched ? "true" : "false",
         args.fuse_scale_b_decode ? "true" : "false",
         "false",
         "false",
         "false",
         "false",
-        "false",
+        args.fuse_predecode_pair ? "true" : "false",
         "false",
         "false",
         "false",
