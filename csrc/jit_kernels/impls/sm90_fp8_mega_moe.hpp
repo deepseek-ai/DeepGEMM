@@ -44,14 +44,9 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
-        bool async_l1_tma_store;
-        bool split_sfa_tma;
         bool direct_l2_scatter;
-        bool l2_dual_accum;
         bool phase_profile;
-        bool l1_dual_k_accum;
         bool l2_nmajor_schedule;
-        bool l1_nmajor_schedule;
         bool one_warp_cleanup;
         KernelPhase kernel_phase;
         MegaMoESM90Config config;
@@ -105,11 +100,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
-        {},
-        {},
-        {},
-        {},
         {}
     >);
 }};
@@ -128,14 +118,9 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.async_l1_tma_store ? "true" : "false",
-    args.split_sfa_tma ? "true" : "false",
     args.direct_l2_scatter ? "true" : "false",
-    args.l2_dual_accum ? "true" : "false",
     args.phase_profile ? "true" : "false",
-    args.l1_dual_k_accum ? "true" : "false",
     args.l2_nmajor_schedule ? "true" : "false",
-    args.l1_nmajor_schedule ? "true" : "false",
     args.one_warp_cleanup ? "true" : "false");
     }
 
@@ -248,14 +233,9 @@ static void sm90_fp8_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
-        .async_l1_tma_store = get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0,
-        .split_sfa_tma = get_env<int>("DG_SM90_MOE_SPLIT_SFA_TMA", 0) != 0,
         .direct_l2_scatter = config.direct_l2_scatter,
-        .l2_dual_accum = get_env<int>("DG_SM90_MOE_L2_DUAL_ACCUM", 0) != 0,
         .phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0,
-        .l1_dual_k_accum = get_env<int>("DG_SM90_MOE_L1_DUAL_K", 0) != 0,
         .l2_nmajor_schedule = config.l2_nmajor_schedule,
-        .l1_nmajor_schedule = get_env<int>("DG_SM90_MOE_L1_NMAJOR", 0) != 0,
         .one_warp_cleanup = config.one_warp_cleanup,
         .kernel_phase = SM90FP8MegaMoERuntime::KernelPhase::Linear1,
         .config = config,

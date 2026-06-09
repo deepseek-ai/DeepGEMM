@@ -102,14 +102,9 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     uint32_t kNumSMs, uint32_t kNumRanks, \
     float kActivationClamp, \
     bool kFastMath, \
-    bool kAsyncL1TMAStoreRequested = true, \
-    bool kSplitSFATMARequested = false, \
     bool kDirectL2ScatterRequested = false, \
-    bool kL2DualAccumRequested = false, \
     bool kPhaseProfileRequested = false, \
-    bool kL1DualKAccumRequested = false, \
     bool kL2NMajorScheduleRequested = false, \
-    bool kL1NMajorScheduleRequested = false, \
     bool kOneWarpCleanupRequested = false, \
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2, \
     uint32_t L1_SHAPE_K = kHidden, \
@@ -165,10 +160,9 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     kNumExpertsPerWave, BLOCK_M, BLOCK_N, BLOCK_K, kNumMaxPoolTokens, \
     kNumPaddedSFPoolTokens, kNumStages, kNumDispatchThreads, \
     kNumNonEpilogueThreads, kNumEpilogueThreads, kClusterSize, kNumSMs, \
-    kNumRanks, kActivationClamp, kFastMath, kAsyncL1TMAStoreRequested, \
-    kSplitSFATMARequested, kDirectL2ScatterRequested, kL2DualAccumRequested, \
-    kPhaseProfileRequested, kL1DualKAccumRequested, kL2NMajorScheduleRequested, \
-    kL1NMajorScheduleRequested, kOneWarpCleanupRequested, L1_SHAPE_N, \
+    kNumRanks, kActivationClamp, kFastMath, kDirectL2ScatterRequested, \
+    kPhaseProfileRequested, kL2NMajorScheduleRequested, kOneWarpCleanupRequested, \
+    L1_SHAPE_N, \
     L1_SHAPE_K, L2_SHAPE_N, L2_SHAPE_K, kNumDispatchWarps, \
     kNumMMANonEpilogueWarps, kNumEpilogueWarps, kNumEpilogueWarpgroups, \
     kNumThreads, kNumTokensPerWarp, kNumExpertsPerRank
@@ -268,17 +262,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t WG_BLOCK_N = (kSplitNWarpgroups || kSerialNWarpgroups) ? BLOCK_N / 2 : BLOCK_N;
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;       // post-SwiGLU tile N
     constexpr uint32_t WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2; // post-SwiGLU per-WG N
-    constexpr bool kAsyncL1TMAStore =
-        kAsyncL1TMAStoreRequested && MegaMoEPhase::runs_linear1 &&
-        (!kSplitNWarpgroups) && kNumEpilogueWarpgroups == 1;
-    constexpr bool kSplitSFATMA = kSplitSFATMARequested;
+    constexpr bool kAsyncL1TMAStore = false;
+    constexpr bool kSplitSFATMA = false;
     constexpr bool kDirectL2Scatter = kDirectL2ScatterRequested && MegaMoEPhase::runs_linear2 &&
         (!kSerialNWarpgroups) && WG_BLOCK_N == 128;
-    constexpr bool kL2DualAccum = kL2DualAccumRequested && MegaMoEPhase::runs_linear2 &&
-        (!kSplitNWarpgroups) && (!kSerialNWarpgroups) && WG_BLOCK_N == 128;
-    constexpr bool kL1DualKAccum = kL1DualKAccumRequested && MegaMoEPhase::runs_linear1 &&
-        (!kSplitNWarpgroups) && (!kSerialNWarpgroups) && WG_BLOCK_N == 128 &&
-        (kHidden / BLOCK_K) % 2 == 0;
+    constexpr bool kL2DualAccum = false;
+    constexpr bool kL1DualKAccum = false;
     using L1WGMMA   = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     using L2WGMMA   = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
@@ -438,7 +427,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks, kClusterSize, kL2NMajorScheduleRequested, kL1NMajorScheduleRequested>(workspace);
+        kNumSMs, kNumRanks, kClusterSize, kL2NMajorScheduleRequested, false>(workspace);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;

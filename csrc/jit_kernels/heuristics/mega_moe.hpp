@@ -612,8 +612,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_cd_l1 = num_epilogue_warpgroups * wg_block_m * (wg_block_n / 2);  // 1 byte/elem (FP8)
     const bool direct_l2_scatter = direct_l2_scatter_enabled and
                                    not serial_n_warpgroups and wg_block_n == 128;
-    const bool async_l1_tma_store = get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0 and
-                                    not split_n_warpgroups and num_epilogue_warpgroups == 1;
+    const bool async_l1_tma_store = false;
     const int smem_cd_l2 = direct_l2_scatter ? 0 :
         num_epilogue_warpgroups * wg_block_m * wg_block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd_l1_async = async_l1_tma_store ?
@@ -758,27 +757,16 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                    forced_epilogue_warpgroups == 1 or
                    forced_epilogue_warpgroups == 2);
 
-    const bool use_b_stationary_2wg =
-        get_env<int>("DG_SM90_MOE_B_STATIONARY_2WG") != 0;
     const bool use_bn256_split_n_env =
         get_env<int>("DG_SM90_MOE_BN256_2WG", 1) != 0 and
         forced_block_m != 128;
-    DG_HOST_ASSERT(not (use_b_stationary_2wg and use_bn256_split_n_env));
 
     std::vector<int> block_m_candidates;
-    if (forced_block_m > 0) {
-        append_unique_moe_candidate(block_m_candidates, forced_block_m);
-    } else if (use_b_stationary_2wg) {
-        append_unique_moe_candidate(block_m_candidates, 128);
-    } else {
-        append_unique_moe_candidate(block_m_candidates, 64);
-    }
+    append_unique_moe_candidate(block_m_candidates, forced_block_m > 0 ? forced_block_m : 64);
 
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
     const int block_k = 128;
-    const bool split_sfa_tma = get_env<int>("DG_SM90_MOE_SPLIT_SFA_TMA", 0) != 0;
-    const bool use_cluster_bcast_b = get_env<int>("DG_SM90_MOE_CLUSTER_BCAST_B") != 0 or use_b_stationary_2wg;
     const int num_sms = device_runtime->get_num_sms();
 
     std::vector<MegaMoESM90Config> candidates;
@@ -800,8 +788,7 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
             if (forced_epilogue_warpgroups > 0) {
                 append_unique_moe_candidate(epilogue_wg_candidates, forced_epilogue_warpgroups);
             } else {
-                append_unique_moe_candidate(epilogue_wg_candidates,
-                    (block_m == 128 or use_b_stationary_2wg or block_n == 256) ? 2 : 1);
+                append_unique_moe_candidate(epilogue_wg_candidates, block_n == 256 ? 2 : 1);
             }
 
             for (const int& num_epilogue_warpgroups: epilogue_wg_candidates) {
@@ -813,33 +800,22 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                     continue;
                 const int num_epilogue_threads = num_epilogue_warpgroups * 128;
 
-                if (use_cluster_bcast_b and
-                    not ((block_m == 64 and block_n == 128 and num_epilogue_threads == 128) or
-                         (block_m == 128 and block_n == 128 and num_epilogue_threads == 256)))
-                    continue;
-                const int cluster_size = use_cluster_bcast_b ? 2 : 1;
+                const int cluster_size = 1;
                 const int swizzle_acts_mode = 128;
                 const int swizzle_weights_mode = 128;
 
-                const bool prefer_compact_frontend =
-                    block_n == 256 and not split_sfa_tma;
-                const bool compact_frontend = get_env<int>("DG_SM90_MOE_COMPACT_FRONTEND",
-                                                           prefer_compact_frontend ? 1 : 0) != 0;
+                const bool compact_frontend = block_n == 256;
                 const int forced_dispatch_warps = get_env<int>("DG_SM90_MOE_DISPATCH_WARPS", -1);
                 DG_HOST_ASSERT(forced_dispatch_warps == -1 or forced_dispatch_warps == 0 or
                                forced_dispatch_warps == 2 or forced_dispatch_warps == 4 or
                                forced_dispatch_warps == 8);
                 std::vector<int> dispatch_warp_candidates;
-                if (forced_dispatch_warps > 0) {
-                    append_unique_moe_candidate(dispatch_warp_candidates, forced_dispatch_warps);
-                } else {
-                    append_unique_moe_candidate(dispatch_warp_candidates, compact_frontend ? 2 : 4);
-                }
+                append_unique_moe_candidate(dispatch_warp_candidates,
+                                            forced_dispatch_warps > 0 ? forced_dispatch_warps :
+                                            (compact_frontend ? 2 : 4));
 
                 for (const int& num_dispatch_warps: dispatch_warp_candidates) {
                     if (compact_frontend and num_dispatch_warps != 2)
-                        continue;
-                    if (split_sfa_tma and compact_frontend)
                         continue;
                     const int num_dispatch_threads = num_dispatch_warps * 32;
                     const int num_non_epilogue_threads = compact_frontend ? 64 : 128;
