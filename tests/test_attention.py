@@ -273,7 +273,13 @@ def test_paged_mqa_logits():
                     for block_kv in ((32, 64) if arch_major == 10 else (64, )):
                         for use_2d_context_lens, clean_logits in [(True, False)]:
                             for batch_size in (256, 4096):
-                                for next_n in ((1, ) if is_varlen else ((1, 2, 4, 5, 6) if arch_major == 10 else (1, 2))):
+                                if is_varlen:
+                                    next_ns = (1, )
+                                elif arch_major == 10:
+                                    next_ns = (1, 2, 4, 5, 6)
+                                else:
+                                    next_ns = (1, 2, 3)
+                                for next_n in next_ns:
                                     for max_tokens_per_batch in ((1, 4, 10) if is_varlen else (1, )):
                                         for num_heads, head_dim in [(64, 128), (32, 128)]:
                                             for avg_kv in (8192, 32768):

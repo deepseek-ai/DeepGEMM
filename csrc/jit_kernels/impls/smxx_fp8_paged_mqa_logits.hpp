@@ -14,6 +14,7 @@ public:
         int aligned_batch_size;
         int split_kv;
         int num_sms;
+        int num_next_n_atoms;
         
         int batch_size;
         int next_n;
@@ -33,11 +34,11 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&smxx_paged_mqa_logits_metadata<
-        {}, {}, {}
+    auto ptr = reinterpret_cast<void*>(&sched::smxx_paged_mqa_logits_metadata<
+        {}, {}, {}, {}
     >);
 }};
-)", arch, args.aligned_batch_size, args.split_kv, args.num_sms);
+)", arch, args.aligned_batch_size, args.split_kv, args.num_sms, args.num_next_n_atoms);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -46,6 +47,7 @@ static void __instantiate_kernel() {{
             args.next_n,
             args.is_context_lens_2d,
             args.context_lens,
+            nullptr,
             args.schedule_metadata
         ));
     }
@@ -60,6 +62,8 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     constexpr int num_threads = 32;
     const int aligned_batch_size = align(batch_size, 32);
     const int split_kv = block_kv * num_math_warpgroups;
+    const int next_n_atom = (next_n >= 2) ? 2 : 1;
+    const int num_next_n_atoms = ceil_div(next_n, next_n_atom);
     
     // Calculate shared memory size
     const int smem_size = aligned_batch_size * static_cast<int>(sizeof(int));
@@ -71,6 +75,7 @@ static void smxx_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
         .aligned_batch_size = aligned_batch_size,
         .split_kv = split_kv,
         .num_sms = num_sms,
+        .num_next_n_atoms = num_next_n_atoms,
         .batch_size = batch_size,
         .next_n = next_n,
         .is_context_lens_2d = is_context_lens_2d,
