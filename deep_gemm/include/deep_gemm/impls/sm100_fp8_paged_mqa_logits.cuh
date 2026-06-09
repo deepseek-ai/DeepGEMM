@@ -184,8 +184,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
 
         while (fetched_next_task) {
             // Prefetch next Q when (q, atom) changes
-            const auto next_advance = scheduler.get_atom_advance(next_q_atom_idx, batch_size);
-            bool prefetch_q = (q_atom_idx != next_q_atom_idx) and scheduler.exist_q_atom_idx(next_q_atom_idx + next_advance);
+            bool prefetch_q = (q_atom_idx != next_q_atom_idx) and scheduler.exist_q_atom_idx(next_q_atom_idx + scheduler.get_last_advance());
 
             if (q_atom_idx != next_q_atom_idx)
                 kv_block_idx_ptr = 32;
@@ -209,7 +208,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
             if (prefetch_q) {
                 CUTE_TIE_DECL(get_q_pipeline(q_iter_idx ++), q_stage_idx, q_phase);
                 empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
-                issue_tma_q(q_stage_idx, q_atom_idx + next_advance);
+                issue_tma_q(q_stage_idx, next_q_atom_idx + scheduler.get_last_advance());
             }
 
             uint32_t kv_block_idx[kNumBlocksPerSplit];
@@ -347,7 +346,7 @@ void sm100_fp8_paged_mqa_logits(const uint32_t batch_size,
                 }
 
                 if constexpr (kIsVarlen) {
-                    is_paired_atom = (scheduler.get_atom_advance(next_q_atom_idx, batch_size) == 2);
+                    is_paired_atom = (scheduler.get_last_advance() == 2);
                 }
             }
 

@@ -4,6 +4,7 @@
 
 #include <cutlass/arch/barrier.h>
 
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
@@ -41,9 +42,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
-    // GEMM with accumulation must have FP32 output
-    if constexpr (kWithAccumulation)
-        DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
+    // C/D type: BF16 and FP32 are supported, with or without accumulation
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
 
     // MMA Configs
     constexpr uint32_t LAYOUT_AD_M = 128;
@@ -101,7 +101,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // Synchronize the cluster before 2-CTA TMEM allocation
-    kNumMulticast > 1 ? cute::cluster_sync() : void();
+    kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : void();
 
     // Utils
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -180,7 +180,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
-    kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
+    kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
@@ -410,11 +410,9 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             uint32_t values[4];
             #pragma unroll
             for (uint32_t i = 0; i < 4; ++ i)
-                values[i] = ptx::ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
+                values[i] = ptx::ld_shared(smem_ptr + i * 32 + lane_idx);
             __syncwarp();
-            #pragma unroll
-            for (uint32_t i = 0; i < 4; ++ i)
-                ptx::st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
+            ptx::st_shared(smem_ptr + lane_idx * 4, values[0], values[1], values[2], values[3]);
         };
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -497,7 +495,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     }
 
     // TODO: Remove redundant synchronization
-    kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
+    kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Deallocate tensor memory
     if (warp_idx == 0)

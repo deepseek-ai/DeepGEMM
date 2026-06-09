@@ -56,6 +56,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         hidden, intermediate_hidden
     )
 
+    # Cast weights into FP4
+    def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_groups, n, k = bf16_weights.shape
+        w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
+        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        for i in range(num_groups):
+            w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
+        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+        return w, w_sf
+
     # Create inputs
     # noinspection PyGlobalUndefined
     def create_inputs():
@@ -77,27 +87,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
             topk_weights.masked_fill_(topk_idx < 0, 0)
 
-        # Check SF requirements
-        assert hidden % 128 == 0
-        assert intermediate_hidden % 128 == 0
-        assert l1_weights.shape[2] % 128 == 0 and l2_weights.shape[2] % 128 == 0
-
-        # Cast inputs to FP8 with per-32 UE8M0 SF
+        # Cast inputs to FP8/FP4 with per-32 UE8M0 SF
+        assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
         x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+        l1_weights = _cast_weights_to_fp4(l1_weights)
+        l2_weights = _cast_weights_to_fp4(l2_weights)
 
-        # Cast grouped BF16 weights to FP4 with MN-major SF
-        # TODO: merge with `cast_fp8_fp4_with_major`
-        def cast_grouped_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-            num_groups, n, k = bf16_weights.shape
-            w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
-            w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
-            for i in range(num_groups):
-                w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
-            w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
-            return w, w_sf
-
-        l1_weights = cast_grouped_weights_to_fp4(l1_weights)
-        l2_weights = cast_grouped_weights_to_fp4(l2_weights)
         transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
 
     # Run fused mega MoE
@@ -109,15 +104,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        # noinspection PyTypeChecker
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            transformed_l1_weights, transformed_l2_weights,
-            buffer,
+        kernel_kwargs = dict(
+            y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
+            sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
-            fast_math=bool(args.fast_math)
-        )
+            fast_math=bool(args.fast_math))
+        deep_gemm.fp8_fp4_mega_moe(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
     dist_print('Config:', once_in_node=True)
@@ -154,37 +147,41 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_gpu_timeout_secs=10, num_cpu_timeout_secs=30
     ) if is_legacy_loaded else None
 
-    def run_baseline():
-        recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
-            x, topk_idx=topk_idx, topk_weights=topk_weights,
-            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_baseline,
-            num_experts=num_experts, expert_alignment=alignment,
-            do_cpu_sync=False, do_handle_copy=False,
-            do_expand=True, use_tma_aligned_col_major_sf=True,
-        )
-        n = recv_x[0].size(0)
-        l1_y = torch.empty((n, intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
-            recv_x, l1_weights, l1_y, handle.psum_num_recv_tokens_per_expert,
-            use_psum_layout=True, recipe=(1, 1, 32))
-        # noinspection PyCallingNonCallable
-        l1_y = tilelang_ops.swiglu_apply_weight_to_fp8(
-            x=l1_y,
-            topk_weights=recv_topk_weights,
-            avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
-            num_per_channels=32,
-            use_col_major_scales=True,
-            round_scale=True,
-            ue8m0_scale=True,
-            output_bf16=False,
-            clamp_value=args.activation_clamp,
-            fast_math=bool(args.fast_math)
-        )
-        l2_y = torch.empty((n, hidden), dtype=torch.bfloat16, device='cuda')
-        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
-            l1_y, l2_weights, l2_y, handle.psum_num_recv_tokens_per_expert,
-            use_psum_layout=True, recipe=(1, 1, 32))
-        return ep_buffer.combine(l2_y, handle=handle)[0], cumulative_local_expert_recv_stats_baseline
+    if is_legacy_loaded:
+        dispatch_kwargs = {'do_cpu_sync': False, 'do_handle_copy': False,
+                           'do_expand': True, 'use_tma_aligned_col_major_sf': True}
+        gemm_fn = deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous
+        gemm_kwargs = {'use_psum_layout': True, 'recipe': (1, 1, 32)}
+        activation_kwargs = {'round_scale': True, 'ue8m0_scale': True, 'output_bf16': False}
+        get_num_tokens = lambda recv_x: recv_x[0].size(0)
+
+        def run_baseline():
+            # Dispatch
+            recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
+                x, topk_idx=topk_idx, topk_weights=topk_weights,
+                cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_baseline,
+                num_experts=num_experts, expert_alignment=alignment,
+                **dispatch_kwargs)
+            num_recv_tokens = get_num_tokens(recv_x)
+
+            # L1 GEMM
+            l1_y = torch.empty((num_recv_tokens, intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
+            gemm_fn(recv_x, l1_weights, l1_y, handle.psum_num_recv_tokens_per_expert, **gemm_kwargs)
+
+            # Activation
+            l1_y = tilelang_ops.swiglu_apply_weight_to_fp8(
+                x=l1_y, topk_weights=recv_topk_weights,
+                avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
+                num_per_channels=32, use_col_major_scales=True,
+                clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
+                **activation_kwargs)
+
+            # L2 GEMM
+            l2_y = torch.empty((num_recv_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+            gemm_fn(l1_y, l2_weights, l2_y, handle.psum_num_recv_tokens_per_expert, **gemm_kwargs)
+
+            # Combine
+            return ep_buffer.combine(l2_y, handle=handle)[0], cumulative_local_expert_recv_stats_baseline
 
     # Check correctness (must be bitwise identical)
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
@@ -218,15 +215,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
     tflops = safe_div(2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_fused)
 
-    # HBM bytes: weights (FP4 packed = 0.5 bytes) + activations (FP8 = 1 byte) + output (BF16 = 2 bytes)
-    num_touched_experts = torch.unique(gathered_topk_idx.flatten()).numel() - 1 # NOTES minus 1 to exclude "-1"
+    # HBM bytes: weights + activations + output
+    num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
     num_hbm_bytes = (
-        num_touched_experts * intermediate_hidden * 2 * hidden // 2 +   # L1 weights (FP4)
-        num_touched_experts * hidden * intermediate_hidden // 2 +       # L2 weights (FP4)
-        num_recv_tokens * hidden +                                      # L1 acts read (FP8)
-        num_recv_tokens * intermediate_hidden +                         # L1 output write (FP8)
-        num_recv_tokens * intermediate_hidden +                         # L2 acts read (FP8)
-        num_recv_tokens * hidden * 2                                    # L2 output write (BF16)
+        num_touched_experts * intermediate_hidden * 2 * hidden * 0.5                                 # L1 weights
+        + num_touched_experts * hidden * intermediate_hidden * 0.5                                   # L2 weights
+        + num_recv_tokens * hidden                                                                   # L1 acts read
+        + num_recv_tokens * intermediate_hidden                                                      # L1 output write
+        + num_recv_tokens * intermediate_hidden                                                      # L2 acts read
+        + num_recv_tokens * hidden * 2                                                               # L2 output write (always BF16)
     )
     hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
 

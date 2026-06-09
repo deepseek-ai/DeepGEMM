@@ -1,4 +1,5 @@
 import torch
+import types
 from typing import Tuple, Optional
 from ..utils.math import align
 
@@ -15,7 +16,6 @@ from .. import _C
 
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
-                 # MoE arguments
                  num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
@@ -35,8 +35,13 @@ class SymmBuffer:
             hidden, intermediate_hidden,
             use_fp8_dispatch, activation
         )
-        self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
-        self.handle = symm_mem.rendezvous(self.buffer, group=group)
+        allocator = torch if group.size() == 1 else symm_mem
+        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+        self.handle = (
+            types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+            if group.size() == 1
+            else symm_mem.rendezvous(self.buffer, group=group)
+        )
         self.buffer.zero_()
         self.group.barrier()
         torch.cuda.synchronize()
@@ -72,16 +77,13 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
     )
 
 
-def _interleave_l1_weights(l1_weights: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...] instead of [gate | up]
-    def interleave(t, gran: int = 8) -> torch.Tensor:
-        g, n, *rest = t.shape
-        half = n // 2
-        gate = t[:, :half].reshape(g, half // gran, gran, *rest)
-        up = t[:, half:].reshape(g, half // gran, gran, *rest)
-        return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
-
-    return interleave(l1_weights[0]), interleave(l1_weights[1])
+    g, n, *rest = t.shape
+    half = n // 2
+    gate = t[:, :half].reshape(g, half // gran, gran, *rest)
+    up = t[:, half:].reshape(g, half // gran, gran, *rest)
+    return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
 
 
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
@@ -97,12 +99,14 @@ def transform_weights_for_mega_moe(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor]
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    # L1: interleave gate/up, then transpose SF for UTCCP
-    l1_interleaved = _interleave_l1_weights(l1_weights)
-    l1_weights = (l1_interleaved[0], _transpose_sf_for_utccp(l1_interleaved[1]))
-    # L2: only transpose SF for UTCCP
-    l2_weights = (l2_weights[0], _transpose_sf_for_utccp(l2_weights[1]))
-    return l1_weights, l2_weights
+    # L1: interleave gate/up for weight and SF, then transpose SF for UTCCP.
+    l1_w = _interleave_weights(l1_weights[0])
+    l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
+    l1_transformed = (l1_w, l1_sf)
+    # L2: only transpose SF for UTCCP.
+    l2_transformed = (l2_weights[0], _transpose_sf_for_utccp(l2_weights[1]))
+    return l1_transformed, l2_transformed
+
 
 
 def fp8_fp4_mega_moe(y: torch.Tensor,

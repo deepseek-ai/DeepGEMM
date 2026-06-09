@@ -26,10 +26,10 @@ static bool early_return(const int& m, const int &n, const int& k,
     const bool is_cd_same = c.has_value() and c->data_ptr() == d.data_ptr();
     if (is_cd_same)
         DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
     if (c.has_value()) {
         check_major_type_cd(c.value());
-        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
-        DG_HOST_ASSERT(c.value().scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(d.scalar_type() == c.value().scalar_type());
     }
 
     // No accumulation
