@@ -22,3 +22,8 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+
+# Profiling artifacts (Nsight Compute / Systems reports and sweep logs)
+*.ncu-rep
+*.nsys-rep
+profile_logs/
