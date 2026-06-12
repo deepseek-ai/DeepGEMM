@@ -3,7 +3,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <dlfcn.h>
+#include <cstdlib>
 #include <filesystem>
+#include <string>
 
 #include "../utils/exception.hpp"
 #include "../utils/compatibility.hpp"
@@ -16,6 +18,22 @@ static void* get_driver_handle() {
     if (handle == nullptr) {
         handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
         DG_HOST_ASSERT(handle != nullptr and "Failed to load CUDA driver `libcuda.so.1`");
+    }
+    return handle;
+}
+
+static void* get_runtime_handle() {
+    static void* handle = nullptr;
+    if (handle == nullptr) {
+        if (const auto cuda_home = std::getenv("CUDA_HOME"); cuda_home != nullptr and cuda_home[0] != '\0') {
+            const auto runtime_path = std::string(cuda_home) + "/lib64/libcudart.so.13";
+            handle = dlopen(runtime_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+        }
+        if (handle == nullptr)
+            handle = dlopen("libcudart.so.13", RTLD_LAZY | RTLD_LOCAL);
+        if (handle == nullptr)
+            handle = dlopen("libcudart.so", RTLD_LAZY | RTLD_LOCAL);
+        DG_HOST_ASSERT(handle != nullptr and "Failed to load CUDA runtime `libcudart.so`");
     }
     return handle;
 }
@@ -33,6 +51,18 @@ static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
     return func(std::forward<decltype(args)>(args)...); \
 }
 
+#define DECL_LAZY_CUDA_RUNTIME_FUNCTION(name) \
+template <typename... Args> \
+static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
+    using FuncType = decltype(&(name)); \
+    static FuncType func = nullptr; \
+    if (func == nullptr) { \
+        func = reinterpret_cast<FuncType>(dlsym(get_runtime_handle(), #name)); \
+        DG_HOST_ASSERT(func != nullptr and "Failed to load CUDA runtime API"); \
+    } \
+    return func(std::forward<decltype(args)>(args)...); \
+}
+
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorName);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorString);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuFuncSetAttribute);
@@ -44,6 +74,33 @@ DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLibraryUnload);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuKernelGetFunction);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuLaunchKernelEx);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuTensorMapEncodeTiled);
+
+#if CUDART_VERSION >= 13010
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaDeviceGetExecutionCtx);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaDeviceGetDevResource);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaDevSmResourceSplit);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaDevResourceGenerateDesc);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaGreenCtxCreate);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaExecutionCtxGetId);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaExecutionCtxDestroy);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaGraphAddNode);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaGraphKernelNodeSetAttribute);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaGraphLaunch);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaGraphExecDestroy);
+DECL_LAZY_CUDA_RUNTIME_FUNCTION(cudaGraphDestroy);
+
+static cudaError_t lazy_cudaGraphInstantiate(cudaGraphExec_t *phGraphExec,
+                                             cudaGraph_t graph,
+                                             unsigned long long flags) {
+    using FuncType = cudaError_t (CUDARTAPI *)(cudaGraphExec_t*, cudaGraph_t, unsigned long long);
+    static FuncType func = nullptr;
+    if (func == nullptr) {
+        func = reinterpret_cast<FuncType>(dlsym(get_runtime_handle(), "cudaGraphInstantiate"));
+        DG_HOST_ASSERT(func != nullptr and "Failed to load CUDA runtime API");
+    }
+    return func(phGraphExec, graph, flags);
+}
+#endif
 
 #if CUDART_VERSION >= 12080 and defined(DG_JIT_USE_RUNTIME_API)
 
