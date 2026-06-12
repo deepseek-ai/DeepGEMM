@@ -58,7 +58,9 @@ class QuantConfig:
             recipe = (1, 1, 128) if is_wgrad else None
         else:
             recipe_a = (1, self.gran_k_a)
-            recipe_b = (1, self.gran_k_b) if self.is_fp4_b or is_wgrad else (self.gran_k_b, self.gran_k_b)
+            # Mixed configs (either operand FP4) are 1D-scaled on both sides: the FP8
+            # operand uses per-token (1, gran) scales, not per-block (gran, gran).
+            recipe_b = (1, self.gran_k_b) if self.is_fp4_b or self.is_fp4_a or is_wgrad else (self.gran_k_b, self.gran_k_b)
         return recipe, recipe_a, recipe_b
 
     def max_diff(self) -> float:
@@ -79,6 +81,8 @@ class QuantConfig:
         elif get_arch_major() == 12:
             quant_config_list.append(QuantConfig((32, 32, True, True)))
             quant_config_list.append(QuantConfig((128, 32, False, True)))
+            # SM120: FP4_A x FP8_B mixed (swapAB orientation, kAIsFP4)
+            quant_config_list.append(QuantConfig((32, 128, True, False)))
         return quant_config_list
 
 
@@ -298,7 +302,8 @@ def generate_normal(m: int, n: int, k: int,
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
     b = cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0,
-                                use_block_cast_for_fp8=not (kernel_type.is_1d1d() and accumulate))
+                                use_block_cast_for_fp8=not (kernel_type.is_1d1d() and accumulate)
+                                                       and not quant_config.is_fp4_a)
 
     return a, b, c, d, ref_d
 
@@ -339,7 +344,7 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
     assert major_a.is_k_major()
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
-    b = grouped_cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)    
+    b = grouped_cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=not quant_config.is_fp4_a)
 
     return m, a, b, grouped_layout, d, ref_d
 
@@ -375,7 +380,7 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
 
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = grouped_cast_fp8_fp4_with_major(a, MajorTypeAB.KMajor, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
-    b = grouped_cast_fp8_fp4_with_major(b, MajorTypeAB.KMajor, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)    
+    b = grouped_cast_fp8_fp4_with_major(b, MajorTypeAB.KMajor, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=not quant_config.is_fp4_a)    
 
     return a, b, masked_m, psum_m, d, ref_d
 

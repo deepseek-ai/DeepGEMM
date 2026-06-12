@@ -81,6 +81,16 @@ __device__ __forceinline__ void ldmatrix_m8n16_x2_b4x16_p64(
          : "memory");
 }
 
+// ldmatrix for FP4 .b4x16_p64, 4 matrices (A operand, m16k32 needs 4 regs).
+// .m8n16.x4: loads 4 matrices of 8×16 4-bit elements; all 32 lanes provide addresses.
+__device__ __forceinline__ void ldmatrix_m8n16_x4_b4x16_p64(
+    uint32_t& d0, uint32_t& d1, uint32_t& d2, uint32_t& d3, void* smem) {
+    asm volatile ("ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64 {%0, %1, %2, %3}, [%4];\n"
+         : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+         : "l"(__cvta_generic_to_shared(smem))
+         : "memory");
+}
+
 // Fragment loaders: pre-computed swizzle variants (fast path)
 
 // Load B fragment from MN-major SMEM B[BLOCK_K, BLOCK_N] via ldmatrix.trans.x2
@@ -112,6 +122,19 @@ __device__ __forceinline__ void load_a_fragment(
     int col = (lane >> 4) * 16 + k_step * mma_k;
     void* addr = ctx.addr(smem_a, col);
     ldmatrix_x4(frag[0], frag[1], frag[2], frag[3], addr);
+}
+
+// Load A fragment from .b4x16_p64 padded SMEM via ldmatrix.m8n16.x4 (fp4 A operand).
+// Same address computation as load_a_fragment (fp8); only the ldmatrix opcode differs.
+// Caller must shift each returned reg << 2 (same as the fp4 B path).
+template <int swizzle_bytes>
+__device__ __forceinline__ void load_a_fragment_b4x16(
+    uint32_t (&frag)[4], char* smem_a,
+    const SwizzleContext<swizzle_bytes>& ctx, int lane, int k_step, int mma_k
+) {
+    int col = (lane >> 4) * 16 + k_step * mma_k;
+    void* addr = ctx.addr(smem_a, col);
+    ldmatrix_m8n16_x4_b4x16_p64(frag[0], frag[1], frag[2], frag[3], addr);
 }
 
 // Load B fragment pair (2 N-tiles) using pre-computed SwizzleContext

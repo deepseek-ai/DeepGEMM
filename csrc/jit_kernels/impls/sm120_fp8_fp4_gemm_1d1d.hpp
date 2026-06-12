@@ -26,6 +26,7 @@ public:
         int gran_k_a, gran_k_b;
         bool is_fp4;
         bool b_is_fp4;
+        bool a_is_fp4;
         bool k_grouped_constant_stride;
         int stride_cd_m;
         int stride_cd_n;
@@ -70,6 +71,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -90,6 +92,7 @@ static void __instantiate_kernel() {{
         get_default_epilogue_type(args.epilogue_type),
         args.is_fp4 ? "true" : "false",
         args.b_is_fp4 ? "true" : "false",
+        args.a_is_fp4 ? "true" : "false",
         (args.gemm_desc.major_b == cute::UMMA::Major::K) ? "true" : "false",
         args.k_grouped_constant_stride ? "true" : "false",
         args.gemm_config.storage_config.store_block_m,
@@ -192,8 +195,11 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                     const bool swap_ab = false) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
-    const bool is_fp4 = (a.scalar_type() == kPackedFP4);
-    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
+    const bool a_dt_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_dt_fp4 = (b.scalar_type() == kPackedFP4);
+    const bool is_fp4 = a_dt_fp4 && b_dt_fp4;       // symmetric FP4xFP4 (k64)
+    const bool b_is_fp4 = (!a_dt_fp4) && b_dt_fp4;  // FP8_A x FP4_B (k32 mixed)
+    const bool a_is_fp4 = a_dt_fp4 && (!b_dt_fp4);  // FP4_A x FP8_B (k32 mixed, swapAB)
 
     auto desc = GemmDesc {
         .gemm_type = GemmType::Normal,
@@ -256,6 +262,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
         .b_is_fp4 = b_is_fp4,
+        .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = swap_ab ? static_cast<int>(d.stride(-1)) : d_stride,
         .stride_cd_n = swap_ab ? static_cast<int>(d.stride(-2)) : 0,
@@ -300,8 +307,11 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
     DG_HOST_ASSERT(c.has_value());
 
-    const bool is_fp4 = (a.scalar_type() == kPackedFP4);
-    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
+    const bool a_dt_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_dt_fp4 = (b.scalar_type() == kPackedFP4);
+    const bool is_fp4 = a_dt_fp4 && b_dt_fp4;       // symmetric FP4xFP4 (k64)
+    const bool b_is_fp4 = (!a_dt_fp4) && b_dt_fp4;  // FP8_A x FP4_B (k32 mixed)
+    const bool a_is_fp4 = a_dt_fp4 && (!b_dt_fp4);  // FP4_A x FP8_B (k32 mixed, swapAB)
     const auto num_groups = static_cast<int>(ks.size());
     int first_k = 0, sum_k = 0, max_k = 0;
     int sum_sf_k_a = 0, sum_sf_k_b = 0;
@@ -367,6 +377,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
         .b_is_fp4 = b_is_fp4,
+        .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = k_grouped_constant_stride,
         .stride_cd_m = n,
         .stride_cd_n = 0,
@@ -407,8 +418,11 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
     if (expected_m_for_psum_layout)
         DG_HOST_ASSERT(use_psum_layout);
 
-    const bool is_fp4 = (a.scalar_type() == kPackedFP4);
-    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
+    const bool a_dt_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_dt_fp4 = (b.scalar_type() == kPackedFP4);
+    const bool is_fp4 = a_dt_fp4 && b_dt_fp4;       // symmetric FP4xFP4 (k64)
+    const bool b_is_fp4 = (!a_dt_fp4) && b_dt_fp4;  // FP8_A x FP4_B (k32 mixed)
+    const bool a_is_fp4 = a_dt_fp4 && (!b_dt_fp4);  // FP4_A x FP8_B (k32 mixed, swapAB)
 
     const auto desc = GemmDesc {
         .gemm_type = gemm_type,
@@ -462,6 +476,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
         .b_is_fp4 = b_is_fp4,
+        .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = n,
         .stride_cd_n = 0,
@@ -495,8 +510,11 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
                                                      const std::string& compiled_dims) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
-    const bool is_fp4 = (a.scalar_type() == kPackedFP4);
-    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
+    const bool a_dt_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_dt_fp4 = (b.scalar_type() == kPackedFP4);
+    const bool is_fp4 = a_dt_fp4 && b_dt_fp4;       // symmetric FP4xFP4 (k64)
+    const bool b_is_fp4 = (!a_dt_fp4) && b_dt_fp4;  // FP8_A x FP4_B (k32 mixed)
+    const bool a_is_fp4 = a_dt_fp4 && (!b_dt_fp4);  // FP4_A x FP8_B (k32 mixed, swapAB)
 
     const auto desc = GemmDesc {
         .gemm_type = GemmType::MGroupedMasked,
@@ -548,6 +566,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
         .b_is_fp4 = b_is_fp4,
+        .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = n,
         .stride_cd_n = 0,
@@ -582,8 +601,11 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     // Requires K-major operands; callers .contiguous() (MN-major scalar path is ~3x slower).
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
-    const bool is_fp4 = (a.scalar_type() == kPackedFP4);
-    const bool b_is_fp4 = (!is_fp4 && b.scalar_type() == kPackedFP4);
+    const bool a_dt_fp4 = (a.scalar_type() == kPackedFP4);
+    const bool b_dt_fp4 = (b.scalar_type() == kPackedFP4);
+    const bool is_fp4 = a_dt_fp4 && b_dt_fp4;       // symmetric FP4xFP4 (k64)
+    const bool b_is_fp4 = (!a_dt_fp4) && b_dt_fp4;  // FP8_A x FP4_B (k32 mixed)
+    const bool a_is_fp4 = a_dt_fp4 && (!b_dt_fp4);  // FP4_A x FP8_B (k32 mixed, swapAB)
 
     const auto desc = GemmDesc {
         .gemm_type = GemmType::Batched,
@@ -634,6 +656,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .gran_k_b = gran_k_b,
         .is_fp4 = is_fp4,
         .b_is_fp4 = b_is_fp4,
+        .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = false,
         .stride_cd_m = swap_ab ? static_cast<int>(d.stride(-1)) : static_cast<int>(d.stride(1)),
         .stride_cd_n = swap_ab ? static_cast<int>(d.stride(1)) : 0,

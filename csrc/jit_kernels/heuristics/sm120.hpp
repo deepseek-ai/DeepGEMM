@@ -116,7 +116,10 @@ struct SM120ArchSpec {
 
     static int get_smem_per_stage(const GemmDesc& desc, const Layout& layout) {
         const bool b_padded_fp4 = (desc.a_dtype != kPackedFP4 && desc.b_dtype == kPackedFP4);
-        const int smem_a = layout.block_m * get_smem_bytes_per_k(desc.a_dtype, layout.block_k);
+        // Mixed FP4_A x FP8_B (swapAB): A uses .b4x16_p64 padded SMEM (row = block_k, like mixed B).
+        const bool a_padded_fp4 = (desc.a_dtype == kPackedFP4 && desc.b_dtype != kPackedFP4);
+        const int smem_a = layout.block_m *
+            (a_padded_fp4 ? layout.block_k : get_smem_bytes_per_k(desc.a_dtype, layout.block_k));
         const int smem_b = layout.block_n *
             (b_padded_fp4 ? layout.block_k : get_smem_bytes_per_k(desc.b_dtype, layout.block_k));
         const int smem_sfa = (desc.kernel_type == KernelType::Kernel1D1D)
@@ -130,7 +133,8 @@ struct SM120ArchSpec {
         const auto load_block_m = layout.block_m;
         const auto load_block_n = layout.block_n;
 
-        const auto smem_k_bytes_a = get_smem_bytes_per_k(desc.a_dtype, layout.block_k);
+        const bool a_padded_fp4 = (desc.a_dtype == kPackedFP4 && desc.b_dtype != kPackedFP4);
+        const auto smem_k_bytes_a = a_padded_fp4 ? layout.block_k : get_smem_bytes_per_k(desc.a_dtype, layout.block_k);
         const auto swizzle_mode_a = get_swizzle_mode(smem_k_bytes_a, 1);
         // Mixed FP8xFP4: B uses .b4x16_p64 padded SMEM (row stride = block_k, same as FP8)
         const bool b_padded_fp4 = (desc.a_dtype != kPackedFP4 && desc.b_dtype == kPackedFP4);
@@ -177,7 +181,9 @@ struct SM120ArchSpec {
         constexpr int kNumMaxStages = 16;
 
         const int smem_barriers = kNumMaxStages * 8 * 2;
-        const int smem_a_per_stage = storage_config.load_block_m * get_smem_bytes_per_k(desc.a_dtype, layout.block_k);
+        const bool a_padded_fp4 = (desc.a_dtype == kPackedFP4 && desc.b_dtype != kPackedFP4);
+        const int smem_a_per_stage = storage_config.load_block_m *
+            (a_padded_fp4 ? layout.block_k : get_smem_bytes_per_k(desc.a_dtype, layout.block_k));
         const bool b_padded_fp4 = (desc.a_dtype != kPackedFP4 && desc.b_dtype == kPackedFP4);
         const int smem_b_per_stage = storage_config.load_block_n *
             (b_padded_fp4 ? layout.block_k : get_smem_bytes_per_k(desc.b_dtype, layout.block_k));

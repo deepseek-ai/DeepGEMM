@@ -40,6 +40,7 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
           bool kIsFP4 = false,
           bool kBIsFP4 = false,
+          bool kAIsFP4 = false,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
@@ -69,6 +70,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
                      "Only float or bfloat16 output supported");
     DG_STATIC_ASSERT(!(kIsFP4 && kBIsFP4), "Use kIsFP4 for symmetric FP4x4, not kBIsFP4");
+    // kAIsFP4 = mixed FP4_A x FP8_B (swapAB of the FP8xFP4 mixed path): A fp4-unpacked at k32, B fp8.
+    DG_STATIC_ASSERT(!(kAIsFP4 && (kIsFP4 || kBIsFP4)), "kAIsFP4 (fp4_A x fp8_B) is exclusive");
     DG_STATIC_ASSERT(!kBIsFP4 || kBKMajor, "Mixed FP8xFP4 requires K-major B");
     DG_STATIC_ASSERT(kNumTMAThreads > 0, "SM120a always uses warp-specialized pipeline");
     DG_STATIC_ASSERT(kNumMathThreads % 32 == 0, "Invalid math threads");
@@ -122,7 +125,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // TMA mbarrier reports GMEM bytes. For .b4x16_p64 (kBIsFP4): GMEM = SMEM/2 (packed).
     // For packed FP4 (kIsFP4): SMEM already uses packed size, so SMEM_B = GMEM bytes.
     static constexpr uint32_t TMA_B_BYTES = kBIsFP4 ? (SMEM_B / 2) : SMEM_B;
-    static constexpr uint32_t SMEM_TMA_BYTES = SMEM_A + TMA_B_BYTES + TMA_SFA_BYTES + TMA_SFB_BYTES;
+    // kAIsFP4: A is fp4 packed in GMEM (.b4x16 expands to unpacked SMEM), so GMEM = SMEM_A/2.
+    static constexpr uint32_t TMA_A_BYTES = kAIsFP4 ? (SMEM_A / 2) : SMEM_A;
+    static constexpr uint32_t SMEM_TMA_BYTES = TMA_A_BYTES + TMA_B_BYTES + TMA_SFA_BYTES + TMA_SFB_BYTES;
     // ldmatrix K stride in bytes: FP4 packed = MMA_K/2, FP8 = MMA_K. Both = 32 bytes.
     static constexpr uint32_t kLdmK = kIsFP4 ? (MMA_K / 2) : MMA_K;
     // tma::copy swizzle for split computation: FP4 packed with B64 has 64 byte rows = full BLOCK_K,
@@ -362,7 +367,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             #pragma unroll
             for (uint32_t i = 0; i < kAccumPerWarp; ++i) accum[i] = 0.f;
 
-            static constexpr bool kUsePerNTileX4 = kBKMajor and not kBIsFP4 and (kKSteps >= 2);
+            // kAIsFP4 uses the regular (non-perNTileX4) path to keep the fp4-A load localized.
+            static constexpr bool kUsePerNTileX4 = kBKMajor and not kBIsFP4 and not kAIsFP4 and (kKSteps >= 2);
             using sf_t = cute::conditional_t<kIsFP4, uint16_t, uint8_t>;
 
             // SF-major loop: when gran_k >= BLOCK_K, one packed int32 SF covers
@@ -574,7 +580,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         }
                         #pragma unroll
                         for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
-                            sm120::load_a_fragment(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
+                            if constexpr (kAIsFP4) {
+                                sm120::load_a_fragment_b4x16(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
+                                a_frag[buf][mt][0] <<= 2; a_frag[buf][mt][1] <<= 2;
+                                a_frag[buf][mt][2] <<= 2; a_frag[buf][mt][3] <<= 2;
+                            } else {
+                                sm120::load_a_fragment(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
+                            }
 
                         if constexpr (kGranKA < BLOCK_K or kGranKB < BLOCK_K) {
                             const uint32_t sf_step = (kb * kKSteps + ks);
@@ -626,7 +638,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
                                 const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_bytes[buf][nt];
-                                if constexpr (kBIsFP4)
+                                if constexpr (kAIsFP4)
+                                    sm120_mma::fp4_fp8_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                                else if constexpr (kBIsFP4)
                                     sm120_mma::fp8_fp4_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
                                 else if constexpr (kIsFP4)
                                     sm120_mma::fp4_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
@@ -1044,7 +1058,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         }
                         #pragma unroll
                         for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
-                            sm120::load_a_fragment(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
+                            if constexpr (kAIsFP4) {
+                                sm120::load_a_fragment_b4x16(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
+                                a_frag[buf][mt][0] <<= 2; a_frag[buf][mt][1] <<= 2;
+                                a_frag[buf][mt][2] <<= 2; a_frag[buf][mt][3] <<= 2;
+                            } else {
+                                sm120::load_a_fragment(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
+                            }
 
                         if constexpr (kGranKA < BLOCK_K or kGranKB < BLOCK_K) {
                             const uint32_t sf_step = (kb * kKSteps + ks);
@@ -1096,7 +1116,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                                 float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
                                 const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_bytes[buf][nt];
-                                if constexpr (kBIsFP4)
+                                if constexpr (kAIsFP4)
+                                    sm120_mma::fp4_fp8_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                                else if constexpr (kBIsFP4)
                                     sm120_mma::fp8_fp4_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
                                 else if constexpr (kIsFP4)
                                     sm120_mma::fp4_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
