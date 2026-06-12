@@ -219,6 +219,16 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         if (is_tma_leader) {
             uint32_t last_group_idx = kNumGroups;
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                // Skip empty/padding tiles in the contiguous grouped layout: m_indices
+                // is -1 for blocks with no routed tokens. The worst-case M_sum reserves a
+                // block per local expert, but at decode only a few are routed; processing
+                // the rest wastes a full-width GEMM tile (the dominant EP-decode cost).
+                // Producer and consumer apply the identical check, so no barrier ops are
+                // issued for skipped blocks and the pipeline stays in sync.
+                if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+                    if (__ldg(grouped_layout + m_block_idx * BLOCK_M) < 0)
+                        continue;
+                }
                 if constexpr (kGemmType == GemmType::KGroupedContiguous) {
                     if (last_group_idx != scheduler.current_group_idx) {
                         last_group_idx = scheduler.current_group_idx;
@@ -334,6 +344,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         uint32_t iter_idx = 0;
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            // Skip empty/padding tiles (m_indices == -1); see the matching check in the
+            // producer loop. Both warp groups skip identically, so barriers stay in sync.
+            if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+                if (__ldg(grouped_layout + m_block_idx * BLOCK_M) < 0)
+                    continue;
+            }
             const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
             const uint32_t num_k_blocks_total = math::ceil_div(current_shape_k, BLOCK_K);
             uint32_t num_k_blocks_start = 0, num_k_blocks = num_k_blocks_total;
