@@ -67,8 +67,14 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             const auto start_clock = clock64();
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
+                    // The direct printf is suppressed in translation units that
+                    // define DG_NO_DEVICE_PRINTF (the SM90 MegaMoE kernels), where
+                    // a function-call boundary in the WGMMA pipeline would trigger
+                    // ptxas C7510 serialization.
+#ifndef DG_NO_DEVICE_PRINTF
                     printf("DeepGEMM NVLink barrier timeout (300s): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+#endif
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
                 }
             }
