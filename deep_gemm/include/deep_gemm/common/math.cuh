@@ -62,6 +62,14 @@ CUTLASS_DEVICE float2 fma2(const float2& a, const float2& b, const float2& c) {
 #endif
 }
 
+CUTLASS_DEVICE float2 mul2(const float2& a, const float2& b) {
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
+    return __fmul2_rn(a, b);
+#else
+    return make_float2(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y));
+#endif
+}
+
 CUTLASS_HOST_DEVICE float fast_rcp(const float& x) {
     float ret;
     asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(ret) : "f"(x));
