@@ -51,7 +51,7 @@ template <bool kMasked,
           uint32_t kNumSMs, GemmType kGemmType>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
-                              uint32_t sfa_stride_m, uint32_t sfa_stride_k,
+                              uint32_t sfa_stride_group, uint32_t sfa_stride_m, uint32_t sfa_stride_k,
                               uint32_t sfa_gran_k, bool sfa_packed_int32,
                               uint32_t sfb_stride_group, uint32_t sfb_stride_n, uint32_t sfb_stride_k,
                               uint32_t sfb_gran_k, bool sfb_packed_int32,
@@ -174,7 +174,9 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                         const uint32_t k_scale_idx = k_idx_for_scale / sfa_gran_k;
                         const bool is_valid = m_idx < shape_m * (kMasked ? kNumGroups : 1) and
                                               k_idx_for_scale < shape_k;
-                        const uint32_t sfa_base_offset = m_idx * sfa_stride_m;
+                        const uint32_t sfa_local_m = kMasked ? (m_idx - scheduler.current_group_idx * shape_m) : m_idx;
+                        const uint32_t sfa_base_offset = (kMasked ? scheduler.current_group_idx * sfa_stride_group : 0) +
+                                                         sfa_local_m * sfa_stride_m;
                         smem_sfa[stage_idx][i] = is_valid ?
                             mxfp8_fp8_detail::load_e8m0_scale(
                                 sfa, sfa_base_offset, k_scale_idx, sfa_stride_k, sfa_packed_int32) :

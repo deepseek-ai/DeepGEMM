@@ -49,6 +49,11 @@ def _pack_ue8m0_u8_to_i32(sf: torch.Tensor) -> torch.Tensor:
     ).contiguous()
 
 
+def _pack_ue8m0_u8_to_i32_mn_major(sf: torch.Tensor) -> torch.Tensor:
+    packed = _pack_ue8m0_u8_to_i32(sf)
+    return packed.transpose(-1, -2).contiguous().transpose(-1, -2)
+
+
 def _tflops(m: int, n: int, k: int, elapsed: float) -> float:
     return 2.0 * m * n * k / elapsed / 1e12
 
@@ -165,6 +170,44 @@ def test_m_grouped_mxfp8_fp8_contiguous_packed_int32_scale_accuracy():
         a, b, d, grouped_layout, recipe_a=(1, 128), recipe_b=(1, 32)
     )
     diff = calc_diff(d, ref)
+    assert diff < 0.03
+
+
+def test_m_grouped_mxfp8_fp8_masked_packed_int32_mn_major_scale_accuracy():
+    _require_sm90()
+    groups, max_m, n, k = 3, 128, 64, 640
+    masked_m = torch.tensor([7, 65, 113], device="cuda", dtype=torch.int32)
+    a_ref = torch.randn((groups, max_m, k), device="cuda", dtype=torch.bfloat16)
+    b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
+
+    a_data = torch.empty((groups, max_m, k), device="cuda", dtype=torch.float8_e4m3fn)
+    a_sf_fp32 = torch.empty((groups, max_m, k // 128), device="cuda", dtype=torch.float32)
+    b_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    b_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
+    for group_id in range(groups):
+        a_data[group_id], a_sf_fp32[group_id] = per_token_cast_to_fp8(
+            a_ref[group_id], use_ue8m0=True, gran_k=128
+        )
+        b_data[group_id], b_sf_fp32[group_id] = per_token_cast_to_fp8(
+            b_ref[group_id], use_ue8m0=True, gran_k=32
+        )
+
+    a = (a_data, _pack_ue8m0_u8_to_i32_mn_major(_e8m0_from_fp32_pow2(a_sf_fp32)))
+    b = (b_data, _e8m0_from_fp32_pow2(b_sf_fp32))
+    a_dequant = _cast_back_from_fp8_1d(a_data, a_sf_fp32, gran_k=128)
+    ref = torch.zeros((groups, max_m, n), device="cuda", dtype=torch.bfloat16)
+    for group_id, valid_m in enumerate(masked_m.tolist()):
+        b_dequant = _cast_back_from_fp8_1d(b_data[group_id], b_sf_fp32[group_id], gran_k=32)
+        ref[group_id, :valid_m] = (a_dequant[group_id, :valid_m] @ b_dequant.t()).to(torch.bfloat16)
+
+    d = torch.empty_like(ref)
+    deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_masked(
+        a, b, d, masked_m, expected_m=max_m, recipe_a=(1, 128), recipe_b=(1, 32)
+    )
+    diff = max(
+        calc_diff(d[group_id, :valid_m], ref[group_id, :valid_m])
+        for group_id, valid_m in enumerate(masked_m.tolist())
+    )
     assert diff < 0.03
 
 
