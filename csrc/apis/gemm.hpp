@@ -5,6 +5,8 @@
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
+#include "../jit_kernels/impls/sm90_mxfp8_fp8_gemm_1d2d.hpp"
+#include "../jit_kernels/impls/sm90_fp8_fp4_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
@@ -266,6 +268,76 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
+}
+
+static void m_grouped_mxfp8_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                                   const std::pair<torch::Tensor, torch::Tensor>& b,
+                                                   const torch::Tensor& d,
+                                                   const torch::Tensor& grouped_layout,
+                                                   const std::string& compiled_dims) {
+    (void) compiled_dims;
+    const auto major_a = get_major_type_ab(a.first);
+    const auto major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(grouped_layout.is_contiguous());
+
+    const auto arch_major = device_runtime->get_arch_major();
+    const auto [m, k] = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
+    const auto [m_, n_] = get_shape<2>(d);
+    const auto [m__] = get_shape<1>(grouped_layout);
+    DG_HOST_ASSERT(arch_major == 9);
+    DG_HOST_ASSERT(m == m_ and m == m__ and n == n_ and k == k_);
+    DG_HOST_ASSERT(k % 32 == 0 and num_groups > 0);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and d.is_contiguous());
+    DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8);
+    const auto [num_groups_sfb, n_sfb, k_sfb] = get_shape<3>(b.second);
+    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and k_sfb == ceil_div(k, 32));
+
+    if (m == 0)
+        return;
+
+    const std::variant<std::tuple<int, int, int>, std::tuple<int, int>> sfa_recipe = std::make_tuple(1, 128);
+    const auto sfa = layout::transform_sf_into_required_layout(
+        a.second, m, k, sfa_recipe, std::nullopt, std::nullopt, false);
+    sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
+        a.first, sfa, b.first, b.second, d, grouped_layout, num_groups, m, n, k, compiled_dims);
+}
+
+static void m_grouped_mxfp8_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                               const std::pair<torch::Tensor, torch::Tensor>& b,
+                                               const torch::Tensor& d,
+                                               const torch::Tensor& masked_m,
+                                               const int& expected_m,
+                                               const std::string& compiled_dims) {
+    (void) expected_m;
+    (void) compiled_dims;
+    const auto major_a = get_major_type_ab(a.first);
+    const auto major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(masked_m.is_contiguous());
+
+    const auto arch_major = device_runtime->get_arch_major();
+    const auto [num_groups, m, k] = check_grouped_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [num_groups_, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
+    const auto [num_groups__, m_, n_] = get_shape<3>(d);
+    DG_HOST_ASSERT(arch_major == 9);
+    DG_HOST_ASSERT(num_groups == num_groups_ and num_groups == num_groups__);
+    DG_HOST_ASSERT(masked_m.numel() == num_groups);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(k % 32 == 0 and m > 0 and n > 0);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and d.is_contiguous());
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8);
+    const auto [num_groups_sfb, n_sfb, k_sfb] = get_shape<3>(b.second);
+    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and k_sfb == ceil_div(k, 32));
+
+    const std::variant<std::tuple<int, int, int>, std::tuple<int, int>> sfa_recipe = std::make_tuple(1, 128);
+    const auto sfa = layout::transform_sf_into_required_layout(
+        a.second, m, k, sfa_recipe, num_groups, std::nullopt, false);
+    sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
+        a.first, sfa, b.first, b.second, d, masked_m, num_groups, m, n, k, compiled_dims);
 }
 
 static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -644,6 +716,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("expected_m"), py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false);
+    m.def("m_grouped_mxfp8_fp8_gemm_nt_contiguous", &m_grouped_mxfp8_fp8_gemm_nt_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
+          py::arg("compiled_dims") = "nk");
+    m.def("m_grouped_mxfp8_fp8_gemm_nt_masked", &m_grouped_mxfp8_fp8_gemm_nt_masked,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
+          py::arg("expected_m"), py::arg("compiled_dims") = "nk");
     m.def("k_grouped_fp8_gemm_tn_contiguous", &k_grouped_fp8_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks"),
           py::arg("ks_tensor"), py::arg("c") = std::nullopt,
