@@ -221,16 +221,22 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfa, uint8_t* sfb, int* grouped_layout,
                 const uint32_t offset = n_offset * SHAPE_K_SFB_PER_STAGE + k_scale_offset;
                 return mxfp8_fp8_detail::e8m0_to_float(smem_sfb[stage_idx][offset]);
             };
-            auto load_sfa = [&](uint32_t m_offset, uint32_t k_scale_offset) {
-                const uint32_t offset = m_offset * SHAPE_K_SFA_PER_STAGE + k_scale_offset;
-                return mxfp8_fp8_detail::e8m0_to_float(smem_sfa[stage_idx][offset]);
-            };
-
             if (scheduler.is_computation_valid(m_block_idx, math_wg_idx * WGMMA::M)) {
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                     const auto a_desc_base_lo = a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
                     const auto b_desc_base_lo = b_desc_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
                     full_barriers[stage_idx]->wait(phase);
+                    constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
+                    const uint32_t sfa_base_m = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
+                    auto load_sfa = [&](uint32_t m_offset, uint32_t k_scale_offset) {
+                        const uint32_t m_idx = sfa_base_m + m_offset;
+                        const uint32_t k_scale_idx = k_block_idx * SHAPE_K_SFA_PER_STAGE + k_scale_offset;
+                        const bool is_valid = m_idx < shape_m * (kMasked ? kNumGroups : 1) and
+                                              k_scale_idx < math::ceil_div(shape_k, 32u);
+                        return mxfp8_fp8_detail::e8m0_to_float(
+                            is_valid ? sfa[m_idx * sfa_stride_m + k_scale_idx * sfa_stride_k] :
+                                       static_cast<uint8_t>(127));
+                    };
 
                     #pragma unroll
                     for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
