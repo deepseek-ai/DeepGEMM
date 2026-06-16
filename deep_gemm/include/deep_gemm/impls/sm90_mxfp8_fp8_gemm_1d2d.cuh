@@ -223,12 +223,13 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                             auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                                const uint32_t n_scale_idx = n_block_idx * BLOCK_N + i * 8;
-                                const float scale_b = load_sfb(n_scale_idx, global_k_scale_idx);
-                                shifted_accum[i * 4 + 0] += scale_a_0 * scale_b * accum[i * 4 + 0];
-                                shifted_accum[i * 4 + 1] += scale_a_0 * scale_b * accum[i * 4 + 1];
-                                shifted_accum[i * 4 + 2] += scale_a_1 * scale_b * accum[i * 4 + 2];
-                                shifted_accum[i * 4 + 3] += scale_a_1 * scale_b * accum[i * 4 + 3];
+                                const uint32_t n_scale_idx = n_block_idx * BLOCK_N + i * 8 + (lane_idx % 4) * 2;
+                                const float scale_b_0 = load_sfb(n_scale_idx, global_k_scale_idx);
+                                const float scale_b_1 = load_sfb(n_scale_idx + 1, global_k_scale_idx);
+                                shifted_accum[i * 4 + 0] += scale_a_0 * scale_b_0 * accum[i * 4 + 0];
+                                shifted_accum[i * 4 + 1] += scale_a_0 * scale_b_1 * accum[i * 4 + 1];
+                                shifted_accum[i * 4 + 2] += scale_a_1 * scale_b_0 * accum[i * 4 + 2];
+                                shifted_accum[i * 4 + 3] += scale_a_1 * scale_b_1 * accum[i * 4 + 3];
                             }
                         }
 
