@@ -37,7 +37,7 @@ if [ "${NUM_GPUS}" -eq 0 ]; then
   echo "No GPUs visible to nvidia-smi — DeepGEMM tests require a GPU." >&2
   exit 1
 fi
-# arch major: 9 == Hopper (SM90), 10 == Blackwell (SM100).
+# arch major: 9 == Hopper (SM90), 10 == Blackwell (SM100/SM103).
 COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
 ARCH_MAJOR=${COMPUTE_CAP%%.*}
 
@@ -123,14 +123,22 @@ if [ -f "${TESTS_DIR}/test_lazy_init.py" ]; then
   skip_test test_lazy_init.py "tvm_ffi eager CUDA init (upstream)"
 fi
 
-# mega_moe family uses SM100 fp4 + symmetric-memory kernels (SM100-only).
+# mega_moe family covers Blackwell fp4 + symmetric-memory kernels and the SM90
+# Hopper fp8 path.
 # test_mega_moe.py additionally needs deep_ep (with ElasticBuffer); the l1 and
 # pre_dispatch tests use deep_gemm's own symmetric buffer.
-MEGA_MOE_ALL=(
+MEGA_MOE_BLACKWELL=(
   test_mega_moe.py
   test_mega_moe_l1_fp4_accuracy.py
   test_mega_moe_l1_sentinel.py
   test_mega_moe_pre_dispatch.py
+)
+MEGA_MOE_HOPPER=(
+  test_mega_moe_hopper.py
+)
+MEGA_MOE_ALL=(
+  "${MEGA_MOE_BLACKWELL[@]}"
+  "${MEGA_MOE_HOPPER[@]}"
 )
 MEGA_MOE_L1=(
   test_mega_moe_l1_fp4_accuracy.py
@@ -156,9 +164,15 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "fp4 kernel failures, see comment (confirm on B200)"
   done
   [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
+  for t in "${MEGA_MOE_HOPPER[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "SM90-only, arch major ${ARCH_MAJOR}"
+  done
 else
-  for t in "${MEGA_MOE_ALL[@]}"; do
-    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "SM100-only, arch major ${ARCH_MAJOR}"
+  for t in "${MEGA_MOE_BLACKWELL[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "Blackwell-only, arch major ${ARCH_MAJOR}"
+  done
+  for t in "${MEGA_MOE_HOPPER[@]}"; do
+    [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${NPROC}"
   done
 fi
 
