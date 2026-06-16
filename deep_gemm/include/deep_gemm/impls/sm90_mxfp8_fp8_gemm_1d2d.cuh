@@ -167,6 +167,7 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                                                      n_idx * sfb_stride_n + k_scale_idx * sfb_stride_k;
                         smem_sfb[stage_idx][i] = is_valid ? sfb[gmem_offset] : static_cast<uint8_t>(127);
                     }
+                    __threadfence_block();
                     __syncwarp();
 
                     if (is_producer_leader)
