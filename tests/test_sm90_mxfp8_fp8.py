@@ -44,7 +44,7 @@ def _make_contiguous_case(groups: int, m_per_group: int, n: int, k: int):
     a_ref = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
 
-    a = per_token_cast_to_fp8(a_ref, use_ue8m0=False, gran_k=128)
+    a_data, a_sf_fp32 = per_token_cast_to_fp8(a_ref, use_ue8m0=True, gran_k=32)
     b_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
     b_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
     for group_id in range(groups):
@@ -53,7 +53,8 @@ def _make_contiguous_case(groups: int, m_per_group: int, n: int, k: int):
         )
 
     grouped_layout = torch.arange(groups, device="cuda", dtype=torch.int32).repeat_interleave(m_per_group)
-    a_dequant = _cast_back_from_fp8_1d(a[0], a[1], gran_k=128)
+    a = (a_data, _e8m0_from_fp32_pow2(a_sf_fp32))
+    a_dequant = _cast_back_from_fp8_1d(a_data, a_sf_fp32, gran_k=32)
     ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     for group_id in range(groups):
         start = group_id * m_per_group
@@ -83,20 +84,20 @@ def test_m_grouped_mxfp8_fp8_masked_e8m0_scale_accuracy():
     b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
 
     a_data = torch.empty((groups, max_m, k), device="cuda", dtype=torch.float8_e4m3fn)
-    a_sf = torch.empty((groups, max_m, 1), device="cuda", dtype=torch.float32)
+    a_sf_fp32 = torch.empty((groups, max_m, k // 32), device="cuda", dtype=torch.float32)
     b_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
     b_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
     for group_id in range(groups):
-        a_data[group_id], a_sf[group_id] = per_token_cast_to_fp8(
-            a_ref[group_id], use_ue8m0=False, gran_k=128
+        a_data[group_id], a_sf_fp32[group_id] = per_token_cast_to_fp8(
+            a_ref[group_id], use_ue8m0=True, gran_k=32
         )
         b_data[group_id], b_sf_fp32[group_id] = per_token_cast_to_fp8(
             b_ref[group_id], use_ue8m0=True, gran_k=32
         )
 
-    a = (a_data, a_sf)
+    a = (a_data, _e8m0_from_fp32_pow2(a_sf_fp32))
     b = (b_data, _e8m0_from_fp32_pow2(b_sf_fp32))
-    a_dequant = _cast_back_from_fp8_1d(a_data, a_sf, gran_k=128)
+    a_dequant = _cast_back_from_fp8_1d(a_data, a_sf_fp32, gran_k=32)
     ref = torch.zeros((groups, max_m, n), device="cuda", dtype=torch.bfloat16)
     for group_id, valid_m in enumerate(masked_m.tolist()):
         b_dequant = _cast_back_from_fp8_1d(b_data[group_id], b_sf_fp32[group_id], gran_k=32)
@@ -120,7 +121,9 @@ def test_m_grouped_mxfp8_vs_fp8_perf_contiguous_and_masked():
     m = groups * m_per_group
     a_ref = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
-    a = per_token_cast_to_fp8(a_ref, use_ue8m0=False, gran_k=128)
+    a_data, a_mx_sf_fp32 = per_token_cast_to_fp8(a_ref, use_ue8m0=True, gran_k=32)
+    a = (a_data, _e8m0_from_fp32_pow2(a_mx_sf_fp32))
+    a_fp8 = per_token_cast_to_fp8(a_ref, use_ue8m0=False, gran_k=128)
     grouped_layout = torch.arange(groups, device="cuda", dtype=torch.int32).repeat_interleave(m_per_group)
 
     b_mx_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
@@ -144,7 +147,7 @@ def test_m_grouped_mxfp8_vs_fp8_perf_contiguous_and_masked():
 
     def run_fp8_contiguous():
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            a, b_fp8, d_fp8, grouped_layout, recipe_a=(1, 128), recipe_b=(1, 128)
+            a_fp8, b_fp8, d_fp8, grouped_layout, recipe_a=(1, 128), recipe_b=(1, 128)
         )
 
     mx_contiguous_elapsed = _time_kernel(run_mx_contiguous)
@@ -157,13 +160,18 @@ def test_m_grouped_mxfp8_vs_fp8_perf_contiguous_and_masked():
     a_ref_masked = torch.randn((groups, max_m, k), device="cuda", dtype=torch.bfloat16)
     b_ref_masked = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
     a_masked_data = torch.empty((groups, max_m, k), device="cuda", dtype=torch.float8_e4m3fn)
-    a_masked_sf = torch.empty((groups, max_m, k // 128), device="cuda", dtype=torch.float32)
+    a_masked_sf_fp32 = torch.empty((groups, max_m, k // 32), device="cuda", dtype=torch.float32)
+    a_fp8_masked_data = torch.empty((groups, max_m, k), device="cuda", dtype=torch.float8_e4m3fn)
+    a_fp8_masked_sf = torch.empty((groups, max_m, k // 128), device="cuda", dtype=torch.float32)
     b_mx_masked_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
     b_mx_masked_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
     b_fp8_masked_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
     b_fp8_masked_sf = torch.empty((groups, n, k // 128), device="cuda", dtype=torch.float32)
     for group_id in range(groups):
-        a_masked_data[group_id], a_masked_sf[group_id] = per_token_cast_to_fp8(
+        a_masked_data[group_id], a_masked_sf_fp32[group_id] = per_token_cast_to_fp8(
+            a_ref_masked[group_id], use_ue8m0=True, gran_k=32
+        )
+        a_fp8_masked_data[group_id], a_fp8_masked_sf[group_id] = per_token_cast_to_fp8(
             a_ref_masked[group_id], use_ue8m0=False, gran_k=128
         )
         b_mx_masked_data[group_id], b_mx_masked_sf_fp32[group_id] = per_token_cast_to_fp8(
@@ -172,7 +180,8 @@ def test_m_grouped_mxfp8_vs_fp8_perf_contiguous_and_masked():
         b_fp8_masked_data[group_id], b_fp8_masked_sf[group_id] = per_token_cast_to_fp8(
             b_ref_masked[group_id], use_ue8m0=False, gran_k=128
         )
-    a_masked = (a_masked_data, a_masked_sf)
+    a_masked = (a_masked_data, _e8m0_from_fp32_pow2(a_masked_sf_fp32))
+    a_fp8_masked = (a_fp8_masked_data, a_fp8_masked_sf)
     b_mx_masked = (b_mx_masked_data, _e8m0_from_fp32_pow2(b_mx_masked_sf_fp32))
     b_fp8_masked = (b_fp8_masked_data, b_fp8_masked_sf)
     d_mx_masked = torch.empty((groups, max_m, n), device="cuda", dtype=torch.bfloat16)
@@ -185,7 +194,7 @@ def test_m_grouped_mxfp8_vs_fp8_perf_contiguous_and_masked():
 
     def run_fp8_masked():
         deep_gemm.m_grouped_fp8_gemm_nt_masked(
-            a_masked,
+            a_fp8_masked,
             b_fp8_masked,
             d_fp8_masked,
             masked_m,

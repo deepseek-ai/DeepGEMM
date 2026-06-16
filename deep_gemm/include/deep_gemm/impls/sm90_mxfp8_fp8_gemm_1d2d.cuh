@@ -40,15 +40,15 @@ template <bool kMasked,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
+sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfa, uint8_t* sfb, int* grouped_layout,
+                              uint32_t sfa_stride_m, uint32_t sfa_stride_k,
                               uint32_t sfb_stride_group, uint32_t sfb_stride_n, uint32_t sfb_stride_k,
                               uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                               const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                               const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                              const __grid_constant__ cute::TmaDescriptor tensor_map_d,
-                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa) {
+                              const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
-    DG_STATIC_ASSERT(BLOCK_K == 128, "A scale is fixed to per-128 K");
+    DG_STATIC_ASSERT(BLOCK_K == 128, "MXFP8 scale stage assumes 4 K/32 scale groups");
     DG_STATIC_ASSERT(kNumStages >= 1, "Invalid pipeline stages");
 
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_N>::type;
@@ -61,7 +61,8 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
     static constexpr uint32_t SMEM_D_SIZE = math::constexpr_align(BLOCK_M * BLOCK_N * static_cast<uint32_t>(sizeof(__nv_bfloat16)), 1024u);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
-    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
+    static constexpr uint32_t SHAPE_K_SFA_PER_STAGE = BLOCK_K / 32;
+    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * SHAPE_K_SFA_PER_STAGE * sizeof(uint8_t);
     static constexpr uint32_t ALIGNED_SMEM_SFA_SIZE_PER_STAGE = math::constexpr_align(SMEM_SFA_SIZE_PER_STAGE, 128u);
     static constexpr uint32_t SHAPE_K_SFB_PER_STAGE = BLOCK_K / 32;
     static constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = BLOCK_N * SHAPE_K_SFB_PER_STAGE * sizeof(uint8_t);
@@ -74,7 +75,6 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
-        cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_d);
     }
     __syncwarp();
@@ -89,7 +89,7 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
     });
     constexpr uint32_t SMEM_SF_OFFSET = SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
     auto smem_sfa = utils::PatternVisitor([&](const uint32_t& i) {
-        return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
+        return reinterpret_cast<uint8_t*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
     });
     auto smem_sfb = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<uint8_t*>(smem_buffer + SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE +
@@ -148,13 +148,21 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                         tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3, false>(&tensor_map_a, &full_barrier,
                                  smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
                                  num_tma_multicast_a);
-                        tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
-                                 smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(num_total_k_blocks, 1, k_block_idx),
-                                 num_tma_multicast_a);
-
                         tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, false>(&tensor_map_b, &full_barrier,
                                  smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
                                  num_tma_multicast_b);
+                    }
+
+                    const uint32_t sfa_base_m = scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx);
+                    for (uint32_t i = lane_idx; i < BLOCK_M * SHAPE_K_SFA_PER_STAGE; i += 32) {
+                        const uint32_t m_offset = i / SHAPE_K_SFA_PER_STAGE;
+                        const uint32_t k_scale_offset = i % SHAPE_K_SFA_PER_STAGE;
+                        const uint32_t m_idx = sfa_base_m + m_offset;
+                        const uint32_t k_scale_idx = k_block_idx * SHAPE_K_SFA_PER_STAGE + k_scale_offset;
+                        const bool is_valid = m_idx < shape_m * (kMasked ? kNumGroups : 1) and
+                                              k_scale_idx < math::ceil_div(shape_k, 32u);
+                        smem_sfa[stage_idx][i] = is_valid ? sfa[m_idx * sfa_stride_m + k_scale_idx * sfa_stride_k] :
+                                                            static_cast<uint8_t>(127);
                     }
 
                     for (uint32_t i = lane_idx; i < BLOCK_N * SHAPE_K_SFB_PER_STAGE; i += 32) {
@@ -171,7 +179,7 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                     __syncwarp();
 
                     if (is_producer_leader)
-                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
+                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
                 }
             }
 
@@ -213,6 +221,10 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                 const uint32_t offset = n_offset * SHAPE_K_SFB_PER_STAGE + k_scale_offset;
                 return mxfp8_fp8_detail::e8m0_to_float(smem_sfb[stage_idx][offset]);
             };
+            auto load_sfa = [&](uint32_t m_offset, uint32_t k_scale_offset) {
+                const uint32_t offset = m_offset * SHAPE_K_SFA_PER_STAGE + k_scale_offset;
+                return mxfp8_fp8_detail::e8m0_to_float(smem_sfa[stage_idx][offset]);
+            };
 
             if (scheduler.is_computation_valid(m_block_idx, math_wg_idx * WGMMA::M)) {
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
@@ -223,8 +235,6 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                     #pragma unroll
                     for (uint32_t local_idx = 0; local_idx < BLOCK_M / WAVE_BLOCK_M; ++ local_idx) {
                         auto m_offset = local_idx * WAVE_BLOCK_M;
-                        auto scale_a_0 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + r_0 + m_offset) : 0;
-                        auto scale_a_1 = do_wgmma_store ? ptx::ld_shared(smem_sfa[stage_idx] + r_1 + m_offset) : 0;
 
                         #pragma unroll
                         for (uint32_t kk = 0; kk < BLOCK_K / WGMMA::K; ++ kk) {
@@ -244,6 +254,8 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                             if (not do_wgmma_store)
                                 continue;
 
+                            const float scale_a_0 = load_sfa(r_0 + m_offset, kk);
+                            const float scale_a_1 = load_sfa(r_1 + m_offset, kk);
                             auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
