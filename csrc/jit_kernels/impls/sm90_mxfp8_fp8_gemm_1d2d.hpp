@@ -106,7 +106,9 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         const torch::Tensor& b, const torch::Tensor& sfb,
         const torch::Tensor& d, const torch::Tensor& grouped_layout,
         const int& num_groups, const int& m, const int& n, const int& k,
-        const std::string& compiled_dims) {
+        const std::string& compiled_dims,
+        const std::optional<std::tuple<int, int>>& recipe_a,
+        const std::optional<std::tuple<int, int>>& recipe_b) {
     DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(sfa.scalar_type() == torch::kUInt8 or sfa.scalar_type() == torch::kInt);
@@ -131,14 +133,16 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
     tune_mxfp8_fp8_smem_config(config, desc);
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
-    const auto sfa_num_scales = static_cast<int>(sfa.size(1)) * (sfa.scalar_type() == torch::kInt ? 4 : 1);
-    DG_HOST_ASSERT(sfa_num_scales > 0 and k % sfa_num_scales == 0);
-    const auto sfa_gran_k = k / sfa_num_scales;
+    const auto sfa_gran_k = recipe_a.has_value()
+        ? std::get<1>(recipe_a.value())
+        : k / (static_cast<int>(sfa.size(1)) * (sfa.scalar_type() == torch::kInt ? 4 : 1));
     DG_HOST_ASSERT(sfa_gran_k == 32 or sfa_gran_k == 128);
-    const auto sfb_num_scales = static_cast<int>(sfb.size(-1)) * (sfb.scalar_type() == torch::kInt ? 4 : 1);
-    DG_HOST_ASSERT(sfb_num_scales > 0 and k % sfb_num_scales == 0);
-    const auto sfb_gran_k = k / sfb_num_scales;
+    DG_HOST_ASSERT(sfa.size(1) == ceil_div(k, sfa_gran_k * (sfa.scalar_type() == torch::kInt ? 4 : 1)));
+    const auto sfb_gran_k = recipe_b.has_value()
+        ? std::get<1>(recipe_b.value())
+        : k / (static_cast<int>(sfb.size(-1)) * (sfb.scalar_type() == torch::kInt ? 4 : 1));
     DG_HOST_ASSERT(sfb_gran_k == 32 or sfb_gran_k == 128);
+    DG_HOST_ASSERT(sfb.size(-1) == ceil_div(k, sfb_gran_k * (sfb.scalar_type() == torch::kInt ? 4 : 1)));
 
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
                                               config.storage_config.load_block_m,
@@ -178,7 +182,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<false>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v6", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d_scale_recipe_v7", code);
     SM90MXFP8FP8Gemm1D2DRuntime<false>::launch(runtime, args);
 }
 
@@ -187,7 +191,9 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         const torch::Tensor& b, const torch::Tensor& sfb,
         const torch::Tensor& d, const torch::Tensor& masked_m,
         const int& num_groups, const int& m, const int& n, const int& k,
-        const std::string& compiled_dims) {
+        const std::string& compiled_dims,
+        const std::optional<std::tuple<int, int>>& recipe_a,
+        const std::optional<std::tuple<int, int>>& recipe_b) {
     DG_HOST_ASSERT(a.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(b.scalar_type() == torch::kFloat8_e4m3fn);
     DG_HOST_ASSERT(sfa.scalar_type() == torch::kUInt8 or sfa.scalar_type() == torch::kInt);
@@ -212,14 +218,16 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
     tune_mxfp8_fp8_smem_config(config, desc);
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
-    const auto sfa_num_scales = static_cast<int>(sfa.size(-1)) * (sfa.scalar_type() == torch::kInt ? 4 : 1);
-    DG_HOST_ASSERT(sfa_num_scales > 0 and k % sfa_num_scales == 0);
-    const auto sfa_gran_k = k / sfa_num_scales;
+    const auto sfa_gran_k = recipe_a.has_value()
+        ? std::get<1>(recipe_a.value())
+        : k / (static_cast<int>(sfa.size(-1)) * (sfa.scalar_type() == torch::kInt ? 4 : 1));
     DG_HOST_ASSERT(sfa_gran_k == 32 or sfa_gran_k == 128);
-    const auto sfb_num_scales = static_cast<int>(sfb.size(-1)) * (sfb.scalar_type() == torch::kInt ? 4 : 1);
-    DG_HOST_ASSERT(sfb_num_scales > 0 and k % sfb_num_scales == 0);
-    const auto sfb_gran_k = k / sfb_num_scales;
+    DG_HOST_ASSERT(sfa.size(-1) == ceil_div(k, sfa_gran_k * (sfa.scalar_type() == torch::kInt ? 4 : 1)));
+    const auto sfb_gran_k = recipe_b.has_value()
+        ? std::get<1>(recipe_b.value())
+        : k / (static_cast<int>(sfb.size(-1)) * (sfb.scalar_type() == torch::kInt ? 4 : 1));
     DG_HOST_ASSERT(sfb_gran_k == 32 or sfb_gran_k == 128);
+    DG_HOST_ASSERT(sfb.size(-1) == ceil_div(k, sfb_gran_k * (sfb.scalar_type() == torch::kInt ? 4 : 1)));
 
     const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
                                               config.storage_config.load_block_m,
@@ -259,7 +267,7 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         .tensor_map_d = tensor_map_d,
     };
     const auto code = SM90MXFP8FP8Gemm1D2DRuntime<true>::generate(args);
-    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v6", code);
+    const auto runtime = compiler->build("sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d_scale_recipe_v7", code);
     SM90MXFP8FP8Gemm1D2DRuntime<true>::launch(runtime, args);
 }
 

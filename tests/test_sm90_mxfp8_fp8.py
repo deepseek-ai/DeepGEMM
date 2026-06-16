@@ -32,7 +32,14 @@ def _e8m0_from_fp32_pow2(sf: torch.Tensor) -> torch.Tensor:
 
 def _pack_ue8m0_u8_to_i32(sf: torch.Tensor) -> torch.Tensor:
     assert sf.dtype == torch.uint8
-    assert sf.shape[-1] % 4 == 0
+    if sf.shape[-1] % 4 != 0:
+        padded = torch.zeros(
+            (*sf.shape[:-1], ((sf.shape[-1] + 3) // 4) * 4),
+            device=sf.device,
+            dtype=sf.dtype,
+        )
+        padded[..., : sf.shape[-1]] = sf
+        sf = padded
     sf_i32 = sf.contiguous().view(*sf.shape[:-1], sf.shape[-1] // 4, 4).to(torch.int32)
     return (
         sf_i32[..., 0]
@@ -126,7 +133,7 @@ def test_m_grouped_mxfp8_fp8_masked_e8m0_scale_accuracy():
 
 def test_m_grouped_mxfp8_fp8_contiguous_packed_int32_scale_accuracy():
     _require_sm90()
-    groups, m_per_group, n, k = 2, 128, 48, 512
+    groups, m_per_group, n, k = 2, 128, 48, 640
     m = groups * m_per_group
     a_ref = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
@@ -154,7 +161,9 @@ def test_m_grouped_mxfp8_fp8_contiguous_packed_int32_scale_accuracy():
         ref[start:end] = (a_dequant[start:end] @ b_dequant.t()).to(torch.bfloat16)
 
     d = torch.empty_like(ref)
-    deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(a, b, d, grouped_layout)
+    deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
+        a, b, d, grouped_layout, recipe_a=(1, 128), recipe_b=(1, 32)
+    )
     diff = calc_diff(d, ref)
     assert diff < 0.03
 

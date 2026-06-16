@@ -273,7 +273,9 @@ static void m_grouped_mxfp8_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor
                                                    const std::pair<torch::Tensor, torch::Tensor>& b,
                                                    const torch::Tensor& d,
                                                    const torch::Tensor& grouped_layout,
-                                                   const std::string& compiled_dims) {
+                                                   const std::string& compiled_dims,
+                                                   const std::optional<std::tuple<int, int>>& recipe_a,
+                                                   const std::optional<std::tuple<int, int>>& recipe_b) {
     (void) compiled_dims;
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -293,19 +295,32 @@ static void m_grouped_mxfp8_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor
     DG_HOST_ASSERT((a.second.scalar_type() == torch::kUInt8 or a.second.scalar_type() == torch::kInt) and
                    a.second.is_contiguous());
     DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8 or b.second.scalar_type() == torch::kInt);
+    if (recipe_a.has_value())
+        DG_HOST_ASSERT(std::get<0>(recipe_a.value()) == 1 and
+                       (std::get<1>(recipe_a.value()) == 32 or std::get<1>(recipe_a.value()) == 128));
+    if (recipe_b.has_value())
+        DG_HOST_ASSERT(std::get<0>(recipe_b.value()) == 1 and
+                       (std::get<1>(recipe_b.value()) == 32 or std::get<1>(recipe_b.value()) == 128));
     const auto [m_sfa, k_sfa] = get_shape<2>(a.second);
-    const auto num_sfa_scales = k_sfa * (a.second.scalar_type() == torch::kInt ? 4 : 1);
-    DG_HOST_ASSERT(m == m_sfa and k % num_sfa_scales == 0 and (k / num_sfa_scales == 32 or k / num_sfa_scales == 128));
+    const auto gran_k_a = recipe_a.has_value()
+        ? std::get<1>(recipe_a.value())
+        : k / (k_sfa * (a.second.scalar_type() == torch::kInt ? 4 : 1));
+    DG_HOST_ASSERT(m == m_sfa and (gran_k_a == 32 or gran_k_a == 128) and
+                   k_sfa == ceil_div(k, gran_k_a * (a.second.scalar_type() == torch::kInt ? 4 : 1)));
     const auto [num_groups_sfb, n_sfb, k_sfb] = get_shape<3>(b.second);
-    const auto num_sfb_scales = k_sfb * (b.second.scalar_type() == torch::kInt ? 4 : 1);
-    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and k % num_sfb_scales == 0 and
-                   (k / num_sfb_scales == 32 or k / num_sfb_scales == 128));
+    const auto gran_k_b = recipe_b.has_value()
+        ? std::get<1>(recipe_b.value())
+        : k / (k_sfb * (b.second.scalar_type() == torch::kInt ? 4 : 1));
+    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and
+                   (gran_k_b == 32 or gran_k_b == 128) and
+                   k_sfb == ceil_div(k, gran_k_b * (b.second.scalar_type() == torch::kInt ? 4 : 1)));
 
     if (m == 0)
         return;
 
     sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
-        a.first, a.second, b.first, b.second, d, grouped_layout, num_groups, m, n, k, compiled_dims);
+        a.first, a.second, b.first, b.second, d, grouped_layout, num_groups, m, n, k,
+        compiled_dims, recipe_a, recipe_b);
 }
 
 static void m_grouped_mxfp8_fp8_gemm_nt_masked(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -313,7 +328,9 @@ static void m_grouped_mxfp8_fp8_gemm_nt_masked(const std::pair<torch::Tensor, to
                                                const torch::Tensor& d,
                                                const torch::Tensor& masked_m,
                                                const int& expected_m,
-                                               const std::string& compiled_dims) {
+                                               const std::string& compiled_dims,
+                                               const std::optional<std::tuple<int, int>>& recipe_a,
+                                               const std::optional<std::tuple<int, int>>& recipe_b) {
     (void) expected_m;
     (void) compiled_dims;
     const auto major_a = get_major_type_ab(a.first);
@@ -335,17 +352,30 @@ static void m_grouped_mxfp8_fp8_gemm_nt_masked(const std::pair<torch::Tensor, to
     DG_HOST_ASSERT((a.second.scalar_type() == torch::kUInt8 or a.second.scalar_type() == torch::kInt) and
                    a.second.is_contiguous());
     DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8 or b.second.scalar_type() == torch::kInt);
+    if (recipe_a.has_value())
+        DG_HOST_ASSERT(std::get<0>(recipe_a.value()) == 1 and
+                       (std::get<1>(recipe_a.value()) == 32 or std::get<1>(recipe_a.value()) == 128));
+    if (recipe_b.has_value())
+        DG_HOST_ASSERT(std::get<0>(recipe_b.value()) == 1 and
+                       (std::get<1>(recipe_b.value()) == 32 or std::get<1>(recipe_b.value()) == 128));
     const auto [num_groups_sfa, m_sfa, k_sfa] = get_shape<3>(a.second);
-    const auto num_sfa_scales = k_sfa * (a.second.scalar_type() == torch::kInt ? 4 : 1);
-    DG_HOST_ASSERT(num_groups == num_groups_sfa and m == m_sfa and k % num_sfa_scales == 0 and
-                   (k / num_sfa_scales == 32 or k / num_sfa_scales == 128));
+    const auto gran_k_a = recipe_a.has_value()
+        ? std::get<1>(recipe_a.value())
+        : k / (k_sfa * (a.second.scalar_type() == torch::kInt ? 4 : 1));
+    DG_HOST_ASSERT(num_groups == num_groups_sfa and m == m_sfa and
+                   (gran_k_a == 32 or gran_k_a == 128) and
+                   k_sfa == ceil_div(k, gran_k_a * (a.second.scalar_type() == torch::kInt ? 4 : 1)));
     const auto [num_groups_sfb, n_sfb, k_sfb] = get_shape<3>(b.second);
-    const auto num_sfb_scales = k_sfb * (b.second.scalar_type() == torch::kInt ? 4 : 1);
-    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and k % num_sfb_scales == 0 and
-                   (k / num_sfb_scales == 32 or k / num_sfb_scales == 128));
+    const auto gran_k_b = recipe_b.has_value()
+        ? std::get<1>(recipe_b.value())
+        : k / (k_sfb * (b.second.scalar_type() == torch::kInt ? 4 : 1));
+    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and
+                   (gran_k_b == 32 or gran_k_b == 128) and
+                   k_sfb == ceil_div(k, gran_k_b * (b.second.scalar_type() == torch::kInt ? 4 : 1)));
 
     sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
-        a.first, a.second, b.first, b.second, d, masked_m, num_groups, m, n, k, compiled_dims);
+        a.first, a.second, b.first, b.second, d, masked_m, num_groups, m, n, k,
+        compiled_dims, recipe_a, recipe_b);
 }
 
 static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -726,10 +756,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk", py::arg("disable_ue8m0_cast") = false);
     m.def("m_grouped_mxfp8_fp8_gemm_nt_contiguous", &m_grouped_mxfp8_fp8_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
-          py::arg("compiled_dims") = "nk");
+          py::arg("compiled_dims") = "nk", py::arg("recipe_a") = std::nullopt,
+          py::arg("recipe_b") = std::nullopt);
     m.def("m_grouped_mxfp8_fp8_gemm_nt_masked", &m_grouped_mxfp8_fp8_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
-          py::arg("expected_m"), py::arg("compiled_dims") = "nk");
+          py::arg("expected_m"), py::arg("compiled_dims") = "nk",
+          py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt);
     m.def("k_grouped_fp8_gemm_tn_contiguous", &k_grouped_fp8_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("ks"),
           py::arg("ks_tensor"), py::arg("c") = std::nullopt,
