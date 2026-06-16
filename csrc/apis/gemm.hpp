@@ -290,12 +290,16 @@ static void m_grouped_mxfp8_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor
     DG_HOST_ASSERT(k % 32 == 0 and num_groups > 0);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and d.is_contiguous());
     DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT(a.second.scalar_type() == torch::kUInt8 and a.second.is_contiguous());
-    DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT((a.second.scalar_type() == torch::kUInt8 or a.second.scalar_type() == torch::kInt) and
+                   a.second.is_contiguous());
+    DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8 or b.second.scalar_type() == torch::kInt);
     const auto [m_sfa, k_sfa] = get_shape<2>(a.second);
-    DG_HOST_ASSERT(m == m_sfa and k_sfa == ceil_div(k, 32));
+    const auto num_sfa_scales = k_sfa * (a.second.scalar_type() == torch::kInt ? 4 : 1);
+    DG_HOST_ASSERT(m == m_sfa and k % num_sfa_scales == 0 and (k / num_sfa_scales == 32 or k / num_sfa_scales == 128));
     const auto [num_groups_sfb, n_sfb, k_sfb] = get_shape<3>(b.second);
-    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and k_sfb == ceil_div(k, 32));
+    const auto num_sfb_scales = k_sfb * (b.second.scalar_type() == torch::kInt ? 4 : 1);
+    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and k % num_sfb_scales == 0 and
+                   (k / num_sfb_scales == 32 or k / num_sfb_scales == 128));
 
     if (m == 0)
         return;
@@ -328,12 +332,17 @@ static void m_grouped_mxfp8_fp8_gemm_nt_masked(const std::pair<torch::Tensor, to
     DG_HOST_ASSERT(k % 32 == 0 and m > 0 and n > 0);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and d.is_contiguous());
     DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT(a.second.scalar_type() == torch::kUInt8 and a.second.is_contiguous());
-    DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT((a.second.scalar_type() == torch::kUInt8 or a.second.scalar_type() == torch::kInt) and
+                   a.second.is_contiguous());
+    DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8 or b.second.scalar_type() == torch::kInt);
     const auto [num_groups_sfa, m_sfa, k_sfa] = get_shape<3>(a.second);
-    DG_HOST_ASSERT(num_groups == num_groups_sfa and m == m_sfa and k_sfa == ceil_div(k, 32));
+    const auto num_sfa_scales = k_sfa * (a.second.scalar_type() == torch::kInt ? 4 : 1);
+    DG_HOST_ASSERT(num_groups == num_groups_sfa and m == m_sfa and k % num_sfa_scales == 0 and
+                   (k / num_sfa_scales == 32 or k / num_sfa_scales == 128));
     const auto [num_groups_sfb, n_sfb, k_sfb] = get_shape<3>(b.second);
-    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and k_sfb == ceil_div(k, 32));
+    const auto num_sfb_scales = k_sfb * (b.second.scalar_type() == torch::kInt ? 4 : 1);
+    DG_HOST_ASSERT(num_groups == num_groups_sfb and n == n_sfb and k % num_sfb_scales == 0 and
+                   (k / num_sfb_scales == 32 or k / num_sfb_scales == 128));
 
     sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         a.first, a.second, b.first, b.second, d, masked_m, num_groups, m, n, k, compiled_dims);

@@ -28,6 +28,16 @@ CUTLASS_DEVICE float e8m0_to_float(uint8_t scale) {
     return __uint_as_float(static_cast<uint32_t>(scale) << 23);
 }
 
+CUTLASS_DEVICE uint8_t load_e8m0_scale(const void* ptr, uint32_t base_offset,
+                                       uint32_t k_scale_idx, uint32_t stride_k,
+                                       bool packed_int32) {
+    if (packed_int32) {
+        const auto packed = reinterpret_cast<const uint32_t*>(ptr)[base_offset + (k_scale_idx / 4) * stride_k];
+        return static_cast<uint8_t>((packed >> ((k_scale_idx % 4) * 8)) & 0xff);
+    }
+    return reinterpret_cast<const uint8_t*>(ptr)[base_offset + k_scale_idx * stride_k];
+}
+
 } // namespace mxfp8_fp8_detail
 
 template <bool kMasked,
@@ -40,9 +50,11 @@ template <bool kMasked,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfa, uint8_t* sfb, int* grouped_layout,
+sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                               uint32_t sfa_stride_m, uint32_t sfa_stride_k,
+                              uint32_t sfa_gran_k, bool sfa_packed_int32,
                               uint32_t sfb_stride_group, uint32_t sfb_stride_n, uint32_t sfb_stride_k,
+                              uint32_t sfb_gran_k, bool sfb_packed_int32,
                               uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                               const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                               const __grid_constant__ cute::TmaDescriptor tensor_map_b,
@@ -158,22 +170,30 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfa, uint8_t* sfb, int* grouped_layout,
                         const uint32_t m_offset = i / SHAPE_K_SFA_PER_STAGE;
                         const uint32_t k_scale_offset = i % SHAPE_K_SFA_PER_STAGE;
                         const uint32_t m_idx = sfa_base_m + m_offset;
-                        const uint32_t k_scale_idx = k_block_idx * SHAPE_K_SFA_PER_STAGE + k_scale_offset;
+                        const uint32_t k_idx_for_scale = k_block_idx * BLOCK_K + k_scale_offset * 32;
+                        const uint32_t k_scale_idx = k_idx_for_scale / sfa_gran_k;
                         const bool is_valid = m_idx < shape_m * (kMasked ? kNumGroups : 1) and
-                                              k_scale_idx < math::ceil_div(shape_k, 32u);
-                        smem_sfa[stage_idx][i] = is_valid ? sfa[m_idx * sfa_stride_m + k_scale_idx * sfa_stride_k] :
-                                                            static_cast<uint8_t>(127);
+                                              k_idx_for_scale < shape_k;
+                        const uint32_t sfa_base_offset = m_idx * sfa_stride_m;
+                        smem_sfa[stage_idx][i] = is_valid ?
+                            mxfp8_fp8_detail::load_e8m0_scale(
+                                sfa, sfa_base_offset, k_scale_idx, sfa_stride_k, sfa_packed_int32) :
+                            static_cast<uint8_t>(127);
                     }
 
                     for (uint32_t i = lane_idx; i < BLOCK_N * SHAPE_K_SFB_PER_STAGE; i += 32) {
                         const uint32_t n_offset = i / SHAPE_K_SFB_PER_STAGE;
                         const uint32_t k_scale_offset = i % SHAPE_K_SFB_PER_STAGE;
                         const uint32_t n_idx = n_block_idx * BLOCK_N + n_offset;
-                        const uint32_t k_scale_idx = k_block_idx * SHAPE_K_SFB_PER_STAGE + k_scale_offset;
-                        const bool is_valid = n_idx < shape_n and k_scale_idx < math::ceil_div(shape_k, 32u);
-                        const uint32_t gmem_offset = scheduler.current_group_idx * sfb_stride_group +
-                                                     n_idx * sfb_stride_n + k_scale_idx * sfb_stride_k;
-                        smem_sfb[stage_idx][i] = is_valid ? sfb[gmem_offset] : static_cast<uint8_t>(127);
+                        const uint32_t k_idx_for_scale = k_block_idx * BLOCK_K + k_scale_offset * 32;
+                        const uint32_t k_scale_idx = k_idx_for_scale / sfb_gran_k;
+                        const bool is_valid = n_idx < shape_n and k_idx_for_scale < shape_k;
+                        const uint32_t sfb_base_offset = scheduler.current_group_idx * sfb_stride_group +
+                                                         n_idx * sfb_stride_n;
+                        smem_sfb[stage_idx][i] = is_valid ?
+                            mxfp8_fp8_detail::load_e8m0_scale(
+                                sfb, sfb_base_offset, k_scale_idx, sfb_stride_k, sfb_packed_int32) :
+                            static_cast<uint8_t>(127);
                     }
                     __threadfence_block();
                     __syncwarp();
