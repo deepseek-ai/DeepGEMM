@@ -292,8 +292,7 @@ static void m_grouped_mxfp8_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor
     DG_HOST_ASSERT(k % 32 == 0 and num_groups > 0);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and d.is_contiguous());
     DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT((a.second.scalar_type() == torch::kUInt8 or a.second.scalar_type() == torch::kInt) and
-                   a.second.is_contiguous());
+    DG_HOST_ASSERT(a.second.scalar_type() == torch::kUInt8 or a.second.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8 or b.second.scalar_type() == torch::kInt);
     if (recipe_a.has_value())
         DG_HOST_ASSERT(std::get<0>(recipe_a.value()) == 1 and
@@ -349,8 +348,7 @@ static void m_grouped_mxfp8_fp8_gemm_nt_masked(const std::pair<torch::Tensor, to
     DG_HOST_ASSERT(k % 32 == 0 and m > 0 and n > 0);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 and d.is_contiguous());
     DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT((a.second.scalar_type() == torch::kUInt8 or a.second.scalar_type() == torch::kInt) and
-                   a.second.is_contiguous());
+    DG_HOST_ASSERT(a.second.scalar_type() == torch::kUInt8 or a.second.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(b.second.scalar_type() == torch::kUInt8 or b.second.scalar_type() == torch::kInt);
     if (recipe_a.has_value())
         DG_HOST_ASSERT(std::get<0>(recipe_a.value()) == 1 and
