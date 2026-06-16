@@ -63,6 +63,9 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
     static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
     static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
     static constexpr uint32_t ALIGNED_SMEM_SFA_SIZE_PER_STAGE = math::constexpr_align(SMEM_SFA_SIZE_PER_STAGE, 128u);
+    static constexpr uint32_t SHAPE_K_SFB_PER_STAGE = BLOCK_K / 32;
+    static constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = BLOCK_N * SHAPE_K_SFB_PER_STAGE * sizeof(uint8_t);
+    static constexpr uint32_t ALIGNED_SMEM_SFB_SIZE_PER_STAGE = math::constexpr_align(SMEM_SFB_SIZE_PER_STAGE, 128u);
 
     const uint32_t num_total_k_blocks = math::ceil_div(shape_k, BLOCK_K);
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -88,8 +91,13 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
     auto smem_sfa = utils::PatternVisitor([&](const uint32_t& i) {
         return reinterpret_cast<float*>(smem_buffer + SMEM_SF_OFFSET + i * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
     });
+    auto smem_sfb = utils::PatternVisitor([&](const uint32_t& i) {
+        return reinterpret_cast<uint8_t*>(smem_buffer + SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE +
+                                          i * ALIGNED_SMEM_SFB_SIZE_PER_STAGE);
+    });
 
-    auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_buffer + SMEM_SF_OFFSET + kNumStages * ALIGNED_SMEM_SFA_SIZE_PER_STAGE);
+    auto barrier_start_ptr = reinterpret_cast<Barrier*>(
+        smem_buffer + SMEM_SF_OFFSET + kNumStages * (ALIGNED_SMEM_SFA_SIZE_PER_STAGE + ALIGNED_SMEM_SFB_SIZE_PER_STAGE));
     auto full_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + i; });
     auto empty_barriers = utils::PatternVisitor([&](const uint32_t& i) { return barrier_start_ptr + kNumStages + i; });
 
@@ -120,7 +128,7 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
 
     if (warp_idx >= kNumMathThreads / 32) {
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
-        if (warp_idx == kNumMathThreads / 32 + 2 and cute::elect_one_sync()) {
+        if (warp_idx == kNumMathThreads / 32 + 2) {
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
                 const uint32_t num_tma_multicast_a = (kIsTMAMulticastOnA and is_tma_multicast_valid) ? kNumTMAMulticast : 1;
@@ -128,22 +136,41 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                 DG_STATIC_ASSERT(kNumTMAMulticast <= 2, "Scheduler does not support > 2 TMA multicast");
 
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
-                    empty_barriers[stage_idx]->wait(phase ^ 1);
+                    const bool is_producer_leader = cute::elect_one_sync();
+                    if (is_producer_leader)
+                        empty_barriers[stage_idx]->wait(phase ^ 1);
+                    __syncwarp();
 
                     constexpr bool kWithGroupOffsetA = kGemmType == GemmType::MGroupedMasked;
                     auto& full_barrier = *full_barriers[stage_idx];
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
-                    tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3, false>(&tensor_map_a, &full_barrier,
-                             smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
-                             num_tma_multicast_a);
-                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
-                             smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(num_total_k_blocks, 1, k_block_idx),
-                             num_tma_multicast_a);
+                    if (is_producer_leader) {
+                        tma::copy<BLOCK_K, BLOCK_M, kSwizzleAMode, __nv_fp8_e4m3, false>(&tensor_map_a, &full_barrier,
+                                 smem_a[stage_idx], k_idx, scheduler.get_global_idx<kWithGroupOffsetA>(shape_m, BLOCK_M, m_block_idx),
+                                 num_tma_multicast_a);
+                        tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, &full_barrier,
+                                 smem_sfa[stage_idx], m_block_idx * BLOCK_M, scheduler.template get_global_idx<kWithGroupOffsetA, sched::IndexType::SF_K>(num_total_k_blocks, 1, k_block_idx),
+                                 num_tma_multicast_a);
 
-                    tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, false>(&tensor_map_b, &full_barrier,
-                             smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
-                             num_tma_multicast_b);
-                    full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
+                        tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, __nv_fp8_e4m3, false>(&tensor_map_b, &full_barrier,
+                                 smem_b[stage_idx], k_idx, scheduler.get_global_idx<true>(shape_n, BLOCK_N, n_block_idx, m_block_idx),
+                                 num_tma_multicast_b);
+                    }
+
+                    for (uint32_t i = lane_idx; i < BLOCK_N * SHAPE_K_SFB_PER_STAGE; i += 32) {
+                        const uint32_t n_offset = i / SHAPE_K_SFB_PER_STAGE;
+                        const uint32_t k_scale_offset = i % SHAPE_K_SFB_PER_STAGE;
+                        const uint32_t n_idx = n_block_idx * BLOCK_N + n_offset;
+                        const uint32_t k_scale_idx = k_block_idx * SHAPE_K_SFB_PER_STAGE + k_scale_offset;
+                        const bool is_valid = n_idx < shape_n and k_scale_idx < math::ceil_div(shape_k, 32u);
+                        const uint32_t gmem_offset = scheduler.current_group_idx * sfb_stride_group +
+                                                     n_idx * sfb_stride_n + k_scale_idx * sfb_stride_k;
+                        smem_sfb[stage_idx][i] = is_valid ? sfb[gmem_offset] : static_cast<uint8_t>(127);
+                    }
+                    __syncwarp();
+
+                    if (is_producer_leader)
+                        full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE);
                 }
             }
 
@@ -181,12 +208,9 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                 }
             };
 
-            auto load_sfb = [&](uint32_t n_idx, uint32_t k_scale_idx) {
-                if (n_idx >= shape_n or k_scale_idx >= math::ceil_div(shape_k, 32u))
-                    return 1.0f;
-                const uint32_t offset = scheduler.current_group_idx * sfb_stride_group +
-                                        n_idx * sfb_stride_n + k_scale_idx * sfb_stride_k;
-                return mxfp8_fp8_detail::e8m0_to_float(sfb[offset]);
+            auto load_sfb = [&](uint32_t n_offset, uint32_t k_scale_offset) {
+                const uint32_t offset = n_offset * SHAPE_K_SFB_PER_STAGE + k_scale_offset;
+                return mxfp8_fp8_detail::e8m0_to_float(smem_sfb[stage_idx][offset]);
             };
 
             if (scheduler.is_computation_valid(m_block_idx, math_wg_idx * WGMMA::M)) {
@@ -219,13 +243,12 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
                             if (not do_wgmma_store)
                                 continue;
 
-                            const uint32_t global_k_scale_idx = k_block_idx * (BLOCK_K / WGMMA::K) + kk;
                             auto shifted_accum = final_accum + WGMMA::kNumAccum * local_idx;
                             #pragma unroll
                             for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
-                                const uint32_t n_scale_idx = n_block_idx * BLOCK_N + i * 8 + (lane_idx % 4) * 2;
-                                const float scale_b_0 = load_sfb(n_scale_idx, global_k_scale_idx);
-                                const float scale_b_1 = load_sfb(n_scale_idx + 1, global_k_scale_idx);
+                                const uint32_t n_scale_offset = i * 8 + (lane_idx % 4) * 2;
+                                const float scale_b_0 = load_sfb(n_scale_offset, kk);
+                                const float scale_b_1 = load_sfb(n_scale_offset + 1, kk);
                                 shifted_accum[i * 4 + 0] += scale_a_0 * scale_b_0 * accum[i * 4 + 0];
                                 shifted_accum[i * 4 + 1] += scale_a_0 * scale_b_1 * accum[i * 4 + 1];
                                 shifted_accum[i * 4 + 2] += scale_a_1 * scale_b_0 * accum[i * 4 + 2];

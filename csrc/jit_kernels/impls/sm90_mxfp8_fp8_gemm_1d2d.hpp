@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <torch/python.h>
 
 #include "../../jit/compiler.hpp"
@@ -72,6 +74,21 @@ static void __instantiate_kernel() {{
     }
 };
 
+static void tune_mxfp8_fp8_smem_config(GemmConfig& config, const GemmDesc& desc) {
+    const int orig_num_stages = config.pipeline_config.num_stages;
+    const int original_per_stage =
+        config.storage_config.load_block_m * config.layout.block_k * c10::elementSize(desc.a_dtype) +
+        config.storage_config.load_block_n * config.layout.block_k * c10::elementSize(desc.b_dtype) +
+        align(config.layout.block_m * static_cast<int>(sizeof(float)), 128);
+    const int sfb_per_stage = align(config.layout.block_n * (config.layout.block_k / 32) * static_cast<int>(sizeof(uint8_t)), 128);
+    const int smem_extra = config.pipeline_config.smem_size - orig_num_stages * original_per_stage;
+    const int merged_per_stage = original_per_stage + sfb_per_stage;
+    int chosen_stages = std::min(orig_num_stages, (SM90ArchSpec::smem_capacity - smem_extra) / merged_per_stage);
+    DG_HOST_ASSERT(chosen_stages >= 1);
+    config.pipeline_config.num_stages = chosen_stages;
+    config.pipeline_config.smem_size = smem_extra + chosen_stages * merged_per_stage;
+}
+
 static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         const torch::Tensor& a, const torch::Tensor& sfa,
         const torch::Tensor& b, const torch::Tensor& sfb,
@@ -98,7 +115,8 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_contiguous_1d2d(
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
         .expected_m = m, .expected_n = n, .expected_k = k, .expected_num_groups = 1
     };
-    const auto config = get_best_config<SM90ArchSpec>(desc);
+    auto config = get_best_config<SM90ArchSpec>(desc);
+    tune_mxfp8_fp8_smem_config(config, desc);
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
 
@@ -167,7 +185,8 @@ static void sm90_m_grouped_mxfp8_fp8_gemm_masked_1d2d(
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
         .expected_m = m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
-    const auto config = get_best_config<SM90ArchSpec>(desc);
+    auto config = get_best_config<SM90ArchSpec>(desc);
+    tune_mxfp8_fp8_smem_config(config, desc);
     DG_HOST_ASSERT(config.storage_config.swizzle_a_mode == config.layout.block_k);
     DG_HOST_ASSERT(config.storage_config.swizzle_b_mode == config.layout.block_k);
 
