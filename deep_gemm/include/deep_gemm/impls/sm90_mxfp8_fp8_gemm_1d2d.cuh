@@ -217,10 +217,6 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfa, uint8_t* sfb, int* grouped_layout,
                 }
             };
 
-            auto load_sfb = [&](uint32_t n_offset, uint32_t k_scale_offset) {
-                const uint32_t offset = n_offset * SHAPE_K_SFB_PER_STAGE + k_scale_offset;
-                return mxfp8_fp8_detail::e8m0_to_float(smem_sfb[stage_idx][offset]);
-            };
             if (scheduler.is_computation_valid(m_block_idx, math_wg_idx * WGMMA::M)) {
                 for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                     const auto a_desc_base_lo = a_desc_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
@@ -236,6 +232,15 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfa, uint8_t* sfb, int* grouped_layout,
                         return mxfp8_fp8_detail::e8m0_to_float(
                             is_valid ? sfa[m_idx * sfa_stride_m + k_scale_idx * sfa_stride_k] :
                                        static_cast<uint8_t>(127));
+                    };
+                    auto load_sfb = [&](uint32_t n_offset, uint32_t k_scale_offset) {
+                        const uint32_t n_idx = n_block_idx * BLOCK_N + n_offset;
+                        const uint32_t k_scale_idx = k_block_idx * SHAPE_K_SFB_PER_STAGE + k_scale_offset;
+                        const bool is_valid = n_idx < shape_n and k_scale_idx < math::ceil_div(shape_k, 32u);
+                        const uint32_t gmem_offset = scheduler.current_group_idx * sfb_stride_group +
+                                                     n_idx * sfb_stride_n + k_scale_idx * sfb_stride_k;
+                        return mxfp8_fp8_detail::e8m0_to_float(
+                            is_valid ? sfb[gmem_offset] : static_cast<uint8_t>(127));
                     };
 
                     #pragma unroll
