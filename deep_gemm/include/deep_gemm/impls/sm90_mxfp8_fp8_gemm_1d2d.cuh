@@ -182,7 +182,7 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(uint8_t* sfb, int* grouped_layout,
             };
 
             auto load_sfb = [&](uint32_t n_idx, uint32_t k_scale_idx) {
-                if (n_idx >= shape_n)
+                if (n_idx >= shape_n or k_scale_idx >= math::ceil_div(shape_k, 32u))
                     return 1.0f;
                 const uint32_t offset = scheduler.current_group_idx * sfb_stride_group +
                                         n_idx * sfb_stride_n + k_scale_idx * sfb_stride_k;

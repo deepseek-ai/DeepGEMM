@@ -55,7 +55,8 @@ def _make_contiguous_case(groups: int, m_per_group: int, n: int, k: int):
 
 def test_m_grouped_mxfp8_fp8_contiguous_e8m0_scale_accuracy():
     _require_sm90()
-    groups, m_per_group, n, k = 2, 17, 48, 64
+    # SM90 grouped-contiguous WGMMA/TMA maps one B group per M tile.
+    groups, m_per_group, n, k = 2, 128, 48, 128
     a, b, grouped_layout, ref = _make_contiguous_case(groups, m_per_group, n, k)
     d = torch.empty_like(ref)
 
@@ -66,7 +67,7 @@ def test_m_grouped_mxfp8_fp8_contiguous_e8m0_scale_accuracy():
 
 def test_m_grouped_mxfp8_fp8_masked_e8m0_scale_accuracy():
     _require_sm90()
-    groups, max_m, n, k = 2, 32, 48, 64
+    groups, max_m, n, k = 2, 32, 48, 128
     masked_m = torch.tensor([7, 19], device="cuda", dtype=torch.int32)
     a_ref = torch.randn((groups, max_m, k), device="cuda", dtype=torch.bfloat16)
     b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
