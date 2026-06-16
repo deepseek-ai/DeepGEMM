@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import Callable
 
 import pytest
 import torch
@@ -7,7 +8,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import deep_gemm
-from deep_gemm.testing import calc_diff
+from deep_gemm.testing import bench, calc_diff
 from deep_gemm.utils.math import per_token_cast_to_fp8
 
 
@@ -27,6 +28,15 @@ def _cast_back_from_fp8_1d(x: torch.Tensor, sf: torch.Tensor, gran_k: int) -> to
 def _e8m0_from_fp32_pow2(sf: torch.Tensor) -> torch.Tensor:
     assert sf.dtype == torch.float32 or sf.dtype == torch.float
     return ((sf.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+
+
+def _tflops(m: int, n: int, k: int, elapsed: float) -> float:
+    return 2.0 * m * n * k / elapsed / 1e12
+
+
+def _time_kernel(fn: Callable[[], None]) -> float:
+    fn()
+    return bench(fn, num_warmups=5, num_tests=10)
 
 
 def _make_contiguous_case(groups: int, m_per_group: int, n: int, k: int):
@@ -99,3 +109,130 @@ def test_m_grouped_mxfp8_fp8_masked_e8m0_scale_accuracy():
         for group_id, valid_m in enumerate(masked_m.tolist())
     )
     assert diff < 0.03
+
+
+def test_m_grouped_mxfp8_vs_fp8_perf_contiguous_and_masked():
+    _require_sm90()
+    groups, n, k = 4, 1024, 1024
+
+    # Contiguous: one B group per M tile.
+    m_per_group = 128
+    m = groups * m_per_group
+    a_ref = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
+    a = per_token_cast_to_fp8(a_ref, use_ue8m0=False, gran_k=128)
+    grouped_layout = torch.arange(groups, device="cuda", dtype=torch.int32).repeat_interleave(m_per_group)
+
+    b_mx_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    b_mx_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
+    b_fp8_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    b_fp8_sf = torch.empty((groups, n, k // 128), device="cuda", dtype=torch.float32)
+    for group_id in range(groups):
+        b_mx_data[group_id], b_mx_sf_fp32[group_id] = per_token_cast_to_fp8(
+            b_ref[group_id], use_ue8m0=True, gran_k=32
+        )
+        b_fp8_data[group_id], b_fp8_sf[group_id] = per_token_cast_to_fp8(
+            b_ref[group_id], use_ue8m0=False, gran_k=128
+        )
+    b_mx = (b_mx_data, _e8m0_from_fp32_pow2(b_mx_sf_fp32))
+    b_fp8 = (b_fp8_data, b_fp8_sf)
+    d_mx = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    d_fp8 = torch.empty_like(d_mx)
+
+    def run_mx_contiguous():
+        deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(a, b_mx, d_mx, grouped_layout)
+
+    def run_fp8_contiguous():
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            a, b_fp8, d_fp8, grouped_layout, recipe_a=(1, 128), recipe_b=(1, 128)
+        )
+
+    mx_contiguous_elapsed = _time_kernel(run_mx_contiguous)
+    fp8_contiguous_elapsed = _time_kernel(run_fp8_contiguous)
+    contiguous_diff = float(calc_diff(d_mx, d_fp8))
+
+    # Masked: same shape class, but allow uneven active rows per group.
+    max_m = 128
+    masked_m = torch.tensor([128, 96, 64, 32], device="cuda", dtype=torch.int32)
+    a_ref_masked = torch.randn((groups, max_m, k), device="cuda", dtype=torch.bfloat16)
+    b_ref_masked = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
+    a_masked_data = torch.empty((groups, max_m, k), device="cuda", dtype=torch.float8_e4m3fn)
+    a_masked_sf = torch.empty((groups, max_m, k // 128), device="cuda", dtype=torch.float32)
+    b_mx_masked_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    b_mx_masked_sf_fp32 = torch.empty((groups, n, k // 32), device="cuda", dtype=torch.float32)
+    b_fp8_masked_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    b_fp8_masked_sf = torch.empty((groups, n, k // 128), device="cuda", dtype=torch.float32)
+    for group_id in range(groups):
+        a_masked_data[group_id], a_masked_sf[group_id] = per_token_cast_to_fp8(
+            a_ref_masked[group_id], use_ue8m0=False, gran_k=128
+        )
+        b_mx_masked_data[group_id], b_mx_masked_sf_fp32[group_id] = per_token_cast_to_fp8(
+            b_ref_masked[group_id], use_ue8m0=True, gran_k=32
+        )
+        b_fp8_masked_data[group_id], b_fp8_masked_sf[group_id] = per_token_cast_to_fp8(
+            b_ref_masked[group_id], use_ue8m0=False, gran_k=128
+        )
+    a_masked = (a_masked_data, a_masked_sf)
+    b_mx_masked = (b_mx_masked_data, _e8m0_from_fp32_pow2(b_mx_masked_sf_fp32))
+    b_fp8_masked = (b_fp8_masked_data, b_fp8_masked_sf)
+    d_mx_masked = torch.empty((groups, max_m, n), device="cuda", dtype=torch.bfloat16)
+    d_fp8_masked = torch.empty_like(d_mx_masked)
+
+    def run_mx_masked():
+        deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_masked(
+            a_masked, b_mx_masked, d_mx_masked, masked_m, expected_m=max_m
+        )
+
+    def run_fp8_masked():
+        deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            a_masked,
+            b_fp8_masked,
+            d_fp8_masked,
+            masked_m,
+            expected_m=max_m,
+            recipe_a=(1, 128),
+            recipe_b=(1, 128),
+        )
+
+    mx_masked_elapsed = _time_kernel(run_mx_masked)
+    fp8_masked_elapsed = _time_kernel(run_fp8_masked)
+    masked_diff = max(
+        float(calc_diff(d_mx_masked[group_id, :valid_m], d_fp8_masked[group_id, :valid_m]))
+        for group_id, valid_m in enumerate(masked_m.tolist())
+    )
+
+    masked_active_m = int(masked_m.sum().item())
+    rows = [
+        (
+            "contiguous",
+            m,
+            mx_contiguous_elapsed,
+            fp8_contiguous_elapsed,
+            _tflops(m, n, k, mx_contiguous_elapsed),
+            _tflops(m, n, k, fp8_contiguous_elapsed),
+            contiguous_diff,
+        ),
+        (
+            "masked",
+            masked_active_m,
+            mx_masked_elapsed,
+            fp8_masked_elapsed,
+            _tflops(masked_active_m, n, k, mx_masked_elapsed),
+            _tflops(masked_active_m, n, k, fp8_masked_elapsed),
+            masked_diff,
+        ),
+    ]
+    print("kernel | active M | MXFP8 us | FP8 us | MXFP8 TFLOPS | FP8 TFLOPS | speedup | diff")
+    print("-- | -- | -- | -- | -- | -- | -- | --")
+    for name, active_m, mx_elapsed, fp8_elapsed, mx_tflops, fp8_tflops, diff in rows:
+        print(
+            f"{name} | {active_m} | {mx_elapsed * 1e6:.0f} | {fp8_elapsed * 1e6:.0f} | "
+            f"{mx_tflops:.1f} | {fp8_tflops:.1f} | {fp8_elapsed / mx_elapsed:.2f}x | {diff:.4f}"
+        )
+
+    assert mx_contiguous_elapsed > 0
+    assert fp8_contiguous_elapsed > 0
+    assert mx_masked_elapsed > 0
+    assert fp8_masked_elapsed > 0
+    assert contiguous_diff == contiguous_diff
+    assert masked_diff == masked_diff
