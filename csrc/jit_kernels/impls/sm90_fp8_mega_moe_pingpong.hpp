@@ -72,8 +72,9 @@ public:
         return fmt::format(R"(
 // JIT cache key: bump this comment to invalidate the cache when
 // sm90_fp8_mega_moe_pingpong.cuh changes in a way the template args don't capture.
-// pingpong_v2: L2-acts SF uses true-float scale (sf = amax/448) instead of
+// pingpong_v3: L2-acts SF uses true-float scale (sf = amax/448) instead of
 //   UE8M0 power-of-2 alignment (no storage saving on Hopper; matches reference).
+//   v3: sf_inv = rcp(sf) (one mul fewer per row than kE4M3Max*rcp(amax)).
 // Eliminate all vprintf calls that cause ptxas C7510 (WGMMA pipeline
 // serialization due to function call boundary):
 // 1. DG_DEVICE_ASSERT → trap-only (no printf)
