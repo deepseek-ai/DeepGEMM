@@ -54,6 +54,21 @@ def _pack_ue8m0_u8_to_i32_mn_major(sf: torch.Tensor) -> torch.Tensor:
     return packed.transpose(-1, -2).contiguous().transpose(-1, -2)
 
 
+def test_packed_ue8m0_i32_byte_order_matches_sm100_layout():
+    _require_sm90()
+    import deep_gemm.utils.layout
+
+    sf = torch.tensor(
+        [[2.0, 4.0, 8.0, 16.0], [32.0, 64.0, 128.0, 256.0]],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    expected = _pack_ue8m0_u8_to_i32(_e8m0_from_fp32_pow2(sf))
+    packed = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+
+    assert torch.equal(packed.cpu(), expected.cpu())
+
+
 def _tflops(m: int, n: int, k: int, elapsed: float) -> float:
     return 2.0 * m * n * k / elapsed / 1e12
 
