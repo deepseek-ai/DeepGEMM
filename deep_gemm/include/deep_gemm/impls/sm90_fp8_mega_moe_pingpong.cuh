@@ -1122,18 +1122,22 @@ sm90_fp8_mega_moe_pingpong_impl(void* y,
                 amax_r0 = math::warp_reduce<4, false>(amax_r0, math::ReduceMax<float>());
                 amax_r1 = math::warp_reduce<4, false>(amax_r1, math::ReduceMax<float>());
 
-                // Compute SF and inverse SF for each row
-                float sf_r0, sf_inv_r0;
-                float sf_r1, sf_inv_r1;
-                {
-                    float2 amax_pair = {amax_r0, amax_r1};
-                    float2 sf_pair, sf_inv_pair;
-                    math::get_e4m3_sf_and_sf_inv(amax_pair, sf_pair, sf_inv_pair);
-                    sf_r0     = sf_pair.x;
-                    sf_inv_r0 = sf_inv_pair.x;
-                    sf_r1     = sf_pair.y;
-                    sf_inv_r1 = sf_inv_pair.y;
-                }
+                // Compute SF and inverse SF for each row.
+                // NOTE: true-float scale (sf = amax / 448), NOT UE8M0 power-of-2.
+                // The SF is stored as float in `l2_sf_buffer` and consumed by the L2
+                // GEMM as a plain `float x float` dequant (no packed-scale HW path on
+                // Hopper WGMMA), so a power-of-2 alignment would not save storage and
+                // would only waste ~1 bit of e4m3 dynamic range (the ceil rounds the
+                // scale up). Using the true float scale lets the max element hit the
+                // full e4m3 range (=448) and matches the PyTorch reference
+                // (`sf = amax/448`, tests/test_mega_moe_sm90.py).
+                constexpr float kE4M3Max = 448.0f;
+                const float clamped_amax_r0 = cute::max(amax_r0, 1e-4f);
+                const float clamped_amax_r1 = cute::max(amax_r1, 1e-4f);
+                const float sf_r0     = clamped_amax_r0 * (1.0f / kE4M3Max);
+                const float sf_r1     = clamped_amax_r1 * (1.0f / kE4M3Max);
+                const float sf_inv_r0 = kE4M3Max * math::fast_rcp(clamped_amax_r0);
+                const float sf_inv_r1 = kE4M3Max * math::fast_rcp(clamped_amax_r1);
 
                 // Quantize and write to smem_cd_l1 (row-major, no swizzle).
                 // The L1-output TMA store descriptor is built with swizzle_mode = 0
