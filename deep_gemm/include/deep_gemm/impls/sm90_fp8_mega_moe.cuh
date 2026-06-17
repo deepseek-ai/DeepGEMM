@@ -1382,9 +1382,6 @@ sm90_fp8_mega_moe_impl(void* y,
                                     ptx::warpgroup_fence_operand(swap_accum[i]);
                                 ptx::warpgroup_wait<0>();
 
-                                if (lane_idx == 0)
-                                    empty_barriers[stage_idx]->arrive();
-
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
                                     const uint32_t token_0 = i * 8 + col_idx * 2;
@@ -1398,6 +1395,9 @@ sm90_fp8_mega_moe_impl(void* y,
                                     final_accum[i * 4 + 1] += scale_1 * gate_sf * swap_accum[i * 4 + 1];
                                     final_accum[i * 4 + 3] += scale_1 * up_sf * swap_accum[i * 4 + 3];
                                 }
+
+                                if (lane_idx == 0)
+                                    empty_barriers[stage_idx]->arrive();
                             };
 
                             const uint32_t n_swap = ((valid_m + 7u) / 8u) * 8u;
@@ -2069,10 +2069,13 @@ sm90_fp8_mega_moe_impl(void* y,
                     }
                 }
 
-                // Each warp writes and then scatters only its own 16-row
-                // slice, so a warp-level fence is enough before reading
-                // back from shared memory.
-                __syncwarp();
+                // In the normal layout each warp writes and then scatters its
+                // own 16-row slice. swapAB writes by output-column ownership
+                // instead, so a token row is produced by the whole warpgroup.
+                if constexpr (kSwapABActive)
+                    ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                else
+                    __syncwarp();
 
                 // Scatter to remote ranks via NVLink (one row per warp-pair)
                 // Each warpgroup-warp covers 8 unique rows x 2 (r_0 + r_1 doubled by warps)

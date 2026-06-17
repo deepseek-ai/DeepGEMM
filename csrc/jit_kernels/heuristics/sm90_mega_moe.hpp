@@ -44,8 +44,7 @@ struct MegaMoESM90Config {
 
 static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
     const int& num_ranks, const int& num_experts,
-    const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& num_tokens) {
+    const int& num_topk, const int& num_tokens) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
@@ -142,10 +141,11 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int& hidden, const int& intermediate_hidden,
     const int& num_padded_sf_pool_tokens) {
     const auto [block_m, num_epilogue_threads] = get_block_config_for_mega_moe_sm90(
-        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
+        num_ranks, num_experts, num_topk, num_tokens);
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-    const bool auto_split_mn = expected_tokens_per_expert >= 64.0f;
+    const bool auto_split_mn =
+        block_m == 128 and num_epilogue_threads == 512;
     const bool decode_split_n_path =
         block_m == 64 and num_epilogue_threads == 256;
     const bool decode_use_block_n_256 =
