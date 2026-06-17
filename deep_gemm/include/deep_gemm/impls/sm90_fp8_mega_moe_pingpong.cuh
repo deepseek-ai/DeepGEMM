@@ -1132,12 +1132,13 @@ sm90_fp8_mega_moe_pingpong_impl(void* y,
                 // full e4m3 range (=448) and matches the PyTorch reference
                 // (`sf = amax/448`, tests/test_mega_moe_sm90.py).
                 constexpr float kE4M3Max = 448.0f;
-                const float clamped_amax_r0 = cute::max(amax_r0, 1e-4f);
-                const float clamped_amax_r1 = cute::max(amax_r1, 1e-4f);
-                const float sf_r0     = clamped_amax_r0 * (1.0f / kE4M3Max);
-                const float sf_r1     = clamped_amax_r1 * (1.0f / kE4M3Max);
-                const float sf_inv_r0 = kE4M3Max * math::fast_rcp(clamped_amax_r0);
-                const float sf_inv_r1 = kE4M3Max * math::fast_rcp(clamped_amax_r1);
+                const float sf_r0     = cute::max(amax_r0, 1e-4f) * (1.0f / kE4M3Max);
+                const float sf_r1     = cute::max(amax_r1, 1e-4f) * (1.0f / kE4M3Max);
+                // sf_inv = 1/sf (reciprocal of the stored scale), saving one mul per
+                // row vs `kE4M3Max * rcp(amax)` and keeping quant/dequant exactly
+                // inverse w.r.t. the SF that gets written to the pool.
+                const float sf_inv_r0 = math::fast_rcp(sf_r0);
+                const float sf_inv_r1 = math::fast_rcp(sf_r1);
 
                 // Quantize and write to smem_cd_l1 (row-major, no swizzle).
                 // The L1-output TMA store descriptor is built with swizzle_mode = 0
