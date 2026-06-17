@@ -207,10 +207,16 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
     // L2 BF16 (BLOCK_M * BLOCK_N * 2 bytes).  The tile covers the full
     // BLOCK_M rows; each warpgroup writes its own WG_BLOCK_M-row slice
     // within that single staging tile.
+    // CD output is DOUBLE-BUFFERED: while one buffer's tile is being TMA-stored to
+    // HBM, the next tile's MMA + epilogue writes the other buffer, overlapping the
+    // store latency with compute. kNumCDStages buffers; the host pipeline config
+    // accounts for the 2x CD region (one fewer GEMM stage in exchange).
+    constexpr uint32_t kNumCDStages    = 2;
     constexpr uint32_t SMEM_CD_L1_SIZE = BLOCK_M * L1_OUT_BLOCK_N * sizeof(cutlass::float_e4m3_t);
     constexpr uint32_t SMEM_CD_L2_SIZE = BLOCK_M * BLOCK_N * sizeof(nv_bfloat16);
-    constexpr uint32_t SMEM_CD_SIZE    = math::constexpr_align(
+    constexpr uint32_t SMEM_CD_BUF_SIZE = math::constexpr_align(
         SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE, kSharedMemoryAlignment);
+    constexpr uint32_t SMEM_CD_SIZE    = kNumCDStages * SMEM_CD_BUF_SIZE;
 
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
         SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE +
@@ -226,8 +232,15 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         smem_buffer, SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE);
 
     // CD output is shared by L1 (FP8) and L2 (BF16); reinterpret-cast as needed.
-    auto smem_cd_l1 = reinterpret_cast<cutlass::float_e4m3_t*>(smem_gemm_base);
-    auto smem_cd_l2 = reinterpret_cast<nv_bfloat16*>(smem_gemm_base);
+    // Double-buffered: smem_cd_l1(buf)/smem_cd_l2(buf) select buffer `buf` in {0,1}.
+    auto smem_cd_l1 = utils::PatternVisitor([=](const uint32_t& buf) {
+        return reinterpret_cast<cutlass::float_e4m3_t*>(
+            math::advance_ptr(smem_gemm_base, buf * SMEM_CD_BUF_SIZE));
+    });
+    auto smem_cd_l2 = utils::PatternVisitor([=](const uint32_t& buf) {
+        return reinterpret_cast<nv_bfloat16*>(
+            math::advance_ptr(smem_gemm_base, buf * SMEM_CD_BUF_SIZE));
+    });
 
     auto smem_a       = utils::PatternVisitor([=](const uint32_t& i) {
         return math::advance_ptr<a_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
@@ -801,6 +814,14 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
         scheduler.fetch_expert_recv_count();
         scheduler.set_expert_idx(0);
         uint32_t pos = 0;
+        // Deferred L1-store completion + L2 notification (double-buffered CD).
+        // We issue tile N's TMA store, then keep computing tile N+1 while it drains.
+        // The arrival-mask bit (which tells L2 the L1 output is in HBM) is set only
+        // AFTER the store completes, so we defer it by one L1 tile and flush the
+        // last pending one when L1 finishes (before any L2 reads it).
+        bool     l1_store_pending          = false;
+        uint32_t l1_pending_pool_block_idx = 0;
+        uint32_t l1_pending_n_block_idx    = 0;
         while (true) {
             CUTE_TIE_DECL(scheduler.get_next_block(), block_phase, local_expert_idx, m_block_idx, n_block_idx);
             if (block_phase == sched::BlockPhase::None)
@@ -814,7 +835,26 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
             const uint32_t valid_m        = scheduler.template get_valid_m<false>();
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
             const uint32_t m_idx          = pool_block_idx * BLOCK_M;
+            // Double-buffered CD staging tile: alternate per tile so the previous
+            // tile's L1 TMA store can drain in the background while this tile's
+            // MMA + epilogue fills the other buffer.
+            const uint32_t cd_buf         = pos % kNumCDStages;
             const uint32_t n_idx          = n_block_idx * BLOCK_N;
+
+            // Flush any deferred L1 store BEFORE starting an L2 tile: the L2 loader
+            // spins on the arrival mask, so the last L1 tile's store must complete
+            // and its mask bit be published before L2 begins (scheduler emits all L1
+            // blocks of a wave, then all L2 blocks, so this fires at the transition).
+            if (block_phase == sched::BlockPhase::Linear2 and l1_store_pending) {
+                ptx::tma_store_wait<0>();
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                    ptx::red_or_rel_gpu(
+                        workspace.get_l2_arrival_mask_ptr(l1_pending_pool_block_idx),
+                        1ull << l1_pending_n_block_idx);
+                }
+                l1_store_pending = false;
+            }
 
             // ---------------- GEMM (MMA region; 2 WGs cooperate on this tile) ----------------
             using WGMMA                        = L1WGMMA;
@@ -1140,7 +1180,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 // COOP: each WG writes its own WG_BLOCK_M-row band into the shared
                 // smem_cd staging tile at row offset `row_block_offset`. Both WGs run
                 // their epilogues concurrently into disjoint row ranges.
-                auto* smem_cd_l1_wg = smem_cd_l1 + row_block_offset * L1_OUT_BLOCK_N;
+                auto* smem_cd_l1_wg = smem_cd_l1[cd_buf] + row_block_offset * L1_OUT_BLOCK_N;
 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++p) {
                     const float v00 = swiglu_r0[p][0] * sf_inv_r0;
@@ -1187,16 +1227,26 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
-                ptx::tma_store_wait<0>();
 
-                // Notify L2 only AFTER BOTH WGs have stored their bands (full-epilogue
-                // 256-thread barrier), so the arrival mask reflects the complete tile.
+                // DOUBLE-BUFFERED store/compute overlap: do NOT wait for THIS tile's
+                // store here. Both WGs rendezvous (256-thread) so this buffer's store
+                // has been fully issued, then we retire the PREVIOUS pending L1 store:
+                // tma_store_wait<1> guarantees at most 1 store in flight (i.e. the
+                // previous one — same buffer two tiles ago — has completed), so its
+                // arrival-mask bit is now safe to publish to L2. This tile's own store
+                // keeps draining in the background while the next tile's MMA runs.
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                    ptx::red_or_rel_gpu(
-                        workspace.get_l2_arrival_mask_ptr(pool_block_idx),
-                        1ull << n_block_idx);
+                if (l1_store_pending) {
+                    ptx::tma_store_wait<1>();
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        ptx::red_or_rel_gpu(
+                            workspace.get_l2_arrival_mask_ptr(l1_pending_pool_block_idx),
+                            1ull << l1_pending_n_block_idx);
+                    }
                 }
+                l1_store_pending          = true;
+                l1_pending_pool_block_idx = pool_block_idx;
+                l1_pending_n_block_idx    = n_block_idx;
             } else {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
                 constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
@@ -1227,7 +1277,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     // Row r_1 cols [chunk_hi*8 + col_idx*2, chunk_hi*8 + col_idx*2 + 1] = r1_hi
                     // COOP: each WG writes its own WG_BLOCK_M-row band of smem_cd_l2.
                     auto write_pair = [&](uint32_t row, uint32_t col, uint32_t packed) {
-                        auto smem_ptr = smem_cd_l2 + (row_block_offset + row) * BLOCK_N + col;
+                        auto smem_ptr = smem_cd_l2[cd_buf] + (row_block_offset + row) * BLOCK_N + col;
                         // BF16 STS: 2 bf16 elements
                         *reinterpret_cast<uint32_t*>(smem_ptr) = packed;
                     };
@@ -1261,7 +1311,7 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                     const uint32_t dst_topk_idx  = src_metadata.topk_idx;
 
                     // Read 8 BF16s (= 16 bytes = 1 uint4) from smem (this WG's band).
-                    auto smem_ptr     = smem_cd_l2 + tile_row * BLOCK_N + lane_in_row * cols_per_lane;
+                    auto smem_ptr     = smem_cd_l2[cd_buf] + tile_row * BLOCK_N + lane_in_row * cols_per_lane;
                     const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
 
                     // Write to remote
@@ -1289,6 +1339,19 @@ sm90_fp8_mega_moe_cooperative_impl(void* y,
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }
             ++pos;
+        }
+
+        // Flush any still-pending L1 store (e.g. a wave that ended on L1 blocks):
+        // ensure it lands in HBM and its arrival-mask bit is published.
+        if (l1_store_pending) {
+            ptx::tma_store_wait<0>();
+            ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+            if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                ptx::red_or_rel_gpu(
+                    workspace.get_l2_arrival_mask_ptr(l1_pending_pool_block_idx),
+                    1ull << l1_pending_n_block_idx);
+            }
+            l1_store_pending = false;
         }
 
         // ---------------- COMBINE ----------------

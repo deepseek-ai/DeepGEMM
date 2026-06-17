@@ -72,6 +72,10 @@ public:
         return fmt::format(R"(
 // JIT cache key: bump this comment to invalidate the cache when
 // sm90_fp8_mega_moe_cooperative.cuh changes in a way the template args don't capture.
+// cooperative_v7: double-buffered CD staging (kNumCDStages=2) to overlap the L1
+//   TMA store with the next tile's MMA+epilogue; arrival-mask publish deferred one
+//   L1 tile and flushed at the L1->L2 transition. Host pipeline config passes
+//   cd_stages=2 (one fewer GEMM stage in exchange).
 // cooperative_v3: L2-acts SF uses true-float scale (sf = amax/448) instead of
 //   UE8M0 power-of-2 alignment (no storage saving on Hopper; matches reference).
 //   v3: sf_inv = rcp(sf) (one mul fewer per row than kE4M3Max*rcp(amax)).

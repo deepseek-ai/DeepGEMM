@@ -127,7 +127,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k,
-    const int& num_dispatch_warps, const int& num_epilogue_warps) {
+    const int& num_dispatch_warps, const int& num_epilogue_warps,
+    const int& cd_stages = 1) {
     constexpr int kSmemAlignment = 1024;
 
     // Dispatch region (same as SM100)
@@ -144,7 +145,10 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // WG_BLOCK_M-row slice within a single staging tile.
     const int smem_cd_l1 = block_m * (block_n / 2);  // 1 byte/elem (FP8)
     const int smem_cd_l2 = block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
-    const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
+    // `cd_stages` buffers (cooperative double-buffers CD to overlap the L1 store
+    // with the next tile's compute; pingpong uses 1). Must match the kernel's
+    // SMEM_CD_SIZE = kNumCDStages * aligned(max(L1,L2)).
+    const int smem_cd = cd_stages * align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
     // SF on SM90:
     //   * SFA per stage must hold the larger of L1 (BLOCK_M floats, per-128 K)
@@ -291,7 +295,8 @@ static MegaMoESM90Config get_mega_moe_cooperative_config_sm90(
         SM90ArchSpec::smem_capacity,
         num_experts, hidden,
         block_m, block_n, block_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32);
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        /*cd_stages=*/2);
 
     const auto config = MegaMoESM90Config {
         block_m, block_n, block_k,
