@@ -399,6 +399,17 @@ void dg_m_grouped_bf16_gemm_nt_contiguous(TensorView a, TensorView b, TensorView
     );
 }
 
+void dg_m_grouped_bf16_gemm_nn_contiguous(TensorView a, TensorView b, TensorView d,
+                                          TensorView grouped_layout,
+                                          std::string compiled_dims,
+                                          bool use_psum_layout) {
+    gemm::m_grouped_bf16_gemm_nn_contiguous(
+        convert_to_torch_tensor(a), convert_to_torch_tensor(b),
+        convert_to_torch_tensor(d), convert_to_torch_tensor(grouped_layout),
+        compiled_dims, use_psum_layout
+    );
+}
+
 void dg_m_grouped_bf16_gemm_nt_masked(TensorView a, TensorView b, TensorView d,
                                       TensorView masked_m,
                                       int64_t expected_m,
@@ -407,6 +418,22 @@ void dg_m_grouped_bf16_gemm_nt_masked(TensorView a, TensorView b, TensorView d,
         convert_to_torch_tensor(a), convert_to_torch_tensor(b),
         convert_to_torch_tensor(d), convert_to_torch_tensor(masked_m),
         (int) expected_m, compiled_dims
+    );
+}
+
+void dg_k_grouped_bf16_gemm_tn_contiguous(TensorView a, TensorView b, TensorView d,
+                                          Array<int64_t> ks, TensorView ks_tensor,
+                                          Optional<TensorView> c,
+                                          std::string compiled_dims) {
+    std::vector<int> ks_val;
+    ks_val.reserve(ks.size());
+    for (Array<int64_t>::iterator it = ks.begin(); it != ks.end(); ++it)
+        ks_val.push_back(static_cast<int>(*it));
+    auto c_opt = c.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(c.value())) : std::nullopt;
+    gemm::k_grouped_bf16_gemm_tn_contiguous(
+        convert_to_torch_tensor(a), convert_to_torch_tensor(b),
+        convert_to_torch_tensor(d), ks_val, convert_to_torch_tensor(ks_tensor),
+        c_opt, compiled_dims
     );
 }
 
@@ -422,7 +449,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(bf16_gemm_nn, dg_bf16_gemm_nn);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bf16_gemm_tn, dg_bf16_gemm_tn);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bf16_gemm_tt, dg_bf16_gemm_tt);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_bf16_gemm_nt_contiguous, dg_m_grouped_bf16_gemm_nt_contiguous);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_bf16_gemm_nn_contiguous, dg_m_grouped_bf16_gemm_nn_contiguous);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(m_grouped_bf16_gemm_nt_masked, dg_m_grouped_bf16_gemm_nt_masked);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(k_grouped_bf16_gemm_tn_contiguous, dg_k_grouped_bf16_gemm_tn_contiguous);
 
 // Einsum
 void dg_einsum(std::string expr, TensorView a, TensorView b, TensorView d,

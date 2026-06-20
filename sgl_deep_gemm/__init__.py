@@ -257,8 +257,14 @@ try:
     def m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, expected_m_for_psum_layout=None):
         _C.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, expected_m_for_psum_layout)
 
+    def m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False):
+        _C.m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout)
+
     def m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims='nk'):
         _C.m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims)
+
+    def k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c=None, compiled_dims='mn'):
+        _C.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c, compiled_dims)
 
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 

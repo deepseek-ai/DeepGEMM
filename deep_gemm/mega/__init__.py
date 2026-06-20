@@ -51,11 +51,12 @@ class SymmBuffer:
         self.group.barrier()
         torch.cuda.synchronize()
 
-        # Create input buffer views
+        # Create input buffer views (as torch tensors, not tvm-ffi tensors).
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+         self.l2_acts, self.l2_acts_sf) = map(
+            torch.from_dlpack, slice_input_buffers(self.buffer))
 
     def destroy(self):
         self.handle = None
