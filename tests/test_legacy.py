@@ -13,7 +13,7 @@ from generators import (
 
 def test_m_grouped_gemm_contiguous_tl() -> None:    
     print('Testing m-grouped contiguous Triton GEMM:')
-    for _, _, num_groups, expected_m_per_group, n, k, major_a, major_b, _ in enumerate_m_grouped_contiguous(torch.bfloat16):
+    for _, _, num_groups, expected_m_per_group, n, k, major_a, major_b, _, _ in enumerate_m_grouped_contiguous(torch.bfloat16):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
 
@@ -49,23 +49,27 @@ def test_m_grouped_gemm_contiguous_tl() -> None:
 
 def test_k_grouped_gemm_contiguous_tl() -> None:    
     print('Testing k-grouped contiguous Triton GEMM:')
-    for num_groups, m, n, major_a, major_b, ks, expected_k_per_group in enumerate_k_grouped_contiguous(torch.bfloat16):
+    for num_groups, m, n, major_a, major_b, _, aligned_ks_cpu, expected_k_per_group, _, k_alignment, use_psum_layout in enumerate_k_grouped_contiguous(torch.bfloat16):
+        # Legacy Triton kernels do not mask per-group K tails inside the BLOCK_SIZE_K loop.
+        if use_psum_layout or k_alignment != 128:
+            continue
+
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
 
         for fused_operand in ('a', 'b'):
-            k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_ue8m0=False, use_bf16=True)
+            k, a, b, c, d, ref_d, _, _ = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, aligned_ks_cpu, use_ue8m0=False, use_bf16=True)
             func_name = f"{fused_operand}_fused_k_grouped_bf16_gemm_{major_opt.lower()}_contiguous_tl"
             k_indices = torch.arange(0, k, dtype=torch.int32, device='cuda')
-            k_start = torch.empty(len(ks), dtype=torch.int32, device='cuda')
-            k_end = torch.empty(len(ks), dtype=torch.int32, device='cuda')
-            for i, group_k in enumerate(ks):
+            k_start = torch.empty(len(aligned_ks_cpu), dtype=torch.int32, device='cuda')
+            k_end = torch.empty(len(aligned_ks_cpu), dtype=torch.int32, device='cuda')
+            for i, group_k in enumerate(aligned_ks_cpu):
                 k_start[i] = k_end[i-1] if i > 0 else 0
                 k_end[i] = k_start[i] + group_k
             getattr(deep_gemm.legacy, func_name)(a, b, c, (k_indices, k_start, k_end), True)
             diff = calc_diff(c, ref_d)
             assert diff < 0.001, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}'
-        k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_ue8m0=False, use_bf16=True)
+        k, a, b, c, d, ref_d, _, _ = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, aligned_ks_cpu, use_ue8m0=False, use_bf16=True)
 
         # noinspection PyShadowingNames
         def test_func():

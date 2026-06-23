@@ -39,6 +39,16 @@ CUTLASS_DEVICE dtype_t exchange(dtype_t ptr, const uint32_t& src_lane_idx) {
     return recv_dtype;
 }
 
+CUTLASS_DEVICE nv_bfloat162 cvt_relu_bf16x2_f32(const float2& v) {
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
+    uint32_t packed;
+    asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;\n" : "=r"(packed) : "f"(v.y), "f"(v.x));
+    return *reinterpret_cast<const nv_bfloat162*>(&packed);
+#else
+    return __floats2bfloat162_rn(fmaxf(v.x, 0.0f), fmaxf(v.y, 0.0f));
+#endif
+}
+
 CUTLASS_DEVICE void accumulate(float2& a, nv_bfloat162 b) {
 #if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
     // Use `add.rn.f32.bf16` instruction to perform fused (cast + add) operation on SM100
@@ -48,15 +58,6 @@ CUTLASS_DEVICE void accumulate(float2& a, nv_bfloat162 b) {
     const auto [x, y] = __bfloat1622float2(b);
     a.x += x, a.y += y;
 #endif
-}
-
-CUTLASS_DEVICE nv_bfloat162
-cvt_f32x2_to_bf16x2_relu(const float& a, const float& b) {
-    nv_bfloat162 result;
-    asm volatile ("cvt.rn.relu.bf16x2.f32 %0, %1, %2;\n"
-                  : "=r"(*reinterpret_cast<uint32_t*>(&result))
-                  : "f"(b), "f"(a));
-    return result;
 }
 
 } // namespace deep_gemm::ptx

@@ -44,6 +44,8 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
+        {},
         {}, {}, {},
         {}
     >);
@@ -60,7 +62,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_non_epilogue_threads, args.gemm_config.launch_config.num_epilogue_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms,
-        args.gemm_config.layout.swap_ab,
+        heuristics_runtime->get_mk_alignment_for_contiguous_layout(),
+        args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation, to_string(args.gemm_desc.cd_dtype),
         args.gemm_desc.tc_util);
     }
@@ -135,6 +138,7 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                  const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                  const std::string& compiled_dims,
                                                  const bool& use_psum_layout,
+                                                 const bool& ensure_zero_padding,
                                                  const std::optional<int>& expected_m_for_psum_layout) {
     const auto gemm_type = use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
@@ -155,6 +159,7 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
         .with_accumulation = false,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
+        .ensure_zero_padding = ensure_zero_padding,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
         .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
@@ -254,22 +259,17 @@ static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
                                       const std::optional<torch::Tensor>& c,
                                       const torch::Tensor& d,
                                       const int& m, const int& n,
-                                      const std::vector<int>& ks, const torch::Tensor& ks_tensor,
+                                      const torch::Tensor& grouped_layout,
                                       const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                      const std::string& compiled_dims) {
+                                      const std::string& compiled_dims,
+                                      const bool& use_psum_layout) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::MN and major_b == cute::UMMA::Major::MN);
 
-    int sum_k = 0;
-    for (const auto k: ks) {
-        sum_k += k;
-        DG_HOST_ASSERT(k % 128 == 0);
-    }
-    const auto num_groups = static_cast<int>(ks.size());
-
-    // Get config using max K for better performance
-    const auto max_k = *std::max_element(ks.begin(), ks.end());
+    const auto sum_k = static_cast<int>(a.size(0));
+    const auto num_groups = static_cast<int>(grouped_layout.numel());
+    const auto expected_k = ceil_div(sum_k, num_groups);
     const auto desc = GemmDesc {
-        .gemm_type = GemmType::KGroupedContiguous,
+        .gemm_type = use_psum_layout ? GemmType::KGroupedContiguousWithPsumLayout : GemmType::KGroupedContiguous,
         .kernel_type = KernelType::KernelNoSF,
         .m = m, .n = n, .k = sum_k, .num_groups = num_groups,
         .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
@@ -278,7 +278,8 @@ static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
         .with_accumulation = c.has_value(),
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims,
-        .expected_m = m, .expected_n = n, .expected_k = max_k, .expected_num_groups = num_groups
+        // NOTES: expected_k is not used in SM100 get_best_config yet.
+        .expected_m = m, .expected_n = n, .expected_k = expected_k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -306,7 +307,7 @@ static void sm100_bf16_k_grouped_gemm(const torch::Tensor& a,
         .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   config.layout.get_cluster_size()),
-        .grouped_layout = ks_tensor.data_ptr(),
+        .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd

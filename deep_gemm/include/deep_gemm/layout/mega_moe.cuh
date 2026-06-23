@@ -26,8 +26,8 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
 
 // SF pool capacity: all experts share a contiguous SF region, sized by pool blocks × SF_BLOCK_M
 template <typename T>
-CUTLASS_HOST_DEVICE constexpr T get_num_padded_sf_pool_tokens(T num_max_pool_tokens, T block_m) {
-    return (num_max_pool_tokens / block_m) * math::constexpr_align(block_m, static_cast<T>(128));
+CUTLASS_HOST_DEVICE constexpr T get_num_sf_ring_tokens(T num_ring_tokens, T block_m) {
+    return (num_ring_tokens / block_m) * math::constexpr_align(block_m, static_cast<T>(128));
 }
 
 // Per-token source metadata for combine write-back
@@ -44,9 +44,12 @@ struct Workspace {
     uint32_t num_max_tokens_per_rank;
     uint32_t num_max_recv_tokens_per_expert;
 
-    // Pool capacity: all local experts share a contiguous token pool
+    // Ring-buffer capacity used by reusable token/data buffers
+    uint32_t num_ring_tokens;
+    uint32_t num_ring_blocks;
+
+    // Full-pool span used by non-ring token metadata
     uint32_t num_max_pool_tokens;
-    uint32_t num_max_pool_blocks;
 
     // For both grid barrier and NVLink barrier
     static constexpr uint64_t kNumBarrierSignalBytes = 32;
@@ -56,14 +59,16 @@ struct Workspace {
               const uint32_t& num_ranks,
               const uint32_t& num_experts,
               const uint32_t& num_max_tokens_per_rank,
-              const uint32_t& num_topk):
+              const uint32_t& num_topk,
+              const uint32_t& num_ring_tokens):
         base(base),
         num_ranks(num_ranks), num_experts(num_experts),
-        num_max_tokens_per_rank(num_max_tokens_per_rank) {
+        num_max_tokens_per_rank(num_max_tokens_per_rank),
+        num_ring_tokens(num_ring_tokens) {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
-        num_max_pool_blocks = num_max_pool_tokens / kMinCandidateBlockM;
+        num_ring_blocks = num_ring_tokens / kMinCandidateBlockM;
     }
 
     CUTLASS_HOST_DEVICE
@@ -79,16 +84,22 @@ struct Workspace {
         // Expert recv count sum
         num_bytes += num_experts_per_rank * sizeof(uint64_t);
 
-        // L1 arrival count (padded to even entry count for `uint64_t` alignment of L2 mask)
-        num_bytes += math::align(num_max_pool_blocks, 2u) * sizeof(uint32_t);
+        // L1 full token count (ring)
+        num_bytes += num_ring_blocks * sizeof(uint32_t);
 
-        // L2 block arrival mask
-        num_bytes += num_max_pool_blocks * sizeof(uint64_t);
+        // L1 empty block count (ring)
+        num_bytes += num_ring_blocks * sizeof(uint32_t);
+
+        // L2 full block count (ring)
+        num_bytes += num_ring_blocks * sizeof(uint32_t);
+
+        // L2 empty block count (ring)
+        num_bytes += num_ring_blocks * sizeof(uint32_t);
 
         // Dispatch pulling source token-topk
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
 
-        // Combine push source indices
+        // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
         // Align to TMA descriptor requirements
@@ -142,29 +153,40 @@ struct Workspace {
     }
 
     CUTLASS_DEVICE
-    uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
+    uint32_t* get_l1_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
         const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
-        return reinterpret_cast<uint32_t*>(base) + pool_block_idx;
+        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
     }
 
     CUTLASS_DEVICE
-    uint64_t* get_l2_arrival_mask_ptr(const uint32_t& pool_block_idx = 0) const {
-        // Pad L1 entry count to even so that the `l2_arrival_mask` is 8-byte aligned
-        const auto base = get_l1_arrival_count_ptr(math::align(num_max_pool_blocks, 2u));
-        return reinterpret_cast<uint64_t*>(base) + pool_block_idx;
+    uint32_t* get_l1_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
+        const auto base = get_l1_full_count_ptr(num_ring_blocks);
+        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l2_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
+        const auto base = get_l1_empty_count_ptr(num_ring_blocks);
+        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_l2_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
+        const auto base = get_l2_full_count_ptr(num_ring_blocks);
+        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
     }
 
     // For dispatch pulling
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_l2_arrival_mask_ptr(num_max_pool_blocks);
+        const auto base = get_l2_empty_count_ptr(num_ring_blocks);
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;
     }
 
-    // For combine usages
+    // For combine usages (full)
     CUTLASS_DEVICE
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
@@ -211,10 +233,10 @@ struct Buffer {
     CUTLASS_HOST_DEVICE
     Buffer(const Data& data_layout,
            const uint32_t& num_ranks,
-           const uint32_t& max_num_tokens_per_rank,
+           const uint32_t& num_max_tokens_per_rank,
            void* base = nullptr) :
         data_layout(data_layout),
-        num_ranks(num_ranks), num_max_tokens_per_rank(max_num_tokens_per_rank),
+        num_ranks(num_ranks), num_max_tokens_per_rank(num_max_tokens_per_rank),
         base(base) {}
 
     CUTLASS_HOST_DEVICE

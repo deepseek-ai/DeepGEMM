@@ -48,7 +48,7 @@ public:
         if (device_runtime->get_arch_major() != 10)
             return kLegacyMKAlignmentForContiguousLayout;
 
-        int block_m = 240, mma_step = 16;
+        int block_m = 224, mma_step = 32;
         if (expected_m.has_value()) {
             // Reduce `block_m` while ensuring it covers `m`
             for (; block_m > 32 and block_m - mma_step >= expected_m.value(); block_m -= mma_step);

@@ -8,6 +8,7 @@
 #include <deep_gemm/scheduler/gemm.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
+#include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
@@ -26,7 +27,8 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          bool kSwapAB,
+          uint32_t kKAlignment,
+          bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
           uint64_t kTensorCoreUtilControl>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
@@ -61,6 +63,8 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast: 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     DG_STATIC_ASSERT(BLOCK_K_ == 64, "Invalid block K");
+    DG_STATIC_ASSERT(BLOCK_K % UMMA_K == 0, "Block K must be divisible by UMMA K");
+    DG_STATIC_ASSERT(kKAlignment % UMMA_K == 0, "K alignment must be divisible by UMMA K");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
     DG_STATIC_ASSERT((kSwapAB and BLOCK_N == LAYOUT_AD_M) or
                      (not kSwapAB and (BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == LAYOUT_AD_M)), "Invalid block size");
@@ -172,7 +176,8 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs>(
+    // NOTES: BF16 has no SF, so `kSFKSpan` is unused here; pass `kKAlignment` explicitly to avoid relying on the default.
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kKAlignment>(
         shape_m, shape_n, shape_k, grouped_layout);
 
     // Pipeline and TMA phases
@@ -208,7 +213,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
                 // NOTES: `k_idx` is actually the k index default for K-major, while `k_b_idx` may be MN-major
                 // And for all m-grouped GEMMs, A must be K-majored
-                DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous or kGemmType == GemmType::Batched or
+                DG_STATIC_ASSERT(kGemmType == GemmType::Normal or is_k_grouped_contiguous(kGemmType) or kGemmType == GemmType::Batched or
                                  kMajorA == cute::UMMA::Major::K, "Invalid major");
                 uint32_t k_idx = k_block_idx * BLOCK_K;
                 uint32_t k_a_idx = scheduler.template get_global_idx<(kMajorA == cute::UMMA::Major::MN), sched::IndexType::K> (
@@ -305,6 +310,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
             // Launch MMAs
             const auto num_total_k_blocks = math::ceil_div(scheduler.current_shape_k, BLOCK_K);
+            constexpr bool kMayHaveTailKBlock = is_k_grouped_contiguous(kGemmType) ? (kKAlignment % BLOCK_K != 0) : (SHAPE_K == 0 or SHAPE_K % BLOCK_K != 0);
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait TMA arrival
                 full_barriers[stage_idx]->wait(phase);
@@ -316,20 +322,43 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                 const auto a_desc_base_lo = __shfl_sync(0xffffffff, a_desc_lo, static_cast<int>(stage_idx));
                 const auto b_desc_base_lo = __shfl_sync(0xffffffff, b_desc_lo, static_cast<int>(stage_idx));
                 if (cute::elect_one_sync()) {
-                    #pragma unroll
-                    for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
-                        uint32_t atom_k_idx = k * UMMA_K / BLOCK_ATOM_K;
+                    auto issue_umma = [&]<uint32_t kUMMAKIdx>() {
+                        constexpr uint32_t kAtomKIdx = kUMMAKIdx * UMMA_K / BLOCK_ATOM_K;
+                        constexpr uint32_t kInnerKIdx = kUMMAKIdx * UMMA_K % BLOCK_ATOM_K;
                         a_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorA, LOAD_BLOCK_M, kSwizzleAMode, cutlass::bfloat16_t>(
-                                        a_desc_base_lo, atom_k_idx * LOAD_BLOCK_M * BLOCK_ATOM_K, k * UMMA_K % BLOCK_ATOM_K);
+                                        a_desc_base_lo, kAtomKIdx * LOAD_BLOCK_M * BLOCK_ATOM_K, kInnerKIdx);
                         b_desc.lo = mma::sm100::advance_umma_desc_lo<kMajorB, LOAD_BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(
-                                        b_desc_base_lo, atom_k_idx * LOAD_BLOCK_N * BLOCK_ATOM_K, k * UMMA_K % BLOCK_ATOM_K);
+                                        b_desc_base_lo, kAtomKIdx * LOAD_BLOCK_N * BLOCK_ATOM_K, kInnerKIdx);
                         if (kSwapAB) {
                             mma_t::fma(b_desc, a_desc, accum_stage_idx * UMMA_N,
-                                       k_block_idx > 0 or k > 0, runtime_instr_desc);
+                                       kUMMAKIdx > 0 or k_block_idx > 0, runtime_instr_desc);
                         } else {
                             mma_t::fma(a_desc, b_desc, accum_stage_idx * UMMA_N,
-                                       k_block_idx > 0 or k > 0, runtime_instr_desc);
+                                       kUMMAKIdx > 0 or k_block_idx > 0, runtime_instr_desc);
                         }
+                    };
+                    auto issue_full_k_block = [&]() {
+                        utils::for_each_static_until<BLOCK_K / UMMA_K>(std::make_integer_sequence<uint32_t, BLOCK_K / UMMA_K>(), issue_umma);
+                    };
+
+                    if constexpr (kMayHaveTailKBlock) {
+                        auto issue_tail_k_block = [&](const uint32_t& remaining_k) {
+                            const auto num_valid_umma_k = math::ceil_div(remaining_k, UMMA_K);
+                            // Prefix expansion uses switch only for small cases to avoid long SASS.
+                            utils::for_each_static_prefix(std::make_integer_sequence<uint32_t, BLOCK_K / UMMA_K>(), num_valid_umma_k, issue_umma);
+                        };
+                        const auto is_last_k_block = k_block_idx == num_total_k_blocks - 1;
+                        if (is_last_k_block) {
+                            const auto remaining_k = scheduler.current_shape_k - k_block_idx * BLOCK_K;
+                            if (remaining_k < BLOCK_K)
+                                issue_tail_k_block(remaining_k);
+                            else
+                                issue_full_k_block();
+                        } else {
+                            issue_full_k_block();
+                        }
+                    } else {
+                        issue_full_k_block();
                     }
                 }
                 __syncwarp();
