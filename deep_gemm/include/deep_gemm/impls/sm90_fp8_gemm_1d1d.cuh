@@ -197,6 +197,15 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                     ptx::tensor_map_replace_global_addr_in_smem(smem_tensor_map_b, gmem_b_ptr + current_k_offset * shape_n);
                     ptx::tensor_map_replace_global_inner_dim_stride_in_smem(smem_tensor_map_a, scheduler.current_shape_k, scheduler.current_shape_k);
                     ptx::tensor_map_replace_global_inner_dim_stride_in_smem(smem_tensor_map_b, scheduler.current_shape_k, scheduler.current_shape_k);
+
+                    // Make sure tensormaps are not used by TMA before updating GMEM.
+                    cute::tma_desc_commit_group();
+                    cute::tma_desc_wait_group();
+                    // Only used to prevent `ptxas` from moving the following GMEM stores before `cute::tma_desc_wait_group()`.
+                    // Shouldn't be needed otherwise, since we only use one thread.
+
+                    __syncwarp(1U << lane_idx);
+
                     *(gmem_tensor_map_a) = *(smem_tensor_map_a);
                     *(gmem_tensor_map_b) = *(smem_tensor_map_b);
                     ptx::tensor_map_release_gpu();
