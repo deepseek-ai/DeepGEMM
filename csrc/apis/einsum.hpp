@@ -170,31 +170,21 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     if (batch_size == 0 or gemm::early_return(m, n, k, d, c))
         return;
 
-    // AB-swap small-M decode path. Mirrors TRT-LLM's runGemmSwapAB
-    // (cpp/include/tensorrt_llm/deep_gemm/fp8_gemm.cuh): SM120 1d1d has
-    // BLOCK_M ≥ 64, so M_orig ≤ 32 wastes lanes. Swapping A↔B moves the
-    // small dim to N where BLOCK_N can shrink to {16, 32}. The swap runs
-    // BEFORE the SF layout transform so transform_sf_pair_into_required_layout
-    // sees operands in their post-swap roles. The kernel writes back into the
-    // caller's (B, M_orig, N_orig) buffer directly via runtime stride_cd_m/n
-    // (no temp buffer); see sm120_fp8_fp4_bmm for the stride remap.
+    // AB-swap for small-M decode: BLOCK_M >= 64 wastes lanes at M <= 32, so swap A<->B to
+    // put the small dim on N (BLOCK_N 16/32). Done before the SF transform; the kernel
+    // writes back to the caller's buffer via runtime stride_cd_m/n (see sm120_fp8_fp4_bmm).
+    // Excluded when accumulating (c): swapped strides break the batched epilogue.
     const auto arch_major = device_runtime->get_arch_major();
     constexpr int kSwapAbMMax = 32;
     const bool swap_ab_eligible =
         arch_major == 12 and m >= 1 and m <= kSwapAbMMax
         and major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K
-        and d.stride(-1) == 1    // d's innermost dim must be contiguous
-        and not c.has_value();   // swap's strided/transposed output is incompatible with
-                                 // the batched accumulation epilogue (both the REDUCE_ADD
-                                 // TMA-store path and the direct-store path mishandle the
-                                 // batch offset + swapped strides). Mirrors the dense GEMM
-                                 // swap exclusion in gemm.hpp.
+        and d.stride(-1) == 1
+        and not c.has_value();
 
     if (swap_ab_eligible) {
-        // Swap the recipe's gran_mn entries too: (gran_mn_a, gran_mn_b, gran_k)
-        // describes the original A/B roles, so after operand swap the per-tensor
-        // granularities must follow. Without this, asymmetric recipes
-        // like (1, 128, 128) trip the SF layout shape check.
+        // Swap per-tensor granularities to match the swapped operands; else asymmetric
+        // recipes like (1,128,128) trip the SF layout shape check.
         const auto eff_recipe = recipe.has_value()
             ? recipe.value()
             : get_default_recipe(sfa.scalar_type(), sfb.scalar_type());
