@@ -1,4 +1,3 @@
-import copy
 import numpy as np
 import random
 import torch
@@ -11,9 +10,21 @@ from deep_gemm.testing import (
 from generators import (
     get_arch_major, layout_masked_to_psum, align,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
+    enumerate_k_grouped_contiguous_test_variants,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
+    generate_k_grouped_contiguous_psum,
     get_mk_alignment_for_contiguous_layout
 )
+
+
+def check_bf16_psum_zero_padding(a: torch.Tensor, d: torch.Tensor, grouped_layout: torch.Tensor) -> None:
+    for group_idx, current_m in enumerate(grouped_layout.cpu().tolist()):
+        aligned_m = align(current_m, get_mk_alignment_for_contiguous_layout())
+        if current_m < aligned_m:
+            a_padding = a[current_m: aligned_m]
+            d_padding = d[current_m: aligned_m]
+            assert torch.equal(a_padding, torch.zeros_like(a_padding)), f'{group_idx=}, nonzero BF16 input padding'
+            assert torch.equal(d_padding, torch.zeros_like(d_padding)), f'{group_idx=}, nonzero BF16 output padding'
 
 
 def test_gemm() -> None:
@@ -53,7 +64,7 @@ def test_gemm() -> None:
 def test_m_grouped_gemm_contiguous() -> None:
     print('Testing m-grouped contiguous GEMM:')
 
-    for _, _, num_groups, expected_m_per_group, n, k, major_a, major_b, use_psum_layout in enumerate_m_grouped_contiguous(torch.bfloat16):
+    for _, _, num_groups, expected_m_per_group, n, k, major_a, major_b, use_psum_layout, ensure_zero_padding in enumerate_m_grouped_contiguous(torch.bfloat16):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
         major_opt += 'T' if major_b.is_k_major() else 'N'
 
@@ -69,13 +80,17 @@ def test_m_grouped_gemm_contiguous() -> None:
                 assert major_a.is_k_major()
                 b = b if major_b.is_k_major() else b.mT
                 assert a[0].is_contiguous() and b[0].is_contiguous()
-            getattr(deep_gemm, func_name)(a, b, d, grouped_layout, use_psum_layout=use_psum_layout)
+            getattr(deep_gemm, func_name)(a, b, d, grouped_layout, use_psum_layout=use_psum_layout,
+                                          ensure_zero_padding=ensure_zero_padding)
             if use_psum_layout:
                 for j in range(num_groups):
                     start = 0 if j == 0 else align(grouped_layout[j - 1], get_mk_alignment_for_contiguous_layout())
                     end = grouped_layout[j]
                     diff = calc_diff(d[start : end], ref_d[start : end])
-                    assert diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}'
+                    assert diff < 1e-5, (f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, '
+                                         f'alias={test_alias}, {ensure_zero_padding=}')
+                if ensure_zero_padding:
+                    check_bf16_psum_zero_padding(a, d, grouped_layout)
             else:
                 diff = calc_diff(d, ref_d)
                 assert diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}'
@@ -84,10 +99,12 @@ def test_m_grouped_gemm_contiguous() -> None:
 
         # noinspection PyShadowingNames
         def test_func():
-            deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, use_psum_layout=use_psum_layout)
+            deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, use_psum_layout=use_psum_layout,
+                                                        ensure_zero_padding=ensure_zero_padding)
 
         t = bench_kineto(test_func, 'bf16_gemm', suppress_kineto_output=True)
-        print(f' > Perf ({num_groups=}, m={m:5}, n={n:5}, k={k:5}, layout={major_opt}, psum={use_psum_layout}): '
+        print(f' > Perf ({num_groups=}, m={m:5}, n={n:5}, k={k:5}, layout={major_opt}, '
+              f'psum={use_psum_layout}, zero_pad={ensure_zero_padding}): '
               f'{t * 1e6:4.0f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
@@ -153,35 +170,50 @@ def test_m_grouped_gemm_masked() -> None:
 
 def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped contiguous GEMM:')
-    
-    # TODO: Support arbitrary alignment
-    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
 
-    for num_groups, m, n, major_a, major_b, ks, expected_k_per_group in enumerate_k_grouped_contiguous(torch.bfloat16):
-        for test_empty_groups in (False, True):
-            new_ks = copy.deepcopy(ks)
-            if test_empty_groups and len(ks) > 1:
-                new_ks[random.randint(0, num_groups - 1)] = 0
-            k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, new_ks, use_bf16=True)
-            new_ks_tensor = torch.tensor(new_ks, dtype=torch.int, device='cuda')
-            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, new_ks, new_ks_tensor, c)
+    for num_groups, m, n, major_a, major_b, real_ks_cpu, aligned_ks_cpu, _, _, alignment, use_psum_layout in enumerate_k_grouped_contiguous(torch.bfloat16):
+        include_k_tail = get_arch_major() == 10 and alignment == 32
+        for test_real_ks_cpu, test_aligned_ks_cpu, _, test_k_tail in enumerate_k_grouped_contiguous_test_variants(real_ks_cpu, alignment, use_psum_layout, include_k_tail):
+            if use_psum_layout:
+                total_k, a, b, c, d, ref_d, grouped_layout, _ = generate_k_grouped_contiguous_psum(num_groups, m, n, major_a, major_b, test_real_ks_cpu, k_alignment=alignment, use_bf16=True, gran_k=alignment)
+            else:
+                total_k, a, b, c, d, ref_d, grouped_layout, _ = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, test_aligned_ks_cpu, use_bf16=True)
+            c_orig = c.clone() if use_psum_layout else None
+            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, test_aligned_ks_cpu, grouped_layout, c, use_psum_layout=use_psum_layout)
 
             diff = calc_diff(d, ref_d)
-            assert diff < 1e-5, f'{m=}, {n=}, {k=}, {ks=}, {diff:.7f}'
+            assert diff < 1e-5, f'{m=}, {n=}, {total_k=}, {test_real_ks_cpu=}, {test_aligned_ks_cpu=}, {use_psum_layout=}, {test_k_tail=}, {diff:.7f}'
+
+            # Unsynced psum paths
+            if use_psum_layout:
+                c.copy_(c_orig)
+                deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, None, grouped_layout, c,
+                                                            use_psum_layout=True)
+                diff = calc_diff(d, ref_d)
+                assert diff < 1e-5, f'None ks_cpu path: {m=}, {n=}, {total_k=}, {test_real_ks_cpu=}, {diff:.7f}'
+
+                c.copy_(c_orig)
+                deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, [], grouped_layout, c,
+                                                            use_psum_layout=True)
+                diff = calc_diff(d, ref_d)
+                assert diff < 1e-5, f'empty ks_cpu path: {m=}, {n=}, {total_k=}, {test_real_ks_cpu=}, {diff:.7f}'
 
         # Test performance
-        k, a, b, c, d, ref_d = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, ks, use_bf16=True)
-        ks_tensor = torch.tensor(ks, dtype=torch.int, device='cuda')
+        if use_psum_layout:
+            total_k, a, b, c, d, ref_d, grouped_layout, _ = generate_k_grouped_contiguous_psum(num_groups, m, n, major_a, major_b, real_ks_cpu, k_alignment=alignment, use_bf16=True, gran_k=alignment)
+        else:
+            total_k, a, b, c, d, ref_d, grouped_layout, _ = generate_k_grouped_contiguous(num_groups, m, n, major_a, major_b, aligned_ks_cpu, use_bf16=True)
 
         # noinspection PyShadowingNames
         def test_func():
-            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c)
+            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, aligned_ks_cpu, grouped_layout, c, use_psum_layout=use_psum_layout)
 
         t = bench_kineto(test_func, 'bf16_gemm', suppress_kineto_output=True)
-        print(f' > Perf ({num_groups=:2}, m={m:5}, n={n:5}, k={k:5}): '
+        print(f' > Perf ({num_groups=:2}, m={m:5}, n={n:5}, k={total_k:5}, align={alignment:3}, psum={int(use_psum_layout)}): '
               f'{t * 1e6:4.0f} us | '
-              f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{2 * m * n * total_k / t / 1e12:4.0f} TFLOPS | '
               f'{count_bytes(a, b, c, d) / 1e9 / t:4.0f} GB/s')
+
     print()
 
 

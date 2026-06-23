@@ -148,7 +148,7 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
                                          const std::optional<torch::Tensor>& c,
                                          const torch::Tensor& d,
                                          const int& m, const int& n,
-                                         const std::vector<int>& ks, const torch::Tensor& ks_tensor,
+                                         const std::vector<int>& ks_cpu, const torch::Tensor& grouped_layout,
                                          const torch::Tensor& tensor_map_buffer,
                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                          const std::string& compiled_dims) {
@@ -156,14 +156,14 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
 
     // TODO: refactor with the mk alignment function
-    const auto num_groups = static_cast<int>(ks.size());
+    const auto num_groups = static_cast<int>(ks_cpu.size());
     int first_k = 0, sum_k = 0, sum_sf_k = 0, max_k = 0;
     for (int i = 0; i < num_groups; ++ i) {
-        if (first_k == 0 and ks[i] != 0)
-            first_k = ks[i];
-        sum_k += ks[i], sum_sf_k += ceil_div(ks[i], 128);
-        max_k = std::max(max_k, ks[i]);
-        DG_HOST_ASSERT(ks[i] % 128 == 0);
+        if (first_k == 0 and ks_cpu[i] != 0)
+            first_k = ks_cpu[i];
+        sum_k += ks_cpu[i], sum_sf_k += ceil_div(ks_cpu[i], 128);
+        max_k = std::max(max_k, ks_cpu[i]);
+        DG_HOST_ASSERT(ks_cpu[i] % 128 == 0);
     }
 
     // Get config using max K for better performance
@@ -212,7 +212,7 @@ static void sm90_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Te
                                   config.layout.get_cluster_size()),
         .gmem_a_ptr = a.data_ptr(),
         .gmem_b_ptr = b.data_ptr(),
-        .grouped_layout = ks_tensor.data_ptr(),
+        .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_buffer = tensor_map_buffer.data_ptr(),
         .tensor_map_a_base = tensor_map_a_base,
         .tensor_map_b_base = tensor_map_b_base,

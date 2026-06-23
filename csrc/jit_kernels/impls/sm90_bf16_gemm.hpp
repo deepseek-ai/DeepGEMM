@@ -264,20 +264,20 @@ static void sm90_bf16_k_grouped_gemm(const torch::Tensor& a,
                                      const std::optional<torch::Tensor>& c,
                                      const torch::Tensor& d,
                                      const int& m, const int& n,
-                                     const std::vector<int>& ks, const torch::Tensor& ks_tensor,
+                                     const std::vector<int>& ks_cpu, const torch::Tensor& grouped_layout,
                                      const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                      const std::string& compiled_dims) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::MN and major_b == cute::UMMA::Major::MN);
 
     int sum_k = 0;
-    for (const auto k: ks) {
+    for (const auto k: ks_cpu) {
         sum_k += k;
         DG_HOST_ASSERT(k % 128 == 0);
     }
-    const auto num_groups = static_cast<int>(ks.size());
+    const auto num_groups = static_cast<int>(ks_cpu.size());
 
     // Get config using max K for better performance
-    const auto max_k = *std::max_element(ks.begin(), ks.end());
+    const auto max_k = *std::max_element(ks_cpu.begin(), ks_cpu.end());
     const auto desc = GemmDesc {
         .gemm_type = GemmType::KGroupedContiguous,
         .kernel_type = KernelType::KernelNoSF,
@@ -316,7 +316,7 @@ static void sm90_bf16_k_grouped_gemm(const torch::Tensor& a,
         .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
                                   config.pipeline_config.smem_size,
                                   config.layout.get_cluster_size()),
-        .grouped_layout = ks_tensor.data_ptr(),
+        .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,

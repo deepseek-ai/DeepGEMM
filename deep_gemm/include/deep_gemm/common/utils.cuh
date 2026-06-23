@@ -1,5 +1,7 @@
 #pragma once
 
+#include <utility>
+
 #include <cuda/std/cstdint>
 
 #include <deep_gemm/common/exception.cuh>
@@ -18,6 +20,31 @@ struct PatternVisitor {
         return func(i);
     }
 };
+
+template <uint32_t kNumValid, uint32_t... kIdx, typename FuncT>
+CUTLASS_DEVICE void for_each_static_until(std::integer_sequence<uint32_t, kIdx...>,
+                                          FuncT&& func) {
+    ((kIdx < kNumValid ? func.template operator()<kIdx>() : void()), ...);
+}
+
+template <uint32_t... kIdx, typename FuncT>
+CUTLASS_DEVICE void for_each_static_prefix(std::integer_sequence<uint32_t, kIdx...>,
+                                           const uint32_t& num_valid,
+                                           FuncT&& func) {
+    using seq_t = std::integer_sequence<uint32_t, kIdx...>;
+    constexpr uint32_t kNumIndices = sizeof...(kIdx);
+    if constexpr (kNumIndices <= 4) {
+        switch (num_valid) {
+            case 0: break;
+            case 1: for_each_static_until<1>(seq_t(), func); break;
+            case 2: for_each_static_until<2>(seq_t(), func); break;
+            case 3: for_each_static_until<3>(seq_t(), func); break;
+            default: for_each_static_until<kNumIndices>(seq_t(), func); break;
+        }
+    } else {
+        ((kIdx < num_valid ? func.template operator()<kIdx>() : void()), ...);
+    }
+}
 
 template <uint32_t kNumBytes>
 struct Vectorized {

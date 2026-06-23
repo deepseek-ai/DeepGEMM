@@ -18,8 +18,9 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 def pack_ue8m0_to_int(x: torch.Tensor):
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
-    assert (x.view(torch.int) & ((1 << 23) - 1) == 0).all()
-    return (x.view(torch.int) >> 23).to(torch.uint8).view(torch.int)
+    x_int = x.view(torch.int)
+    assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
+    return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
 def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
@@ -70,14 +71,13 @@ def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple, use_ue8m0: bool) -
 
 
 def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
-    ax = x.abs().clamp_max(6.0)
+    ax = x.abs()
     # {0, 0.5, 1, 1.5, 2, 3, 4, 6}
     # midpoints: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
-    boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-                              device=x.device, dtype=ax.dtype)
-    idx = torch.bucketize(ax, boundaries) 
-    code = idx.to(torch.uint8)
-    sign = (x < 0) & (idx != 0)
+    code = torch.zeros_like(x, dtype=torch.uint8)
+    for boundary in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        code += (ax > boundary).to(torch.uint8)
+    sign = (x < 0) & (code != 0)
     code = code | (sign.to(torch.uint8) << 3)
     return code.view(torch.int8)
 
@@ -98,7 +98,17 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)  # int8, (m, padded_n)
     codes2 = codes.view(m, padded_n // 2, 2)
     packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)  # int8
-    return packed[:, :n // 2].contiguous(), pack_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
+    if use_packed_ue8m0:
+        # `pack_ue8m0_to_int` packs 4 ue8m0 bytes into one int32, so the scale count
+        # must be a multiple of 4. Small head dims (e.g. 64 with gran_k=32 -> 2 scales)
+        # pad with 1.0 (= 2^0, mantissa-zero so it satisfies the pack assert); the
+        # padding scales cover no real elements and are never read by the kernel.
+        num_sf = sf.size(-1)
+        if num_sf % 4 != 0:
+            pad = align(num_sf, 4) - num_sf
+            sf = torch.nn.functional.pad(sf, (0, pad), value=1.0)
+        return packed[:, :n // 2].contiguous(), pack_ue8m0_to_int(sf)
+    return packed[:, :n // 2].contiguous(), sf
 
 
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:

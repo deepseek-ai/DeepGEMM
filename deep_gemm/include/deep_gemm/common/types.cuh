@@ -24,12 +24,21 @@ enum class GemmType {
     KGroupedContiguous                  = 3,
     Batched                             = 4,
     MGroupedContiguousWithPsumLayout    = 5,
+    KGroupedContiguousWithPsumLayout    = 6,
 };
 
 constexpr CUTLASS_HOST_DEVICE bool is_m_grouped_contiguous(const GemmType& gemm_type) {
     switch (gemm_type) {
         case GemmType::MGroupedContiguous:                  return true;
         case GemmType::MGroupedContiguousWithPsumLayout:    return true;
+        default: return false;
+    }
+}
+
+constexpr CUTLASS_HOST_DEVICE bool is_k_grouped_contiguous(const GemmType& gemm_type) {
+    switch (gemm_type) {
+        case GemmType::KGroupedContiguous:                  return true;
+        case GemmType::KGroupedContiguousWithPsumLayout:    return true;
         default: return false;
     }
 }

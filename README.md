@@ -9,8 +9,8 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 ## News
 
 - 2026.04.16: Mega MoE, FP8xFP4 GEMM, FP4 Indexer, PDL, faster JIT compilation and more.
+    - Performance comparison will be posted later.
     - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) for more details.
-    - For Mega MoE benchmarks, refer to [#316](https://github.com/deepseek-ai/DeepGEMM/pull/316).
 - 2025.09.28: DeepGEMM now supports scoring kernels (weighted ReLU MQA logits) for the lightning indexer for DeepSeek v3.2.
     - Please see [#200](https://github.com/deepseek-ai/DeepGEMM/pull/200) for more details.
 - 2025.07.20: DeepGEMM now supports both SM90/SM100, and has a full refactor with a low-CPU-overhead JIT CPP module.

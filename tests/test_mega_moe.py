@@ -41,6 +41,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     random.seed(rank_idx)
 
     # Settings
+    is_bf16xbf16 = args.mma_type == 'bf16xbf16'
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
@@ -53,7 +54,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden
+        hidden, intermediate_hidden,
+        mma_type=args.mma_type
     )
 
     # Cast weights into FP4
@@ -87,19 +89,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             topk_idx.masked_fill_(rand_mask < args.masked_ratio, -1)
             topk_weights.masked_fill_(topk_idx < 0, 0)
 
-        # Cast inputs to FP8/FP4 with per-32 UE8M0 SF
-        assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
-        x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-        l1_weights = _cast_weights_to_fp4(l1_weights)
-        l2_weights = _cast_weights_to_fp4(l2_weights)
+        if not is_bf16xbf16:
+            # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
+            assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
+            x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+            l1_weights = _cast_weights_to_fp4(l1_weights)
+            l2_weights = _cast_weights_to_fp4(l2_weights)
 
-        transformed_l1_weights, transformed_l2_weights = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
+        transformed_l1_weights, transformed_l2_weights = (
+            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
     def run_fused():
-        buffer.x[:num_tokens].copy_(x[0])
-        buffer.x_sf[:num_tokens].copy_(x[1])
+        if is_bf16xbf16:
+            buffer.x[:num_tokens].copy_(x)
+        else:
+            buffer.x[:num_tokens].copy_(x[0])
+            buffer.x_sf[:num_tokens].copy_(x[1])
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
@@ -110,10 +117,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
-        deep_gemm.fp8_fp4_mega_moe(**kernel_kwargs)
+        (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
     dist_print('Config:', once_in_node=True)
+    dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
@@ -147,13 +155,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_gpu_timeout_secs=10, num_cpu_timeout_secs=30
     ) if is_legacy_loaded else None
 
+    # Baseline params differ by mma type
+    run_baseline = None
     if is_legacy_loaded:
-        dispatch_kwargs = {'do_cpu_sync': False, 'do_handle_copy': False,
-                           'do_expand': True, 'use_tma_aligned_col_major_sf': True}
-        gemm_fn = deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous
-        gemm_kwargs = {'use_psum_layout': True, 'recipe': (1, 1, 32)}
-        activation_kwargs = {'round_scale': True, 'ue8m0_scale': True, 'output_bf16': False}
-        get_num_tokens = lambda recv_x: recv_x[0].size(0)
+        if is_bf16xbf16:
+            dispatch_kwargs = {'do_cpu_sync': False, 'do_handle_copy': False, 'do_expand': True}
+            gemm_fn = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+            gemm_kwargs = {'compiled_dims': '', 'use_psum_layout': True}
+            swiglu_kwargs = {'round_scale': False, 'ue8m0_scale': False, 'output_bf16': True}
+            get_num_tokens = lambda recv_x: recv_x.size(0)
+        else:
+            dispatch_kwargs = {'do_cpu_sync': False, 'do_handle_copy': False,
+                               'do_expand': True, 'use_tma_aligned_col_major_sf': True}
+            gemm_fn = deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous
+            gemm_kwargs = {'use_psum_layout': True, 'recipe': (1, 1, 32)}
+            swiglu_kwargs = {'round_scale': True, 'ue8m0_scale': True, 'output_bf16': False}
+            get_num_tokens = lambda recv_x: recv_x[0].size(0)
 
         def run_baseline():
             # Dispatch
@@ -168,13 +185,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             l1_y = torch.empty((num_recv_tokens, intermediate_hidden * 2), dtype=torch.bfloat16, device='cuda')
             gemm_fn(recv_x, l1_weights, l1_y, handle.psum_num_recv_tokens_per_expert, **gemm_kwargs)
 
-            # Activation
-            l1_y = tilelang_ops.swiglu_apply_weight_to_fp8(
+            # SwiGLU
+            swiglu_result = tilelang_ops.swiglu_apply_weight_to_fp8(
                 x=l1_y, topk_weights=recv_topk_weights,
                 avail_tokens=handle.psum_num_recv_tokens_per_expert[-1],
                 num_per_channels=32, use_col_major_scales=True,
                 clamp_value=args.activation_clamp, fast_math=bool(args.fast_math),
-                **activation_kwargs)
+                **swiglu_kwargs)
+            l1_y = swiglu_result[-1] if is_bf16xbf16 else swiglu_result
 
             # L2 GEMM
             l2_y = torch.empty((num_recv_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -217,13 +235,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
+    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (1, 0.5)
     num_hbm_bytes = (
-        num_touched_experts * intermediate_hidden * 2 * hidden * 0.5                                 # L1 weights
-        + num_touched_experts * hidden * intermediate_hidden * 0.5                                   # L2 weights
-        + num_recv_tokens * hidden                                                                   # L1 acts read
-        + num_recv_tokens * intermediate_hidden                                                      # L1 output write
-        + num_recv_tokens * intermediate_hidden                                                      # L2 acts read
-        + num_recv_tokens * hidden * 2                                                               # L2 output write (always BF16)
+        num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size   # L1 weights
+        + num_touched_experts * hidden * intermediate_hidden * weight_elem_size     # L2 weights
+        + num_recv_tokens * hidden * act_elem_size                                  # L1 acts read
+        + num_recv_tokens * intermediate_hidden * act_elem_size                     # L1 output write
+        + num_recv_tokens * intermediate_hidden * act_elem_size                     # L2 acts read
+        + num_recv_tokens * hidden * 2                                              # L2 output write (always BF16)
     )
     hbm_gbs = safe_div(num_hbm_bytes / 1e9, t_fused)
 
@@ -272,6 +291,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
+    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

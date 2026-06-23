@@ -32,7 +32,9 @@ template <GemmType kGemmType,
           uint32_t kNumGroups,
           uint32_t kNumMulticast, bool kIsMulticastOnA,
           uint32_t kNumSMs,
-          uint32_t SF_K_ALIGNMENT = 512u,  // for k-grouped GEMM only: 128 on SM90 (float SF), gran_k * 4 on SM100 (packed UE8M0 SF)
+          bool kEnsureZeroPadding = true,
+          uint32_t kKAlignment = 128u,     // psum k-group start alignment
+          uint32_t kSFKSpan = 512u,        // K covered by one k-grouped SF row
           uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>()>
 struct Scheduler {
     int current_iter = -1;
@@ -55,12 +57,28 @@ struct Scheduler {
     uint32_t last_psum_m = 0, current_psum_m, current_m_block_cumsum = 0;
     // Only used for k-grouped layout
     uint32_t current_shape_k, current_num_valid_groups = 0, current_k_cumsum = 0, current_sf_k_cumsum = 0;
+    // NOTES: only used by the non-psum path; the psum path never reads them.
     uint32_t next_group_idx, next_shape_k;
+    // Only used for `KGroupedContiguousWithPsumLayout`
+    uint32_t current_k_start = 0, current_k_end = 0;
 
     // Only used for k-grouped gemm
     CUTLASS_DEVICE void get_next_k_group(uint32_t &group_idx, uint32_t &shape_k) const {
         for (; group_idx < kNumGroups; ++ group_idx) {
             shape_k = grouped_layout[group_idx];
+            if (shape_k > 0)
+                break;
+        }
+    }
+
+    CUTLASS_DEVICE void get_next_psum_k_group(uint32_t &group_idx, uint32_t &shape_k,
+                                               uint32_t &k_start, uint32_t &k_end) const {
+        // NOTES: `grouped_layout[i]` is the psum end offset (K elements); each group starts at `align(prev_end, kKAlignment)`. Skip empty groups.
+        for (; group_idx < kNumGroups; ++ group_idx) {
+            const auto next_k_end = static_cast<uint32_t>(grouped_layout[group_idx]);
+            k_start = math::align(k_end, kKAlignment);
+            shape_k = next_k_end - k_start;
+            k_end = next_k_end;
             if (shape_k > 0)
                 break;
         }
@@ -83,12 +101,16 @@ struct Scheduler {
             this->grouped_layout = grouped_layout;
             current_psum_m = grouped_layout[0];
             num_m_blocks = math::ceil_div(current_psum_m, BLOCK_M);
-        } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+        } else if constexpr (is_k_grouped_contiguous(kGemmType)) {
             num_blocks = num_m_blocks * num_n_blocks;
             this->grouped_layout = grouped_layout;
-            get_next_k_group(current_group_idx, current_shape_k);
-            next_group_idx = current_group_idx + 1;
-            get_next_k_group(next_group_idx, next_shape_k);
+            if constexpr (kGemmType == GemmType::KGroupedContiguousWithPsumLayout) {
+                get_next_psum_k_group(current_group_idx, current_shape_k, current_k_start, current_k_end);
+            } else {
+                get_next_k_group(current_group_idx, current_shape_k);
+                next_group_idx = current_group_idx + 1;
+                get_next_k_group(next_group_idx, next_shape_k);
+            }
         }
     }
 
@@ -141,15 +163,19 @@ struct Scheduler {
         } else if constexpr (kGemmType == GemmType::MGroupedMasked or kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
             const auto offset = kWithGroupOffset ? current_group_idx : 0;
             return offset * shape_dim + block_idx * block_size;
-        } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+        } else if constexpr (is_k_grouped_contiguous(kGemmType)) {
             auto offset = 0;
             if constexpr (kWithGroupOffset) {
-                if constexpr (kIndexType == IndexType::MN)
+                if constexpr (kIndexType == IndexType::MN) {
                     offset = current_group_idx * shape_dim;
-                else if constexpr (kIndexType == IndexType::K)
-                    offset = current_k_cumsum;
-                else if constexpr (kIndexType == IndexType::SF_K)
+                } else if constexpr (kIndexType == IndexType::K) {
+                    if constexpr (kGemmType == GemmType::KGroupedContiguousWithPsumLayout)
+                        offset = current_k_start;
+                    else
+                        offset = current_k_cumsum;
+                } else if constexpr (kIndexType == IndexType::SF_K) {
                     offset = current_sf_k_cumsum;
+                }
             }
             return offset + block_idx * block_size;
         } else if constexpr (kGemmType == GemmType::Batched) {
@@ -163,7 +189,7 @@ struct Scheduler {
     CUTLASS_DEVICE uint32_t get_aligned_effective_m_in_block(const uint32_t& m_block_idx) const {
         constexpr uint32_t UMMA_STEP_N = 16;
         DG_STATIC_ASSERT(BLOCK_M % UMMA_STEP_N == 0, "Invalid alignment");
-        if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout)
+        if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout and not kEnsureZeroPadding)
             return math::align(m_block_idx == last_psum_m / BLOCK_M + num_m_blocks - 1 ? current_psum_m - m_block_idx * BLOCK_M : BLOCK_M, UMMA_STEP_N);
         return BLOCK_M;
     }
@@ -209,7 +235,7 @@ struct Scheduler {
 
             // NOTES: `last_psum_m` is aligned with block M
             m_block_idx += last_psum_m / BLOCK_M;
-        } else if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+        } else if constexpr (is_k_grouped_contiguous(kGemmType)) {
             while (true) {
                 // End of the task
                 if (current_group_idx == kNumGroups)
@@ -220,13 +246,16 @@ struct Scheduler {
                     break;
 
                 // Move to check the next group
-                current_k_cumsum += current_shape_k;
-                current_sf_k_cumsum += math::ceil_div(current_shape_k, SF_K_ALIGNMENT);
+                current_sf_k_cumsum += math::ceil_div(current_shape_k, kSFKSpan);
                 current_num_valid_groups ++;
-
-                current_group_idx = next_group_idx ++;
-                current_shape_k = next_shape_k;
-                get_next_k_group(next_group_idx, next_shape_k);
+                if constexpr (kGemmType == GemmType::KGroupedContiguousWithPsumLayout) {
+                    get_next_psum_k_group(++ current_group_idx, current_shape_k, current_k_start, current_k_end);
+                } else {
+                    current_k_cumsum += current_shape_k;
+                    current_group_idx = next_group_idx ++;
+                    current_shape_k = next_shape_k;
+                    get_next_k_group(next_group_idx, next_shape_k);
+                }
             }
 
             get_swizzled_block_idx(next_block_idx - current_num_valid_groups * num_blocks, m_block_idx, n_block_idx);
@@ -262,7 +291,7 @@ struct Scheduler {
         if (num_blocks_in_group == 1)
             return false;
         if constexpr (kGemmType == GemmType::Normal or kGemmType == GemmType::MGroupedMasked or
-                      kGemmType == GemmType::KGroupedContiguous or kGemmType == GemmType::Batched or
+                      is_k_grouped_contiguous(kGemmType) or kGemmType == GemmType::Batched or
                       kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
             return true;
         } else {

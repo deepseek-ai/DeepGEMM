@@ -86,6 +86,7 @@ from .mega import (
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
+    bf16_mega_moe,
 )
 
 # Some utils
@@ -123,4 +124,4 @@ _C.init(
     _find_cuda_home()                           # CUDA home
 )
 
-__version__ = '2.5.0'
+__version__ = '2.6.1'

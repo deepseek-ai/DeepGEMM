@@ -22,6 +22,9 @@ struct GemmDesc {
     int num_sms, tc_util;
     std::string compiled_dims;
 
+    // SM100 m-grouped psum layout padding contract
+    bool ensure_zero_padding = true;
+
     // Shape for heuristic generation
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
@@ -60,6 +63,7 @@ struct GemmDesc {
            << ", num_sms=" << desc.num_sms
            << ", tc_util=" << desc.tc_util
            << ", compiled_dims=" << desc.compiled_dims
+           << ", ensure_zero_padding=" << static_cast<int>(desc.ensure_zero_padding)
            << ", expected_m=" << desc.expected_m
            << ", expected_n=" << desc.expected_n
            << ", expected_k=" << desc.expected_k

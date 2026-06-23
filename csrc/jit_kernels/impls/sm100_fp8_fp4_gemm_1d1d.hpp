@@ -25,7 +25,7 @@ public:
         const std::optional<std::string> epilogue_type;
 
         // TODO: move into descriptor
-        int gran_k_a, gran_k_b;
+        int gran_k_a, gran_k_b, k_alignment;
 
         void* grouped_layout;
         CUtensorMap tensor_map_a;
@@ -44,7 +44,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_gemm_1d1d_impl<
-        {}, {},
+        {}, {}, {},
         {}, {},
         {}, {}, {},
         {}, {}, {},
@@ -53,6 +53,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
+        {},
         {},
         {},
         {}, {},
@@ -62,7 +63,7 @@ static void __instantiate_kernel() {{
 }};
 )",
         to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
-        args.gran_k_a, args.gran_k_b,
+        args.gran_k_a, args.gran_k_b, args.k_alignment,
         get_compiled_dim(args.gemm_desc.m, 'm', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
@@ -73,7 +74,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_non_epilogue_threads, args.gemm_config.launch_config.num_epilogue_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms,
-        args.gemm_config.layout.swap_ab,
+        args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.a_dtype), to_string(args.gemm_desc.b_dtype), to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type));
@@ -143,6 +144,8 @@ static void sm100_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .epilogue_type = epilogue_type,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
+        // NOTES: `k_alignment` is only used by k-grouped psum, dummy here
+        .k_alignment = gran_k_a,
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -164,6 +167,7 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
                                                          const std::string& compiled_dims,
                                                          const bool& use_psum_layout,
+                                                         const bool& ensure_zero_padding,
                                                          const std::optional<int>& expected_m_for_psum_layout) {
     const auto gemm_type = use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
@@ -185,6 +189,7 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
+        .ensure_zero_padding = ensure_zero_padding,
         .expected_m = expected_m_for_psum_layout.value_or(m),
         .expected_n = n, .expected_k = k,
         .expected_num_groups = expected_m_for_psum_layout.has_value() ? num_groups : 1
@@ -222,6 +227,8 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
+        // NOTES: `k_alignment` is only used by k-grouped psum, dummy here
+        .k_alignment = gran_k_a,
         .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -289,6 +296,8 @@ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
+        // NOTES: `k_alignment` is only used by k-grouped psum, dummy here
+        .k_alignment = gran_k_a,
         .grouped_layout = masked_m.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
@@ -306,26 +315,23 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::T
                                           const std::optional<torch::Tensor>& c,
                                           const torch::Tensor& d,
                                           const int& m, const int& n,
-                                          const std::vector<int>& ks, const torch::Tensor& ks_tensor,
+                                          const torch::Tensor& grouped_layout,
                                           const int& gran_k,
+                                          const int& k_alignment,
                                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                          const std::string& compiled_dims) {
+                                          const std::string& compiled_dims,
+                                          const bool& use_psum_layout) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::MN and major_b == cute::UMMA::Major::MN);
     DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
+    DG_HOST_ASSERT(k_alignment % 32 == 0);
     const int gran_k_a = gran_k;
     const int gran_k_b = gran_k;
+    const auto num_groups = static_cast<int>(grouped_layout.numel());
+    const auto sum_k = static_cast<int>(a.size(0));
+    const auto expected_k = ceil_div(sum_k, num_groups);
 
-    int sum_k = 0, sum_sf_k = 0;
-    for (const auto k: ks) {
-        sum_k += k, sum_sf_k += ceil_div(k, gran_k * 4);
-        DG_HOST_ASSERT(k % gran_k == 0);
-    }
-    const auto num_groups = static_cast<int>(ks.size());
-
-    // Get config using max K for better performance
-    const auto max_k = *std::max_element(ks.begin(), ks.end());
     const auto desc = GemmDesc {
-        .gemm_type = GemmType::KGroupedContiguous,
+        .gemm_type = use_psum_layout ? GemmType::KGroupedContiguousWithPsumLayout : GemmType::KGroupedContiguous,
         .kernel_type = KernelType::Kernel1D1D,
         .m = m, .n = n, .k = sum_k, .num_groups = num_groups,
         .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
@@ -335,7 +341,8 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::T
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
-        .expected_m = m, .expected_n = n, .expected_k = max_k, .expected_num_groups = num_groups
+        // NOTES: expected_k is not used in SM100 get_best_config yet.
+        .expected_m = m, .expected_n = n, .expected_k = expected_k, .expected_num_groups = num_groups
     };
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
@@ -355,9 +362,9 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::T
                                                 config.storage_config.store_block_n,
                                                 static_cast<int>(d.stride(1)), num_groups,
                                                 config.storage_config.swizzle_cd_mode);
-    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, sum_sf_k * gran_k_a * 4,
+    const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, static_cast<int>(sfa.size(0)) * gran_k_a * 4,
                                                  config.layout.block_m, gran_k_a, 1, 0);
-    const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, sum_sf_k * gran_k_b * 4,
+    const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, static_cast<int>(sfb.size(0)) * gran_k_b * 4,
                                                  config.layout.block_n, gran_k_b, 1, 0);
 
     // Launch kernel
@@ -370,7 +377,8 @@ static void sm100_k_grouped_fp8_gemm_1d1d(const torch::Tensor& a, const torch::T
         .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
-        .grouped_layout = ks_tensor.data_ptr(),
+        .k_alignment = k_alignment,
+        .grouped_layout = grouped_layout.data_ptr(),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
@@ -444,6 +452,8 @@ static void sm100_fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
+        // NOTES: `k_alignment` is only used by k-grouped psum, dummy here
+        .k_alignment = gran_k_a,
         .grouped_layout = nullptr,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,

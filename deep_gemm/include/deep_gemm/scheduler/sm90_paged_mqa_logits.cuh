@@ -8,7 +8,7 @@ namespace deep_gemm::sched {
 
 template <uint32_t kAlignedBatchSize, uint32_t SPLIT_KV, uint32_t kNumSMs, bool kIsVarlen = false>
 CUTLASS_GLOBAL __launch_bounds__(32, 1)
-void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t next_n, const bool is_context_lens_2d,
+void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t next_n, const bool is_context_lens_2d,
                                     const uint32_t* context_lens, const uint32_t* indices, uint32_t* schedule_metadata) {
     DG_STATIC_ASSERT(kAlignedBatchSize % 32 == 0, "Invalid aligned batch size");
     const uint32_t lane_idx = ptx::get_lane_idx();
@@ -128,17 +128,17 @@ void smxx_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
 
 // Conditional storage for varlen indices pointer (EBO: zero cost when unused)
 template <bool kHasIndices>
-struct IndicesStorage {
+struct SM90IndicesStorage {
     const uint32_t* indices;
 };
 
 template <>
-struct IndicesStorage<false> {};
+struct SM90IndicesStorage<false> {};
 
 template <uint32_t kNextN, bool kIsContextLens2D, bool kIsVarlen,
           uint32_t BLOCK_KV, uint32_t kNumBlocksPerSplit,
           uint32_t kNumNextNAtoms>
-struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
+struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
     const uint32_t* context_lens;
     uint32_t batch_size;
 
@@ -191,9 +191,9 @@ struct PagedMQALogitsScheduler : IndicesStorage<kIsVarlen> {
         }
     }
 
-    CUTLASS_DEVICE explicit PagedMQALogitsScheduler(const uint32_t& sm_idx, const uint32_t& batch_size,
-                                                    const uint32_t* context_lens,
-                                                    const uint32_t* schedule_meta, const uint32_t* indices) {
+    CUTLASS_DEVICE explicit SM90PagedMQALogitsScheduler(const uint32_t& sm_idx, const uint32_t& batch_size,
+                                                        const uint32_t* context_lens,
+                                                        const uint32_t* schedule_meta, const uint32_t* indices) {
         this->context_lens = context_lens;
         this->batch_size = batch_size;
         if constexpr (kIsVarlen) {

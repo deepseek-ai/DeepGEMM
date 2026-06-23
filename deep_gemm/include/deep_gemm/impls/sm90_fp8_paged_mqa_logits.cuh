@@ -15,7 +15,7 @@
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
-#include <deep_gemm/scheduler/paged_mqa_logits.cuh>
+#include <deep_gemm/scheduler/sm90_paged_mqa_logits.cuh>
 
 namespace deep_gemm {
 
@@ -135,7 +135,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     cudaGridDependencySynchronize();
 
     // Scheduler
-    auto scheduler = sched::PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_KV, kNumMathWarpGroups, 1>(
+    auto scheduler = sched::SM90PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_KV, kNumMathWarpGroups, 1>(
         blockIdx.x, batch_size, context_lens, schedule_meta, indices);
     DG_STATIC_ASSERT(SPLIT_KV % BLOCK_KV == 0, "Unaligned SPLIT_KV");
 
