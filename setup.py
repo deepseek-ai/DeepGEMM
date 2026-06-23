@@ -16,7 +16,6 @@ from packaging.version import parse
 from pathlib import Path
 from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
-from scripts.generate_pyi import generate_pyi_file
 
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
@@ -126,7 +125,13 @@ class CustomBuildPy(build_py):
         build_py.run(self)
 
     def generate_pyi_file(self):
-        generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'generate_pyi', os.path.join(current_dir, 'scripts', 'generate_pyi.py')
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
         pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
         pyi_target = os.path.join(self.build_lib, 'deep_gemm', '_C.pyi')
 
