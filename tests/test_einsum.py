@@ -13,6 +13,14 @@ from deep_gemm.utils.math import (
 )
 
 
+def assert_bf16_einsum_close(expr, z, ref_cublas, x, y):
+    # SM120: DeepGEMM and the cuBLAS reference differ only in FP32 accumulation order (both
+    # equally accurate vs FP64), so bf16-vs-cuBLAS exceeds 1e-10 by a few ULPs; check FP32 truth.
+    assert calc_diff(z, ref_cublas) < (1e-7 if get_arch_major() == 12 else 1e-10)
+    if get_arch_major() == 12:
+        assert calc_diff(z, torch.einsum(expr, x.float(), y.float())) < 1e-5
+
+
 def test_bmk_bnk_mn() -> None:
     print('Testing "bmk, bnk -> mn":')
     for s in (129, 4096, 8192):
@@ -46,7 +54,7 @@ def test_bhr_hdr_bhd():
             ref_z = torch.einsum('bhr,hdr->bhd', x, y)
             z = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
             deep_gemm.einsum('bhr,hdr->bhd', x, y, z)
-            assert calc_diff(z, ref_z) < 1e-10
+            assert_bf16_einsum_close('bhr,hdr->bhd', z, ref_z, x, y)
 
             t = bench_kineto(lambda: deep_gemm.einsum('bhr,hdr->bhd', x, y, z), 'gemm', suppress_kineto_output=True)
             t_cublaslt = bench_kineto(lambda: deep_gemm.einsum('bhr,hdr->bhd', x, y, z, use_cublaslt=True), 'nvjet', suppress_kineto_output=True)
@@ -68,7 +76,7 @@ def test_bhd_hdr_bhr():
             ref_z = torch.einsum('bhd,hdr->bhr', x, y)
             z = torch.empty((b, h, r), device='cuda', dtype=torch.bfloat16)
             deep_gemm.einsum('bhd,hdr->bhr', x, y, z)
-            assert calc_diff(z, ref_z) < 1e-10
+            assert_bf16_einsum_close('bhd,hdr->bhr', z, ref_z, x, y)
 
             t = bench_kineto(lambda: deep_gemm.einsum('bhd,hdr->bhr', x, y, z), 'gemm', suppress_kineto_output=True)
             t_cublaslt = bench_kineto(lambda: deep_gemm.einsum('bhd,hdr->bhr', x, y, z, use_cublaslt=True), 'nvjet', suppress_kineto_output=True)

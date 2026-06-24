@@ -108,14 +108,18 @@ def test_mqa_logits():
         return ks, ke
 
     def enumerate_mqa_logits():
-        for is_fp4 in ((True, False) if get_arch_major() == 10 else (False, )):
+        for is_fp4 in ((True, False) if get_arch_major() in (10, 12) else (False, )):
             for logits_dtype in (torch.float, torch.bfloat16):
                 for compressed_logits, clean_logits in [(False, True), (True, False)]:
-                    for seq_len in (510, 512):
-                        for seq_len_kv in (130560,):
-                            for num_heads, head_dim in [(64, 128), (32, 128)]:
-                                for disable_cp in (False, True):
-                                    yield is_fp4, logits_dtype, compressed_logits, clean_logits, seq_len, seq_len_kv, num_heads, head_dim, disable_cp
+                    # Two shape regimes: SM120 small-S split-KV coverage, and the
+                    # upstream large-KV / 32-head regime (FP16-weights + OOB paths).
+                    for seq_len, seq_len_kv, head_cfgs in (
+                        *[(s, k, [(64, 128)]) for s in (128, 512, 2048, 4096) for k in (4096, 8192)],
+                        *[(s, k, [(64, 128), (32, 128)]) for s in (510, 512) for k in (130560,)],
+                    ):
+                        for num_heads, head_dim in head_cfgs:
+                            for disable_cp in (False, True):
+                                yield is_fp4, logits_dtype, compressed_logits, clean_logits, seq_len, seq_len_kv, num_heads, head_dim, disable_cp
 
     print('Testing FP8 MQA Logits:')
     for is_fp4, logits_dtype, compressed_logits, clean_logits, seq_len, seq_len_kv, num_heads, head_dim, disable_cp in enumerate_mqa_logits():
@@ -123,10 +127,11 @@ def test_mqa_logits():
         q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
         kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
         weights = torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float32)
-        # Passing FP16 weights explicitly selects sm100_fp8_mqa_logits_f16_weights (FP8 inputs only,
-        # asserts seq_len % 4 == 0); FP32 weights use the generic kernel. FP4 inputs always require
-        # FP32 weights. The FP16 path accumulates the score in FP16, so scale down to avoid overflow.
-        if (not is_fp4) and seq_len % 4 == 0:
+        # Passing FP16 weights explicitly selects sm100_fp8_mqa_logits_f16_weights (SM100-only,
+        # FP8 inputs only, asserts seq_len % 4 == 0); FP32 weights use the generic kernel. FP4
+        # inputs always require FP32 weights. The FP16 path accumulates the score in FP16, so
+        # scale down to avoid overflow. Gate to arch 10: SM90/SM120 have no FP16-weights kernel.
+        if get_arch_major() == 10 and (not is_fp4) and seq_len % 4 == 0:
             weights = (weights * 0.1).to(torch.float16)
 
         ks, ke = generate_ks_ke_tests(seq_len, seq_len_kv, disable_cp)
@@ -271,18 +276,19 @@ def test_paged_mqa_logits():
 
     def enumerate_paged_mqa_logits():
         arch_major = get_arch_major()
-        # Varlen is SM100-only (SM90 kernel statically rejects it). SM90 supports
+        # Varlen is SM100/SM120-only (SM90 kernel statically rejects it). SM90 supports
         # block_kv ∈ {32, 64} (NV PR #314) and adds next_n=4 via cluster multicast.
         max_kv_pool_tokens = 32 * 1024 * 1024
         max_varlen_tokens = 16 * 1024
-        for is_varlen in ((True, False) if arch_major == 10 else (False, )):
-            for is_fp4 in ((True, False) if arch_major == 10 else (False, )):
+        for is_varlen in ((True, False) if arch_major in (10, 12) else (False, )):
+            for is_fp4 in ((True, False) if arch_major in (10, 12) else (False, )):
                 for logits_dtype in (torch.float, torch.bfloat16):
-                    for block_kv in (32, 64):
+                    for block_kv in ((64, ) if arch_major == 12 and not is_fp4 else (32, 64)):
                         for use_2d_context_lens, clean_logits in [(True, False)]:
                             for batch_size in (256, 4096):
-                                # SM90 keeps next_n=4 (NV cluster-multicast); SM100 covers 1,2,4,5,6.
-                                for next_n in ((1, ) if is_varlen else ((1, 2, 4, 5, 6) if arch_major == 10 else (1, 2, 4))):
+                                # SM90 keeps next_n=4 (NV cluster-multicast); SM100 covers 1,2,4,5,6;
+                                # SM120 adds odd next_n=3 (kPadOddN port) for the full 1..6 range.
+                                for next_n in ((1, ) if is_varlen else ((1, 2, 3, 4, 5, 6) if arch_major == 12 else (1, 2, 4, 5, 6) if arch_major == 10 else (1, 2, 4))):
                                     for max_tokens_per_batch in ((1, 4, 10) if is_varlen else (1, )):
                                         for num_heads, head_dim in [(64, 128), (32, 128)]:
                                             for avg_kv in (8192, 32768):

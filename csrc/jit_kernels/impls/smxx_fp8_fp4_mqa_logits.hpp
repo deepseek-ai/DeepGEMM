@@ -5,6 +5,7 @@
 #include "../../jit/kernel_runtime.hpp"
 #include "../heuristics/sm90.hpp"
 #include "../heuristics/sm100.hpp"
+#include "../heuristics/sm120.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
@@ -41,8 +42,6 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        // TODO: optimize performance by tuning args
-        // Block sizes are fixed in this kernel
         DG_HOST_ASSERT(128 % args.num_heads == 0);
         const auto arch = device_runtime->get_arch(true);
 
@@ -96,8 +95,37 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                 const int& num_heads, const int& head_dim,
                                 const int& block_q, const int& block_kv) {
     constexpr int num_specialized_threads = 128;
-    constexpr int num_q_stages = 3, num_kv_stages = 3;
-    const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
+    const int arch_major = device_runtime->get_arch_major();
+    const int num_q_stages = (arch_major == 12 ? 2 : 3);
+    const int num_kv_stages = 3;
+    const int num_math_threads = (arch_major == 12 ? 256 : (arch_major == 10 ? 256 : 512));
+    const int num_sms = device_runtime->get_num_sms();
+
+    // SM120 split-KV: when there are fewer q-blocks than SMs, split each q-block's
+    // KV range across gridDim.y cooperating blocks to fill idle SMs. logits[q,kv]
+    // are independent across kv (no reduction) so splits write disjoint output —
+    // no combine/atomics needed. Only SM120 reads blockIdx.y; SM90/SM100 keep
+    // gridDim.y == 1 and are unaffected.
+    int kv_splits = 1;
+    if (arch_major == 12) {
+        const int num_q_blocks = ceil_div(seq_len, block_q);
+        const int max_kv_blocks = ceil_div(seq_len_kv, block_kv);
+        // Pick the kv_split factor that minimizes wall time ~= waves / kv_splits,
+        // where waves = ceil(num_q_blocks * kv_splits / num_sms) and per-block work
+        // ~ 1/kv_splits. A plain ceil(num_sms/num_q_blocks) can overshoot a wave
+        // boundary; search instead. Keep >= 4 KV-blocks per split so the KV pipeline
+        // still amortizes its fill, and only split when q-blocks underfill the SMs.
+        if (num_q_blocks < num_sms and max_kv_blocks > 1) {
+            const int max_splits = std::max(1, std::min(num_sms / std::max(1, num_q_blocks) + 1,
+                                                        max_kv_blocks / 4));
+            double best_cost = 1e30;
+            for (int s = 1; s <= max_splits; ++s) {
+                const int waves = ceil_div(num_q_blocks * s, num_sms);
+                const double cost = static_cast<double>(waves) / s;  // waves * (work/split)
+                if (cost < best_cost - 1e-9) { best_cost = cost; kv_splits = s; }
+            }
+        }
+    }
 
     // Use compressed logits format when max_seqlen_k is specified
     const bool is_compressed_logits = (max_seqlen_k > 0);
@@ -126,10 +154,16 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     smem_size += num_kv_stages * smem_kv_size_per_stage;
     smem_size += num_q_stages * smem_weight_size_per_stage;
     smem_size += num_kv_stages * kv_scale_size_per_stage;
-    smem_size += (num_q_stages * 2 + num_kv_stages * 2 + (num_math_threads / 128) * 2) * 8;
+    // SM90/SM100 allocate an extra mbarrier pair per math warp-group; SM120 does not.
+    const int math_warpgroup_barriers = (arch_major == 12) ? 0 : (num_math_threads / 128) * 2;
+    smem_size += (num_q_stages * 2 + num_kv_stages * 2 + math_warpgroup_barriers) * 8;
     smem_size += 4;
-    DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
-    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    if (arch_major == 12) {
+        DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
+    } else {
+        DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
+        DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+    }
 
     // Launch
     const SMXXFP8MQALogitsRuntime::Args args = {
@@ -153,7 +187,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
         .logits_dtype = logits_dtype,
         .num_specialized_threads = num_specialized_threads,
         .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
+        .launch_args = LaunchArgs({num_sms, kv_splits},
                                   num_specialized_threads + num_math_threads,
                                   smem_size)
     };
@@ -489,6 +523,158 @@ static void sm100_fp4_mqa_logits(const torch::Tensor& q, const torch::Tensor& sf
     const auto code = SM100FP4MQALogitsRuntime::generate(args);
     const auto runtime = compiler->build("sm100_fp4_mqa_logits", code);
     SM100FP4MQALogitsRuntime::launch(runtime, args);
+}
+
+class SM120FP4MQALogitsRuntime final: public LaunchRuntime<SM120FP4MQALogitsRuntime> {
+public:
+    struct Args {
+        int seq_len;
+        int seq_len_kv;
+        int max_seqlen_k;
+        int stride_logits;
+        int num_heads, head_dim;
+        bool is_compressed_logits;
+
+        int num_q_stages;
+        int num_kv_stages;
+        int block_q;
+        int block_kv;
+
+        int* cu_seq_len_k_start;
+        int* cu_seq_len_k_end;
+        void* logits;
+
+        CUtensorMap tensor_map_q;
+        CUtensorMap tensor_map_sf_q;
+        CUtensorMap tensor_map_kv;
+        CUtensorMap tensor_map_sf_kv;
+        CUtensorMap tensor_map_weights;
+        at::ScalarType logits_dtype;
+
+        int num_tma_threads;
+        int num_math_threads;
+
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        DG_HOST_ASSERT(128 % args.num_heads == 0);
+
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm120_fp4_mqa_logits.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm120_fp4_mqa_logits<
+        {}, {},
+        {},
+        {}, {},
+        {}, {},
+        {},
+        {}, {},
+        {}
+    >);
+}};
+)", args.num_heads, args.head_dim,
+    args.is_compressed_logits,
+    args.block_q, args.block_kv,
+    args.num_q_stages, args.num_kv_stages,
+    args.launch_args.grid_dim.first,
+    args.num_tma_threads, args.num_math_threads,
+    to_string(args.logits_dtype));
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.seq_len, args.seq_len_kv,
+            args.max_seqlen_k, args.stride_logits,
+            args.cu_seq_len_k_start, args.cu_seq_len_k_end,
+            args.logits,
+            args.tensor_map_q, args.tensor_map_sf_q,
+            args.tensor_map_kv, args.tensor_map_sf_kv,
+            args.tensor_map_weights
+        ));
+    }
+};
+
+static void sm120_fp4_mqa_logits(const torch::Tensor& q, const torch::Tensor& sf_q,
+                                 const torch::Tensor& kv, const torch::Tensor& sf_kv,
+                                 const torch::Tensor& weights,
+                                 const torch::Tensor& cu_seq_len_k_start,
+                                 const torch::Tensor& cu_seq_len_k_end,
+                                 const torch::Tensor& logits,
+                                 const at::ScalarType& logits_dtype,
+                                 const int& seq_len, const int& seq_len_kv,
+                                 const int& max_seqlen_k, const int& stride_logits,
+                                 const int& num_heads, const int& head_dim,
+                                 const int& block_q, const int& block_kv) {
+    constexpr int num_tma_threads = 128;
+    constexpr int num_math_threads = 256;
+    constexpr int num_q_stages = 2, num_kv_stages = 5;
+
+    const bool is_compressed_logits = (max_seqlen_k > 0);
+
+    DG_HOST_ASSERT(head_dim == 128);
+    const auto tensor_map_q = make_tma_2d_desc(q, head_dim, seq_len * num_heads,
+                                               head_dim, block_q * num_heads,
+                                               static_cast<int>(q.stride(1)),
+                                               head_dim / 2, 0, false, false);
+    const auto tensor_map_sf_q = make_tma_2d_desc(sf_q, num_heads, seq_len,
+                                                  num_heads, block_q,
+                                                  static_cast<int>(sf_q.stride(0)), 0);
+    const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, seq_len,
+                                                     num_heads, block_q,
+                                                     static_cast<int>(weights.stride(0)), 0);
+    const auto tensor_map_kv = make_tma_2d_desc(kv, head_dim, seq_len_kv,
+                                                head_dim, block_kv,
+                                                static_cast<int>(kv.stride(0)),
+                                                head_dim / 2, 0, false, false);
+    const auto tensor_map_sf_kv = make_tma_2d_desc(sf_kv,
+                                                   get_tma_aligned_size(seq_len_kv, static_cast<int>(sf_kv.element_size())), 1,
+                                                   block_kv, 1, 0, 0);
+
+    const int smem_q_size_per_stage = block_q * num_heads * head_dim / 2;
+    const int smem_sf_q_size_per_stage = block_q * num_heads * sizeof(int);
+    const int smem_kv_size_per_stage = block_kv * head_dim / 2;
+    const int smem_sf_kv_size_per_stage = block_kv * sizeof(int);
+    const int smem_weight_size_per_stage = block_q * num_heads * sizeof(float);
+
+    const int smem_barriers = (num_q_stages + num_kv_stages) * 2 * 8;
+    const int smem_size = num_q_stages * (smem_q_size_per_stage + smem_sf_q_size_per_stage + smem_weight_size_per_stage) +
+                          num_kv_stages * (smem_kv_size_per_stage + smem_sf_kv_size_per_stage) +
+                          smem_barriers;
+    DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
+
+    const SM120FP4MQALogitsRuntime::Args args = {
+        .seq_len = seq_len,
+        .seq_len_kv = seq_len_kv,
+        .max_seqlen_k = max_seqlen_k,
+        .stride_logits = stride_logits,
+        .num_heads = num_heads, .head_dim = head_dim,
+        .is_compressed_logits = is_compressed_logits,
+        .num_q_stages = num_q_stages,
+        .num_kv_stages = num_kv_stages,
+        .block_q = block_q,
+        .block_kv = block_kv,
+        .cu_seq_len_k_start = cu_seq_len_k_start.data_ptr<int>(),
+        .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
+        .logits = logits.data_ptr(),
+        .tensor_map_q = tensor_map_q,
+        .tensor_map_sf_q = tensor_map_sf_q,
+        .tensor_map_kv = tensor_map_kv,
+        .tensor_map_sf_kv = tensor_map_sf_kv,
+        .tensor_map_weights = tensor_map_weights,
+        .logits_dtype = logits_dtype,
+        .num_tma_threads = num_tma_threads,
+        .num_math_threads = num_math_threads,
+        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
+                                  num_tma_threads + num_math_threads,
+                                  smem_size)
+    };
+    const auto code = SM120FP4MQALogitsRuntime::generate(args);
+    const auto runtime = compiler->build("sm120_fp4_mqa_logits", code);
+    SM120FP4MQALogitsRuntime::launch(runtime, args);
 }
 
 } // namespace deep_gemm

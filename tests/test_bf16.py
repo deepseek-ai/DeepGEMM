@@ -39,14 +39,18 @@ def test_gemm() -> None:
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
 
         t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), 'bf16_gemm', suppress_kineto_output=True)
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
+        # cuBLAS uses different kernels by shape: nvjet/cutlass *gemm* for general
+        # shapes, a dot_kernel + reduce_1Block_kernel GEMV path for M=1, plus a
+        # split-K reduce kernel. Sum all matches for the total cuBLAS time.
+        cublas_t = sum(bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c),
+                                    ('nvjet', 'gemm', 'gemv', 'dot', 'reduce'), suppress_kineto_output=True))
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
               f'{t * 1e6:7.1f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
-              f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
+              f'{cublas_t / t:.2f}x cuBLAS')
         if cublas_t > 0:
-            scores.append((cublas_t + split_k_t) / t)
+            scores.append(cublas_t / t)
     print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
 
 
@@ -200,12 +204,15 @@ def test_cublaslt_gemm() -> None:
         threshold = 1e-5 if (accumulate and out_dtype == torch.bfloat16) else 6e-7
         assert diff < threshold, f'{diff=}, ({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})'
 
-        t_nvjet, t_gemv, t_gemm = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
-        t = t_nvjet + t_gemv + t_gemm
+        # cuBLAS uses different kernels by shape: nvjet/cutlass *gemm* for general
+        # shapes, and a dot_kernel + reduce_1Block_kernel GEMV path for M=1. Match all.
+        times = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c),
+                             ('nvjet', 'gemv', 'gemm', 'dot', 'reduce'), suppress_kineto_output=True)
+        t = sum(times)
+        tflops = 2 * m * n * k / t / 1e12 if t > 0 else 0
+        gbps = (count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t if t > 0 else 0
         print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
-              f'{t * 1e6:5.0f} us | '
-              f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
-              f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s')
+              f'{t * 1e6:5.0f} us | {tflops:4.0f} TFLOPS | {gbps:4.0f} GB/s')
     print()
 
 
