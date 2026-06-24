@@ -293,10 +293,11 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         // Helper lambda for loading tensor memory
         auto tmem_load = [](auto num_elems_c, const uint32_t& tmem_addr, float* accum) {
             constexpr int N = decltype(num_elems_c)::value;
-            DG_STATIC_ASSERT(N == 32 or N == 64, "Unsupported TMEM load size");
-            using Loader = cute::conditional_t<N == 32,
-                cute::SM100_TMEM_LOAD_32dp32b32x,
-                cute::SM100_TMEM_LOAD_32dp32b64x>;
+            DG_STATIC_ASSERT(N == 8 or N == 16 or N == 32 or N == 64, "Unsupported TMEM load size");
+            using Loader = cute::conditional_t<N == 8, cute::SM100_TMEM_LOAD_32dp32b8x,
+                           cute::conditional_t<N == 16, cute::SM100_TMEM_LOAD_32dp32b16x,
+                           cute::conditional_t<N == 32, cute::SM100_TMEM_LOAD_32dp32b32x,
+                                                        cute::SM100_TMEM_LOAD_32dp32b64x>>>;
             [&]<size_t... Is>(cute::index_sequence<Is...>) {
                 Loader::copy(tmem_addr, reinterpret_cast<uint32_t*>(accum)[Is]...);
             }(cute::make_index_sequence<N>{});

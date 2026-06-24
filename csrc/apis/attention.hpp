@@ -94,7 +94,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
         // Check FP4 Q
         std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q_fp);
         head_dim *= 2;
-        DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
+        DG_HOST_ASSERT(num_heads == 16 or num_heads == 32 or num_heads == 64);
         DG_HOST_ASSERT(head_dim == 128);
         DG_HOST_ASSERT(q_fp.is_contiguous());
         DG_HOST_ASSERT(q_fp.scalar_type() == kPackedFP4);
@@ -121,7 +121,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     } else {
         // Check FP8 Q
         std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q_fp);
-        DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
+        DG_HOST_ASSERT(num_heads == 16 or num_heads == 32 or num_heads == 64);
         DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
         DG_HOST_ASSERT(q_fp.is_contiguous());
         DG_HOST_ASSERT(q_fp.scalar_type() == torch::kFloat8_e4m3fn);
@@ -295,7 +295,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         std::tie(batch_size, next_n, num_heads, head_dim) = get_shape<4>(q_fp);
         head_dim *= 2;
         DG_HOST_ASSERT(next_n >= 1);
-        DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
+        DG_HOST_ASSERT(num_heads == 16 or num_heads == 32 or num_heads == 64);
         DG_HOST_ASSERT(head_dim == 128);
         DG_HOST_ASSERT(q_fp.is_contiguous());
         DG_HOST_ASSERT(q_fp.scalar_type() == kPackedFP4);
@@ -333,7 +333,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         // Check FP8 Q
         std::tie(batch_size, next_n, num_heads, head_dim) = get_shape<4>(q_fp);
         DG_HOST_ASSERT(next_n >= 1);
-        DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
+        DG_HOST_ASSERT(num_heads == 16 or num_heads == 32 or num_heads == 64);
         DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
         DG_HOST_ASSERT(q_fp.is_contiguous());
         DG_HOST_ASSERT(q_fp.scalar_type() == torch::kFloat8_e4m3fn);

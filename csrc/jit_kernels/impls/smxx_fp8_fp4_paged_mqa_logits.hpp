@@ -311,7 +311,8 @@ static void smxx_fp8_paged_mqa_logits(const torch::Tensor& q,
         const int smem_q_size_per_stage = next_n_per_cta * num_heads * head_dim * static_cast<int>(q.element_size());
         const int smem_kv_size_per_stage = split_kv * head_dim * static_cast<int>(kv_cache.element_size());
         const int smem_kv_scale_size_per_stage = split_kv * static_cast<int>(kv_cache_scales.element_size());
-        const int smem_weight_size_per_stage = next_n_per_cta * num_heads * static_cast<int>(weights.element_size());
+        // The weight stage stride is padded to 128B in the kernel for TMA alignment
+        const int smem_weight_size_per_stage = align(next_n_per_cta * num_heads * static_cast<int>(weights.element_size()), 128);
 
         const int smem_barriers = (num_q_stages + num_kv_stages) * 2 * 8;
         const int smem_umma_barriers = num_math_warp_groups * 2 * 8;
@@ -492,7 +493,8 @@ static void sm100_fp4_paged_mqa_logits(const torch::Tensor& q,
     const int smem_sf_q_size_per_stage = align(next_n_per_cta * num_heads, 128) * sizeof(int);
     const int smem_kv_size_per_stage = split_kv * head_dim / 2;
     const int smem_sf_kv_size_per_stage = align(split_kv, 128) * sizeof(int);
-    const int smem_weight_size_per_stage = next_n_per_cta * num_heads * sizeof(float);
+    // The weight stage stride is padded to 128B in the kernel for TMA alignment
+    const int smem_weight_size_per_stage = align(next_n_per_cta * num_heads * static_cast<int>(sizeof(float)), 128);
 
     const int smem_barriers = (num_q_stages + num_kv_stages + num_tmem_stages) * 2 * 8;
     const int smem_tmem_ptr = 4;
