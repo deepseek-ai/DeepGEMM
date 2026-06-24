@@ -1530,8 +1530,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 run_swap_ab_l1.template operator()<16>();
                             } else if (n_swap <= 24) {
                                 run_swap_ab_l1.template operator()<24>();
-                            } else if (n_swap <= 32) {
-                                run_swap_ab_l1.template operator()<32>();
                             } else {
                                 run_swap_ab_l1.template operator()<64>();
                             }
@@ -1540,8 +1538,6 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 run_swap_ab_l1.template operator()<8>();
                             } else if (n_swap <= 16) {
                                 run_swap_ab_l1.template operator()<16>();
-                            } else if (n_swap <= 32) {
-                                run_swap_ab_l1.template operator()<32>();
                             } else {
                                 run_swap_ab_l1.template operator()<64>();
                             }
