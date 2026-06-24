@@ -190,7 +190,10 @@ sm90_mxfp8_fp8_gemm_1d2d_impl(void* sfa, void* sfb, int* grouped_layout,
                         const uint32_t k_idx_for_scale = k_block_idx * BLOCK_K + k_scale_offset * 32;
                         const uint32_t k_scale_idx = k_idx_for_scale / sfb_gran_k;
                         const bool is_valid = n_idx < shape_n and k_idx_for_scale < shape_k;
-                        const uint32_t sfb_base_offset = scheduler.current_group_idx * sfb_stride_group +
+                        const uint32_t sfb_group_idx = kMasked ?
+                            scheduler.current_group_idx :
+                            static_cast<uint32_t>(cute::max(0, grouped_layout[m_block_idx * BLOCK_M]));
+                        const uint32_t sfb_base_offset = sfb_group_idx * sfb_stride_group +
                                                          n_idx * sfb_stride_n;
                         smem_sfb[stage_idx][i] = is_valid ?
                             mxfp8_fp8_detail::load_e8m0_scale(
