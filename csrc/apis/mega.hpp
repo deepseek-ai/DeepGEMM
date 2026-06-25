@@ -9,7 +9,6 @@
 #endif
 #include "../jit/device_runtime.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
-#include "../jit_kernels/impls/sm90_fp8_mega_moe_pingpong.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe_cooperative.hpp"
 
 namespace deep_gemm::mega {
@@ -47,12 +46,13 @@ get_symm_buffer_size_for_mega_moe(
     // L2 acts SF granularity differs by arch:
     //   * SM100 packs 4 UE8M0 bytes per int along K, so each token uses
     //     `intermediate_hidden / 32` bytes (per-32 K).
-    //   * SM90 stores per-64 K floats so that each L1 epilogue block (which
-    //     produces 64 post-SwiGLU columns) can write its own SF independently
-    //     without cross-CTA amax synchronisation; bytes per token become
-    //     `intermediate_hidden / 64 * sizeof(float) = intermediate_hidden / 16`.
+    //   * SM90 stores per-128 K floats (matching the standard DeepEP runner's
+    //     `scale_block_size=128`): each N-split L1 epilogue block produces 128
+    //     post-SwiGLU columns and writes a single SF for them (the two math
+    //     warpgroups cross-reduce the per-row amax over their 64-col halves), so
+    //     bytes per token = `intermediate_hidden / 128 * sizeof(float) = intermediate_hidden / 32`.
     const int fp8_intermediate_sf_bytes_per_token =
-        is_sm90 ? (intermediate_hidden / 16) : (intermediate_hidden / 32);
+        is_sm90 ? (intermediate_hidden / 32) : (intermediate_hidden / 32);
     const auto fp8_intermediate_sf_layout = layout::Data(fp8_intermediate_sf_bytes_per_token);
     const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
     const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
@@ -148,7 +148,7 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
-            {num_max_padded_sf_pool_tokens, is_sm90 ? intermediate_hidden / 64 : intermediate_hidden / 128},
+            {num_max_padded_sf_pool_tokens, is_sm90 ? intermediate_hidden / 128 : intermediate_hidden / 128},
             {1, num_max_padded_sf_pool_tokens},
             torch::TensorOptions().dtype(sf_dtype).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
@@ -301,12 +301,16 @@ static void fp8_mega_moe(
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
 
-    // Shape constraints required by the SM90 kernel:
-    //   * Hidden dims must be multiples of 128 (per-128 SF + scheduler integer-tiling).
-    //   * `l2_arrival_mask` is uint64, with one bit per L1-output N-block of size 64 in the
-    //     intermediate dim, so `kNumL1BlockNs = intermediate_hidden / 64` must be ≤ 64.
-    DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
-    DG_HOST_ASSERT(intermediate_hidden / 64 <= 64);
+    // Shape constraints required by the SM90 kernel (BLOCK_N=256):
+    //   * L2_SHAPE_N = hidden must be a multiple of BLOCK_N=256 (scheduler tiling).
+    //   * L1_SHAPE_N = 2*intermediate_hidden must be a multiple of 256, i.e.
+    //     intermediate_hidden % 128 == 0.
+    //   * `l2_arrival_mask` is uint64, with one bit per L1-output N-block. Each
+    //     block spans 256 weight cols (= 128 post-SwiGLU cols), so
+    //     `kNumL1BlockNs = 2*intermediate_hidden / 256 = intermediate_hidden / 128`
+    //     must be ≤ 64.
+    DG_HOST_ASSERT(hidden % 256 == 0 and intermediate_hidden % 128 == 0);
+    DG_HOST_ASSERT(intermediate_hidden / 128 <= 64);
 
     // Check weight SF layout (block (128, 128) float, MN-major; not TMA-loaded
     // so no TMA-stride alignment is required, but we do require contiguity in
@@ -338,136 +342,13 @@ static void fp8_mega_moe(
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
-    // Token-count routing: small M (< cooperative_threshold) is epilogue/latency
-    // bound and favours the pingpong kernel (BLOCK_M=64, one WG per tile); large
-    // M is DRAM-bound on weight re-reads and favours the cooperative kernel
-    // (BLOCK_M=128, two WGs cooperatively share one B-tile load → half the weight
-    // HBM traffic). Threshold overridable via DG_SM90_MOE_COOPERATIVE_THRESHOLD.
-    constexpr int kCooperativeThresholdDefault = 256;
-    const int cooperative_threshold =
-        get_env<int>("DG_SM90_MOE_COOPERATIVE_THRESHOLD", kCooperativeThresholdDefault);
-
-    if (num_tokens >= cooperative_threshold) {
-        sm90_fp8_mega_moe_cooperative(y,
-                         l1_acts, l1_acts_sf,
-                         l2_acts, l2_acts_sf,
-                         l1_weights, l2_weights,
-                         l1_weights_sf, l2_weights_sf,
-                         cumulative_local_expert_recv_stats,
-                         sym_buffer_ptrs,
-                         rank_idx, num_max_tokens_per_rank,
-                         num_experts_per_rank,
-                         num_tokens, num_topk,
-                         hidden, intermediate_hidden,
-                         activation_clamp, fast_math);
-    } else {
-        sm90_fp8_mega_moe_pingpong(y,
-                         l1_acts, l1_acts_sf,
-                         l2_acts, l2_acts_sf,
-                         l1_weights, l2_weights,
-                         l1_weights_sf, l2_weights_sf,
-                         cumulative_local_expert_recv_stats,
-                         sym_buffer_ptrs,
-                         rank_idx, num_max_tokens_per_rank,
-                         num_experts_per_rank,
-                         num_tokens, num_topk,
-                         hidden, intermediate_hidden,
-                         activation_clamp, fast_math);
-    }
-
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
-        sym_buffer.zero_();
-}
-
-// SM90 (Hopper) FP8 MegaMoE entry point — PINGPONG implementation.
-// Single-launch fused kernel exactly like the pingpong `fp8_mega_moe`, but
-// one math warpgroup per tile (block_m=64), warpgroups overlap MMA/epilogue. Body is
-// identical to `fp8_mega_moe` except for the launcher invoked. Exposed to
-// Python as `fp8_mega_moe_pingpong`.
-static void fp8_mega_moe_pingpong(
-    const torch::Tensor& y,
-    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
-    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
-    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-    const torch::Tensor& sym_buffer,
-    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
-    const std::tuple<int, int, int>& recipe,
-    const std::string& activation,
-    const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
-) {
-    const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
-    const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
-
-    // Architecture check
-    const auto arch_major = device_runtime->get_arch_major();
-    DG_HOST_ASSERT(arch_major == 9);
-
-    // Config checks: SM90 uses block (128, 128) float SF for weights,
-    // per-token per-128-K float SF for activations.
-    const auto num_tokens = static_cast<int>(y.size(0));
-    const auto [rm, rn, rk] = recipe;
-    DG_HOST_ASSERT(rm == 128 and rn == 128 and rk == 128);
-    DG_HOST_ASSERT(activation == "swiglu");
-
-    // Activation checks
-    const auto activation_clamp =
-        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
-    DG_HOST_ASSERT(activation_clamp >= 0);
-
-    // Tensor checks: SM90 weights must be FP8 e4m3, K-major
-    DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
-    DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
-    DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(l2_weights.scalar_type() == torch::kFloat8_e4m3fn);
-    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = get_shape<3>(l1_weights);
-    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = get_shape<3>(l2_weights);
-    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
-    DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
-    DG_HOST_ASSERT(hidden == hidden_);
-    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
-    DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
-
-    // Shape constraints required by the SM90 kernel:
-    //   * Hidden dims must be multiples of 128 (per-128 SF + scheduler integer-tiling).
-    //   * `l2_arrival_mask` is uint64, with one bit per L1-output N-block of size 64 in the
-    //     intermediate dim, so `kNumL1BlockNs = intermediate_hidden / 64` must be ≤ 64.
-    DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
-    DG_HOST_ASSERT(intermediate_hidden / 64 <= 64);
-
-    // Check weight SF layout (block (128, 128) float, MN-major; not TMA-loaded
-    // so no TMA-stride alignment is required, but we do require contiguity in
-    // the K-direction within each expert).
-    constexpr int kGranMN = 128, kGranK = 128;
-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, false, true, torch::kFloat);
-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, false, true, torch::kFloat);
-
-    // Check stats counter
-    if (cumulative_local_expert_recv_stats.has_value()) {
-        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
-        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
-        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
-    }
-
-    // Check buffer bytes
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
-    const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
-        num_ranks, num_experts,
-        num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden,
-        true, activation);
-    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
-    DG_HOST_ASSERT(num_experts == num_experts_);
-
-    // Already registered tensors
-    const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
-
-    sm90_fp8_mega_moe_pingpong(y,
+    // Single cooperative kernel for all token counts: the N-split cooperative
+    // kernel (BLOCK_M=64, BLOCK_N=256, two math warpgroups split the 256-wide N
+    // tile into two 128-wide halves and share one A-tile load) is the only SM90
+    // mega-MoE path. It quantizes the L2-input activations at per-128 K to match
+    // the standard DeepEP runner. (The former pingpong kernel and the
+    // token-count routing threshold were removed.)
+    sm90_fp8_mega_moe_cooperative(y,
                      l1_acts, l1_acts_sf,
                      l2_acts, l2_acts_sf,
                      l1_weights, l2_weights,
@@ -485,10 +366,11 @@ static void fp8_mega_moe_pingpong(
 }
 
 // SM90 (Hopper) FP8 MegaMoE entry point — COOPERATIVE implementation.
-// Single-launch fused kernel exactly like the pingpong `fp8_mega_moe`, but
-// two math warpgroups cooperatively M-split one tile (block_m=128). Body is
-// identical to `fp8_mega_moe` except for the launcher invoked. Exposed to
-// Python as `fp8_mega_moe_cooperative`.
+// Single-launch fused N-split cooperative kernel (block_m=64, block_n=256): two
+// math warpgroups split the 256-wide N tile into two 128-wide halves, share one
+// A-tile load, and quantize the L2-input activations at per-128 K. Body is
+// identical to `fp8_mega_moe` except this is the explicit (non-auto) entry.
+// Exposed to Python as `fp8_mega_moe_cooperative`.
 static void fp8_mega_moe_cooperative(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
@@ -535,12 +417,16 @@ static void fp8_mega_moe_cooperative(
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
 
-    // Shape constraints required by the SM90 kernel:
-    //   * Hidden dims must be multiples of 128 (per-128 SF + scheduler integer-tiling).
-    //   * `l2_arrival_mask` is uint64, with one bit per L1-output N-block of size 64 in the
-    //     intermediate dim, so `kNumL1BlockNs = intermediate_hidden / 64` must be ≤ 64.
-    DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
-    DG_HOST_ASSERT(intermediate_hidden / 64 <= 64);
+    // Shape constraints required by the SM90 kernel (BLOCK_N=256):
+    //   * L2_SHAPE_N = hidden must be a multiple of BLOCK_N=256 (scheduler tiling).
+    //   * L1_SHAPE_N = 2*intermediate_hidden must be a multiple of 256, i.e.
+    //     intermediate_hidden % 128 == 0.
+    //   * `l2_arrival_mask` is uint64, with one bit per L1-output N-block. Each
+    //     block spans 256 weight cols (= 128 post-SwiGLU cols), so
+    //     `kNumL1BlockNs = 2*intermediate_hidden / 256 = intermediate_hidden / 128`
+    //     must be ≤ 64.
+    DG_HOST_ASSERT(hidden % 256 == 0 and intermediate_hidden % 128 == 0);
+    DG_HOST_ASSERT(intermediate_hidden / 128 <= 64);
 
     // Check weight SF layout (block (128, 128) float, MN-major; not TMA-loaded
     // so no TMA-stride alignment is required, but we do require contiguity in
@@ -595,7 +481,6 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("fp8_mega_moe", &fp8_mega_moe);
-    m.def("fp8_mega_moe_pingpong", &fp8_mega_moe_pingpong);
     m.def("fp8_mega_moe_cooperative", &fp8_mega_moe_cooperative);
 #endif
 }
