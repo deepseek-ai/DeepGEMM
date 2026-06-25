@@ -54,6 +54,10 @@ def _pack_ue8m0_u8_to_i32_mn_major(sf: torch.Tensor) -> torch.Tensor:
     return packed.transpose(-1, -2).contiguous().transpose(-1, -2)
 
 
+def _fp32_from_e8m0_u8(sf: torch.Tensor) -> torch.Tensor:
+    return torch.bitwise_left_shift(sf.to(torch.int32), 23).contiguous().view(torch.float32)
+
+
 def test_packed_ue8m0_i32_byte_order_matches_sm100_layout():
     _require_sm90()
     import deep_gemm.utils.layout
@@ -185,6 +189,67 @@ def test_m_grouped_mxfp8_fp8_contiguous_packed_int32_scale_accuracy():
         a, b, d, grouped_layout, recipe_a=(1, 128), recipe_b=(1, 32)
     )
     diff = calc_diff(d, ref)
+    assert diff < 0.03
+
+
+def test_m_grouped_mxfp8_fp8_contiguous_deepep_normal_scale_layout_accuracy():
+    _require_sm90()
+    torch.manual_seed(0)
+    # Matches SGLang DeepEP normal layout:
+    #   A scale: packed int32 MN-major non-contiguous view, gran_k=128
+    #   B scale: raw uint8 [expert, n, k/32], gran_k=32
+    groups, m_per_group, n, k = 3, 128, 80, 640
+    m = groups * m_per_group
+    a_ref = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b_ref = torch.randn((groups, n, k), device="cuda", dtype=torch.bfloat16)
+    a_data, _ = per_token_cast_to_fp8(a_ref, use_ue8m0=True, gran_k=128)
+    b_data = torch.empty((groups, n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    for group_id in range(groups):
+        b_data[group_id], _ = per_token_cast_to_fp8(
+            b_ref[group_id], use_ue8m0=True, gran_k=32
+        )
+
+    a_exp = (
+        124
+        + (torch.arange(m, device="cuda", dtype=torch.uint8).view(m, 1) % 5)
+        + (torch.arange(k // 128, device="cuda", dtype=torch.uint8).view(1, -1) % 3)
+    )
+    b_exp = (
+        123
+        + (torch.arange(groups, device="cuda", dtype=torch.uint8).view(groups, 1, 1) % 3)
+        + (torch.arange(n, device="cuda", dtype=torch.uint8).view(1, n, 1) % 5)
+        + (torch.arange(k // 32, device="cuda", dtype=torch.uint8).view(1, 1, -1) % 2)
+    )
+
+    a_scale_i32 = _pack_ue8m0_u8_to_i32_mn_major(a_exp)
+    b_scale_u8 = b_exp.contiguous()
+    a = (a_data, a_scale_i32)
+    b = (b_data, b_scale_u8)
+    grouped_layout = torch.arange(groups, device="cuda", dtype=torch.int32).repeat_interleave(
+        m_per_group
+    )
+
+    a_dequant = _cast_back_from_fp8_1d(a_data, _fp32_from_e8m0_u8(a_exp), gran_k=128)
+    b_scale_fp32 = _fp32_from_e8m0_u8(b_exp)
+    ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    for group_id in range(groups):
+        start = group_id * m_per_group
+        end = start + m_per_group
+        b_dequant = _cast_back_from_fp8_1d(b_data[group_id], b_scale_fp32[group_id], gran_k=32)
+        ref[start:end] = (a_dequant[start:end] @ b_dequant.t()).to(torch.bfloat16)
+
+    d = torch.empty_like(ref)
+    deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
+        a, b, d, grouped_layout, recipe_a=(1, 128), recipe_b=(1, 32)
+    )
+    diff = calc_diff(d, ref)
+    max_abs_diff = (d.float() - ref.float()).abs().max().item()
+    print(
+        "DeepEP-normal scale layout diff: "
+        f"calc_diff={diff:.6f}, max_abs_diff={max_abs_diff:.6f}, "
+        f"a_scale_shape={tuple(a_scale_i32.shape)}, a_scale_stride={tuple(a_scale_i32.stride())}, "
+        f"b_scale_shape={tuple(b_scale_u8.shape)}, b_scale_stride={tuple(b_scale_u8.stride())}"
+    )
     assert diff < 0.03
 
 
