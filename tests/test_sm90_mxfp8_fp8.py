@@ -259,6 +259,75 @@ def test_m_grouped_mxfp8_fp8_contiguous_deepep_normal_scale_layout_accuracy():
     assert diff < 0.03
 
 
+def test_m_grouped_mxfp8_fp8_contiguous_dense_linear_raw_u8_scale_accuracy():
+    _require_sm90()
+    torch.manual_seed(1)
+    # Matches SGLang dense linear through the SM90 grouped-contiguous wrapper:
+    # one logical RHS group, raw uint8 UE8M0 scales on both A and B, and padded M.
+    m, padded_m, n, k = 137, 256, 96, 640
+    a_ref = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b_ref = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    a_data, _ = per_token_cast_to_fp8(a_ref, use_ue8m0=True, gran_k=32)
+    b_data, _ = per_token_cast_to_fp8(b_ref, use_ue8m0=True, gran_k=32)
+
+    a_exp = (
+        124
+        + (torch.arange(m, device="cuda", dtype=torch.uint8).view(m, 1) % 5)
+        + (torch.arange(k // 32, device="cuda", dtype=torch.uint8).view(1, -1) % 3)
+    )
+    b_exp = (
+        124
+        + (torch.arange(n, device="cuda", dtype=torch.uint8).view(n, 1) % 5)
+        + (torch.arange(k // 32, device="cuda", dtype=torch.uint8).view(1, -1) % 3)
+    )
+
+    kernel_a = torch.zeros((padded_m, k), device="cuda", dtype=torch.float8_e4m3fn)
+    kernel_a[:m] = a_data
+    kernel_a_scale = torch.zeros((padded_m, k // 32), device="cuda", dtype=torch.uint8)
+    kernel_a_scale[:m] = a_exp
+    kernel_b = b_data.unsqueeze(0).contiguous()
+    kernel_b_scale = b_exp.unsqueeze(0).contiguous()
+    m_indices = torch.full((padded_m,), -1, device="cuda", dtype=torch.int32)
+    m_indices[:m] = 0
+
+    a_dequant = _cast_back_from_fp8_1d(a_data, _fp32_from_e8m0_u8(a_exp), gran_k=32)
+    b_dequant = _cast_back_from_fp8_1d(b_data, _fp32_from_e8m0_u8(b_exp), gran_k=32)
+    ref = (a_dequant @ b_dequant.t()).to(torch.bfloat16)
+    d_padded = torch.empty((padded_m, n), device="cuda", dtype=torch.bfloat16)
+    deep_gemm.m_grouped_mxfp8_fp8_gemm_nt_contiguous(
+        (kernel_a, kernel_a_scale),
+        (kernel_b, kernel_b_scale),
+        d_padded,
+        m_indices,
+        recipe_a=(1, 32),
+        recipe_b=(1, 32),
+    )
+    d = d_padded[:m]
+
+    inv_a_scale = _fp32_from_e8m0_u8((254 - a_exp).to(torch.uint8))
+    inv_b_scale = _fp32_from_e8m0_u8((254 - b_exp).to(torch.uint8))
+    inv_ref = (
+        _cast_back_from_fp8_1d(a_data, inv_a_scale, gran_k=32)
+        @ _cast_back_from_fp8_1d(b_data, inv_b_scale, gran_k=32).t()
+    ).to(torch.bfloat16)
+
+    diff = calc_diff(d, ref)
+    inverse_diff = calc_diff(d, inv_ref)
+    max_abs_diff = (d.float() - ref.float()).abs().max().item()
+    ref_absmax = ref.float().abs().max().item()
+    max_rel_diff = max_abs_diff / max(ref_absmax, 1.0)
+    print(
+        "Dense raw-u8 scale layout diff: "
+        f"calc_diff={diff:.6f}, inverse_scale_calc_diff={inverse_diff:.6f}, "
+        f"max_abs_diff={max_abs_diff:.6f}, ref_absmax={ref_absmax:.6f}, "
+        f"max_rel_diff={max_rel_diff:.6f}, "
+        f"a_scale_shape={tuple(kernel_a_scale.shape)}, "
+        f"b_scale_shape={tuple(kernel_b_scale.shape)}"
+    )
+    assert diff < 0.03
+    assert inverse_diff > diff + 0.1
+
+
 def test_m_grouped_mxfp8_fp8_masked_packed_int32_mn_major_scale_accuracy():
     _require_sm90()
     groups, max_m, n, k = 3, 128, 64, 640
