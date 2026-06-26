@@ -169,37 +169,14 @@ def fp8_mega_moe(y: torch.Tensor,
                  fast_math: bool = True):
     """SM90 (Hopper) MegaMoE entry point.
 
-    Expects FP8 e4m3 weights and block-(128, 128) float scale factors. Routes by
-    token count between the pingpong (small/medium M) and cooperative (large M)
-    kernels; the threshold is overridable via ``DG_SM90_MOE_COOPERATIVE_THRESHOLD``.
+    Expects FP8 e4m3 weights and block-(128, 128) float scale factors. Backed by
+    the single N-split cooperative kernel (BLOCK_M=64, BLOCK_N=256): two math
+    warpgroups split the 256-wide N tile into two 128-wide halves, share one
+    A-tile load, and quantize the L2-input activations at per-128 K to match the
+    standard DeepEP runner. (The former pingpong kernel and token-count routing
+    were removed.)
     """
     _C.fp8_mega_moe(
-        y,
-        l1_weights, l2_weights,
-        cumulative_local_expert_recv_stats,
-        sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe,
-        activation, activation_clamp,
-        fast_math
-    )
-
-
-def fp8_mega_moe_pingpong(y: torch.Tensor,
-                          l1_weights: Tuple[torch.Tensor, torch.Tensor],
-                          l2_weights: Tuple[torch.Tensor, torch.Tensor],
-                          sym_buffer: SymmBuffer,
-                          cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-                          recipe: Tuple[int, int, int] = (128, 128, 128),
-                          activation: str = 'swiglu',
-                          activation_clamp: Optional[float] = None,
-                          fast_math: bool = True):
-    """SM90 MegaMoE — pingpong kernel (BLOCK_M=64), forced regardless of token
-    count. Same calling convention as :func:`fp8_mega_moe`; useful for A/B tests.
-    """
-    _C.fp8_mega_moe_pingpong(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,
@@ -222,9 +199,9 @@ def fp8_mega_moe_cooperative(y: torch.Tensor,
                              activation: str = 'swiglu',
                              activation_clamp: Optional[float] = None,
                              fast_math: bool = True):
-    """SM90 MegaMoE — cooperative kernel (BLOCK_M=128, two warpgroups M-split one
-    tile and share the weight load), forced regardless of token count. Same
-    calling convention as :func:`fp8_mega_moe`; useful for A/B tests.
+    """SM90 MegaMoE — explicit cooperative kernel entry (BLOCK_M=64, BLOCK_N=256,
+    two warpgroups N-split one tile and share the activation load). Identical to
+    :func:`fp8_mega_moe`; kept as a named entry for A/B tests.
     """
     _C.fp8_mega_moe_cooperative(
         y,

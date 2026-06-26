@@ -146,8 +146,16 @@ def _reference_fused(
     num_experts: int, num_topk: int,
     hidden: int, intermediate_hidden: int,
     activation_clamp: float,
+    l2_act_gran_k: int = 64,
 ) -> torch.Tensor:
     """Reference: returns (num_tokens, hidden) bf16 result for *this* rank.
+
+    ``l2_act_gran_k`` selects the FP8 quantization granularity of the L2 input
+    (the SwiGLU output). The fused SM90 ``fp8_mega_moe`` kernel uses **64**
+    (per-L1-N-block, hardwired), so that is the default and the value that makes
+    this reference match the kernel. sglang's *standard DeepEP* path instead
+    quantizes the down-proj input with ``scale_block_size = 128``
+    (``moe_runner/deep_gemm.py``); pass ``128`` to model that path's numerics.
 
     All-gathers the global tokens / topk decisions / per-rank weights, then
     for each global token routes through its topk experts, applies the
@@ -228,11 +236,14 @@ def _reference_fused(
             # SwiGLU + clamp + multiply by topk weight
             l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)   # (S, IH)
 
-            # Per-row, per-64-col FP8 quantize -> dequantize
+            # Per-row, per-`l2_act_gran_k`-col FP8 quantize -> dequantize.
+            # gran=64 matches the fused kernel; gran=128 matches sglang's
+            # standard DeepEP down-proj-input quant (scale_block_size=128).
             s_, ih = l1_y.shape
-            assert ih == intermediate_hidden and ih % 64 == 0
-            l1_view = l1_y.view(s_, ih // 64, 64)
-            amax = l1_view.abs().amax(dim=-1).clamp(1e-4)          # (S, IH/64)
+            assert ih == intermediate_hidden and ih % l2_act_gran_k == 0
+            g = l2_act_gran_k
+            l1_view = l1_y.view(s_, ih // g, g)
+            amax = l1_view.abs().amax(dim=-1).clamp(1e-4)          # (S, IH/g)
             sf2 = amax / 448.0
             l1_q = (l1_view / sf2.unsqueeze(-1)).to(torch.float8_e4m3fn).float()
             l2_in = (l1_q * sf2.unsqueeze(-1)).view(s_, ih)        # (S, IH) fp32
@@ -446,13 +457,11 @@ def _run_scenario(
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_w)
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        # Kernel selection: DG_SM90_MOE_KERNEL ∈ {auto(default), pingpong, cooperative}
-        #   auto        -> fp8_mega_moe (token-count routing)
-        #   pingpong    -> force the pingpong kernel (BLOCK_M=64)
-        #   cooperative -> force the cooperative kernel (BLOCK_M=128)
+        # Kernel selection: DG_SM90_MOE_KERNEL ∈ {auto(default), cooperative}
+        #   auto/cooperative -> the single N-split cooperative kernel
+        #   (BLOCK_M=64, BLOCK_N=256; the pingpong kernel was removed).
         _kernel = os.environ.get('DG_SM90_MOE_KERNEL', 'auto')
         _fn = {'auto': deep_gemm.fp8_mega_moe,
-               'pingpong': deep_gemm.fp8_mega_moe_pingpong,
                'cooperative': deep_gemm.fp8_mega_moe_cooperative}[_kernel]
         _fn(
             y, transformed_l1, transformed_l2, buffer,
@@ -483,6 +492,7 @@ def _run_scenario(
         num_experts, num_topk,
         hidden, intermediate_hidden,
         activation_clamp,
+        l2_act_gran_k=128,  # kernel now quantizes L2 input at per-128 K
     )
 
     diff = calc_diff(y_fused, y_ref)
