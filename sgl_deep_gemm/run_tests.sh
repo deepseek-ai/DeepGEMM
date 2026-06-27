@@ -140,10 +140,6 @@ MEGA_MOE_ALL=(
   "${MEGA_MOE_BLACKWELL[@]}"
   "${MEGA_MOE_HOPPER[@]}"
 )
-MEGA_MOE_L1=(
-  test_mega_moe_l1_fp4_accuracy.py
-  test_mega_moe_l1_sentinel.py
-)
 if [ "${SKIP_MEGA_MOE}" -eq 1 ]; then
   for t in "${MEGA_MOE_ALL[@]}"; do
     [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "--skip-mega-moe"
@@ -156,12 +152,12 @@ elif [ "${ARCH_MAJOR}" -ge 10 ]; then
       skip_test test_mega_moe.py "deep_ep with ElasticBuffer not installed"
     fi
   fi
-  # l1 tests are quarantined: they exercise a manual buffer-packing path that
-  # diverges from sglang's pre_dispatch flow, and hit kernel-level fp4 failures
-  # (TMA stride at >=8 ranks, rel-RMSE). sglang's real path is covered by
-  # test_mega_moe_pre_dispatch + test_mega_moe. Confirm on B200 before re-enabling.
-  for t in "${MEGA_MOE_L1[@]}"; do
-    [ -f "${TESTS_DIR}/${t}" ] && skip_test "${t}" "fp4 kernel failures, see comment (confirm on B200)"
+  L1_NPROC="${NPROC}"
+  if [ "${L1_NPROC}" -gt 2 ]; then
+    L1_NPROC=2
+  fi
+  for t in test_mega_moe_l1_fp4_accuracy.py test_mega_moe_l1_sentinel.py; do
+    [ -f "${TESTS_DIR}/${t}" ] && run_test "${t}" --num-processes "${L1_NPROC}"
   done
   [ -f "${TESTS_DIR}/test_mega_moe_pre_dispatch.py" ] && run_test test_mega_moe_pre_dispatch.py
   for t in "${MEGA_MOE_HOPPER[@]}"; do

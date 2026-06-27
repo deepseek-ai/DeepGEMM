@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import tvm_ffi
+
+from .cuda_helpers import find_cuda_home, get_cuda_arch
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -23,21 +24,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Build & load the tvm-ffi _C module
 # ---------------------------------------------------------------------------
-def _find_cuda_home() -> str:
-    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
-    if cuda_home is None:
-        try:
-            with open(os.devnull, 'w') as devnull:
-                nvcc = subprocess.check_output(['which', 'nvcc'], stderr=devnull).decode().rstrip('\r\n')
-                cuda_home = os.path.dirname(os.path.dirname(nvcc))
-        except Exception:
-            cuda_home = '/usr/local/cuda'
-            if not os.path.exists(cuda_home):
-                cuda_home = None
-    assert cuda_home is not None
-    return cuda_home
-
-
 def _build_module(pkg_dir: str, cuda_home: str) -> str:
     """Build the _C shared library using tvm_ffi.cpp.build()."""
     import tvm_ffi.cpp
@@ -45,7 +31,7 @@ def _build_module(pkg_dir: str, cuda_home: str) -> str:
     root_dir = os.path.dirname(pkg_dir)
     cxx_abi = int(torch.compiled_with_cxx11_abi())
 
-    os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', _get_cuda_arch())
+    os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', get_cuda_arch())
 
     extra_cflags = [
         '-std=c++17', '-O3', '-fPIC',
@@ -107,25 +93,13 @@ def _build_module(pkg_dir: str, cuda_home: str) -> str:
     shutil.copy2(lib_path, target)
     return target
 
-
-def _get_cuda_arch() -> str:
-    try:
-        status = subprocess.run(
-            args=['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
-            capture_output=True, check=True,
-        )
-        return status.stdout.decode('utf-8').strip().split('\n')[0]
-    except Exception:
-        return '9.0'
-
-
 def _load_module() -> Module:
     """Load (or build then load) the compiled tvm-ffi module."""
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     lib_path = os.path.join(pkg_dir, '_C.so')
 
     if not os.path.exists(lib_path):
-        cuda_home = _find_cuda_home()
+        cuda_home = find_cuda_home()
         print(f'[DeepGEMM] Building _C module with tvm-ffi (CUDA_HOME={cuda_home})...')
         lib_path = _build_module(pkg_dir, cuda_home)
         print(f'[DeepGEMM] Built _C module: {lib_path}')
@@ -146,10 +120,20 @@ set_pdl = _C.set_pdl
 get_pdl = _C.get_pdl
 
 # cuBLASLt Kernels
-cublaslt_gemm_nt = _C.cublaslt_gemm_nt
-cublaslt_gemm_nn = _C.cublaslt_gemm_nn
-cublaslt_gemm_tn = _C.cublaslt_gemm_tn
-cublaslt_gemm_tt = _C.cublaslt_gemm_tt
+def cublaslt_gemm_nt(a, b, d, c=None):
+    _C.cublaslt_gemm_nt(a, b, d, c)
+
+
+def cublaslt_gemm_nn(a, b, d, c=None):
+    _C.cublaslt_gemm_nn(a, b, d, c)
+
+
+def cublaslt_gemm_tn(a, b, d, c=None):
+    _C.cublaslt_gemm_tn(a, b, d, c)
+
+
+def cublaslt_gemm_tt(a, b, d, c=None):
+    _C.cublaslt_gemm_tt(a, b, d, c)
 
 def _parse_tensor_or_tuple(input):
     if type(input) is tuple or type(input) is list:
@@ -185,13 +169,13 @@ try:
     fp8_gemm_tn = fp8_fp4_gemm_tn
     fp8_gemm_tt = fp8_fp4_gemm_tt
 
-    def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, expected_m_for_psum_layout=None):
+    def m_grouped_fp8_fp4_gemm_nt_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, ensure_zero_padding=True, expected_m_for_psum_layout=None):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, expected_m_for_psum_layout)
+        _C.m_grouped_fp8_fp4_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout)
 
-    def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False):
+    def m_grouped_fp8_fp4_gemm_nn_contiguous(a, b, d, grouped_layout, recipe=None, recipe_a=None, recipe_b=None, compiled_dims='nk', disable_ue8m0_cast=False, use_psum_layout=False, ensure_zero_padding=True):
         (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
-        _C.m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout)
+        _C.m_grouped_fp8_fp4_gemm_nn_contiguous(a_data, a_sf, b_data, b_sf, d, grouped_layout, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, use_psum_layout, ensure_zero_padding)
 
     m_grouped_fp8_gemm_nt_contiguous = m_grouped_fp8_fp4_gemm_nt_contiguous
     m_grouped_fp8_gemm_nn_contiguous = m_grouped_fp8_fp4_gemm_nn_contiguous
@@ -254,17 +238,25 @@ try:
 
     fp8_m_grouped_gemm_nt_masked = m_grouped_fp8_fp4_gemm_nt_masked
 
-    def m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, expected_m_for_psum_layout=None):
-        _C.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, expected_m_for_psum_layout)
+    def k_grouped_fp8_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.k_grouped_fp8_gemm_tn_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout, c, recipe, compiled_dims, use_psum_layout)
 
-    def m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False):
-        _C.m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout)
+    def k_grouped_fp8_gemm_nt_contiguous(a, b, d, ks, grouped_layout, c=None, recipe=(1, 1, 128), compiled_dims='mn', use_psum_layout=False):
+        (a_data, a_sf), (b_data, b_sf) = _parse_tensor_or_tuple(a), _parse_tensor_or_tuple(b)
+        _C.k_grouped_fp8_gemm_nt_contiguous(a_data, a_sf, b_data, b_sf, d, ks, grouped_layout, c, recipe, compiled_dims, use_psum_layout)
+
+    def m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, ensure_zero_padding=True, expected_m_for_psum_layout=None):
+        _C.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout)
+
+    def m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims='nk', use_psum_layout=False, ensure_zero_padding=True):
+        _C.m_grouped_bf16_gemm_nn_contiguous(a, b, d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding)
 
     def m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims='nk'):
         _C.m_grouped_bf16_gemm_nt_masked(a, b, d, masked_m, expected_m, compiled_dims)
 
-    def k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c=None, compiled_dims='mn'):
-        _C.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, ks_tensor, c, compiled_dims)
+    def k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c=None, compiled_dims='mn', use_psum_layout=False):
+        _C.k_grouped_bf16_gemm_tn_contiguous(a, b, d, ks, grouped_layout, c, compiled_dims, use_psum_layout)
 
     bf16_m_grouped_gemm_nt_masked = m_grouped_bf16_gemm_nt_masked
 
@@ -277,6 +269,7 @@ from .mega import (
     SymmBuffer,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
+    bf16_mega_moe,
     mega_moe_pre_dispatch,
 )
 
@@ -357,20 +350,26 @@ def get_symm_buffer_for_mega_moe(group,
                                  num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
                                  hidden: int, intermediate_hidden: int,
-                                 use_fp8_dispatch: bool = True,
+                                 use_fp8_dispatch: Union[bool, None] = None,
+                                 mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu'):
+    if use_fp8_dispatch is not None:
+        assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+        assert mma_type.split('x')[0] == 'fp8'
         return get_symm_buffer_for_sm90_mega_moe(
             group, num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
-            use_fp8_dispatch, activation
+            True, activation
         )
     return mega.get_symm_buffer_for_mega_moe(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        use_fp8_dispatch, activation
+        use_fp8_dispatch=use_fp8_dispatch,
+        mma_type=mma_type,
+        activation=activation
     )
 
 
@@ -423,7 +422,7 @@ from .utils import *
 # Initialize CPP modules
 _C.init(
     os.path.dirname(os.path.abspath(__file__)),
-    _find_cuda_home()
+    find_cuda_home()
 )
 
 def _read_version() -> str:

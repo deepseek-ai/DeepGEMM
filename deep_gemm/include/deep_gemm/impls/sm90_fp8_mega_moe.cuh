@@ -74,7 +74,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerLane,
           uint32_t kNumL1BlockNs, uint32_t kNumL2BlockNs,
           uint32_t kNumL1BlockKs, uint32_t kNumL2BlockKs,
-          typename L1Func, typename L2Func>
+          typename WorkspaceT, typename L1Func, typename L2Func>
 CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_block_split(
     sched::MegaMoEScheduler<BLOCK_M, BLOCK_N, BLOCK_K,
                             L1_SHAPE_N, L1_SHAPE_K,
@@ -84,7 +84,8 @@ CUTLASS_DEVICE void sm90_fp8_mega_moe_for_each_block_split(
                             kNumSMs, kNumRanks,
                             kNumExpertsPerLane,
                             kNumL1BlockNs, kNumL2BlockNs,
-                            kNumL1BlockKs, kNumL2BlockKs>& scheduler,
+                            kNumL1BlockKs, kNumL2BlockKs,
+                            WorkspaceT>& scheduler,
     L1Func&& l1_func, L2Func&& l2_func) {
     scheduler.fetch_expert_recv_count();
     scheduler.set_expert_idx(0);
@@ -210,7 +211,13 @@ sm90_fp8_mega_moe_impl(void* y,
     // Workspaces and symmetric buffer slicing (mirror SM100 layout, except SF
     // for L2 activations uses per-64 K granularity)
     // =====================================================================
-    const auto workspace = layout::Workspace(
+    constexpr uint32_t SF_BLOCK_M = math::constexpr_align(BLOCK_M, 128u);
+    constexpr uint32_t kNumPoolBlocks = kNumMaxPoolTokens / BLOCK_M;
+    DG_STATIC_ASSERT(kNumMaxPoolTokens % BLOCK_M == 0, "Invalid SM90 MegaMoE pool size");
+    DG_STATIC_ASSERT(kNumPaddedSFPoolTokens >= kNumPoolBlocks * SF_BLOCK_M,
+                     "Invalid SM90 MegaMoE SF pool capacity");
+
+    const auto workspace = layout::SM90Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
     constexpr auto fp8_token_layout              = layout::Data(kHidden);
@@ -389,12 +396,20 @@ sm90_fp8_mega_moe_impl(void* y,
     // =====================================================================
     // Scheduler (cluster=1)
     // =====================================================================
+    constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
+    constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
+    constexpr uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N;
+    constexpr uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K;
+    constexpr uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K;
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumSMs, kNumRanks,
+        kNumExpertsPerLane, kNumL1BlockNs, kNumL2BlockNs,
+        kNumL1BlockKs, kNumL2BlockKs,
+        layout::SM90Workspace>(workspace);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -636,7 +651,9 @@ sm90_fp8_mega_moe_impl(void* y,
                     input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
                     current_rank_in_expert_idx);
                 const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
-                const uint32_t sf_pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+                const uint32_t pool_block_idx = expert_pool_block_offset + token_idx_in_expert / BLOCK_M;
+                const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
+                const uint32_t sf_pool_token_idx = pool_block_idx * SF_BLOCK_M + token_idx_in_block;
                 #pragma unroll
                 for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
@@ -667,7 +684,7 @@ sm90_fp8_mega_moe_impl(void* y,
                     cute::tma_store_arrive();
                     ptx::tma_store_wait<0>();
                     ptx::red_add_rel(
-                        workspace.get_l1_arrival_count_ptr(expert_pool_block_offset + token_idx_in_expert / BLOCK_M), 1);
+                        workspace.get_l1_arrival_count_ptr(pool_block_idx), 1);
                 }
                 __syncwarp();
             }
@@ -753,7 +770,6 @@ sm90_fp8_mega_moe_impl(void* y,
                     while (ptx::ld_acq(ptr) != expected);
                 } else {
                     const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                    // Each L1 N block sets one bit; total bits = L1_SHAPE_N / BLOCK_N.
                     const uint64_t expected = (kNumL1BlockNs >= 64)
                         ? ~0ull : ((1ull << kNumL1BlockNs) - 1ull);
                     while (ptx::ld_acq_gpu(ptr) != expected);
@@ -764,6 +780,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 if (cute::elect_one_sync()) {
                     const uint32_t m_idx = pool_block_idx * BLOCK_M;
+                    const uint32_t sfa_m_idx = pool_block_idx * SF_BLOCK_M;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
                     // TMA load A
@@ -776,7 +793,7 @@ sm90_fp8_mega_moe_impl(void* y,
                         // L1 SFA per-128: load (BLOCK_M, 1) at K=k_block_idx
                         tma::copy<BLOCK_M, 1, 0, float>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                            m_idx, k_block_idx, 1);
+                            sfa_m_idx, k_block_idx, 1);
                         full_barriers[stage_idx]->arrive_and_expect_tx(
                             SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(float));
                     } else {
@@ -785,11 +802,11 @@ sm90_fp8_mega_moe_impl(void* y,
                         // 0 and BLOCK_M to match math's load offsets (`+ 0 * BLOCK_M` / `+ 1 * BLOCK_M`).
                         tma::copy<BLOCK_M, 1, 0, float>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                            m_idx, k_block_idx * 2, 1);
+                            sfa_m_idx, k_block_idx * 2, 1);
                         tma::copy<BLOCK_M, 1, 0, float>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx],
                             smem_sfa[stage_idx] + BLOCK_M,
-                            m_idx, k_block_idx * 2 + 1, 1);
+                            sfa_m_idx, k_block_idx * 2 + 1, 1);
                         full_barriers[stage_idx]->arrive_and_expect_tx(
                             SMEM_A_SIZE_PER_STAGE + 2 * BLOCK_M * sizeof(float));
                     }
@@ -1597,8 +1614,8 @@ sm90_fp8_mega_moe_impl(void* y,
                     auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
                     // SF buffer is (kNumPaddedSFPoolTokens x kIntermediateHidden/64), MN-major:
                     //   addr[k_idx * num_padded_sf_pool_tokens + token_idx]
-                    const uint32_t token_r0 = pool_block_idx * BLOCK_M + row_offset_r0;
-                    const uint32_t token_r1 = pool_block_idx * BLOCK_M + row_offset_r1;
+                    const uint32_t token_r0 = pool_block_idx * SF_BLOCK_M + row_offset_r0;
+                    const uint32_t token_r1 = pool_block_idx * SF_BLOCK_M + row_offset_r1;
                     const uint32_t k_sf_idx = sf_n_block_idx;  // one per-64 post-SwiGLU group
                     if (valid_r0)
                         sf_base_ptr[k_sf_idx * kNumPaddedSFPoolTokens + token_r0] = sf_r0;

@@ -14,6 +14,8 @@ except Exception as exception:
 
 from .. import _C
 
+_MAX_CANDIDATE_BLOCK_M = 192
+
 
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
@@ -84,9 +86,15 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
     if num_max_tokens_per_rank >= 6144:
         # We assume must be prefill (decode cannot have such size)
-        # We try to give ~8 GB budget (within V4 Pro config)
-        # And batch size is mostly stable, to save buffer size, we use 1 expert per wave
-        num_ring_tokens = align(768 * 1024, _C.get_token_alignment_for_mega_moe())
+        # Use the full-pool capacity so prefill keeps the tuned non-wrapping
+        # access pattern from the original MegaMoE implementation.
+        num_experts_per_rank = num_experts // group.size()
+        num_max_recv_tokens = group.size() * num_max_tokens_per_rank
+        num_max_experts_per_token = min(num_topk, num_experts_per_rank)
+        num_ring_tokens = align(
+            num_max_recv_tokens * num_max_experts_per_token +
+            num_experts_per_rank * (_MAX_CANDIDATE_BLOCK_M - 1),
+            _C.get_token_alignment_for_mega_moe())
     else:
         # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
         # the wave heuristics can select the best number of experts per wave

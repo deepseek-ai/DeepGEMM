@@ -21,7 +21,8 @@ get_symm_buffer_size_for_sm90_mega_moe(
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
 
-    const auto workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
+    const auto workspace = layout::SM90Workspace(
+        nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
 
     const auto fp8_token_layout = layout::Data(hidden);
     const auto bf16_token_layout = layout::Data(hidden * 2);
@@ -50,7 +51,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
     for (int block_m: layout::kCandidateBlockM) {
         num_max_padded_sf_pool_tokens = std::max(
             num_max_padded_sf_pool_tokens,
-            layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m)
+            layout::get_num_sf_ring_tokens(num_max_pool_tokens, block_m)
         );
     }
 

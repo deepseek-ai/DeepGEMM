@@ -103,7 +103,7 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
         if (num_expected_tokens_per_expert <= 8.5) {
             // Really small token-per-expert (e.g. RL long-tail rollout), use larger BLOCK_K for less synchronization.
             // Under kind::mxf4, bump block_m so the dense FP4 A/B smem tiles remain comfortably aligned.
-            return use_mxf4_kind ? std::tuple<int, int, int, int, int>{2, 32, 16, 256, 2}
+            return use_mxf4_kind ? std::tuple<int, int, int, int, int>{2, 32, 16, 128, 2}
                                  : std::tuple<int, int, int, int, int>{2, 16, 8, 256, 2};
         } else if (num_expected_tokens_per_expert <= 16.5) {
             // Small batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 128
@@ -123,6 +123,13 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
         }
     }();
     block_k /= get_num_mma_elem_bytes(mma_kind);
+    if (mma_kind == MmaKind::MXFP8FP4 and not use_mxf4_kind) {
+        // K-major SM100 descriptors only support swizzles up to 128 bytes.
+        // The non-MXF4 FP8/FP4 path stores both operands as 1 byte per K
+        // element in smem, so a 256-element tile would require an illegal
+        // 256-byte swizzle.
+        block_k = std::min(block_k, 128);
+    }
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -274,6 +281,10 @@ static MegaMoEConfig get_mega_moe_config(
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
     const int gran_k = 32;
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+        num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+    const bool use_full_pool_fp8_fp4_path =
+        mma_kind == MmaKind::MXFP8FP4 and num_ring_tokens >= num_max_pool_tokens;
 
     // Waves: clamp by pool capacity
     // TODO: more delicated wave calculation for BF16
@@ -289,8 +300,10 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Pull: divide token bytes by 2 until <= kPullThreshold
     constexpr int kPullThreshold = 4096;
-    int num_bytes_per_pull = use_fp4_acts ? (hidden / 2) : hidden * get_num_mma_elem_bytes(mma_kind);
-    while (num_bytes_per_pull > kPullThreshold) {
+    int num_bytes_per_pull = use_full_pool_fp8_fp4_path ?
+        hidden * get_num_mma_elem_bytes(mma_kind) :
+        (use_fp4_acts ? (hidden / 2) : hidden * get_num_mma_elem_bytes(mma_kind));
+    while (not use_full_pool_fp8_fp4_path and num_bytes_per_pull > kPullThreshold) {
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;
     }

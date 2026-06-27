@@ -41,7 +41,7 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$PKG_DIR"
 
 cp sgl_deep_gemm/LICENSE sgl_deep_gemm/README.md sgl_deep_gemm/pyproject.toml "$BUILD_DIR/"
-cp sgl_deep_gemm/__init__.py "$PKG_DIR/"
+cp sgl_deep_gemm/__init__.py sgl_deep_gemm/cuda_helpers.py "$PKG_DIR/"
 
 # `__init__.py` imports `.utils`, `.testing`, `.legacy`, `.mega` — pulled from
 # the existing deep_gemm/ tree.
@@ -66,6 +66,7 @@ echo "Version: $(cat "$PKG_DIR/VERSION")"
 
 echo "--- Compiling _C.so ---"
 ROOT_DIR="$ROOT_DIR" PKG_DIR="$PKG_DIR" "$PYTHON_EXE" -u - <<'PY'
+import importlib.util
 import os, shutil, subprocess, sys, sysconfig
 root_dir = os.environ['ROOT_DIR']
 pkg_dir = os.environ['PKG_DIR']
@@ -87,10 +88,15 @@ subprocess.run = _streamed_run
 
 import torch
 import tvm_ffi.cpp
-from setup import _find_cuda_home, _get_cuda_arch
 
-cuda_home = _find_cuda_home()
-os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', _get_cuda_arch())
+helpers_path = os.path.join(root_dir, 'sgl_deep_gemm', 'cuda_helpers.py')
+helpers_spec = importlib.util.spec_from_file_location('sgl_deep_gemm_cuda_helpers', helpers_path)
+cuda_helpers = importlib.util.module_from_spec(helpers_spec)
+assert helpers_spec.loader is not None
+helpers_spec.loader.exec_module(cuda_helpers)
+
+cuda_home = cuda_helpers.find_cuda_home()
+os.environ.setdefault('TVM_FFI_CUDA_ARCH_LIST', cuda_helpers.get_cuda_arch())
 
 cxx_abi = int(torch.compiled_with_cxx11_abi())
 extra_cflags = [

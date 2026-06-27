@@ -64,7 +64,8 @@ static std::tuple<int, int> get_block_config_for_mega_moe_sm90(
 
 static int get_num_experts_per_wave_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
+    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
+    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     if (expected_tokens_per_expert < 1.0f or expected_tokens_per_expert > 4.0f)
@@ -79,7 +80,8 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
     }
     return get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
+        intermediate_hidden, block_m, block_n, num_sms,
+        num_ring_tokens, num_max_tokens_per_rank, num_ranks);
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
@@ -145,7 +147,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
     const int num_sms = device_runtime->get_num_sms();
     const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
         num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
+        intermediate_hidden, block_m, block_n, num_sms,
+        num_max_pool_tokens, num_max_tokens_per_rank, num_ranks);
 
     const bool reduce_decode_threads = num_epilogue_threads == 128;
     const bool decode_split_n =

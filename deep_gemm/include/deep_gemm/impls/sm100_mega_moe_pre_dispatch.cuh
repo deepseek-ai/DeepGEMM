@@ -5,7 +5,6 @@
 #include <cuda/std/cstdint>
 
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/common/reduction.cuh>
 #include <deep_gemm/common/utils.cuh>
 
 namespace deep_gemm {
@@ -108,8 +107,8 @@ __global__ void mega_moe_pre_dispatch_kernel(
         // Reduce absmax across the kThreadsPerGroup threads that cover one
         // group. Lanes outside the group keep their own value (different
         // group's max), so SF write below is gated to one thread per group.
-        local_max = warp_reduce<kThreadsPerGroup, /*kIntergroupReduce=*/false>(
-            local_max, ReduceMax<float>{});
+        local_max = math::warp_reduce<kThreadsPerGroup, /*kIntergroupReduce=*/false>(
+            local_max, math::ReduceMax<float>{});
 
         // Match host `per_token_cast_to_fp4/fp8`: clamp absmax to 1e-4
         // before dividing by the dtype's max representable value.

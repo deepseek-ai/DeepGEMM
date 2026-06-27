@@ -85,6 +85,27 @@ sm100_bf16_mega_moe_impl(void* y,
     // Workspaces
     const auto workspace = layout::Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk, kNumRingTokens);
+    constexpr uint32_t kNumMaxPoolTokens = layout::get_num_max_pool_tokens<uint32_t>(
+        kNumRanks, kNumMaxTokensPerRank, kNumTopk, kNumExpertsPerRank);
+    constexpr bool kRingCoversFullPool = kNumRingTokens >= kNumMaxPoolTokens;
+    const auto get_ring_block_idx = [](const uint32_t& pool_block_idx) {
+        if constexpr (kRingCoversFullPool)
+            return pool_block_idx;
+        else
+            return pool_block_idx % kNumRingBlocks;
+    };
+    const auto get_ring_token_idx = [](const uint32_t& pool_token_idx) {
+        if constexpr (kRingCoversFullPool)
+            return pool_token_idx;
+        else
+            return pool_token_idx % kNumRingTokens;
+    };
+    const auto get_ring_wave_idx = [](const uint32_t& pool_block_idx) {
+        if constexpr (kRingCoversFullPool)
+            return 0u;
+        else
+            return pool_block_idx / kNumRingBlocks;
+    };
 
     // Token and buffer layouts
     constexpr auto bf16_token_layout = layout::Data(kHidden * sizeof(nv_bfloat16));
@@ -484,15 +505,17 @@ sm100_bf16_mega_moe_impl(void* y,
 
             // Wait for ring buffer slot to be available (previous consumer must have finished all N blocks)
             constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
-            const auto l1_empty_count_target = (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
-            if (l1_empty_count_target > 0) {
-                const auto empty_ptr = workspace.get_l1_empty_count_ptr(pool_block_idx % kNumRingBlocks);
-                while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+            if constexpr (not kRingCoversFullPool) {
+                const auto l1_empty_count_target = get_ring_wave_idx(pool_block_idx) * kNumL1BlockNs;
+                if (l1_empty_count_target > 0) {
+                    const auto empty_ptr = workspace.get_l1_empty_count_ptr(get_ring_block_idx(pool_block_idx));
+                    while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+                }
             }
 
             const auto src_base_ptr = sym_buffer.map(
                 input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
-            const auto dst_base_ptr = l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
+            const auto dst_base_ptr = l1_token_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
                 ptx::tma_store_1d(
@@ -522,7 +545,7 @@ sm100_bf16_mega_moe_impl(void* y,
                 const auto weight = *sym_buffer.map(
                     input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
                     current_rank_in_expert_idx);
-                *l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
+                *l1_topk_weights_buffer.get_data_buffer(get_ring_token_idx(pool_token_idx)).template get_base_ptr<float>() = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
@@ -532,7 +555,7 @@ sm100_bf16_mega_moe_impl(void* y,
                 issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
-                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
+                    workspace.get_l1_full_count_ptr(get_ring_block_idx(pool_block_idx)),
                     is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
                 );
             }
@@ -580,10 +603,11 @@ sm100_bf16_mega_moe_impl(void* y,
 
                 // Clean L1 and L2 full stuffs and ring buffer counts
                 for (uint32_t j = thread_idx; j < num_recv_m_blocks; j += kNumDispatchThreads) {
-                    *workspace.get_l1_full_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l1_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l2_full_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
-                    *workspace.get_l2_empty_count_ptr((expert_pool_block_offset + j) % kNumRingBlocks) = 0;
+                    const auto ring_block_idx = get_ring_block_idx(expert_pool_block_offset + j);
+                    *workspace.get_l1_full_count_ptr(ring_block_idx) = 0;
+                    *workspace.get_l1_empty_count_ptr(ring_block_idx) = 0;
+                    *workspace.get_l2_full_count_ptr(ring_block_idx) = 0;
+                    *workspace.get_l2_empty_count_ptr(ring_block_idx) = 0;
                 }
                 __syncwarp();
             }
@@ -613,16 +637,16 @@ sm100_bf16_mega_moe_impl(void* y,
 
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t ring_block_idx = get_ring_block_idx(pool_block_idx);
 
             // Wait the token arrival
             if (block_phase == sched::BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_full_count_ptr(ring_block_idx);
-                const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
+                const auto num_expected_tokens = BLOCK_M * (get_ring_wave_idx(pool_block_idx) + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
             } else {
                 const auto ptr = workspace.get_l2_full_count_ptr(ring_block_idx);
-                const auto num_expected_blocks = L2_SHAPE_K / (BLOCK_N / 2) * (pool_block_idx / kNumRingBlocks + 1);
+                const auto num_expected_blocks = L2_SHAPE_K / (BLOCK_N / 2) * (get_ring_wave_idx(pool_block_idx) + 1);
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
             }
 
@@ -835,16 +859,18 @@ sm100_bf16_mega_moe_impl(void* y,
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
             const uint32_t valid_m = ptx::exchange(scheduler.template get_valid_m<false>(), 0);
             const uint32_t pool_block_idx = scheduler.get_current_pool_block_offset() + m_block_idx;
-            const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+            const uint32_t ring_block_idx = get_ring_block_idx(pool_block_idx);
             const uint32_t ring_m_idx = ring_block_idx * BLOCK_M;  // Ring-buffer offset for reusable data buffers
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;       // Full-pool offset for non-ring metadata
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
             if (block_phase == sched::BlockPhase::Linear1) {
                 // Wait L2 block empty
-                const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
-                const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
-                while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
+                if constexpr (not kRingCoversFullPool) {
+                    const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
+                    const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * get_ring_wave_idx(pool_block_idx);
+                    while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
+                }
 
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
@@ -973,16 +999,20 @@ sm100_bf16_mega_moe_impl(void* y,
                     ptx::red_add_rel(
                         workspace.get_l2_full_count_ptr(ring_block_idx), 1u);
 
-                    // Increment L1 empty count for this physical slot (one per N block)
-                    ptx::red_add(
-                        workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                    if constexpr (not kRingCoversFullPool) {
+                        // Increment L1 empty count for this physical slot (one per N block)
+                        ptx::red_add(
+                            workspace.get_l1_empty_count_ptr(ring_block_idx), 1u);
+                    }
                 }
                 __syncwarp();
             } else {
                 // Increment L2 empty count for this physical slot (one per N block)
-                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                    ptx::red_add(
-                        workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
+                if constexpr (not kRingCoversFullPool) {
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        ptx::red_add(
+                            workspace.get_l2_empty_count_ptr(ring_block_idx), 1u);
+                    }
                 }
                 __syncwarp();
 

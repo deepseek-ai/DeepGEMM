@@ -65,10 +65,17 @@ try:
         return _get_C().get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
 
     def get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-            sf: torch.Tensor, ks_tensor: torch.Tensor, ks: list[int], gran_k: int) -> torch.Tensor:
+            sf: torch.Tensor,
+            grouped_layout: torch.Tensor,
+            ks: Optional[list[int]],
+            gran_k: int,
+            k_alignment: Optional[int] = None,
+            use_psum_layout: bool = False) -> torch.Tensor:
         """Pack k-grouped FP32 scaling factors into UE8M0 int32 in MN-major TMA-aligned layout."""
+        if k_alignment is None:
+            k_alignment = get_mk_alignment_for_contiguous_layout()
         return _get_C().get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
-            sf, ks_tensor, ks, gran_k)
+            sf, grouped_layout, [] if ks is None else ks, gran_k, k_alignment, use_psum_layout)
 
 except AttributeError:
     pass
