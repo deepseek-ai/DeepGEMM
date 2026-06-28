@@ -155,10 +155,15 @@ static FP4SM90APIDefaults get_fp4_sm90_api_defaults(
           expected_tokens_per_expert >= 0.375f and expected_tokens_per_expert < 0.75f) or
          (fp4_pro_shape and
           expected_tokens_per_expert >= 0.25f and expected_tokens_per_expert < 0.375f));
+    // swapAB on/off kill-switch (default ON). Set DG_SM90_FP4_SWAP_AB=0 to force
+    // the non-swap path for A/B accuracy comparison.
+    const bool swap_ab_env_enabled = get_env<int>("DG_SM90_FP4_SWAP_AB", 1) != 0;
     const bool default_swap_ab =
+        swap_ab_env_enabled and
         (fp4_flash_shape or fp4_pro_shape) and
         expected_tokens_per_expert > 0.0f and expected_tokens_per_expert <= 24.0f;
     const bool default_swap_ab_fast_amax =
+        swap_ab_env_enabled and
         fp4_pro_shape and
         expected_tokens_per_expert >= 12.0f and expected_tokens_per_expert <= 24.0f;
     return {

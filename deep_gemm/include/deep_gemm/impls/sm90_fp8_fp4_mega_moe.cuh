@@ -1945,10 +1945,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             const float weight_0 = *l1_topk_weights_buffer
                                 .get_data_buffer(m_idx + token_0)
                                 .get_base_ptr<float>();
-                            v0 = silu(g0) * u0 * weight_0;
                             if constexpr (kSwapABFastAmaxActive) {
+                                v0 = silu(g0) * u0 * weight_0;
                                 swap_v0[i] = v0;
                             } else {
+                                v0 = silu(g0) * u0;
                                 smem_cd_swap_l1_fp32[token_0 * L1_OUT_BLOCK_N + out_col_base] = v0;
                             }
                         }
@@ -1962,10 +1963,11 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                             const float weight_1 = *l1_topk_weights_buffer
                                 .get_data_buffer(m_idx + token_1)
                                 .get_base_ptr<float>();
-                            v1 = silu(g1) * u1 * weight_1;
                             if constexpr (kSwapABFastAmaxActive) {
+                                v1 = silu(g1) * u1 * weight_1;
                                 swap_v1[i] = v1;
                             } else {
+                                v1 = silu(g1) * u1;
                                 smem_cd_swap_l1_fp32[token_1 * L1_OUT_BLOCK_N + out_col_base] = v1;
                             }
                         }
@@ -2047,11 +2049,13 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
                                 const float v = smem_cd_swap_l1_fp32[token * L1_OUT_BLOCK_N + col];
                                 amax = cute::max(amax, cute::abs(v));
                             }
+                            const float wtok = *l1_topk_weights_buffer.get_data_buffer(m_idx + token).get_base_ptr<float>();
+                            amax *= cute::abs(wtok);
                             float2 amax_pair = {amax, amax};
                             float2 sf_pair, sf_inv_pair;
                             sm90_fp8_fp4_mega_moe_get_e4m3_sf_and_sf_inv(amax_pair, sf_pair, sf_inv_pair);
                             const float sf = sf_pair.x;
-                            const float sf_inv = sf_inv_pair.x;
+                            const float sf_inv = wtok * sf_inv_pair.x;
 
                             auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
                             const uint32_t token_idx = pool_block_idx * BLOCK_M + token;
