@@ -166,6 +166,12 @@ CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {
     return ret;
 }
 
+CUTLASS_DEVICE void st_global_v4_u32(uint4* ptr, const uint4& value) {
+    asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w)
+                 : "memory");
+}
+
 CUTLASS_DEVICE uint32_t ld_acq(const uint32_t* ptr) {
     uint32_t ret;
     asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));

@@ -1,6 +1,6 @@
 import torch
 import types
-from typing import Tuple, Optional
+from typing import List, Tuple, Optional
 from ..utils.math import align
 
 # noinspection PyBroadException
@@ -20,7 +20,8 @@ class SymmBuffer:
                  num_max_tokens_per_rank: int, num_topk: int,
                  hidden: int, intermediate_hidden: int,
                  use_fp8_dispatch: bool = True,
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 split: bool = False):
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -28,8 +29,12 @@ class SymmBuffer:
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
 
-        # Allocate a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
+        # Allocate a symmetric buffer. The split-kernel pipeline reserves a slightly larger
+        # bookkeeping region (route-based dispatch metadata), so it has its own sizing; the
+        # input/pool/combine layout is identical, so inputs/outputs stay comparable to fused.
+        size_fn = (_C.get_symm_buffer_size_for_mega_moe_split if split
+                   else _C.get_symm_buffer_size_for_mega_moe)
+        num_bytes, slice_input_buffers = size_fn(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
@@ -130,3 +135,83 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
+
+
+def get_symm_buffer_for_mega_moe_split(group: dist.ProcessGroup,
+                                       num_experts: int,
+                                       num_max_tokens_per_rank: int, num_topk: int,
+                                       hidden: int, intermediate_hidden: int,
+                                       use_fp8_dispatch: bool = True,
+                                       activation: str = 'swiglu') -> SymmBuffer:
+    # Symmetric buffer for the split-kernel pipeline (route-based dispatch bookkeeping region).
+    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+    return SymmBuffer(
+        group, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        use_fp8_dispatch, activation,
+        split=True
+    )
+
+
+class SM100FP8FP4MegaMoESplitGraph:
+    """CUDA graph for the split-kernel MoE forward.
+
+    Wires three kernels into one graph using green contexts: dispatch_l1_swiglu (K1, gather +
+    Linear1 + SwiGLU) and l2_combine (K2, Linear2 + NVLink combine) run concurrently on disjoint
+    SM partitions (`kernel1_sms` / `kernel2_sms`), coupled through an in-HBM arrival mask;
+    combine_reduce (K3, top-k reduce) runs on `reduce_sms` after both. Requires CUDA Runtime 13.1+.
+    """
+    def __init__(self,
+                 states: List[torch.Tensor],
+                 ys: List[torch.Tensor],
+                 sym_buffers: List[SymmBuffer],
+                 l1_weights: List[Tuple[torch.Tensor, torch.Tensor]],
+                 l2_weights: List[Tuple[torch.Tensor, torch.Tensor]],
+                 stats: List[torch.Tensor],
+                 num_tokens: int,
+                 activation_clamp: float,
+                 fast_math: bool,
+                 kernel1_sms: int,
+                 kernel2_sms: int,
+                 reduce_sms: int,
+                 kernel2_work_iters: int,
+                 reduce_work_iters: int):
+        assert len(states) == len(ys) == len(sym_buffers) == len(l1_weights) == len(l2_weights) == len(stats)
+        raw_sym_buffers = [buffer.buffer for buffer in sym_buffers]
+        sym_buffer_ptrs = [buffer.handle.buffer_ptrs for buffer in sym_buffers]
+        l1_weight_tensors = [weight_pair[0] for weight_pair in l1_weights]
+        l1_weight_sf_tensors = [weight_pair[1] for weight_pair in l1_weights]
+        l2_weight_tensors = [weight_pair[0] for weight_pair in l2_weights]
+        l2_weight_sf_tensors = [weight_pair[1] for weight_pair in l2_weights]
+        first_buffer = sym_buffers[0]
+        self._impl = _C.SM100FP8FP4MegaMoESplitGraph(
+            states,
+            ys,
+            raw_sym_buffers,
+            sym_buffer_ptrs,
+            l1_weight_tensors,
+            l1_weight_sf_tensors,
+            l2_weight_tensors,
+            l2_weight_sf_tensors,
+            stats,
+            first_buffer.group.rank(),
+            first_buffer.num_max_tokens_per_rank,
+            first_buffer.num_experts,
+            first_buffer.num_topk,
+            num_tokens,
+            first_buffer.hidden,
+            first_buffer.intermediate_hidden,
+            activation_clamp,
+            fast_math,
+            kernel1_sms,
+            kernel2_sms,
+            reduce_sms,
+            kernel2_work_iters,
+            reduce_work_iters)
+
+    def replay(self):
+        self._impl.replay()
+
+    def get_green_context_ids(self):
+        return self._impl.get_green_context_ids()

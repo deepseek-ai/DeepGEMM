@@ -84,8 +84,10 @@ except ImportError:
 from .mega import (
     SymmBuffer,
     get_symm_buffer_for_mega_moe,
+    get_symm_buffer_for_mega_moe_split,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
+    SM100FP8FP4MegaMoESplitGraph,
 )
 
 # Some utils
