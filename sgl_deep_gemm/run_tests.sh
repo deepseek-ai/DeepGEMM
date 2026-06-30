@@ -136,6 +136,7 @@ MEGA_MOE_BLACKWELL=(
 MEGA_MOE_HOPPER=(
   test_mega_moe_hopper.py
   test_mega_moe_pre_dispatch_sm90.py
+  test_mega_moe_fp4_hopper.py
 )
 MEGA_MOE_ALL=(
   "${MEGA_MOE_BLACKWELL[@]}"
