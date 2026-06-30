@@ -227,3 +227,20 @@ def mega_moe_pre_dispatch(x: torch.Tensor,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
         num_tokens, group_size, use_fp4_acts,
     )
+
+
+def mega_moe_pre_dispatch_sm90(x: torch.Tensor,
+                               topk_idx: torch.Tensor,
+                               topk_weights: torch.Tensor,
+                               buf_x: torch.Tensor,
+                               buf_x_sf: torch.Tensor,
+                               buf_topk_idx: torch.Tensor,
+                               buf_topk_weights: torch.Tensor,
+                               num_tokens: int,
+                               group_size: int = 128,
+                               routed_scaling_factor: float = 1.0) -> None:
+    _C.mega_moe_pre_dispatch_sm90(
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, float(routed_scaling_factor),
+    )

@@ -44,6 +44,7 @@ public:
         bool l2_arrival_counter;
         bool l2_epilogue_requires_full_sync;
         bool split_phase_hot_path;
+        bool use_swap_ab;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -93,6 +94,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -113,7 +115,8 @@ static void __instantiate_kernel() {{
     args.reuse_accum_as_final ? "true" : "false",
     args.l2_arrival_counter ? "true" : "false",
     args.l2_epilogue_requires_full_sync ? "true" : "false",
-    args.split_phase_hot_path ? "true" : "false");
+    args.split_phase_hot_path ? "true" : "false",
+    args.use_swap_ab ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -187,6 +190,9 @@ static void sm90_fp8_mega_moe(
         default_split_mn_barrier_opt or decode_l2_counter;
     const bool l2_epilogue_requires_full_sync =
         not l2_arrival_counter;
+    const bool use_swap_ab = should_use_swap_ab_for_mega_moe_sm90(
+        num_experts_per_rank, num_tokens, num_topk,
+        config.block_m, config.num_epilogue_threads);
 
     // Tensormap construction
     // Acts/weights: standard 2D TMA descriptors (FP8 K-major).
@@ -280,6 +286,7 @@ static void sm90_fp8_mega_moe(
         .l2_arrival_counter = l2_arrival_counter,
         .l2_epilogue_requires_full_sync = l2_epilogue_requires_full_sync,
         .split_phase_hot_path = split_phase_hot_path,
+        .use_swap_ab = use_swap_ab,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

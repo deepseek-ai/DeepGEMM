@@ -4,11 +4,30 @@
 
 #include "mega.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
+#include "../jit_kernels/impls/sm90_mega_moe_pre_dispatch.hpp"
 
 namespace deep_gemm::mega {
 
 static int get_token_alignment_for_sm90_mega_moe() {
     return layout::kLCMCandidateBlockM;
+}
+
+static void mega_moe_pre_dispatch_sm90(
+    const torch::Tensor& x,
+    const torch::Tensor& topk_idx,
+    const torch::Tensor& topk_weights,
+    const torch::Tensor& buf_x,
+    const torch::Tensor& buf_x_sf,
+    const torch::Tensor& buf_topk_idx,
+    const torch::Tensor& buf_topk_weights,
+    const int& num_tokens,
+    const int& group_size,
+    const float& routed_scaling_factor) {
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
+    sm90_mega_moe_pre_dispatch(
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, routed_scaling_factor);
 }
 
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
