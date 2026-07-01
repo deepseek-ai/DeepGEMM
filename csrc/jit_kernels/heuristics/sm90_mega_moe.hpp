@@ -267,7 +267,8 @@ static int get_default_num_stages_cap_for_mega_moe_sm90_fp4(
 
 static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
-    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms) {
+    const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
+    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const bool fp4_small_block_n_kernel =
@@ -323,7 +324,8 @@ static int get_num_experts_per_wave_for_mega_moe_sm90_fp4(
     }
     return get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
+        intermediate_hidden, block_m, block_n, num_sms,
+        num_ring_tokens, num_max_tokens_per_rank, num_ranks);
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90_fp4(
@@ -448,7 +450,8 @@ static MegaMoESM90Config get_mega_moe_config_sm90_fp4(
     const int num_sms = device_runtime->get_num_sms();
     int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90_fp4(
         num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
+        intermediate_hidden, block_m, block_n, num_sms,
+        num_max_pool_tokens, num_max_tokens_per_rank, num_ranks);
 
     const bool fp4_small_block_n_kernel =
         block_m == 64 and block_n == 128;

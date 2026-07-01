@@ -428,7 +428,7 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // Workspaces and symmetric buffer slicing (mirror SM100 layout, except SF
     // for L2 activations uses per-64 K granularity)
     // =====================================================================
-    const auto workspace = layout::Workspace(
+    const auto workspace = layout::SM90Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank, kNumTopk);
 
     constexpr auto fp8_token_layout              = SM90FP8FP4MegaMoEData(kHidden);
@@ -752,13 +752,20 @@ sm90_fp8_fp4_mega_moe_impl(void* y,
     // =====================================================================
     // Scheduler
     // =====================================================================
+    constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
+    constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
+    constexpr uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N;
+    constexpr uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K;
+    constexpr uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K;
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
-    constexpr uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
+        kNumSMs, kNumRanks,
+        kNumExpertsPerLane, kNumL1BlockNs, kNumL2BlockNs,
+        kNumL1BlockKs, kNumL2BlockKs,
+        layout::SM90Workspace>(workspace);
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
