@@ -1692,7 +1692,13 @@ sm90_fp8_mega_moe_impl(void* y,
                         const float sf_inv = sf_inv_pair.x;
 
                         auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
-                        const uint32_t token_idx = pool_block_idx * BLOCK_M + token;
+                        // ROOT-CAUSE FIX: the L2-activation SF pool is strided by SF_BLOCK_M
+                        // (=align(BLOCK_M,128)=128), which is how the L2 producer reads it
+                        // (sfa_m_idx = pool_block_idx * SF_BLOCK_M) and how the non-swap L1
+                        // writes it. This swapAB path used BLOCK_M (64), so for pool_block_idx>=1
+                        // the SF landed in the wrong rows -> L2 read stale SF -> every pool block
+                        // after the first was corrupted (block 0 was correct because 0*64==0*128).
+                        const uint32_t token_idx = pool_block_idx * SF_BLOCK_M + token;
                         sf_base_ptr[n_block_idx * kNumPaddedSFPoolTokens + token_idx] = sf;
 
                         #pragma unroll

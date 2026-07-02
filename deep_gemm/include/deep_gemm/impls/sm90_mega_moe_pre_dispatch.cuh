@@ -4,7 +4,8 @@
 #include <cuda_fp8.h>
 #include <cuda/std/cstdint>
 
-#include <deep_gemm/common/reduction.cuh>
+#include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/utils.cuh>
 
 namespace deep_gemm {
 
@@ -53,8 +54,8 @@ __global__ void sm90_mega_moe_pre_dispatch_kernel(
             local_max = fmaxf(local_max, fmaxf(fabsf(fp.x), fabsf(fp.y)));
         }
 
-        local_max = warp_reduce<kThreadsPerGroup, false>(
-            local_max, ReduceMax<float>{});
+        local_max = math::warp_reduce<kThreadsPerGroup, false>(
+            local_max, math::ReduceMax<float>{});
 
         const float absmax = fmaxf(local_max, 1e-10f);
         const float raw_scale = absmax / 448.0f;

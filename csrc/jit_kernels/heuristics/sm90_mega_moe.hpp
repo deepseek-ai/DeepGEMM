@@ -86,6 +86,11 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
 static bool should_use_swap_ab_for_mega_moe_sm90(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& block_m, const int& num_epilogue_threads) {
+    // swapAB is ENABLED by default (the L1 SF-pool stride bug that corrupted
+    // pool blocks >= 1 was fixed: BLOCK_M -> SF_BLOCK_M in the swapAB L1 epilogue).
+    // Kill-switch retained: set DG_SM90_FP8_SWAP_AB=0 to force the non-swap path.
+    if (get_env<int>("DG_SM90_FP8_SWAP_AB", 1) == 0)
+        return false;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens) * num_topk / num_experts_per_rank;
     const bool decode_split_n_path =
