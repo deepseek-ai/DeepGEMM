@@ -26,7 +26,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
-          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K>
+          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
+          typename WorkspaceT = layout::Workspace>
 struct MegaMoEScheduler {
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
@@ -41,7 +42,7 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumL2BlockNs % 2 == 0, "L2 N block count must be even for 2-CTA cluster");
 
     // Arrival counts
-    const layout::Workspace& workspace;
+    const WorkspaceT& workspace;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
@@ -58,7 +59,7 @@ struct MegaMoEScheduler {
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit MegaMoEScheduler(const WorkspaceT& workspace): workspace(workspace) {
         block_idx = blockIdx.x;
     }
 

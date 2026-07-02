@@ -1,7 +1,7 @@
 // TODO: merge this file with `math.cuh` (the device part)
 #pragma once
 
-#include <torch/python.h>
+#include <torch/torch.h>
 
 #include "exception.hpp"
 

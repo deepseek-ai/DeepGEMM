@@ -14,6 +14,8 @@ except Exception as exception:
 
 from .. import _C
 
+_MAX_CANDIDATE_BLOCK_M = 192
+
 
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
@@ -51,11 +53,12 @@ class SymmBuffer:
         self.group.barrier()
         torch.cuda.synchronize()
 
-        # Create input buffer views
+        # Create input buffer views (as torch tensors, not tvm-ffi tensors).
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+         self.l2_acts, self.l2_acts_sf) = map(
+            torch.from_dlpack, slice_input_buffers(self.buffer))
 
     def destroy(self):
         self.handle = None
@@ -83,9 +86,15 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
     if num_max_tokens_per_rank >= 6144:
         # We assume must be prefill (decode cannot have such size)
-        # We try to give ~8 GB budget (within V4 Pro config)
-        # And batch size is mostly stable, to save buffer size, we use 1 expert per wave
-        num_ring_tokens = align(768 * 1024, _C.get_token_alignment_for_mega_moe())
+        # Use the full-pool capacity so prefill keeps the tuned non-wrapping
+        # access pattern from the original MegaMoE implementation.
+        num_experts_per_rank = num_experts // group.size()
+        num_max_recv_tokens = group.size() * num_max_tokens_per_rank
+        num_max_experts_per_token = min(num_topk, num_experts_per_rank)
+        num_ring_tokens = align(
+            num_max_recv_tokens * num_max_experts_per_token +
+            num_experts_per_rank * (_MAX_CANDIDATE_BLOCK_M - 1),
+            _C.get_token_alignment_for_mega_moe())
     else:
         # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
         # the wave heuristics can select the best number of experts per wave
@@ -161,9 +170,12 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
+    (l1_weights_data, l1_weights_sf) = l1_weights
+    (l2_weights_data, l2_weights_sf) = l2_weights
     _C.fp8_fp4_mega_moe(
         y,
-        l1_weights, l2_weights,
+        l1_weights_data, l1_weights_sf,
+        l2_weights_data, l2_weights_sf,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
@@ -197,4 +209,38 @@ def bf16_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math,
         sym_buffer.num_ring_tokens
+    )
+
+
+def mega_moe_pre_dispatch(x: torch.Tensor,
+                          topk_idx: torch.Tensor,
+                          topk_weights: torch.Tensor,
+                          buf_x: torch.Tensor,
+                          buf_x_sf: torch.Tensor,
+                          buf_topk_idx: torch.Tensor,
+                          buf_topk_weights: torch.Tensor,
+                          num_tokens: int,
+                          group_size: int = 32,
+                          use_fp4_acts: bool = False) -> None:
+    _C.mega_moe_pre_dispatch(
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, use_fp4_acts,
+    )
+
+
+def mega_moe_pre_dispatch_sm90(x: torch.Tensor,
+                               topk_idx: torch.Tensor,
+                               topk_weights: torch.Tensor,
+                               buf_x: torch.Tensor,
+                               buf_x_sf: torch.Tensor,
+                               buf_topk_idx: torch.Tensor,
+                               buf_topk_weights: torch.Tensor,
+                               num_tokens: int,
+                               group_size: int = 128,
+                               routed_scaling_factor: float = 1.0) -> None:
+    _C.mega_moe_pre_dispatch_sm90(
+        x, topk_idx, topk_weights,
+        buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
+        num_tokens, group_size, float(routed_scaling_factor),
     )

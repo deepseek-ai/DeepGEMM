@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cuda.h>
-#include <torch/python.h>
+#include <torch/torch.h>
 
 #include "../heuristics/sm90.hpp"
 #include "../../jit/handle.hpp"
@@ -54,6 +54,7 @@ static std::string to_string(const GemmType& type) {
 static std::string to_string(const at::ScalarType& dtype) {
     switch (dtype) {
         case torch::kInt:           return "int";
+        case torch::kByte:          return "uint8_t";
         case torch::kFloat:         return "float";
         case torch::kBFloat16:      return "cutlass::bfloat16_t";
         case torch::kFloat8_e4m3fn: return "cutlass::float_e4m3_t";
@@ -80,6 +81,7 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
 
     switch (dtype) {
         case torch::kInt:           return CU_TENSOR_MAP_DATA_TYPE_INT32;
+        case torch::kByte:          return CU_TENSOR_MAP_DATA_TYPE_UINT8;
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
