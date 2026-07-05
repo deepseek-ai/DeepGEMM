@@ -49,6 +49,7 @@ def read_cases(path: str) -> list:
 
 def run_case(case: dict, args, out_dtype: torch.dtype) -> dict:
     testcase_id, m, n, k = case['testcase_id'], case['m'], case['n'], case['k']
+    total_start = time.perf_counter()
     result = {
         'testcase_id': testcase_id,
         'm': m,
@@ -58,6 +59,8 @@ def run_case(case: dict, args, out_dtype: torch.dtype) -> dict:
         'diff': '',
         'max_abs': '',
         'elapsed_ms': '',
+        'kernel_elapsed_ms': '',
+        'total_elapsed_ms': '',
         'error': '',
     }
 
@@ -101,6 +104,7 @@ def run_case(case: dict, args, out_dtype: torch.dtype) -> dict:
             'diff': f'{diff:.8f}',
             'max_abs': f'{max_abs:.8f}',
             'elapsed_ms': f'{elapsed_ms:.3f}',
+            'kernel_elapsed_ms': f'{elapsed_ms:.3f}',
             'error': '' if passed else f'Diff too large: {diff:.8f} >= {args.max_diff}',
         })
 
@@ -111,12 +115,17 @@ def run_case(case: dict, args, out_dtype: torch.dtype) -> dict:
 
     except Exception as exc:
         result['error'] = repr(exc)
+    finally:
+        result['total_elapsed_ms'] = f'{(time.perf_counter() - total_start) * 1000:.3f}'
 
     return result
 
 
 def write_results(path: str, results: list) -> None:
-    fieldnames = ['testcase_id', 'm', 'k', 'n', 'passed', 'diff', 'max_abs', 'elapsed_ms', 'error']
+    fieldnames = [
+        'testcase_id', 'm', 'k', 'n', 'passed', 'diff', 'max_abs',
+        'elapsed_ms', 'kernel_elapsed_ms', 'total_elapsed_ms', 'error',
+    ]
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'w', newline='') as f:
@@ -167,7 +176,9 @@ def main() -> None:
         status = 'PASS' if result['passed'] else 'FAIL'
         print(f" > [{idx}/{len(cases)}] {case['testcase_id']}: "
               f"m={case['m']}, n={case['n']}, k={case['k']} -> {status}, "
-              f"diff={result['diff']}, max_abs={result['max_abs']}, error={result['error']}")
+              f"diff={result['diff']}, max_abs={result['max_abs']}, "
+              f"kernel_elapsed_ms={result['kernel_elapsed_ms']}, "
+              f"total_elapsed_ms={result['total_elapsed_ms']}, error={result['error']}")
 
     write_results(args.result_csv, results)
     num_passed = sum(int(r['passed']) for r in results)
