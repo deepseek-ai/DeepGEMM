@@ -65,7 +65,10 @@ def test_gemm() -> None:
               f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
         if cublas_t > 0:
             scores.append((cublas_t + split_k_t) / t)
-    print(f"Average FP8xFP8 GEMM speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
+    if scores:
+        print(f"Average FP8xFP8 GEMM speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
+    else:
+        print("Skipped FP8xFP8 cuBLASLt speedup summary; only FP8xFP4 configs were tested.\n")
 
 
 def test_m_grouped_gemm_contiguous() -> None:

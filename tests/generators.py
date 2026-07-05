@@ -73,10 +73,9 @@ class QuantConfig:
     def get_list_from_dtype(dtype: torch.dtype) -> List:
         if dtype == torch.bfloat16:
             return [None]
-        quant_config_list = [QuantConfig()]
         if get_arch_major() == 10:
-            quant_config_list.append(QuantConfig((128, 32, False, True)))
-        return quant_config_list
+            return [QuantConfig((32, 32, False, True))]
+        return [QuantConfig()]
 
 
 def reset_seed(seed: int = 0):
@@ -127,7 +126,7 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
 
     for kernel_type in get_kernel_types(dtype):
         for quant_config in quant_config_list:
-            if len(quant_config_list) > 1:
+            if quant_config is not None and (len(quant_config_list) > 1 or not quant_config.is_legacy()):
                 quant_config.print()
             reset_seed()
 
@@ -160,7 +159,7 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
     n_k_list = [(6144, 7168), (7168, 3072), (4096, 4096), (4096, 2048)]
     for kernel_type in get_kernel_types(dtype):
         for quant_config in quant_config_list:
-            if len(quant_config_list) > 1:
+            if quant_config is not None and (len(quant_config_list) > 1 or not quant_config.is_legacy()):
                 quant_config.print()
             for use_psum_layout in get_psum_layout_usage():
                 for ensure_zero_padding in ((False, True) if use_psum_layout and get_arch_major() == 10 else (False, )):
@@ -178,7 +177,7 @@ def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
     n_k_list = [(6144, 7168), (7168, 3072), (4096, 4096), (4096, 2048)]
     for kernel_type in get_kernel_types(dtype):
         for quant_config in quant_config_list:
-            if len(quant_config_list) > 1:
+            if quant_config is not None and (len(quant_config_list) > 1 or not quant_config.is_legacy()):
                 quant_config.print()
             for use_psum_layout in get_psum_layout_usage():
                 reset_seed()
