@@ -48,8 +48,8 @@ def run_case(case: dict, out_dtype: torch.dtype, max_diff: float, accumulate: bo
     }
 
     try:
-        if k % 2 != 0:
-            raise ValueError('K must be even because FP4 packs two values per byte')
+        if k % 128 != 0:
+            raise ValueError('K must be a multiple of 128 for K-major FP4 TMA unpacked shared memory')
 
         kernel_type = KernelType.Kernel1D1D
         quant_config = QuantConfig((32, 32, False, True))
