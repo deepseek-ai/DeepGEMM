@@ -1,5 +1,9 @@
 #pragma once
 
+// NOTES: derived from `sm100_fp8_fp4_mega_moe.cuh` with FP8 (e4m3) weights instead of
+// FP4 (e2m1). All scale-factor handling is identical to the FP4 version: the weight SF
+// remains 4-packed UE8M0 stored in `uint32_t` with the same K granularity
+
 #include <cstdint>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -49,7 +53,7 @@ template <
     uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
-sm100_fp8_fp4_mega_moe_impl(void* y,
+sm100_fp8_fp8_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
@@ -161,9 +165,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     );
 
     // Data types
-    // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
+    // NOTES: both activations and weights are FP8 (e4m3)
     using a_dtype_t = cutlass::float_e4m3_t;
-    using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
+    using b_dtype_t = cutlass::float_e4m3_t;
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
@@ -754,7 +758,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     tma::copy<BLOCK_N, 1, 0>(
                         tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     if (is_leader_cta) {
-                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                        // NOTES: FP8 B tiles transfer twice the bytes of the FP4 path
+                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) * 2 + sizeof(SharedStorage::smem_sfb[0]) * 2);
                     } else {
                         shared_storage.full_barriers[stage_idx].arrive(0u);
                     }
