@@ -191,26 +191,29 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                 if (kGemmType == GemmType::KGroupedContiguous and last_group_idx != scheduler.current_group_idx) {
                     last_group_idx = scheduler.current_group_idx;
 
-                    // Directly update current tensor map
+                    // Drain all pending TMA data operations before modifying tensor map descriptors.
+                    // This prevents a race where tensormap.replace operations and in-flight TMA loads
+                    // compete within the same commit group, which the PTX ISA allows to resolve in any order.
+                    cute::tma_desc_commit_group();
+                    cute::tma_desc_wait_group();
+                    __syncwarp(1U << lane_idx);
+
+                    // Update current tensor map descriptors
                     const uint64_t current_k_offset = scheduler.current_k_cumsum;
                     ptx::tensor_map_replace_global_addr_in_smem(smem_tensor_map_a, gmem_a_ptr + current_k_offset * shape_m);
                     ptx::tensor_map_replace_global_addr_in_smem(smem_tensor_map_b, gmem_b_ptr + current_k_offset * shape_n);
                     ptx::tensor_map_replace_global_inner_dim_stride_in_smem(smem_tensor_map_a, scheduler.current_shape_k, scheduler.current_shape_k);
                     ptx::tensor_map_replace_global_inner_dim_stride_in_smem(smem_tensor_map_b, scheduler.current_shape_k, scheduler.current_shape_k);
 
-                    // Make sure tensormaps are not used by TMA before updating GMEM.
+                    // Fence the descriptor modifications
                     cute::tma_desc_commit_group();
                     cute::tma_desc_wait_group();
-                    // Only used to prevent `ptxas` from moving the following GMEM stores before `cute::tma_desc_wait_group()`.
-                    // Shouldn't be needed otherwise, since we only use one thread.
-
                     __syncwarp(1U << lane_idx);
 
+                    // Copy updated descriptors to global memory and make them visible to TMA
                     *(gmem_tensor_map_a) = *(smem_tensor_map_a);
                     *(gmem_tensor_map_b) = *(smem_tensor_map_b);
                     ptx::tensor_map_release_gpu();
-
-                    // Immediately acquire current tensor map
                     ptx::tensor_map_acquire_gpu(gmem_tensor_map_a);
                     ptx::tensor_map_acquire_gpu(gmem_tensor_map_b);
                 }
