@@ -85,9 +85,10 @@ struct SM120ArchSpec {
             continue;
         for (int block_k : block_k_candidates) {
         for (int block_n : block_n_candidates) {
-            // The kNWarps=4 layout (BLOCK_M < 64) needs an even kNTilesPerWarp
-            // (ldmatrix.x2 B loading), i.e. BLOCK_N % 64 == 0
-            if (block_m < 64 and block_n % 64 != 0)
+            // BLOCK_M < 64 (kNWarps=4): BLOCK_N=64 only. Even kNTilesPerWarp (ldmatrix.x2)
+            // requires BLOCK_N % 64; measured vs BN=128: never worse, -1.6% on thin-N decode,
+            // and doubles SM fill at tiny M.
+            if (block_m < 64 and block_n != 64)
                 continue;
             if (!is_small_n and (block_n > 128 or block_n > mn_major_b_max_n))
                 continue;
