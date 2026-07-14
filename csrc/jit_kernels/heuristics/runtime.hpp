@@ -49,9 +49,9 @@ public:
     struct ContiguousMKAlignment { int max_block_m, min_block_m, step; };
 
     static ContiguousMKAlignment get_contiguous_mk_alignment(const int& arch_major) {
-        // SM120: warp layout is kMWarps(4) * MMA_M(16), so BLOCK_M is a multiple of 64
+        // SM120: BLOCK_M in {32, 64, 128}; 32 uses the kNWarps=4 warp layout (decode)
         if (arch_major == 12)
-            return {128, 64, 64};
+            return {128, 32, 32};
         // SM100: 16-row MMA steps from 240 down to 32
         if (arch_major == 10)
             return {240, 32, 16};
@@ -70,6 +70,9 @@ public:
                 per_group_m = (per_group_m + num_groups.value() - 1) / num_groups.value();
             for (; block_m > spec.min_block_m and block_m - spec.step >= per_group_m; block_m -= spec.step);
         }
+        // SM120 supports no 96-row tile (per-expert m > 64 measures best at 128)
+        if (device_runtime->get_arch_major() == 12 and block_m == 96)
+            block_m = 128;
         return block_m;
     }
 };
