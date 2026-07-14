@@ -80,6 +80,15 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l2_weights = torch.randn(
             (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
+        # Imbalance-aware benchmarking: bias the router scores toward a Zipf(alpha)
+        # distribution so a few "hot" experts dominate, reproducing the skewed
+        # routing that the imbalance-aware block_m heuristic targets. alpha=0 keeps
+        # the original (near-uniform) behavior.
+        if getattr(args, 'skew_alpha', 0.0) and args.skew_alpha > 0.0:
+            ranks = torch.arange(1, num_experts + 1, device='cuda', dtype=torch.float)
+            zipf_bias = -args.skew_alpha * torch.log(ranks)         # log-prob bias
+            perm = torch.randperm(num_experts, device='cuda')       # hot experts random
+            scores = scores + zipf_bias[perm].unsqueeze(0)
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
@@ -290,6 +299,10 @@ if __name__ == '__main__':
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
+    parser.add_argument('--skew-alpha', type=float, default=0.0,
+                        help='Zipf skew for router (0=uniform). Use with '
+                             'DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M=1 to benchmark '
+                             'imbalance-aware block_m selection.')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
 

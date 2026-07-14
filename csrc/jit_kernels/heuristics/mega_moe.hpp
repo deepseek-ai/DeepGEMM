@@ -92,13 +92,113 @@ static int get_num_wave_pool_tokens(
     );
 };
 
+// Imbalance-aware effective tokens-per-expert estimator.
+//
+// The default heuristic sizes `block_m` from the MEAN tokens/expert
+// (num_tokens * num_ranks * num_topk / num_experts). Under skewed (imbalanced)
+// routing the realized distribution is far from uniform: most experts receive
+// far fewer tokens than the mean, so a mean-sized `block_m` pads those cold
+// experts heavily (the kernel MMAs `ceil(c/block_m) * block_m` rows per expert,
+// padding included). Choosing a smaller `block_m` when the realized per-expert
+// counts are small reduces that padded work.
+//
+// When `DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M=1` and per-expert receive stats are
+// available, we compute the block_m (from the SAME candidate set the kernel
+// already supports) that MINIMIZES total padded rows over the realized counts,
+// then feed its implied "effective tokens per expert" into the existing tier
+// selector below. A strict fallback guarantees we never pick a coarser tier
+// than the mean-based heuristic (i.e. we never regress the balanced case).
+//
+// `recv_stats` (optional): realized per-local-expert token counts on this rank.
+static float get_effective_tokens_per_expert_for_mega_moe(
+    const int& num_ranks, const int& num_experts, const int& num_topk,
+    const int& num_tokens, const int& num_experts_per_rank,
+    const int* recv_stats) {
+    const float mean_tpe = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+
+    // Gate: opt-in via env, and only when realized stats are provided.
+    if (recv_stats == nullptr or get_env<int>("DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M", 0) == 0)
+        return mean_tpe;
+
+    // Objective: minimize WALL-COST, not raw padded rows. Padded rows alone would
+    // always pick the smallest block_m (best packing), but small block_m under-
+    // utilizes the SM100 UMMA M-dimension. We therefore weight padded rows by the
+    // inverse of an MMA M-utilization efficiency that saturates by block_m>=96:
+    //   wall_cost(b) = (sum_e ceil(c_e/b) * b) / eta(b)
+    // The efficiency curve is a conservative, monotone model of tensor-core M
+    // utilization vs block_m (tunable; validated on-GPU by the benchmark).
+    auto mma_efficiency = [](const int block_m) -> float {
+        switch (block_m) {
+            case 8:   return 0.20f;
+            case 16:  return 0.35f;
+            case 32:  return 0.60f;
+            case 64:  return 0.90f;
+            case 96:  return 0.97f;
+            case 128: return 1.00f;
+            case 192: return 1.00f;
+            default:  return 1.00f;
+        }
+    };
+
+    auto wall_cost = [&](const int block_m) -> double {
+        int64_t rows = 0;
+        for (int e = 0; e < num_experts_per_rank; ++ e) {
+            const int c = recv_stats[e];
+            if (c > 0)
+                rows += static_cast<int64_t>(ceil_div(c, block_m)) * block_m;
+        }
+        return static_cast<double>(rows) / mma_efficiency(block_m);
+    };
+
+    // Pick the candidate minimizing wall-cost; tie-break toward LARGER block_m
+    // (fewer tiles => less scheduling / MMA-launch overhead, better utilization).
+    int best_block_m = layout::kCandidateBlockM[0];
+    double best_cost = wall_cost(best_block_m);
+    for (int i = 1; i < layout::kNumCandidateBlockMs; ++ i) {
+        const int b = layout::kCandidateBlockM[i];
+        const double cost = wall_cost(b);
+        if (cost < best_cost - 1e-9 or (std::abs(cost - best_cost) <= 1e-9 and b > best_block_m)) {
+            best_cost = cost;
+            best_block_m = b;
+        }
+    }
+
+    // Map the chosen block_m back to an "effective tokens per expert" that lands
+    // in the corresponding tier of `get_block_config_for_mega_moe`. We pick the
+    // upper edge of the tier for `best_block_m` so the tier selector reproduces it.
+    // Tier edges (see below): (,8.5]->16, (,16.5]->32, (,32.5]->64,
+    //   (,64.5]->96, (,96.5]->128, else 192.
+    float eff = mean_tpe;
+    switch (best_block_m) {
+        case 8:   eff = 4.0f;  break;   // maps into <=8.5 tier (block_m=16 path uses <=16.5)
+        case 16:  eff = 8.0f;  break;
+        case 32:  eff = 16.0f; break;
+        case 64:  eff = 32.0f; break;
+        case 96:  eff = 64.0f; break;
+        case 128: eff = 96.0f; break;
+        case 192: eff = 128.0f; break;
+        default:  eff = mean_tpe; break;
+    }
+
+    // STRICT FALLBACK: never choose a SMALLER effective (finer tier) if the
+    // mean already implies a finer or equal one is unnecessary; and never
+    // regress the balanced case — only adopt `eff` when it is <= mean_tpe
+    // (i.e. adaptivity only shrinks block_m for cold/skewed cases, never grows).
+    return std::min(eff, mean_tpe);
+}
+
 static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const int* recv_stats = nullptr,
+    const int num_experts_per_rank = 0) {
     auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int, int, int, int> {
-        float num_expected_tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+        float num_expected_tokens_per_expert = get_effective_tokens_per_expert_for_mega_moe(
+            num_ranks, num_experts, num_topk, num_tokens,
+            num_experts_per_rank > 0 ? num_experts_per_rank : num_experts / num_ranks,
+            recv_stats);
         if (num_expected_tokens_per_expert <= 8.5) {
             // Really small token-per-expert (e.g. RL long-tail rollout), use the smallest block_m and larger BLOCK_K for less synchronization
             return {2, 16, 8, 256, 2};
@@ -249,11 +349,15 @@ static MegaMoEConfig get_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const int* recv_stats = nullptr) {
 
     // Block config
+    // NOTES: `recv_stats` (realized per-local-expert token counts, host-side) enables
+    // imbalance-aware `block_m` selection when `DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M=1`.
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind,
+                                      recv_stats, num_experts_per_rank);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;

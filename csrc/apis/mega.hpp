@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 #include <pybind11/functional.h>
 
 #include <deep_gemm/common/types.cuh>
@@ -229,6 +230,21 @@ static void fp8_fp4_mega_moe(
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
+    // Imbalance-aware block_m: optionally snapshot the realized per-local-expert
+    // receive counts to the host so the heuristic can size `block_m` from the
+    // actual (skewed) distribution rather than the uniform mean.
+    // Gated by env so the default path is bit-for-bit unchanged. The extra
+    // device->host copy is `num_experts_per_rank` ints (tens of values) and is
+    // skipped entirely when the flag is off or no stats tensor is supplied.
+    std::vector<int> host_recv_stats;
+    const int* host_recv_stats_ptr = nullptr;
+    if (get_env<int>("DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M", 0) != 0 and
+        cumulative_local_expert_recv_stats.has_value()) {
+        const auto cpu = cumulative_local_expert_recv_stats->to(torch::kCPU, torch::kInt);
+        host_recv_stats.assign(cpu.data_ptr<int>(), cpu.data_ptr<int>() + cpu.numel());
+        host_recv_stats_ptr = host_recv_stats.data();
+    }
+
     // Dispatch into different architectures
     if (arch_major == 10) {
         sm100_fp8_fp4_mega_moe(y,
@@ -242,7 +258,8 @@ static void fp8_fp4_mega_moe(
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math,
+                               host_recv_stats_ptr);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
