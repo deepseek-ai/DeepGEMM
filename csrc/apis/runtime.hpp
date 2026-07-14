@@ -8,6 +8,8 @@
 
 namespace deep_gemm::runtime {
 
+#if 0
+
 static void register_apis(pybind11::module_& m) {
     m.def("set_num_sms", [&](const int& new_num_sms) {
         device_runtime->set_num_sms(new_num_sms);
@@ -47,5 +49,7 @@ static void register_apis(pybind11::module_& m) {
 #endif
     });
 }
+
+#endif
 
 } // namespace deep_gemm::runtime
