@@ -53,7 +53,8 @@ struct SM120ArchSpec {
         // but only beneficial for large M (>= 2048) and non-mixed dtypes.
         const bool is_mixed = (desc.a_dtype != desc.b_dtype);
         std::vector<int> block_k_candidates;
-        if (!is_mixed and expected_m >= 2048)
+        // BLOCK_M=32 decode keeps BK=128: enables the padding-skip cp.async A path (SW128)
+        if (!is_mixed and expected_m >= 2048 and not (is_m_grouped and runtime_align == 32))
             block_k_candidates.push_back(64 / elem_size);
         block_k_candidates.push_back(128 / elem_size);
 

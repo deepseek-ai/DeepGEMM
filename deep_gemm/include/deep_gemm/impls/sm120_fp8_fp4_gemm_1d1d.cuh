@@ -131,6 +131,12 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // kAIsFP4: A is fp4 packed in GMEM (.b4x16 expands to unpacked SMEM), so GMEM = SMEM_A/2.
     static constexpr uint32_t TMA_A_BYTES = kAIsFP4 ? (SMEM_A / 2) : SMEM_A;
     static constexpr uint32_t SMEM_TMA_BYTES = TMA_A_BYTES + TMA_B_BYTES + TMA_SFA_BYTES + TMA_SFB_BYTES;
+    // Load A via warp-cooperative cp.async, skipping M-padding rows at the source (they are
+    // never stored — see kSkipPaddingStore). Only the verified SW128/BK=128 FP8-A layout.
+    static constexpr bool kUseCpAsyncA = kSkipPaddingStore and not kIsFP4 and not kAIsFP4
+        and BLOCK_K == 128 and kSwizzleAMode == 128
+        and (kGemmType == GemmType::MGroupedContiguous or kGemmType == GemmType::MGroupedMasked);
+    static constexpr uint32_t SMEM_TMA_BYTES_PRODUCER = kUseCpAsyncA ? (SMEM_TMA_BYTES - TMA_A_BYTES) : SMEM_TMA_BYTES;
     // ldmatrix K stride in bytes: FP4 packed = MMA_K/2, FP8 = MMA_K. Both = 32 bytes.
     static constexpr uint32_t kLdmK = kIsFP4 ? (MMA_K / 2) : MMA_K;
     // tma::copy swizzle for split computation: FP4 packed with B64 has 64 byte rows = full BLOCK_K,
@@ -198,7 +204,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++i) {
-            full_barriers[i]->init(1);
+            // kUseCpAsyncA: +32 arrivals from the leader warp's per-lane cp.async completion
+            full_barriers[i]->init(kUseCpAsyncA ? 33 : 1);
             empty_barriers[i]->init(kNumMathWarps);
         }
         cutlass::arch::fence_barrier_init();
@@ -221,7 +228,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     if (warp_idx >= kNumMathWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kTMARegisters>();
 
-        const bool is_tma_leader = (warp_idx == kNumMathWarps and lane_idx == 0);
+        // With kUseCpAsyncA the whole leader warp runs the loop (cp.async is warp-cooperative;
+        // scheduler math is lane-uniform); TMA issue and barrier ops stay on lane 0.
+        const bool is_tma_leader = (warp_idx == kNumMathWarps and (kUseCpAsyncA or lane_idx == 0));
         uint32_t tma_iter_idx = 0;
 
         if (is_tma_leader) {
@@ -302,9 +311,30 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
                 const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
 
+                // Valid (non-padding) A rows in this tile; padding is a per-expert suffix
+                uint32_t valid_rows = BLOCK_M;
+                if constexpr (kUseCpAsyncA) {
+                    if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+                        uint32_t cnt = 0;
+                        for (uint32_t r = lane_idx; r < BLOCK_M; r += 32)
+                            cnt += (__ldg(grouped_layout + m_idx + r) >= 0);
+                        valid_rows = __reduce_add_sync(0xffffffff, cnt);
+                    } else {
+                        const auto masked_m = static_cast<uint32_t>(__ldg(grouped_layout + scheduler.current_group_idx));
+                        valid_rows = min(BLOCK_M, masked_m - m_block_idx * BLOCK_M);
+                    }
+                }
+
                 for (uint32_t kb = kb_start; kb < kb_end; ++kb) {
                     CUTE_TIE_DECL(get_pipeline(tma_iter_idx++), s, p);
-                    empty_barriers[s]->wait(p ^ 1);
+                    if constexpr (kUseCpAsyncA) {
+                        // Single-lane spin, warp-wide release
+                        if (lane_idx == 0)
+                            empty_barriers[s]->wait(p ^ 1);
+                        __syncwarp();
+                    } else {
+                        empty_barriers[s]->wait(p ^ 1);
+                    }
 
                     const uint32_t k_idx = kb * BLOCK_K;
                     uint32_t sfa_k, sfb_k;
@@ -321,17 +351,34 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
                             shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
                     }
-                    tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
-                    tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
-                    tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
-                    if constexpr (kBKMajor) {
-                        tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
-                    } else {
-                        tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
-                            tma_b_desc, full_barriers[s], smem_b[s],
-                            n_idx, k_idx, 1, batch_idx);
+                    if constexpr (kUseCpAsyncA) {
+                        // Load only valid A rows; padding rows keep stale SMEM (their outputs
+                        // are never stored). Completion is tracked by the mbarrier itself.
+                        sm120::cpasync_load_rows<BLOCK_K, kSwizzleAMode>(
+                            smem_a[s], reinterpret_cast<const char*>(gmem_a_ptr) + static_cast<uint64_t>(m_idx) * shape_k + k_idx,
+                            valid_rows, shape_k, lane_idx);
                     }
-                    full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
+                    if (not kUseCpAsyncA or lane_idx == 0) {
+                        tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
+                        tma::copy<BLOCK_N, BLOCK_K, 0>(&tensor_map_sfb, full_barriers[s], smem_sfb[s], n_block_idx * BLOCK_N, sfb_k, 1);
+                        if constexpr (not kUseCpAsyncA)
+                            tma::copy<BLOCK_K, BLOCK_M, kTMACopySwizzleA, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
+                        if constexpr (kBKMajor) {
+                            tma::copy<BLOCK_K, BLOCK_N, kTMACopySwizzleB, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
+                        } else {
+                            tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, char, kIsBatchedMM>(
+                                tma_b_desc, full_barriers[s], smem_b[s],
+                                n_idx, k_idx, 1, batch_idx);
+                        }
+                    }
+                    if constexpr (kUseCpAsyncA) {
+                        // Per-lane async arrival (fires when this lane's cp.asyncs land) + TMA tx
+                        sm120::cpasync_mbarrier_arrive(full_barriers[s]);
+                        if (lane_idx == 0)
+                            full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES_PRODUCER);
+                    } else {
+                        full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES_PRODUCER);
+                    }
                 }
             }
         }
