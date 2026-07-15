@@ -92,113 +92,41 @@ static int get_num_wave_pool_tokens(
     );
 };
 
-// Imbalance-aware effective tokens-per-expert estimator.
-//
-// The default heuristic sizes `block_m` from the MEAN tokens/expert
-// (num_tokens * num_ranks * num_topk / num_experts). Under skewed (imbalanced)
-// routing the realized distribution is far from uniform: most experts receive
-// far fewer tokens than the mean, so a mean-sized `block_m` pads those cold
-// experts heavily (the kernel MMAs `ceil(c/block_m) * block_m` rows per expert,
-// padding included). Choosing a smaller `block_m` when the realized per-expert
-// counts are small reduces that padded work.
-//
-// When `DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M=1` and per-expert receive stats are
-// available, we compute the block_m (from the SAME candidate set the kernel
-// already supports) that MINIMIZES total padded rows over the realized counts,
-// then feed its implied "effective tokens per expert" into the existing tier
-// selector below. A strict fallback guarantees we never pick a coarser tier
-// than the mean-based heuristic (i.e. we never regress the balanced case).
-//
-// `recv_stats` (optional): realized per-local-expert token counts on this rank.
+// Return the upstream mean tokens/expert, except for the explicit block_m
+// calibration override. The earlier imbalance-aware shrink policy was removed
+// after B200 measurements showed up to 31% regressions under skew.
 static float get_effective_tokens_per_expert_for_mega_moe(
     const int& num_ranks, const int& num_experts, const int& num_topk,
-    const int& num_tokens, const int& num_experts_per_rank,
-    const int* recv_stats) {
+    const int& num_tokens) {
     const float mean_tpe = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
 
-    // Gate: opt-in via env, and only when realized stats are provided.
-    if (recv_stats == nullptr or get_env<int>("DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M", 0) == 0)
-        return mean_tpe;
-
-    // Objective: minimize WALL-COST, not raw padded rows. Padded rows alone would
-    // always pick the smallest block_m (best packing), but small block_m under-
-    // utilizes the SM100 UMMA M-dimension. We therefore weight padded rows by the
-    // inverse of an MMA M-utilization efficiency that saturates by block_m>=96:
-    //   wall_cost(b) = (sum_e ceil(c_e/b) * b) / eta(b)
-    // The efficiency curve is a conservative, monotone model of tensor-core M
-    // utilization vs block_m (tunable; validated on-GPU by the benchmark).
-    auto mma_efficiency = [](const int block_m) -> float {
-        switch (block_m) {
-            case 8:   return 0.20f;
-            case 16:  return 0.35f;
-            case 32:  return 0.60f;
-            case 64:  return 0.90f;
-            case 96:  return 0.97f;
-            case 128: return 1.00f;
-            case 192: return 1.00f;
-            default:  return 1.00f;
-        }
-    };
-
-    auto wall_cost = [&](const int block_m) -> double {
-        int64_t rows = 0;
-        for (int e = 0; e < num_experts_per_rank; ++ e) {
-            const int c = recv_stats[e];
-            if (c > 0)
-                rows += static_cast<int64_t>(ceil_div(c, block_m)) * block_m;
-        }
-        return static_cast<double>(rows) / mma_efficiency(block_m);
-    };
-
-    // Pick the candidate minimizing wall-cost; tie-break toward LARGER block_m
-    // (fewer tiles => less scheduling / MMA-launch overhead, better utilization).
-    int best_block_m = layout::kCandidateBlockM[0];
-    double best_cost = wall_cost(best_block_m);
-    for (int i = 1; i < layout::kNumCandidateBlockMs; ++ i) {
-        const int b = layout::kCandidateBlockM[i];
-        const double cost = wall_cost(b);
-        if (cost < best_cost - 1e-9 or (std::abs(cost - best_cost) <= 1e-9 and b > best_block_m)) {
-            best_cost = cost;
-            best_block_m = b;
+    // Benchmark/calibration override. This deliberately bypasses both the
+    // imbalance gate and strict fallback so every production tier can be timed
+    // on the same realized routing distribution. Invalid values fail loudly.
+    const int forced_block_m = get_env<int>("DG_MEGA_MOE_FORCE_BLOCK_M", 0);
+    if (forced_block_m != 0) {
+        switch (forced_block_m) {
+            case 16:  return 8.0f;
+            case 32:  return 16.0f;
+            case 64:  return 32.0f;
+            case 96:  return 64.0f;
+            case 128: return 96.0f;
+            case 192: return 128.0f;
+            default: DG_HOST_ASSERT(false and "DG_MEGA_MOE_FORCE_BLOCK_M must be one of 16,32,64,96,128,192");
         }
     }
 
-    // Map the chosen block_m back to an "effective tokens per expert" that lands
-    // in the corresponding tier of `get_block_config_for_mega_moe`. We pick the
-    // upper edge of the tier for `best_block_m` so the tier selector reproduces it.
-    // Tier edges (see below): (,8.5]->16, (,16.5]->32, (,32.5]->64,
-    //   (,64.5]->96, (,96.5]->128, else 192.
-    float eff = mean_tpe;
-    switch (best_block_m) {
-        case 8:   eff = 4.0f;  break;   // maps into <=8.5 tier (block_m=16 path uses <=16.5)
-        case 16:  eff = 8.0f;  break;
-        case 32:  eff = 16.0f; break;
-        case 64:  eff = 32.0f; break;
-        case 96:  eff = 64.0f; break;
-        case 128: eff = 96.0f; break;
-        case 192: eff = 128.0f; break;
-        default:  eff = mean_tpe; break;
-    }
-
-    // STRICT FALLBACK: never choose a SMALLER effective (finer tier) if the
-    // mean already implies a finer or equal one is unnecessary; and never
-    // regress the balanced case — only adopt `eff` when it is <= mean_tpe
-    // (i.e. adaptivity only shrinks block_m for cold/skewed cases, never grows).
-    return std::min(eff, mean_tpe);
+    return mean_tpe;
 }
 
 static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
-    const MmaKind& mma_kind,
-    const int* recv_stats = nullptr,
-    const int num_experts_per_rank = 0) {
+    const MmaKind& mma_kind) {
     auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int, int, int, int> {
         float num_expected_tokens_per_expert = get_effective_tokens_per_expert_for_mega_moe(
-            num_ranks, num_experts, num_topk, num_tokens,
-            num_experts_per_rank > 0 ? num_experts_per_rank : num_experts / num_ranks,
-            recv_stats);
+            num_ranks, num_experts, num_topk, num_tokens);
         if (num_expected_tokens_per_expert <= 8.5) {
             // Really small token-per-expert (e.g. RL long-tail rollout), use the smallest block_m and larger BLOCK_K for less synchronization
             return {2, 16, 8, 256, 2};
@@ -234,8 +162,9 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
 static int get_num_experts_per_wave_for_mega_moe(
     const int& num_experts_per_rank, const int& num_tokens, const int& num_topk,
     const int& intermediate_hidden, const int& block_m, const int& block_n, const int& num_sms,
-    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks) {
-    
+    const int& num_ring_tokens, const int& num_max_tokens_per_rank, const int& num_ranks,
+    const int* recv_stats = nullptr) {
+
     // Get max experts per wave limitation
     int num_max_experts_per_wave = num_experts_per_rank;
     while (num_max_experts_per_wave > 0 and
@@ -243,45 +172,108 @@ static int get_num_experts_per_wave_for_mega_moe(
         num_max_experts_per_wave --;
     DG_HOST_ASSERT(num_max_experts_per_wave > 0 and "Buffer size is too small");
 
-    // Reduce per-expert block count by this factor since uneven routing leaves some experts with fewer tokens
-    constexpr int kImbalanceFactor = 2;
-
-    // Count L1 blocks per expert assuming tokens are evenly spread across experts
-    const float num_expected_tokens_per_expert = static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
-    const int num_expected_m_blocks = std::max(ceil_div(static_cast<int>(std::ceil(num_expected_tokens_per_expert)), block_m), 1);
-    const int num_l1_n_blocks = (2 * intermediate_hidden) / block_n;
-    const int num_expected_l1_blocks_per_expert = num_expected_m_blocks * num_l1_n_blocks;
-
-    // Pick the smallest value whose total blocks (after imbalance reduction) can keep all SMs busy
-    int num_min_expected_experts_to_fill_sms = ceil_div(kImbalanceFactor * num_sms, num_expected_l1_blocks_per_expert);
-
-    // Most experts don't have tokens, calculate all experts at once
-    if (num_expected_tokens_per_expert < 1)
-        num_min_expected_experts_to_fill_sms = num_experts_per_rank;
-
-    // Ring capacity is the bottleneck
-    if (num_min_expected_experts_to_fill_sms >= num_max_experts_per_wave)
-        return num_max_experts_per_wave;
-
-    // When each expert nearly fills all SMs, use the smallest wave to maximize L2 cache reuse
-    if (num_expected_l1_blocks_per_expert >= num_sms) 
-        return num_min_expected_experts_to_fill_sms;
-
-    // Search to 2 * num_min_expected_experts_to_fill_sms for a value where the last partial
-    // wave has as many experts as possible relative to a full wave
-    const int num_sweep_max_experts_per_wave = std::min(num_max_experts_per_wave, num_min_expected_experts_to_fill_sms * 2);
-    int best_num_experts_per_wave = num_min_expected_experts_to_fill_sms;
-    float best_tail_ratio = -1.0f;
-    for (int num_experts_per_wave = num_min_expected_experts_to_fill_sms; 
-             num_experts_per_wave <= num_sweep_max_experts_per_wave; ++ num_experts_per_wave) {
-        int remainder = num_experts_per_rank % num_experts_per_wave;
-        float tail_ratio = (remainder == 0) ? 1.0f : static_cast<float>(remainder) / num_experts_per_wave;
-        if (tail_ratio > best_tail_ratio) {
-            best_tail_ratio = tail_ratio;
-            best_num_experts_per_wave = num_experts_per_wave;
-        }
+    // Benchmark/calibration override for the scheduler wave boundary. Keep the
+    // production default untouched unless explicitly requested.
+    const int forced_num_experts_per_wave = get_env<int>("DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE", 0);
+    if (forced_num_experts_per_wave != 0) {
+        DG_HOST_ASSERT(forced_num_experts_per_wave > 0 and
+                       forced_num_experts_per_wave <= num_max_experts_per_wave and
+                       "DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE exceeds the ring-buffer limit");
+        return forced_num_experts_per_wave;
     }
-    return best_num_experts_per_wave;
+
+    const int num_l1_n_blocks = (2 * intermediate_hidden) / block_n;
+    const int default_num_experts_per_wave = [&]() {
+        // Reduce per-expert block count by this factor since uneven routing leaves some experts with fewer tokens
+        constexpr int kImbalanceFactor = 2;
+
+        // Count L1 blocks per expert assuming tokens are evenly spread across experts
+        const float num_expected_tokens_per_expert = static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
+        const int num_expected_m_blocks = std::max(
+            ceil_div(static_cast<int>(std::ceil(num_expected_tokens_per_expert)), block_m), 1);
+        const int num_expected_l1_blocks_per_expert = num_expected_m_blocks * num_l1_n_blocks;
+
+        // Pick the smallest value whose total blocks (after imbalance reduction) can keep all SMs busy
+        int num_min_expected_experts_to_fill_sms =
+            ceil_div(kImbalanceFactor * num_sms, num_expected_l1_blocks_per_expert);
+
+        // Most experts don't have tokens, calculate all experts at once
+        if (num_expected_tokens_per_expert < 1)
+            num_min_expected_experts_to_fill_sms = num_experts_per_rank;
+
+        // Ring capacity is the bottleneck
+        if (num_min_expected_experts_to_fill_sms >= num_max_experts_per_wave)
+            return num_max_experts_per_wave;
+
+        // When each expert nearly fills all SMs, use the smallest wave to maximize L2 cache reuse
+        if (num_expected_l1_blocks_per_expert >= num_sms)
+            return num_min_expected_experts_to_fill_sms;
+
+        // Search to 2 * num_min_expected_experts_to_fill_sms for a value where the last partial
+        // wave has as many experts as possible relative to a full wave
+        const int num_sweep_max_experts_per_wave =
+            std::min(num_max_experts_per_wave, num_min_expected_experts_to_fill_sms * 2);
+        int best_num_experts_per_wave = num_min_expected_experts_to_fill_sms;
+        float best_tail_ratio = -1.0f;
+        for (int num_experts_per_wave = num_min_expected_experts_to_fill_sms;
+             num_experts_per_wave <= num_sweep_max_experts_per_wave; ++ num_experts_per_wave) {
+            const int remainder = num_experts_per_rank % num_experts_per_wave;
+            const float tail_ratio = remainder == 0 ?
+                1.0f : static_cast<float>(remainder) / num_experts_per_wave;
+            if (tail_ratio > best_tail_ratio) {
+                best_tail_ratio = tail_ratio;
+                best_num_experts_per_wave = num_experts_per_wave;
+            }
+        }
+        return best_num_experts_per_wave;
+    }();
+
+    // The production default remains the strict fallback. Adaptive sizing uses
+    // the previous iteration's realized local-expert receive counts, so it is
+    // opt-in and never guesses during the first call or after a counter reset.
+    if (recv_stats == nullptr or get_env<int>("DG_MEGA_MOE_ADAPTIVE_WAVE", 0) == 0)
+        return default_num_experts_per_wave;
+
+    // B200 calibration shows two independent effects: small waves repeatedly pay
+    // L1/L2 CTA tails, while large waves lose activation locality. The useful
+    // operating point is determined by the expected tokens/expert tier and by
+    // how many local experts were actually active in the previous iteration.
+    // Keep the policy deliberately small (two adaptive tiers) to bound the
+    // JIT cache, and retain the upstream answer outside the calibrated region.
+    int num_active_experts = 0;
+    int64_t recv_sum = 0;
+    int64_t recv_square_sum = 0;
+    for (int expert_idx = 0; expert_idx < num_experts_per_rank; ++ expert_idx) {
+        num_active_experts += recv_stats[expert_idx] > 0;
+        recv_sum += recv_stats[expert_idx];
+        recv_square_sum += static_cast<int64_t>(recv_stats[expert_idx]) * recv_stats[expert_idx];
+    }
+    const float active_ratio =
+        static_cast<float>(num_active_experts) / num_experts_per_rank;
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
+    const double recv_mean = static_cast<double>(recv_sum) / num_experts_per_rank;
+    const double recv_variance =
+        static_cast<double>(recv_square_sum) / num_experts_per_rank - recv_mean * recv_mean;
+    const bool is_balanced = recv_mean > 0.0 and
+        recv_variance <= 0.25 * recv_mean * recv_mean;  // coefficient of variation <= 0.5
+
+    int adaptive_num_experts_per_wave = default_num_experts_per_wave;
+    if (expected_tokens_per_expert > 64.5f and expected_tokens_per_expert <= 128.5f) {
+        // Once each expert approaches two M tiles, smaller waves preserve L1→L2
+        // locality. Sparse routing benefits from wave 8; balanced routing uses
+        // wave 12. Moderately skewed routing stays on the upstream wave 16
+        // because its measured change was inside the A/B noise band.
+        if (active_ratio <= 0.92f)
+            adaptive_num_experts_per_wave = 8;
+        else if (is_balanced)
+            adaptive_num_experts_per_wave = 12;
+    }
+
+    // Do not exceed the ring-buffer capacity. Falling back, rather than silently
+    // clamping to an uncalibrated size, keeps other layouts on the upstream path.
+    return adaptive_num_experts_per_wave <= num_max_experts_per_wave ?
+        adaptive_num_experts_per_wave : default_num_experts_per_wave;
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
@@ -353,11 +345,9 @@ static MegaMoEConfig get_mega_moe_config(
     const int* recv_stats = nullptr) {
 
     // Block config
-    // NOTES: `recv_stats` (realized per-local-expert token counts, host-side) enables
-    // imbalance-aware `block_m` selection when `DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M=1`.
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind,
-                                      recv_stats, num_experts_per_rank);
+        get_block_config_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
@@ -374,7 +364,8 @@ static MegaMoEConfig get_mega_moe_config(
     const int num_experts_per_wave = get_num_experts_per_wave_for_mega_moe(
         num_experts_per_rank, num_tokens, num_topk,
         intermediate_hidden, block_m, block_n, num_sms,
-        num_ring_tokens, num_max_tokens_per_rank, num_ranks);
+        num_ring_tokens, num_max_tokens_per_rank, num_ranks,
+        recv_stats);
 
     // Thread layout
     const int num_dispatch_threads = 128;
@@ -412,8 +403,9 @@ static MegaMoEConfig get_mega_moe_config(
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, block_m={}, num_experts_per_wave={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk,
+            block_m, num_experts_per_wave);
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;

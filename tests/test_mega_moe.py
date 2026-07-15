@@ -80,10 +80,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         l2_weights = torch.randn(
             (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
-        # Imbalance-aware benchmarking: bias the router scores toward a Zipf(alpha)
-        # distribution so a few "hot" experts dominate, reproducing the skewed
-        # routing that the imbalance-aware block_m heuristic targets. alpha=0 keeps
-        # the original (near-uniform) behavior.
+        # Adaptive-scheduler benchmarking: bias the router scores toward a
+        # Zipf(alpha) distribution so a few "hot" experts dominate. alpha=0
+        # keeps the original (near-uniform) behavior.
         if getattr(args, 'skew_alpha', 0.0) and args.skew_alpha > 0.0:
             ranks = torch.arange(1, num_experts + 1, device='cuda', dtype=torch.float)
             zipf_bias = -args.skew_alpha * torch.log(ranks)         # log-prob bias
@@ -146,6 +145,72 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         dist_print(f' > Done, exiting', once_in_node=True)
 
         # Destroy and exit
+        dist.barrier()
+        buffer.destroy()
+        dist.destroy_process_group()
+        return
+
+    # Compare output and receive-stat updates across the default, adaptive, and
+    # every forceable block_m tier without depending on optional DeepEP/TileLang.
+    if args.validate_config_invariance:
+        create_inputs()
+        initial_stats = cumulative_local_expert_recv_stats_fused.clone()
+        old_force = os.environ.get('DG_MEGA_MOE_FORCE_BLOCK_M')
+        old_adaptive_wave = os.environ.get('DG_MEGA_MOE_ADAPTIVE_WAVE')
+        old_force_wave = os.environ.get('DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE')
+
+        def run_config(force_block_m: int, force_wave_size: int = 0, adaptive_wave: int = 0):
+            os.environ['DG_MEGA_MOE_ADAPTIVE_WAVE'] = str(adaptive_wave)
+            if force_block_m:
+                os.environ['DG_MEGA_MOE_FORCE_BLOCK_M'] = str(force_block_m)
+            else:
+                os.environ.pop('DG_MEGA_MOE_FORCE_BLOCK_M', None)
+            if force_wave_size:
+                os.environ['DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE'] = str(force_wave_size)
+            else:
+                os.environ.pop('DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE', None)
+            cumulative_local_expert_recv_stats_fused.copy_(initial_stats)
+            # The first call snapshots the cumulative counter; the second call
+            # supplies a valid per-iteration delta and exercises adaptivity.
+            run_fused()
+            y_config, stats_config = run_fused()
+            torch.cuda.synchronize()
+            return y_config.clone(), stats_config.clone()
+
+        try:
+            reference_y, reference_stats = run_config(0)
+            configs = [
+                ('adaptive_wave', 0, 0, 1),
+            ] + [
+                (f'block_m={block_m}', block_m, 0, 0)
+                for block_m in (16, 32, 64, 96, 128, 192)
+            ] + [
+                (f'experts_per_wave={wave_size}', 0, wave_size, 0)
+                for wave_size in (4, 8, 12, 16, 24, 32)
+            ]
+            for label, force_block_m, force_wave_size, adaptive_wave in configs:
+                actual_y, actual_stats = run_config(
+                    force_block_m, force_wave_size, adaptive_wave)
+                assert torch.equal(actual_y, reference_y), f'{label} changed MegaMoE output'
+                assert torch.equal(actual_stats, reference_stats), f'{label} changed receive stats'
+            dist_print(
+                ' > config invariance validation passed '
+                '(adaptive wave + 6 block_m + 6 wave tiers)',
+                once_in_node=True)
+        finally:
+            if old_force is None:
+                os.environ.pop('DG_MEGA_MOE_FORCE_BLOCK_M', None)
+            else:
+                os.environ['DG_MEGA_MOE_FORCE_BLOCK_M'] = old_force
+            if old_adaptive_wave is None:
+                os.environ.pop('DG_MEGA_MOE_ADAPTIVE_WAVE', None)
+            else:
+                os.environ['DG_MEGA_MOE_ADAPTIVE_WAVE'] = old_adaptive_wave
+            if old_force_wave is None:
+                os.environ.pop('DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE', None)
+            else:
+                os.environ['DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE'] = old_force_wave
+
         dist.barrier()
         buffer.destroy()
         dist.destroy_process_group()
@@ -231,11 +296,91 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                       (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
 
+    if args.routing_stats_only:
+        local_expert_ids = gathered_topk_idx[gathered_topk_idx >= 0] \
+            - rank_idx * num_experts_per_rank
+        recv_counts = torch.bincount(
+            local_expert_ids, minlength=num_experts_per_rank).cpu()
+        recv_counts_f = recv_counts.float()
+        mean = recv_counts_f.mean().item()
+        cv = recv_counts_f.std(unbiased=False).item() / mean if mean > 0 else 0.0
+        counts_csv = ','.join(str(value) for value in recv_counts.tolist())
+        dist_print(
+            f'ROUTING_STATS rank={rank_idx} sum={recv_counts.sum().item()} '
+            f'active={(recv_counts > 0).sum().item()} max={recv_counts.max().item()} '
+            f'mean={mean:.3f} cv={cv:.4f} counts={counts_csv}')
+        buffer.destroy()
+        ep_buffer.destroy() if is_legacy_loaded else None
+        dist.destroy_process_group()
+        return
+
+    if args.validate_adaptive_wave_ab:
+        old_adaptive_wave = os.environ.get('DG_MEGA_MOE_ADAPTIVE_WAVE')
+        old_force_block_m = os.environ.get('DG_MEGA_MOE_FORCE_BLOCK_M')
+        old_force_wave = os.environ.get('DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE')
+        baseline_times, adaptive_times = [], []
+
+        def bench_wave_config(adaptive: bool):
+            os.environ['DG_MEGA_MOE_ADAPTIVE_WAVE'] = '1' if adaptive else '0'
+            os.environ.pop('DG_MEGA_MOE_FORCE_BLOCK_M', None)
+            os.environ.pop('DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE', None)
+            return bench_kineto(
+                run_fused, 'mega_moe', num_tests=args.adaptive_wave_ab_num_tests,
+                barrier=lambda: dist.barrier(), with_multiple_kernels=True)
+
+        try:
+            for repeat_idx in range(args.adaptive_wave_ab_repeats):
+                # Reverse the order every repetition to cancel clock/thermal drift.
+                if repeat_idx % 2 == 0:
+                    baseline_times.append(bench_wave_config(False))
+                    adaptive_times.append(bench_wave_config(True))
+                else:
+                    adaptive_times.append(bench_wave_config(True))
+                    baseline_times.append(bench_wave_config(False))
+
+            def median(values):
+                ordered = sorted(values)
+                middle = len(ordered) // 2
+                return ordered[middle] if len(ordered) % 2 else \
+                    (ordered[middle - 1] + ordered[middle]) / 2
+            baseline_median = median(baseline_times)
+            adaptive_median = median(adaptive_times)
+            speedup_pct = (baseline_median / adaptive_median - 1.0) * 100.0
+            baseline_samples = ','.join(f'{value * 1e6:.3f}' for value in baseline_times)
+            adaptive_samples = ','.join(f'{value * 1e6:.3f}' for value in adaptive_times)
+            dist_print(
+                f'WAVE_AB_SAMPLES rank={rank_idx} '
+                f'baseline_us={baseline_samples} adaptive_us={adaptive_samples}')
+            dist_print(
+                f'WAVE_AB_SUMMARY rank={rank_idx} '
+                f'baseline_us={baseline_median * 1e6:.3f} '
+                f'adaptive_us={adaptive_median * 1e6:.3f} '
+                f'speedup_pct={speedup_pct:.3f}')
+        finally:
+            for name, value in (
+                ('DG_MEGA_MOE_ADAPTIVE_WAVE', old_adaptive_wave),
+                ('DG_MEGA_MOE_FORCE_BLOCK_M', old_force_block_m),
+                ('DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE', old_force_wave),
+            ):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        buffer.destroy()
+        ep_buffer.destroy() if is_legacy_loaded else None
+        dist.destroy_process_group()
+        return
+
     # Benchmark
     t_fused = bench_kineto(
         run_fused, 'mega_moe',
         barrier=lambda: ep_buffer.barrier(use_comm_stream=False) if ep_buffer else dist.barrier(),
-        trace_path=None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json')
+        trace_path=None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json',
+        # Adaptive wave sizing can transition between JIT-specialized variants
+        # while receive statistics warm up. Aggregate all matching MegaMoE
+        # kernels instead of requiring one profiler row.
+        with_multiple_kernels=True)
     t_baseline = tilelang_bench(run_baseline, _n_warmup=5, _n_repeat=1, backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
 
     # TFLOPS: 3 matmuls (L1 left, L1 right, L2), each 2 * M * N * K
@@ -300,14 +445,23 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--skew-alpha', type=float, default=0.0,
-                        help='Zipf skew for router (0=uniform). Use with '
-                             'DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M=1 to benchmark '
-                             'imbalance-aware block_m selection.')
+                        help='Zipf skew for router (0=uniform), used by adaptive-wave benchmarks')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
+    parser.add_argument('--validate-config-invariance', '--validate-block-m-invariance',
+                        dest='validate_config_invariance', action='store_true',
+                        help='Compare default/adaptive/all forced block_m and wave tiers')
+    parser.add_argument('--routing-stats-only', action='store_true',
+                        help='Print realized local-expert receive counts and exit before benchmarking')
+    parser.add_argument('--validate-adaptive-wave-ab', action='store_true',
+                        help='Interleave baseline/adaptive-wave benchmarks in one process')
+    parser.add_argument('--adaptive-wave-ab-repeats', type=int, default=4,
+                        help='Number of interleaved baseline/adaptive measurements')
+    parser.add_argument('--adaptive-wave-ab-num-tests', type=int, default=20,
+                        help='Profiled kernel calls per interleaved measurement')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()

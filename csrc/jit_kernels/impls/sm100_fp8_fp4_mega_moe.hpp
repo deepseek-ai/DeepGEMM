@@ -132,8 +132,8 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
 
     // Heuristics
-    // NOTES: `host_recv_stats` are the realized per-local-expert token counts on
-    // the host, used for imbalance-aware `block_m` selection (opt-in via env).
+    // NOTES: `host_recv_stats` are the sampled per-local-expert token counts used
+    // by opt-in adaptive wave sizing.
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,

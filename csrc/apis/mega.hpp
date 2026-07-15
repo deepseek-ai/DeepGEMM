@@ -230,19 +230,61 @@ static void fp8_fp4_mega_moe(
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
-    // Imbalance-aware block_m: optionally snapshot the realized per-local-expert
-    // receive counts to the host so the heuristic can size `block_m` from the
-    // actual (skewed) distribution rather than the uniform mean.
-    // Gated by env so the default path is bit-for-bit unchanged. The extra
-    // device->host copy is `num_experts_per_rank` ints (tens of values) and is
-    // skipped entirely when the flag is off or no stats tensor is supplied.
-    std::vector<int> host_recv_stats;
+    // Adaptive heuristics consume a per-iteration receive-count distribution.
+    // The public tensor is cumulative, so using its absolute values makes the
+    // selected JIT config drift as the counter grows. Snapshot the cumulative
+    // values and pass only a valid delta from the previous snapshot. Sampling is
+    // opt-in and amortized over 256 launches; the cached distribution also avoids
+    // host synchronization and JIT-config churn on the steady-state path. The
+    // first call, counter resets, pointer changes, and zero deltas fall back to
+    // the default heuristic until a new valid delta is observed.
     const int* host_recv_stats_ptr = nullptr;
-    if (get_env<int>("DG_MEGA_MOE_IMBALANCE_AWARE_BLOCK_M", 0) != 0 and
-        cumulative_local_expert_recv_stats.has_value()) {
-        const auto cpu = cumulative_local_expert_recv_stats->to(torch::kCPU, torch::kInt);
-        host_recv_stats.assign(cpu.data_ptr<int>(), cpu.data_ptr<int>() + cpu.numel());
-        host_recv_stats_ptr = host_recv_stats.data();
+    const bool use_adaptive_stats = get_env<int>("DG_MEGA_MOE_ADAPTIVE_WAVE", 0) != 0;
+    if (use_adaptive_stats and cumulative_local_expert_recv_stats.has_value()) {
+        const auto* device_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+        struct AdaptiveRecvStatsCache {
+            const int* device_ptr = nullptr;
+            std::vector<int> previous_cumulative;
+            std::vector<int> cached_delta;
+            int calls_since_refresh = 0;
+            bool has_cached_delta = false;
+        };
+        static thread_local AdaptiveRecvStatsCache cache;
+        constexpr int kRefreshInterval = 256;
+
+        const bool pointer_changed = cache.device_ptr != device_ptr or
+            cache.previous_cumulative.size() !=
+                static_cast<size_t>(cumulative_local_expert_recv_stats->numel());
+        const bool should_refresh = pointer_changed or not cache.has_cached_delta or
+            cache.calls_since_refresh >= kRefreshInterval;
+        if (should_refresh) {
+            const auto cpu = cumulative_local_expert_recv_stats->to(torch::kCPU, torch::kInt);
+            const auto* current_ptr = cpu.data_ptr<int>();
+            bool valid_delta = not pointer_changed;
+            int64_t delta_sum = 0;
+            cache.cached_delta.resize(cpu.numel());
+            if (valid_delta) {
+                for (int i = 0; i < cpu.numel(); ++ i) {
+                    const int delta = current_ptr[i] - cache.previous_cumulative[i];
+                    if (delta < 0) {
+                        valid_delta = false;
+                        break;
+                    }
+                    cache.cached_delta[i] = delta;
+                    delta_sum += delta;
+                }
+            }
+
+            cache.device_ptr = device_ptr;
+            cache.previous_cumulative.assign(current_ptr, current_ptr + cpu.numel());
+            cache.has_cached_delta = valid_delta and delta_sum > 0;
+            cache.calls_since_refresh = 0;
+        } else {
+            ++ cache.calls_since_refresh;
+        }
+
+        if (cache.has_cached_delta)
+            host_recv_stats_ptr = cache.cached_delta.data();
     }
 
     // Dispatch into different architectures
