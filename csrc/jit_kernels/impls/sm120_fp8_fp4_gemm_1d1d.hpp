@@ -39,6 +39,7 @@ public:
         int stride_cd_m;
         int stride_cd_n;
         int stride_cd_batch;
+        bool a_cpasync;  // A is contiguous and K % BLOCK_K == 0: padding-skip cp.async A path allowed
 
         void* gmem_d;
         void* gmem_c;
@@ -81,6 +82,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -106,7 +108,8 @@ static void __instantiate_kernel() {{
         args.k_grouped_constant_stride ? "true" : "false",
         args.gemm_config.storage_config.store_block_m,
         args.gemm_config.split_k_factor,
-        should_skip_padding_store(args.gemm_desc, args.gemm_config) ? "true" : "false");
+        should_skip_padding_store(args.gemm_desc, args.gemm_config) ? "true" : "false",
+        args.a_cpasync ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -491,6 +494,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .stride_cd_m = n,
         .stride_cd_n = 0,
         .stride_cd_batch = 0,
+        .a_cpasync = a.is_contiguous() and (k % config.layout.block_k == 0),
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = a.data_ptr(),
@@ -581,6 +585,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .stride_cd_m = n,
         .stride_cd_n = 0,
         .stride_cd_batch = 0,
+        .a_cpasync = a.is_contiguous() and (k % config.layout.block_k == 0),
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = a.data_ptr(),

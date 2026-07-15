@@ -45,7 +45,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
           uint32_t kSplitKFactor = 1,
-          bool kSkipPaddingStore = false>
+          bool kSkipPaddingStore = false,
+          bool kACpAsync = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
@@ -132,8 +133,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t TMA_A_BYTES = kAIsFP4 ? (SMEM_A / 2) : SMEM_A;
     static constexpr uint32_t SMEM_TMA_BYTES = TMA_A_BYTES + TMA_B_BYTES + TMA_SFA_BYTES + TMA_SFB_BYTES;
     // Load A via warp-cooperative cp.async, skipping M-padding rows at the source (they are
-    // never stored — see kSkipPaddingStore). Only the verified SW128/BK=128 FP8-A layout.
-    static constexpr bool kUseCpAsyncA = kSkipPaddingStore and not kIsFP4 and not kAIsFP4
+    // never stored — see kSkipPaddingStore). Only the verified SW128/BK=128 FP8-A layout;
+    // kACpAsync additionally requires contiguous A and K % BLOCK_K == 0 (host-checked).
+    static constexpr bool kUseCpAsyncA = kACpAsync and kSkipPaddingStore and not kIsFP4 and not kAIsFP4
         and BLOCK_K == 128 and kSwizzleAMode == 128
         and (kGemmType == GemmType::MGroupedContiguous or kGemmType == GemmType::MGroupedMasked);
     static constexpr uint32_t SMEM_TMA_BYTES_PRODUCER = kUseCpAsyncA ? (SMEM_TMA_BYTES - TMA_A_BYTES) : SMEM_TMA_BYTES;
@@ -1368,17 +1370,20 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t row1 = row0 + 8;
 
                         if (can_pair) {
-                            if (row0 < total_shape_m and col + 1 < shape_n and row_is_valid(row0)) {
+                            // Pair store, with a single-element tail for odd shape_n
+                            if (row0 < total_shape_m and col < shape_n and row_is_valid(row0)) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
                                 float v0 = accum[ai + 0], v1 = accum[ai + 1];
-                                if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
-                                store_pair(&gmem_d[idx], v0, v1);
+                                if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); if (col + 1 < shape_n) v1 += read_cd(gmem_c[idx + 1]); }
+                                if (col + 1 < shape_n) store_pair(&gmem_d[idx], v0, v1);
+                                else                   gmem_d[idx] = cd_dtype_t(v0);
                             }
-                            if (row1 < total_shape_m and col + 1 < shape_n and row_is_valid(row1)) {
+                            if (row1 < total_shape_m and col < shape_n and row_is_valid(row1)) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
                                 float v2 = accum[ai + 2], v3 = accum[ai + 3];
-                                if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); v3 += read_cd(gmem_c[idx + 1]); }
-                                store_pair(&gmem_d[idx], v2, v3);
+                                if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); if (col + 1 < shape_n) v3 += read_cd(gmem_c[idx + 1]); }
+                                if (col + 1 < shape_n) store_pair(&gmem_d[idx], v2, v3);
+                                else                   gmem_d[idx] = cd_dtype_t(v2);
                             }
                         } else {
                             // Strided store: per-element N bounds check (handles shape_n=1)

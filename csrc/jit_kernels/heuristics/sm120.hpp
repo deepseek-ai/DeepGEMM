@@ -27,9 +27,12 @@ struct SM120ArchSpec {
         std::vector<int> block_m_candidates;
         const bool is_m_grouped = is_m_grouped_contiguous(desc.gemm_type)
                                   or desc.gemm_type == GemmType::MGroupedMasked;
-        if (runtime_align == 32 and is_m_grouped)
-            // Decode alignment: BLOCK_M=32 via the kNWarps=4 warp layout
+        if (runtime_align == 32 and is_m_grouped) {
+            // Decode alignment: BLOCK_M=32 via the kNWarps=4 warp layout. No valid warp
+            // layout exists for BLOCK_M=32 with N <= 32 tiles — reject explicitly.
+            DG_HOST_ASSERT(not is_small_n and "m-grouped with N <= 32 requires alignment >= 64");
             block_m_candidates.push_back(32);
+        }
         else if (runtime_align <= kMinBlockM)
             block_m_candidates.push_back(64);
         else {
