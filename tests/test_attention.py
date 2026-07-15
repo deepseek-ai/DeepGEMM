@@ -116,8 +116,12 @@ def test_mqa_logits():
                     for seq_len, seq_len_kv, head_cfgs in (
                         *[(s, k, [(64, 128)]) for s in (128, 512, 2048, 4096) for k in (4096, 8192)],
                         *[(s, k, [(64, 128), (32, 128)]) for s in (510, 512) for k in (130560,)],
+                        # head_dim < 128 coverage (FP8-only): kernel swizzle must follow head_dim
+                        (512, 8192, [(64, 64), (64, 32)]),
                     ):
                         for num_heads, head_dim in head_cfgs:
+                            if is_fp4 and head_dim != 128:
+                                continue
                             for disable_cp in (False, True):
                                 yield is_fp4, logits_dtype, compressed_logits, clean_logits, seq_len, seq_len_kv, num_heads, head_dim, disable_cp
 
