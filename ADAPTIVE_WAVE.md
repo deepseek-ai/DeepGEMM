@@ -7,15 +7,20 @@ is a good general fallback, but it cannot see the realized routing distribution.
 Set `DG_MEGA_MOE_ADAPTIVE_WAVE=1` to enable the opt-in B200 FP8×FP4 policy. The policy:
 
 - reads a delta of `cumulative_local_expert_recv_stats` from the preceding window;
-- caches the sampled distribution and refreshes it every 256 launches, avoiding a
+- maintains an independent bounded cache entry for each logical receive-counter
+  tensor, so multiple MegaMoE layers can alternate on one host thread;
+- caches the sampled distribution and refreshes it every 256 launches. This
+  interval was calibrated for stationary B200 routing and amortizes the
   synchronous device-to-host copy on the steady-state path;
 - only changes the calibrated shape (EP 8, 256 experts, top-k 8, hidden 7168,
   intermediate 2048) and `127.5 < expected tokens/expert <= 128.5` band;
 - skips receive-stat sampling entirely outside that calibrated shape and band;
 - uses 8 experts/wave when the active-expert ratio is at or below 0.92;
   balanced and moderate-skew routing retain the upstream size;
-- falls back to the upstream wave size on the first call, after counter resets,
-  outside the calibrated tier, or when the requested tier exceeds ring capacity.
+- falls back to the upstream wave size on the first call, after counter resets or
+  zero-delta samples, outside the calibrated tier, or when the requested tier
+  exceeds ring capacity. Reset and zero-delta samples observe the same refresh
+  interval instead of synchronizing on every launch.
 
 The deliberately narrow gate is based on same-process, order-balanced 8×B200
 measurements. A broader lower bound was rejected after the 96 tokens/expert

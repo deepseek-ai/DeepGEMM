@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <pybind11/functional.h>
 
@@ -236,14 +237,15 @@ static void fp8_fp4_mega_moe(
     // values and pass only a valid delta from the previous snapshot. Sampling is
     // opt-in, restricted to the calibrated tokens/expert band, and amortized
     // over 256 launches; the cached distribution also avoids host synchronization
-    // and JIT-config churn on the steady-state path. The first call, counter
-    // resets, pointer changes, and zero deltas fall back to the default heuristic
-    // until a new valid delta is observed.
+    // and JIT-config churn on the steady-state path. Each logical counter tensor
+    // has an independent bounded cache entry, so alternating MegaMoE layers do
+    // not invalidate one another. The first call, counter resets, and zero deltas
+    // fall back to the default heuristic until a new valid delta is observed.
     const int* host_recv_stats_ptr = nullptr;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
     const bool is_calibrated_shape =
-        num_ranks == 8 and num_experts_per_rank == 32 and num_topk == 8 and
+        num_ranks == 8 and num_experts == 256 and num_experts_per_rank == 32 and num_topk == 8 and
         hidden == 7168 and intermediate_hidden == 2048;
     const bool use_adaptive_stats =
         get_env<int>("DG_MEGA_MOE_ADAPTIVE_WAVE", 0) != 0 and
@@ -251,25 +253,67 @@ static void fp8_fp4_mega_moe(
         expected_tokens_per_expert > 127.5f and expected_tokens_per_expert <= 128.5f;
     if (use_adaptive_stats and cumulative_local_expert_recv_stats.has_value()) {
         const auto* device_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+        struct AdaptiveRecvStatsKey {
+            const void* tensor_impl;
+            const int* device_ptr;
+
+            bool operator==(const AdaptiveRecvStatsKey& other) const {
+                return tensor_impl == other.tensor_impl and device_ptr == other.device_ptr;
+            }
+        };
+        struct AdaptiveRecvStatsKeyHash {
+            size_t operator()(const AdaptiveRecvStatsKey& key) const {
+                const auto tensor_hash = std::hash<const void*>{}(key.tensor_impl);
+                const auto data_hash = std::hash<const int*>{}(key.device_ptr);
+                return tensor_hash ^ (data_hash + (tensor_hash << 6) + (tensor_hash >> 2));
+            }
+        };
         struct AdaptiveRecvStatsCache {
-            const int* device_ptr = nullptr;
+            // Retain the tensor identity while this entry exists. Besides making
+            // the logical identity explicit, this prevents its TensorImpl and
+            // CUDA allocation from being recycled into a false cache hit.
+            torch::Tensor counter_identity;
             std::vector<int> previous_cumulative;
             std::vector<int> cached_delta;
             int calls_since_refresh = 0;
+            bool has_previous_snapshot = false;
+            bool sample_next_call = false;
             bool has_cached_delta = false;
         };
-        static thread_local AdaptiveRecvStatsCache cache;
-        constexpr int kRefreshInterval = 256;
+        static thread_local std::unordered_map<
+            AdaptiveRecvStatsKey, AdaptiveRecvStatsCache,
+            AdaptiveRecvStatsKeyHash> caches;
 
-        const bool pointer_changed = cache.device_ptr != device_ptr or
-            cache.previous_cumulative.size() !=
+        // The B200 A/B calibration used a stationary routing distribution. A
+        // 256-launch interval amortizes the synchronous D2H copy while still
+        // periodically detecting workload changes. Keep the cache bounded for
+        // models that create transient counter tensors on a long-lived thread.
+        constexpr int kRefreshInterval = 256;
+        constexpr size_t kMaxCachedCounters = 64;
+        const AdaptiveRecvStatsKey cache_key = {
+            cumulative_local_expert_recv_stats->unsafeGetTensorImpl(), device_ptr};
+        auto cache_it = caches.find(cache_key);
+        if (cache_it == caches.end()) {
+            if (caches.size() >= kMaxCachedCounters)
+                caches.clear();
+            cache_it = caches.try_emplace(cache_key).first;
+            cache_it->second.counter_identity = *cumulative_local_expert_recv_stats;
+        }
+        auto& cache = cache_it->second;
+
+        // Count this launch before testing the periodic deadline so refreshes
+        // are exactly kRefreshInterval launches apart after initialization.
+        ++ cache.calls_since_refresh;
+        const bool has_matching_snapshot = cache.has_previous_snapshot and
+            cache.previous_cumulative.size() ==
                 static_cast<size_t>(cumulative_local_expert_recv_stats->numel());
-        const bool should_refresh = pointer_changed or not cache.has_cached_delta or
-            cache.calls_since_refresh >= kRefreshInterval;
+        const bool should_refresh = not has_matching_snapshot or
+            cache.sample_next_call or cache.calls_since_refresh >= kRefreshInterval;
+
         if (should_refresh) {
             const auto cpu = cumulative_local_expert_recv_stats->to(torch::kCPU, torch::kInt);
             const auto* current_ptr = cpu.data_ptr<int>();
-            bool valid_delta = not pointer_changed;
+            bool valid_delta = has_matching_snapshot;
             int64_t delta_sum = 0;
             cache.cached_delta.resize(cpu.numel());
             if (valid_delta) {
@@ -284,12 +328,14 @@ static void fp8_fp4_mega_moe(
                 }
             }
 
-            cache.device_ptr = device_ptr;
             cache.previous_cumulative.assign(current_ptr, current_ptr + cpu.numel());
+            cache.has_previous_snapshot = true;
+            // Only the initial snapshot samples again immediately so adaptivity
+            // can start on the next launch. Zero deltas and counter resets back
+            // off for the regular interval instead of synchronizing every call.
+            cache.sample_next_call = not has_matching_snapshot;
             cache.has_cached_delta = valid_delta and delta_sum > 0;
             cache.calls_since_refresh = 0;
-        } else {
-            ++ cache.calls_since_refresh;
         }
 
         if (cache.has_cached_delta)

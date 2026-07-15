@@ -109,7 +109,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
-    def run_fused():
+    def run_fused(recv_stats=None):
+        recv_stats = cumulative_local_expert_recv_stats_fused \
+            if recv_stats is None else recv_stats
         if is_bf16xbf16:
             buffer.x[:num_tokens].copy_(x)
         else:
@@ -122,11 +124,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         kernel_kwargs = dict(
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
             sym_buffer=buffer,
-            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+            cumulative_local_expert_recv_stats=recv_stats,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
-        return y, cumulative_local_expert_recv_stats_fused
+        return y, recv_stats
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
@@ -179,6 +181,25 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         try:
             reference_y, reference_stats = run_config(0)
+
+            # Alternate two independent logical counters on the same host thread.
+            # Each counter gets an initial snapshot and then a valid delta; this
+            # guards against a single thread-local entry continually invalidating
+            # itself when a process invokes multiple MegaMoE layers.
+            os.environ['DG_MEGA_MOE_ADAPTIVE_WAVE'] = '1'
+            os.environ.pop('DG_MEGA_MOE_FORCE_BLOCK_M', None)
+            os.environ.pop('DG_MEGA_MOE_FORCE_EXPERTS_PER_WAVE', None)
+            alternating_counters = [initial_stats.clone(), initial_stats.clone()]
+            for counter in alternating_counters:
+                run_fused(counter)
+            alternating_results = [run_fused(counter) for counter in alternating_counters]
+            torch.cuda.synchronize()
+            for counter_idx, (actual_y, actual_stats) in enumerate(alternating_results):
+                assert torch.equal(actual_y, reference_y), \
+                    f'adaptive counter {counter_idx} changed MegaMoE output'
+                assert torch.equal(actual_stats, reference_stats), \
+                    f'adaptive counter {counter_idx} changed receive stats'
+
             configs = [
                 ('adaptive_wave', 0, 0, 1),
             ] + [
@@ -195,7 +216,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 assert torch.equal(actual_stats, reference_stats), f'{label} changed receive stats'
             dist_print(
                 ' > config invariance validation passed '
-                '(adaptive wave + 6 block_m + 6 wave tiers)',
+                '(2 adaptive counters + 6 block_m + 6 wave tiers)',
                 once_in_node=True)
         finally:
             if old_force is None:

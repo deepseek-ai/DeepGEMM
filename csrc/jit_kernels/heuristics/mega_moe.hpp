@@ -228,10 +228,10 @@ static int get_num_experts_per_wave_for_mega_moe(
         return best_num_experts_per_wave;
     }();
 
-    // The production default remains the strict fallback. Adaptive sizing uses
-    // the previous iteration's realized local-expert receive counts, so it is
-    // opt-in and never guesses during the first call or after a counter reset.
-    if (recv_stats == nullptr or get_env<int>("DG_MEGA_MOE_ADAPTIVE_WAVE", 0) == 0)
+    // The production default remains the strict fallback. The API only passes
+    // realized receive counts after its opt-in shape/band gate and a valid
+    // sampled delta, so avoid reading the same environment variable again here.
+    if (recv_stats == nullptr)
         return default_num_experts_per_wave;
 
     // B200 calibration shows two independent effects: small waves repeatedly pay
