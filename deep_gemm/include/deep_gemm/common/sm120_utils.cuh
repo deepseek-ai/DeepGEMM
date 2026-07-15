@@ -252,6 +252,32 @@ __device__ __forceinline__ uint32_t load_sf(const char* smem_sf, int idx) {
     return *reinterpret_cast<const uint32_t*>(smem_sf + idx * sizeof(int32_t));
 }
 
+
+// Warp-cooperative cp.async.cg row loader with TMA-equivalent SW128 swizzle.
+// Loads rows [0, num_rows) of kRowBytes each; rows beyond keep stale SMEM.
+template <uint32_t kRowBytes, uint32_t kSwizzleMode>
+CUTLASS_DEVICE void cpasync_load_rows(char* smem_dst, const char* gmem_src,
+                                      const uint32_t& num_rows, const uint32_t& gmem_row_stride,
+                                      const uint32_t& lane_idx) {
+    static_assert(kSwizzleMode == 128 and kRowBytes == 128, "Only the SW128 layout is verified");
+    constexpr uint32_t kChunks = kRowBytes / 16;
+    const uint32_t total = num_rows * kChunks;
+    for (uint32_t item = lane_idx; item < total; item += 32) {
+        const uint32_t row = item / kChunks;
+        const uint32_t offset = CuTeSwizzle<kSwizzleMode>::apply(item * 16);
+        const auto dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst + offset));
+        const char* src = gmem_src + row * static_cast<uint64_t>(gmem_row_stride) + (item % kChunks) * 16;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src) : "memory");
+    }
+}
+
+// The mbarrier receives one arrival per calling thread once all its prior cp.asyncs land.
+// .noinc: the arrival is part of the barrier's fixed expected count (init +1 per lane).
+CUTLASS_DEVICE void cpasync_mbarrier_arrive(void* mbar) {
+    const auto addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(addr) : "memory");
+}
+
 } // namespace deep_gemm::sm120
 
 #endif

@@ -15,6 +15,14 @@
 
 namespace deep_gemm {
 
+// Skip D stores of M-padding rows in m-grouped layouts, leaving them untouched (their contents
+// are unspecified). Requires the direct-store epilogue (swizzle_cd == 0) and no split-K.
+static bool should_skip_padding_store(const GemmDesc& desc, const GemmConfig& config) {
+    return (desc.gemm_type == GemmType::MGroupedContiguous or desc.gemm_type == GemmType::MGroupedMasked)
+        and config.storage_config.swizzle_cd_mode == 0
+        and config.split_k_factor == 1;
+}
+
 class SM120FP8FP4Gemm1D1DRuntime final: public LaunchRuntime<SM120FP8FP4Gemm1D1DRuntime> {
 public:
     struct Args {
@@ -31,6 +39,7 @@ public:
         int stride_cd_m;
         int stride_cd_n;
         int stride_cd_batch;
+        bool a_cpasync;  // A is contiguous and K % BLOCK_K == 0: padding-skip cp.async A path allowed
 
         void* gmem_d;
         void* gmem_c;
@@ -72,6 +81,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -96,7 +107,9 @@ static void __instantiate_kernel() {{
         (args.gemm_desc.major_b == cute::UMMA::Major::K) ? "true" : "false",
         args.k_grouped_constant_stride ? "true" : "false",
         args.gemm_config.storage_config.store_block_m,
-        args.gemm_config.split_k_factor);
+        args.gemm_config.split_k_factor,
+        should_skip_padding_store(args.gemm_desc, args.gemm_config) ? "true" : "false",
+        args.a_cpasync ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -481,9 +494,10 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .stride_cd_m = n,
         .stride_cd_n = 0,
         .stride_cd_batch = 0,
+        .a_cpasync = a.is_contiguous() and (k % config.layout.block_k == 0),
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
-        .gmem_a_ptr = nullptr,
+        .gmem_a_ptr = a.data_ptr(),
         .gmem_b_ptr = nullptr,
         .gmem_workspace = nullptr,
         .grouped_layout = grouped_layout.data_ptr(),
@@ -571,9 +585,10 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .stride_cd_m = n,
         .stride_cd_n = 0,
         .stride_cd_batch = 0,
+        .a_cpasync = a.is_contiguous() and (k % config.layout.block_k == 0),
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
-        .gmem_a_ptr = nullptr,
+        .gmem_a_ptr = a.data_ptr(),
         .gmem_b_ptr = nullptr,
         .gmem_workspace = nullptr,
         .grouped_layout = masked_m.data_ptr(),

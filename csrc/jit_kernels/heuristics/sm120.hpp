@@ -13,7 +13,7 @@ namespace deep_gemm {
 struct SM120ArchSpec {
     static constexpr int smem_capacity = 101376;  // 99KB
 
-    static constexpr int kMinBlockM = 64;   // kMWarps(4) * MMA_M(16), both FP8 and BF16 with kNWarps=2
+    static constexpr int kMinBlockM = 64;   // kNWarps=2 floor; BLOCK_M=32 uses kNWarps=4 (m-grouped decode)
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
         const int elem_size = get_element_size(desc.get_mma_kind());
@@ -25,7 +25,15 @@ struct SM120ArchSpec {
         const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
 
         std::vector<int> block_m_candidates;
-        if (runtime_align <= kMinBlockM)
+        const bool is_m_grouped = is_m_grouped_contiguous(desc.gemm_type)
+                                  or desc.gemm_type == GemmType::MGroupedMasked;
+        if (runtime_align == 32 and is_m_grouped) {
+            // Decode alignment: BLOCK_M=32 via the kNWarps=4 warp layout. No valid warp
+            // layout exists for BLOCK_M=32 with N <= 32 tiles — reject explicitly.
+            DG_HOST_ASSERT(not is_small_n and "m-grouped with N <= 32 requires alignment >= 64");
+            block_m_candidates.push_back(32);
+        }
+        else if (runtime_align <= kMinBlockM)
             block_m_candidates.push_back(64);
         else {
             if (is_small_n)
@@ -48,7 +56,8 @@ struct SM120ArchSpec {
         // but only beneficial for large M (>= 2048) and non-mixed dtypes.
         const bool is_mixed = (desc.a_dtype != desc.b_dtype);
         std::vector<int> block_k_candidates;
-        if (!is_mixed and expected_m >= 2048)
+        // BLOCK_M=32 decode keeps BK=128: enables the padding-skip cp.async A path (SW128)
+        if (!is_mixed and expected_m >= 2048 and not (is_m_grouped and runtime_align == 32))
             block_k_candidates.push_back(64 / elem_size);
         block_k_candidates.push_back(128 / elem_size);
 
@@ -75,10 +84,16 @@ struct SM120ArchSpec {
         for (int block_m : block_m_candidates) {
         // For grouped contiguous GEMM, BLOCK_M must divide runtime_align
         // to prevent tiles from straddling expert boundaries.
-        if (is_m_grouped_contiguous(desc.gemm_type) and block_m > runtime_align)
+        if (is_m_grouped_contiguous(desc.gemm_type)
+            and (block_m > runtime_align or runtime_align % block_m != 0))
             continue;
         for (int block_k : block_k_candidates) {
         for (int block_n : block_n_candidates) {
+            // BLOCK_M < 64 (kNWarps=4): BLOCK_N=64 only. Even kNTilesPerWarp (ldmatrix.x2)
+            // requires BLOCK_N % 64; measured vs BN=128: never worse, -1.6% on thin-N decode,
+            // and doubles SM fill at tiny M.
+            if (block_m < 64 and block_n != 64)
+                continue;
             if (!is_small_n and (block_n > 128 or block_n > mn_major_b_max_n))
                 continue;
 
@@ -145,7 +160,11 @@ struct SM120ArchSpec {
 
         const int cd_size = c10::elementSize(desc.cd_dtype);
         // cd_n_contiguous gates the TMA-store epilogue (off for AB-swap transposed output).
-        const auto swizzle_mode_cd = (desc.cd_n_contiguous and layout.block_n * cd_size >= 128) ? 128 : 0;
+        // M-grouped 1D1D uses the direct-store epilogue so the kernel can skip M-padding row
+        // stores (padding rows of D are unspecified); faster at decode AND prefill (fewer bytes).
+        const bool grouped_skip_padding_store = desc.kernel_type == KernelType::Kernel1D1D
+            and (desc.gemm_type == GemmType::MGroupedContiguous or desc.gemm_type == GemmType::MGroupedMasked);
+        const auto swizzle_mode_cd = (not grouped_skip_padding_store and desc.cd_n_contiguous and layout.block_n * cd_size >= 128) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.
