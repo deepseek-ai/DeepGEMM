@@ -1,7 +1,5 @@
 # MegaMoE Adaptive Wave Sizing
 
-For a detailed Chinese design note, see [`ADAPTIVE_WAVE_ZH.md`](ADAPTIVE_WAVE_ZH.md).
-
 MegaMoE processes a fixed number of local experts in each L1→L2 scheduler wave.
 The upstream heuristic derives that number from the mean tokens per expert. That
 is a good general fallback, but it cannot see the realized routing distribution.
@@ -44,6 +42,40 @@ then reporting the median):
 ```bash
 bash scripts/bench_adaptive_wave_ab.sh
 ```
+
+## B200 performance
+
+The final-source validation used 8×B200, six alternating baseline/adaptive
+measurements per case, and 30 profiled kernel calls per measurement. Distributed
+latency is reduced as `median_repeat(max_rank(latency))`: each repetition first
+takes the slowest of all eight ranks, then the six slowest-rank samples are
+reduced by their median.
+
+The common-token sweep used 256 experts, top-k 8, EP 8, hidden 7168, and
+intermediate hidden 2048. Values below are observed baseline/adaptive deltas:
+
+| tokens/rank | expected TPE | alpha 0.0 | alpha 1.0 | alpha 1.5 |
+|---:|---:|---:|---:|---:|
+| 64 | 16 | +0.933% | -1.223% | +0.752% |
+| 128 | 32 | -1.015% | -0.077% | -0.361% |
+| 256 | 64 | -0.246% | -0.280% | -0.168% |
+| 384 | 96 | -0.763% | +0.676% | -1.009% |
+| 512 | 128 | -0.789% | +0.041% | **+1.268%** |
+| 1024 | 256 | +0.059% | -0.702% | +0.043% |
+| 2048 | 512 | +0.087% | +0.041% | +0.114% |
+
+Only the 512-token, alpha-1.5 cell changes the production kernel configuration
+(upstream wave 16 to adaptive wave 8). Its exact-delivery-source result was
+352.642 → 348.225 µs, a **1.268% speedup with 5/6 wins**. The same wave-8 branch
+was positive across six independent runs and multiple B200 nodes: 0.634%,
+1.365%, 2.231%, 1.580%, 2.072%, and 1.268% (median **1.473%**).
+
+Every other cell retains the upstream block and wave configuration. Their
+approximately -1.23% to +0.93% variation is the measured same-configuration
+noise band and is not attributed to the policy. Two broader candidates were
+explicitly rejected: 384-token high-skew wave 8 regressed 1.481% with 0/6 wins,
+and 512-token balanced wave 12 regressed 1.276% with 0/6 wins in an independent
+repeat.
 
 Forced-wave calibration is available separately:
 
