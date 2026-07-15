@@ -238,36 +238,25 @@ static int get_num_experts_per_wave_for_mega_moe(
     // L1/L2 CTA tails, while large waves lose activation locality. The useful
     // operating point is determined by the expected tokens/expert tier and by
     // how many local experts were actually active in the previous iteration.
-    // Keep the policy deliberately small (two adaptive tiers) to bound the
-    // JIT cache, and retain the upstream answer outside the calibrated region.
+    // Keep the policy deliberately small (one adaptive tier) to bound the JIT
+    // cache, and retain the upstream answer outside the calibrated region.
     int num_active_experts = 0;
-    int64_t recv_sum = 0;
-    int64_t recv_square_sum = 0;
-    for (int expert_idx = 0; expert_idx < num_experts_per_rank; ++ expert_idx) {
+    for (int expert_idx = 0; expert_idx < num_experts_per_rank; ++ expert_idx)
         num_active_experts += recv_stats[expert_idx] > 0;
-        recv_sum += recv_stats[expert_idx];
-        recv_square_sum += static_cast<int64_t>(recv_stats[expert_idx]) * recv_stats[expert_idx];
-    }
     const float active_ratio =
         static_cast<float>(num_active_experts) / num_experts_per_rank;
     const float expected_tokens_per_expert =
         static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
-    const double recv_mean = static_cast<double>(recv_sum) / num_experts_per_rank;
-    const double recv_variance =
-        static_cast<double>(recv_square_sum) / num_experts_per_rank - recv_mean * recv_mean;
-    const bool is_balanced = recv_mean > 0.0 and
-        recv_variance <= 0.25 * recv_mean * recv_mean;  // coefficient of variation <= 0.5
 
     int adaptive_num_experts_per_wave = default_num_experts_per_wave;
-    if (expected_tokens_per_expert > 64.5f and expected_tokens_per_expert <= 128.5f) {
-        // Once each expert approaches two M tiles, smaller waves preserve L1→L2
-        // locality. Sparse routing benefits from wave 8; balanced routing uses
-        // wave 12. Moderately skewed routing stays on the upstream wave 16
-        // because its measured change was inside the A/B noise band.
+    if (expected_tokens_per_expert > 127.5f and expected_tokens_per_expert <= 128.5f) {
+        // At the calibrated 128 tokens/expert point, sparse routing benefits
+        // from wave 8. The narrow band deliberately excludes 96 tokens/expert,
+        // where a 6x30 B200 A/B measured a 1.48% high-skew regression. Balanced
+        // wave 12 was also rejected after an independent repeat regressed 1.28%
+        // with 0/6 wins. All non-sparse routing stays on upstream wave 16.
         if (active_ratio <= 0.92f)
             adaptive_num_experts_per_wave = 8;
-        else if (is_balanced)
-            adaptive_num_experts_per_wave = 12;
     }
 
     // Do not exceed the ring-buffer capacity. Falling back, rather than silently

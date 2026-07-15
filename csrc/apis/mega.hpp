@@ -234,12 +234,21 @@ static void fp8_fp4_mega_moe(
     // The public tensor is cumulative, so using its absolute values makes the
     // selected JIT config drift as the counter grows. Snapshot the cumulative
     // values and pass only a valid delta from the previous snapshot. Sampling is
-    // opt-in and amortized over 256 launches; the cached distribution also avoids
-    // host synchronization and JIT-config churn on the steady-state path. The
-    // first call, counter resets, pointer changes, and zero deltas fall back to
-    // the default heuristic until a new valid delta is observed.
+    // opt-in, restricted to the calibrated tokens/expert band, and amortized
+    // over 256 launches; the cached distribution also avoids host synchronization
+    // and JIT-config churn on the steady-state path. The first call, counter
+    // resets, pointer changes, and zero deltas fall back to the default heuristic
+    // until a new valid delta is observed.
     const int* host_recv_stats_ptr = nullptr;
-    const bool use_adaptive_stats = get_env<int>("DG_MEGA_MOE_ADAPTIVE_WAVE", 0) != 0;
+    const float expected_tokens_per_expert =
+        static_cast<float>(num_tokens * num_topk) / num_experts_per_rank;
+    const bool is_calibrated_shape =
+        num_ranks == 8 and num_experts_per_rank == 32 and num_topk == 8 and
+        hidden == 7168 and intermediate_hidden == 2048;
+    const bool use_adaptive_stats =
+        get_env<int>("DG_MEGA_MOE_ADAPTIVE_WAVE", 0) != 0 and
+        is_calibrated_shape and
+        expected_tokens_per_expert > 127.5f and expected_tokens_per_expert <= 128.5f;
     if (use_adaptive_stats and cumulative_local_expert_recv_stats.has_value()) {
         const auto* device_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
         struct AdaptiveRecvStatsCache {
