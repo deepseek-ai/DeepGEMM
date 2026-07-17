@@ -98,6 +98,25 @@ CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
 }
 
+// SM100 can round two positive FP32 scale candidates directly into packed
+// UE8M0.  The first source is placed in the high byte and the second in the
+// low byte; rebuilding IEEE exponent fields preserves the legacy pow2 result.
+CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv_sm100(const float2& amax, float2& sf, float2& sf_inv) {
+    const float2 scaled = __fmul2_rn(amax, {1.0 / 448.0, 1.0 / 448.0});
+    uint16_t packed_exp;
+    asm volatile("cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;"
+                 : "=h"(packed_exp) : "f"(scaled.x), "f"(scaled.y));
+
+    const uint32_t exp_x = packed_exp >> 8;
+    const uint32_t exp_y = packed_exp & 0xff;
+    const uint32_t sf_x_bits = exp_x << 23;
+    const uint32_t sf_y_bits = exp_y << 23;
+    const uint32_t sf_inv_x_bits = (254 - exp_x) << 23;
+    const uint32_t sf_inv_y_bits = (254 - exp_y) << 23;
+    sf = {__uint_as_float(sf_x_bits), __uint_as_float(sf_y_bits)};
+    sf_inv = {__uint_as_float(sf_inv_x_bits), __uint_as_float(sf_inv_y_bits)};
+}
+
 /// Reduction
 CUTLASS_DEVICE uint32_t warp_inclusive_sum(uint32_t value, const uint32_t& lane_idx) {
     #pragma unroll

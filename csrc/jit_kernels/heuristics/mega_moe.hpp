@@ -78,32 +78,72 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
     const MmaKind& mma_kind) {
+    const float num_expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
     auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int, int, int, int> {
-        float num_expected_tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+        if (mma_kind == MmaKind::MXFP8FP4 and
+            num_tokens >= layout::kLargeTokenBlockMMinTokens) {
+            // B200 large-prefill specialization: reduce token-tail work while
+            // retaining two epilogue warpgroups for the wider store slice.
+            return {2, 240, 24, 128, 2};
+        }
         if (num_expected_tokens_per_expert <= 8.5) {
             // Really small token-per-expert (e.g. RL long-tail rollout), use the smallest block_m and larger BLOCK_K for less synchronization
             return {2, 16, 8, 256, 2};
         } else if (num_expected_tokens_per_expert <= 16.5) {
             // Small batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 128
-            return {2, 32, 16, 128, 2};
+            return {2, 32, 8, 128, 1};
         } else if (num_expected_tokens_per_expert <= 32.5) {
             // Medium batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 256
-            return {2, 64, 32, 128, 1};
+            return {2, 64, 16, 128, 1};
         } else if (num_expected_tokens_per_expert <= 64.5) {
             // Large batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 512
             return {2, 96, 16, 128, 2};
         } else if (num_expected_tokens_per_expert <= 96.5) {
             // Medium batch size, Medium EP, decoding, e.g. 6/384 experts, EP16, bsz 256, or EP32, bsz128
-            return {2, 128, 32, 128, 2};
+            return {2, 128, 16, 128, 2};
+        } else if (mma_kind == MmaKind::MXFP8FP4 and
+                   num_ranks == 8 and num_experts == 384 and num_topk == 6) {
+            // For the calibrated B200 MegaMoE shape, select the smallest
+            // 16-token tile that covers one BM192 wave plus 1.5 sigma of
+            // routing imbalance. The pattern repeats at each BM192 wave and
+            // avoids the severe extra-wave cliffs around 128/192 boundaries.
+            const int num_base_waves = static_cast<int>(
+                std::ceil(num_expected_tokens_per_expert / 192.0f));
+            const float tokens_per_wave =
+                (num_expected_tokens_per_expert +
+                 1.5f * std::sqrt(num_expected_tokens_per_expert)) /
+                static_cast<float>(num_base_waves);
+            // The first wave crosses the BM128 tail cliff earlier than the
+            // Gaussian estimate: B200 measurements at 112 and 120 routed
+            // tokens/expert favor BM160, while 104 still favors BM128.
+            const int tuned_block_m =
+                num_base_waves == 1 and
+                num_expected_tokens_per_expert > 104.5f and
+                num_expected_tokens_per_expert <= 136.5f ? 160 :
+                std::clamp(
+                    static_cast<int>(std::ceil(tokens_per_wave / 16.0f)) * 16,
+                    128, 192);
+            const int tuned_store_block_m =
+                tuned_block_m == 192 ? (num_base_waves == 1 ? 16 : 32) :
+                (tuned_block_m % 32 == 16 ? 8 : 16);
+            return {2, tuned_block_m, tuned_store_block_m, 128, 2};
         } else {
             // Prefill, or large EP decoding
             return {2, 192, 32, 128, 2};
         }
     }();
     block_k /= get_num_mma_elem_bytes(mma_kind);
+    DG_HOST_ASSERT(block_k > 0 and block_k % 128 == 0);
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
-    DG_HOST_ASSERT(std::any_of(
+    const bool is_buffer_neutral_wave_tile =
+        mma_kind == MmaKind::MXFP8FP4 and
+        num_ranks == 8 and num_experts == 384 and num_topk == 6 and
+        num_expected_tokens_per_expert > 96.5 and
+        block_m >= 128 and block_m <= layout::kLegacyMaxCandidateBlockM and
+        block_m % 16 == 0;
+    DG_HOST_ASSERT(is_buffer_neutral_wave_tile or std::any_of(
         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
         [=](const auto& candidate) { return candidate == block_m; })
     );
@@ -190,7 +230,8 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
@@ -205,13 +246,28 @@ static MegaMoEConfig get_mega_moe_config(
     const int num_dispatch_threads = 128;
     const int num_non_epilogue_threads = 128;
 
-    // Pull: divide token bytes by 2 until <= kPullThreshold
-    constexpr int kPullThreshold = 4096;
+    // On B200, medium pulls improve overlap for the small/mid decoding regimes,
+    // while the 96-token/expert boundary and larger shapes still prefer 3584 B.
+    const float num_expected_tokens_per_expert =
+        static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+    const bool use_wave_tail_pulls =
+        mma_kind == MmaKind::MXFP8FP4 and hidden == 7168 and
+        num_ranks == 8 and num_experts == 384 and num_topk == 6 and
+        num_expected_tokens_per_expert > 152.5 and
+        num_expected_tokens_per_expert <= 192.5;
+    const bool use_medium_pulls =
+        is_mma_with_sf(mma_kind) and hidden == 7168 and
+        ((num_expected_tokens_per_expert > 8.5 and
+          num_expected_tokens_per_expert <= 64.5) or
+         use_wave_tail_pulls);
+    const int pull_threshold = use_medium_pulls ? 2048 : 4096;
     int num_bytes_per_pull = hidden * get_num_mma_elem_bytes(mma_kind);
-    while (num_bytes_per_pull > kPullThreshold) {
+    while (num_bytes_per_pull > pull_threshold) {
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;
     }
+    DG_HOST_ASSERT(num_bytes_per_pull > 0);
+    DG_HOST_ASSERT(hidden * get_num_mma_elem_bytes(mma_kind) % num_bytes_per_pull == 0);
 
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(

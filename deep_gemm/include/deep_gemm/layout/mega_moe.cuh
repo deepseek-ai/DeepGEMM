@@ -7,11 +7,14 @@
 
 namespace deep_gemm::layout {
 
-static constexpr int kNumCandidateBlockMs = 7;
-static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192};
-static constexpr int kMaxCandidateBlockM = 192;
+static constexpr int kNumCandidateBlockMs = 8;
+static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192, 240};
+static constexpr int kMaxCandidateBlockM = 240;
 static constexpr int kMinCandidateBlockM = 8;
-static constexpr int kLCMCandidateBlockM = 384;
+static constexpr int kLCMCandidateBlockM = 1920;
+static constexpr int kLegacyMaxCandidateBlockM = 192;
+static constexpr int kLegacyLCMCandidateBlockM = 384;
+static constexpr int kLargeTokenBlockMMinTokens = 8192;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -19,9 +22,15 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
                                                         T num_experts_per_rank) {
     const auto num_max_recv_tokens = num_ranks * num_max_tokens_per_rank;
     const auto num_max_experts_per_token = math::constexpr_min(num_topk, num_experts_per_rank);
+    const bool enable_large_token_block_m =
+        num_max_tokens_per_rank >= static_cast<T>(kLargeTokenBlockMMinTokens);
+    const T max_candidate_block_m = static_cast<T>(
+        enable_large_token_block_m ? kMaxCandidateBlockM : kLegacyMaxCandidateBlockM);
+    const T candidate_block_m_alignment = static_cast<T>(
+        enable_large_token_block_m ? kLCMCandidateBlockM : kLegacyLCMCandidateBlockM);
     return math::constexpr_align(
-        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (static_cast<T>(kMaxCandidateBlockM) - 1),
-        static_cast<T>(kLCMCandidateBlockM));
+        num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (max_candidate_block_m - 1),
+        candidate_block_m_alignment);
 }
 
 // SF pool capacity: all experts share a contiguous SF region, sized by pool blocks × SF_BLOCK_M
