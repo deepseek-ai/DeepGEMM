@@ -17,7 +17,9 @@
 namespace deep_gemm::mega {
 
 static int get_token_alignment_for_mega_moe() {
-    return layout::kLCMCandidateBlockM;
+    // Preserve the public padding contract for decode/small-prefill. BM240 is
+    // enabled only by the internal large-token buffer sizing below.
+    return layout::kLegacyLCMCandidateBlockM;
 }
 
 static int get_block_m_for_mega_moe(
@@ -54,15 +56,25 @@ get_symm_buffer_size_for_mega_moe(
     // Shared
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
-    // Iterate all block candidates to get the maximum ring size
+    // BM240 is a large-token specialization. Keep smaller workloads on the
+    // original candidate set and alignment so their dispatch layout is stable.
+    const int num_candidate_block_ms =
+        num_max_tokens_per_rank >= layout::kLargeTokenBlockMMinTokens ?
+        layout::kNumCandidateBlockMs : layout::kNumCandidateBlockMs - 1;
+    const int candidate_block_m_alignment =
+        num_max_tokens_per_rank >= layout::kLargeTokenBlockMMinTokens ?
+        layout::kLCMCandidateBlockM : layout::kLegacyLCMCandidateBlockM;
+
+    // Iterate applicable block candidates to get the maximum ring size
     int num_ring_tokens = 0;
-    for (const auto& block_m: layout::kCandidateBlockM) {
+    for (int i = 0; i < num_candidate_block_ms; ++ i) {
+        const auto block_m = layout::kCandidateBlockM[i];
         const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
         const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
             num_pool_blocks, num_sms, hidden, intermediate_hidden);
         num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
     }
-    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+    num_ring_tokens = math::align(num_ring_tokens, candidate_block_m_alignment);
 
     // Parse MMA type
     const auto mma_kind = parse_mma_kind(mma_type);
@@ -71,7 +83,8 @@ get_symm_buffer_size_for_mega_moe(
     // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
     if (with_sf) {
-        for (auto block_m: layout::kCandidateBlockM) {
+        for (int i = 0; i < num_candidate_block_ms; ++ i) {
+            const auto block_m = layout::kCandidateBlockM[i];
             num_sf_ring_tokens = std::max(
                 num_sf_ring_tokens,
                 layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));

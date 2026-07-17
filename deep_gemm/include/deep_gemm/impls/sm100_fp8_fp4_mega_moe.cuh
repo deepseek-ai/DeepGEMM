@@ -18,6 +18,127 @@
 
 namespace deep_gemm {
 
+CUTLASS_DEVICE uint4 sm100_fp8_fp4_megamoe_ld_nc_b128(
+    const uint4* __restrict__ ptr) {
+    uint4 value;
+    asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+                 : "l"(ptr));
+    return value;
+}
+
+CUTLASS_DEVICE void sm100_fp8_fp4_megamoe_st_cs_b128(
+    uint4* __restrict__ ptr, const uint4& value) {
+    asm volatile("st.global.cs.v4.b32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(ptr), "r"(value.x), "r"(value.y),
+                   "r"(value.z), "r"(value.w));
+}
+
+template <
+    uint32_t kNumMaxTokensPerRank,
+    uint32_t kHidden,
+    uint32_t kNumTopk
+>
+CUTLASS_DEVICE void
+sm100_fp8_fp4_megamoe_direct_combine_one(
+    const uint4* __restrict__ x,
+    const int64_t* __restrict__ topk_idx,
+    uint4* __restrict__ y,
+    const uint64_t linear_idx) {
+    constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
+    constexpr uint32_t kNumUint4PerToken =
+        kHidden * sizeof(nv_bfloat16) / sizeof(uint4);
+    DG_STATIC_ASSERT(kNumTopk == 6, "Direct combine is specialized for top-k 6");
+    DG_STATIC_ASSERT(kNumUint4PerToken % 32 == 0, "Token vectors must be warp aligned");
+
+    const uint32_t token_idx = static_cast<uint32_t>(linear_idx / kNumUint4PerToken);
+    const uint32_t uint4_idx = static_cast<uint32_t>(linear_idx % kNumUint4PerToken);
+    const uint32_t lane_idx = ptx::get_lane_idx();
+    const int stored_topk_slot_idx = lane_idx < kNumTopk ?
+        static_cast<int>(__ldg(topk_idx + static_cast<uint64_t>(token_idx) * kNumTopk + lane_idx)) : -1;
+    const uint32_t total_mask = __ballot_sync(0xffffffffu, stored_topk_slot_idx >= 0);
+    const uint64_t plane_stride = static_cast<uint64_t>(kNumMaxTokensPerRank) * kNumUint4PerToken;
+    const uint64_t token_offset = static_cast<uint64_t>(token_idx) * kNumUint4PerToken + uint4_idx;
+
+    float2 reduced[kNumElemsPerUint4] = {};
+    if (total_mask == 0x3fu) {
+        const auto packed0 = sm100_fp8_fp4_megamoe_ld_nc_b128(x + token_offset + plane_stride * 0);
+        const auto packed1 = sm100_fp8_fp4_megamoe_ld_nc_b128(x + token_offset + plane_stride * 1);
+        const auto packed2 = sm100_fp8_fp4_megamoe_ld_nc_b128(x + token_offset + plane_stride * 2);
+        const auto packed3 = sm100_fp8_fp4_megamoe_ld_nc_b128(x + token_offset + plane_stride * 3);
+        const auto packed4 = sm100_fp8_fp4_megamoe_ld_nc_b128(x + token_offset + plane_stride * 4);
+        const auto packed5 = sm100_fp8_fp4_megamoe_ld_nc_b128(x + token_offset + plane_stride * 5);
+        const auto values0 = reinterpret_cast<const nv_bfloat162*>(&packed0);
+        const auto values1 = reinterpret_cast<const nv_bfloat162*>(&packed1);
+        const auto values2 = reinterpret_cast<const nv_bfloat162*>(&packed2);
+        const auto values3 = reinterpret_cast<const nv_bfloat162*>(&packed3);
+        const auto values4 = reinterpret_cast<const nv_bfloat162*>(&packed4);
+        const auto values5 = reinterpret_cast<const nv_bfloat162*>(&packed5);
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumElemsPerUint4; ++ i) {
+            ptx::accumulate(reduced[i], values0[i]);
+            ptx::accumulate(reduced[i], values1[i]);
+            ptx::accumulate(reduced[i], values2[i]);
+            ptx::accumulate(reduced[i], values3[i]);
+            ptx::accumulate(reduced[i], values4[i]);
+            ptx::accumulate(reduced[i], values5[i]);
+        }
+    } else {
+        uint32_t mask = total_mask;
+        while (mask) {
+            const uint32_t slot_idx = __ffs(mask) - 1;
+            mask ^= 1u << slot_idx;
+            const auto packed = sm100_fp8_fp4_megamoe_ld_nc_b128(
+                x + token_offset + plane_stride * slot_idx);
+            const auto values = reinterpret_cast<const nv_bfloat162*>(&packed);
+            #pragma unroll
+            for (uint32_t i = 0; i < kNumElemsPerUint4; ++ i)
+                ptx::accumulate(reduced[i], values[i]);
+        }
+    }
+
+    uint4 packed_out;
+    auto out = reinterpret_cast<nv_bfloat162*>(&packed_out);
+    #pragma unroll
+    for (uint32_t i = 0; i < kNumElemsPerUint4; ++ i)
+        out[i] = __float22bfloat162_rn(reduced[i]);
+    sm100_fp8_fp4_megamoe_st_cs_b128(y + linear_idx, packed_out);
+}
+
+// Standalone combine derived from the Kernel Factory 768-thread, 2-CTA
+// cluster winner. It consumes the real padded top-k planes produced by
+// MegaMoE and preserves the producer's FP32 accumulation order for bitwise
+// equality.
+template <
+    uint32_t kNumMaxTokensPerRank,
+    uint32_t kHidden,
+    uint32_t kNumTopk
+>
+__launch_bounds__(768, 2)
+__global__ void __cluster_dims__(2, 1, 1)
+sm100_fp8_fp4_megamoe_direct_combine_impl(
+    const uint4* __restrict__ x,
+    const int64_t* __restrict__ topk_idx,
+    uint4* __restrict__ y,
+    const uint32_t num_tokens) {
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+    constexpr uint32_t kThreads = 768;
+    constexpr uint32_t kNumUint4PerToken =
+        kHidden * sizeof(nv_bfloat16) / sizeof(uint4);
+
+    const uint64_t linear_idx = static_cast<uint64_t>(blockIdx.x) * kThreads + threadIdx.x;
+    const uint64_t num_uint4 = static_cast<uint64_t>(num_tokens) * kNumUint4PerToken;
+    if (linear_idx >= num_uint4)
+        return;
+    sm100_fp8_fp4_megamoe_direct_combine_one<
+        kNumMaxTokensPerRank, kHidden, kNumTopk>(x, topk_idx, y, linear_idx);
+#else
+    if (blockIdx.x == 0 and threadIdx.x == 0)
+        DG_DEVICE_ASSERT(false and "This kernel only supports sm_100f");
+#endif
+}
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -35,6 +156,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kUseDirectCombine = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1108,7 +1230,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Calculate SF
                         float2 sf, sf_inv;
-                        math::get_e4m3_sf_and_sf_inv(amax_values[i], sf, sf_inv);
+                        math::get_e4m3_sf_and_sf_inv_sm100(amax_values[i], sf, sf_inv);
 
                         // Cast
                         const float2 upper = __fmul2_rn(activation_values[i][0], sf_inv);
@@ -1319,6 +1441,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+        // The large-token, no-shared-expert specialization launches the
+        // standalone Kernel Factory combine after this producer exits.
+        if constexpr (kUseDirectCombine)
+            return;
 
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers

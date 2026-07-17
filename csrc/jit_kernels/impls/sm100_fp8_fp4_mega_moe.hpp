@@ -15,6 +15,8 @@
 
 namespace deep_gemm {
 
+static constexpr int kSM100FP8FP4MegaMoEDirectCombineMinTokens = 32768;
+
 class SM100FP8FP4MegaMoERuntime final : public LaunchRuntime<SM100FP8FP4MegaMoERuntime> {
 public:
     struct Args {
@@ -25,6 +27,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool use_direct_combine;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -79,6 +82,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -96,7 +100,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.use_direct_combine ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -124,6 +129,51 @@ static void __instantiate_kernel() {{
             args.tensor_map_shared_l2_acts_sf,
             args.tensor_map_shared_l2_weights,
             args.tensor_map_shared_l2_weights_sf
+        ));
+    }
+};
+
+class SM100FP8FP4MegaMoEDirectCombineRuntime final :
+    public LaunchRuntime<SM100FP8FP4MegaMoEDirectCombineRuntime> {
+public:
+    static constexpr int kNumThreads = 768;
+    static constexpr int kClusterSize = 2;
+
+    struct Args {
+        // Templated arguments
+        int num_max_tokens_per_rank;
+        int hidden;
+        int num_topk;
+
+        // Runtime arguments
+        const void* x;
+        const int64_t* topk_idx;
+        void* y;
+        int num_tokens;
+
+        LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_fp8_fp4_megamoe_direct_combine_impl<
+        {}, {}, {}
+    >);
+}};
+)", args.num_max_tokens_per_rank, args.hidden, args.num_topk);
+    }
+
+    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+            args.x,
+            args.topk_idx,
+            args.y,
+            args.num_tokens
         ));
     }
 };
@@ -273,6 +323,42 @@ static void sm100_fp8_fp4_mega_moe(
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
+    // Use the Kernel Factory direct reduction only for its calibrated target.
+    // Shared experts add another combine plane and keep the fused path.
+    const bool use_direct_combine =
+        num_shared_experts == 0 and
+        num_tokens >= kSM100FP8FP4MegaMoEDirectCombineMinTokens and
+        hidden == 7168 and num_topk == 6;
+
+    const auto mega_moe_buffer = layout::MegaMoEBuffer(
+        reinterpret_cast<void*>(sym_buffer_ptrs[rank_idx]),
+        hidden, intermediate_hidden,
+        num_ranks, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        num_ring_tokens, num_sf_ring_tokens,
+        /*with_sf=*/ true,
+        num_shared_experts);
+    const auto num_direct_vectors = static_cast<int64_t>(num_tokens) * hidden / 8;
+    auto num_direct_blocks = static_cast<int>(
+        (num_direct_vectors + SM100FP8FP4MegaMoEDirectCombineRuntime::kNumThreads - 1) /
+        SM100FP8FP4MegaMoEDirectCombineRuntime::kNumThreads);
+    num_direct_blocks = static_cast<int>(math::align(
+        num_direct_blocks, SM100FP8FP4MegaMoEDirectCombineRuntime::kClusterSize));
+    const SM100FP8FP4MegaMoEDirectCombineRuntime::Args direct_combine_args = {
+        .num_max_tokens_per_rank = num_max_tokens_per_rank,
+        .hidden = hidden,
+        .num_topk = num_topk,
+        .x = mega_moe_buffer.combine_token_buffer.get_base_ptr(),
+        .topk_idx = mega_moe_buffer.input_topk_idx_buffer.get_base_ptr<int64_t>(),
+        .y = y.data_ptr(),
+        .num_tokens = num_tokens,
+        .launch_args = LaunchArgs(
+            num_direct_blocks,
+            SM100FP8FP4MegaMoEDirectCombineRuntime::kNumThreads,
+            0,
+            SM100FP8FP4MegaMoEDirectCombineRuntime::kClusterSize)
+    };
+
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
     const SM100FP8FP4MegaMoERuntime::Args args = {
@@ -283,6 +369,7 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .use_direct_combine = use_direct_combine,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -313,7 +400,17 @@ static void sm100_fp8_fp4_mega_moe(
 
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
     const auto runtime = compiler->build("sm100_fp8_fp4_mega_moe", code);
+    std::shared_ptr<KernelRuntime> direct_combine_runtime;
+    if (use_direct_combine) {
+        const auto direct_combine_code =
+            SM100FP8FP4MegaMoEDirectCombineRuntime::generate(direct_combine_args);
+        direct_combine_runtime = compiler->build(
+            "sm100_fp8_fp4_megamoe_direct_combine", direct_combine_code);
+    }
+
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
+    if (use_direct_combine)
+        SM100FP8FP4MegaMoEDirectCombineRuntime::launch(direct_combine_runtime, direct_combine_args);
 }
 
 } // namespace deep_gemm
