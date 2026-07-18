@@ -17,7 +17,8 @@ void smxx_clean_logits(const uint32_t seq_len, const uint32_t seq_len_kv, const 
     const uint32_t warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
 
     constexpr uint32_t kAlignment = 16 / sizeof(logits_dtype_t);
-    const logits_dtype_t neg_inf = -cute::numeric_limits<logits_dtype_t>::infinity();
+    // Use raw float literal instead of numeric_limits::infinity() to avoid NVRTC constexpr issues on CUDA 12.8
+    const logits_dtype_t neg_inf = logits_dtype_t(-1e38f);
 
     // Allocate filled `-inf` shared memory
     extern __shared__ __align__(1024) logits_dtype_t smem_buffer[];
