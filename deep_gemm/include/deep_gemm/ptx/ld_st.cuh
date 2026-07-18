@@ -137,6 +137,12 @@ CUTLASS_DEVICE void st_shared(const float2* ptr, float2 val) {
     asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "l"(__cvta_generic_to_shared(ptr)), "f"(val.x), "f"(val.y));
 }
 
+CUTLASS_DEVICE void st_shared(const float4* ptr, float4 val) {
+    asm volatile("st.shared.v4.f32 [%0], {%1, %2, %3, %4};" ::
+                 "l"(__cvta_generic_to_shared(ptr)),
+                 "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w));
+}
+
 CUTLASS_DEVICE void st_shared(const uint32_t* ptr, uint32_t val) {
     asm volatile("st.shared.u32 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "r"(val));
 }

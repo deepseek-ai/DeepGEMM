@@ -47,6 +47,8 @@ try:
         m_grouped_fp8_gemm_nt_contiguous,
         m_grouped_fp8_gemm_nn_contiguous,
         m_grouped_fp8_gemm_nt_masked,
+        m_grouped_mxfp8_fp8_gemm_nt_contiguous,
+        m_grouped_mxfp8_fp8_gemm_nt_masked,
         k_grouped_fp8_gemm_nt_contiguous,
         k_grouped_fp8_gemm_tn_contiguous,
         # BF16 GEMMs

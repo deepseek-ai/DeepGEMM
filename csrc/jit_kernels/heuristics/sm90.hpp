@@ -32,7 +32,16 @@ struct SM90ArchSpec {
                    desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout) {
             block_m_candidates = std::vector{heuristics_runtime->get_mk_alignment_for_contiguous_layout()};
         } else if (desc.gemm_type == GemmType::MGroupedMasked) {
-            block_m_candidates = {64, 128};
+            // Masked grouped outputs are laid out as [num_groups, expected_m, n].
+            // Keep BLOCK_M aligned with expected_m when possible, otherwise a
+            // full-block TMA store can cross into the next group's rows.
+            const int expected_m = desc.get_expected_m();
+            for (int candidate: {16, 32, 64, 128}) {
+                if (expected_m % candidate == 0)
+                    block_m_candidates.push_back(candidate);
+            }
+            if (block_m_candidates.empty())
+                block_m_candidates = {64, 128};
         }
 
         // Block N candidates
