@@ -30,8 +30,8 @@ cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declar
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
 if DG_JIT_USE_RUNTIME_API:
     cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
-if not DG_DEBUG:
-    cxx_flags.append('-DNDEBUG')
+if DG_DEBUG:
+    cxx_flags.append('-DDG_DEBUG')
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
