@@ -35,7 +35,7 @@ do { \
     } \
 } while (0)
 #else
-#define DG_HOST_ASSERT(cond) do { (void)sizeof(cond); } while (0)
+#define DG_HOST_ASSERT(cond) do { (void)(cond); } while (0)
 #endif
 #endif
 
