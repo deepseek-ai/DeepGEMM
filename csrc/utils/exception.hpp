@@ -27,12 +27,16 @@ public:
 #endif
 
 #ifndef DG_HOST_ASSERT
+#ifdef NDEBUG
+#define DG_HOST_ASSERT(cond) do { (void)sizeof(cond); } while (0)
+#else
 #define DG_HOST_ASSERT(cond) \
 do { \
     if (not (cond)) { \
         throw DGException("Assertion", __FILE__, __LINE__, #cond); \
     } \
 } while (0)
+#endif
 #endif
 
 #ifndef DG_HOST_UNREACHABLE
