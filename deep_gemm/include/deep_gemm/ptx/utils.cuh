@@ -28,6 +28,10 @@ CUTLASS_DEVICE void sync_unaligned(const uint32_t& num_threads, const uint32_t& 
     asm volatile("barrier.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads));
 }
 
+CUTLASS_DEVICE void fence_proxy_async_shared_cta() {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 template <typename dtype_t>
 CUTLASS_DEVICE dtype_t exchange(dtype_t ptr, const uint32_t& src_lane_idx) {
     DG_STATIC_ASSERT(sizeof(dtype_t) % sizeof(uint32_t) == 0, "");

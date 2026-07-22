@@ -1238,6 +1238,8 @@ sm100_bf16_mega_moe_impl(void* y,
                         for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
                             ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
                     }
+                    // Order generic shared-memory reads before the next TMA load reuses this stage.
+                    ptx::fence_proxy_async_shared_cta();
                     combine_phase ^= load_stage_idx;
                     load_stage_idx ^= 1;
                 }
