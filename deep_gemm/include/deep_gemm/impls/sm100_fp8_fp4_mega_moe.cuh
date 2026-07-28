@@ -35,6 +35,8 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kEvictFirstWeights,
+    bool kTilePackedWeights,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -128,6 +130,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // SF and its buffer configs
     constexpr uint32_t kGranK = 32;
+    constexpr uint32_t kWeightPacketK = 256;
+    DG_STATIC_ASSERT(
+        kWeightPacketK % BLOCK_K == 0,
+        "Weight packet K must be divisible by block K");
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
     DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
@@ -763,6 +769,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t k_idx = k_block_idx * BLOCK_K;
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
                 uint32_t sfb_k_idx = task_info.is_shared() ? k_block_idx * (BLOCK_K / 128) : task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / 128);
+                constexpr uint32_t kNumKBlocksPerPacket =
+                    kWeightPacketK / BLOCK_K;
+                const uint32_t num_n_clusters = shape_n / BLOCK_N / 2;
+                const uint32_t num_k_tiles = shape_k / kWeightPacketK;
+                const uint32_t packet_k_idx =
+                    k_block_idx / kNumKBlocksPerPacket;
+                const uint32_t packet_k_block_idx =
+                    k_block_idx % kNumKBlocksPerPacket;
+                const uint32_t weight_tile_idx =
+                    ((task_info.local_expert_idx * num_n_clusters +
+                      task_info.n_cluster_idx) * num_k_tiles +
+                     packet_k_idx) * 2 +
+                    (is_leader_cta ? 0u : 1u);
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
@@ -777,10 +796,41 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.full_barriers[stage_idx].arrive(0u);
                         }
                     } else {
-                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
-                            tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
-                        tma::copy<BLOCK_N, 1, 0>(
-                            tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                        if constexpr (kTilePackedWeights) {
+                            tma::copy<
+                                BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode,
+                                b_dtype_t, true>(
+                                tensor_map_b_ptr,
+                                &shared_storage.full_barriers[stage_idx],
+                                shared_storage.smem_b[stage_idx],
+                                packet_k_block_idx * BLOCK_K, 0, 2,
+                                weight_tile_idx,
+                                kEvictFirstWeights ?
+                                    cute::TMA::CacheHintSm100::EVICT_FIRST :
+                                    cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                            tma::copy<BLOCK_N, 1, 0, uint32_t, true>(
+                                tensor_map_sfb_ptr,
+                                &shared_storage.full_barriers[stage_idx],
+                                shared_storage.smem_sfb[stage_idx], 0,
+                                packet_k_block_idx * (BLOCK_K / 128), 2,
+                                weight_tile_idx,
+                                kEvictFirstWeights ?
+                                    cute::TMA::CacheHintSm100::EVICT_FIRST :
+                                    cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                        } else {
+                            tma::copy<
+                                BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode,
+                                b_dtype_t>(
+                                tensor_map_b_ptr,
+                                &shared_storage.full_barriers[stage_idx],
+                                shared_storage.smem_b[stage_idx],
+                                k_idx, n_idx, 2);
+                            tma::copy<BLOCK_N, 1, 0>(
+                                tensor_map_sfb_ptr,
+                                &shared_storage.full_barriers[stage_idx],
+                                shared_storage.smem_sfb[stage_idx],
+                                sfb_n_idx, sfb_k_idx, 2);
+                        }
                         if (is_leader_cta) {
                             shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0]) * 2);
                         } else {

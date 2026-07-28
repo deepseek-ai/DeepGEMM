@@ -74,8 +74,8 @@ def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    torch.manual_seed(rank_idx)
-    random.seed(rank_idx)
+    torch.manual_seed(rank_idx + args.seed_offset)
+    random.seed(rank_idx + args.seed_offset)
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
@@ -113,6 +113,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     def create_inputs():
         global x, shared_x, shared_l1_x_sf, topk_idx, topk_weights, l1_weights, l2_weights
         global transformed_l1_weights, transformed_l2_weights
+        global tile_packed_l1_weights, tile_packed_l2_weights
         global shared_l1_weights, shared_l2_weights, transformed_shared_l1_weights, transformed_shared_l2_weights
         global cumulative_local_expert_recv_stats_fused, cumulative_local_expert_recv_stats_baseline
         global initial_cumulative_local_expert_recv_stats_fused, initial_cumulative_local_expert_recv_stats_baseline
@@ -159,6 +160,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         transformed_l1_weights, transformed_l2_weights = (
             deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
+        if (not is_bf16xbf16 and
+                (args.tile_packed_weights or args.compare_tile_packed or
+                 args.benchmark_tile_packed_ab)):
+            tile_packed_l1_weights, tile_packed_l2_weights = (
+                deep_gemm.transform_weights_for_mega_moe(
+                    l1_weights, l2_weights, tile_pack=True))
+        else:
+            tile_packed_l1_weights = tile_packed_l2_weights = None
         if num_shared_experts > 0:
             transformed_shared_l1_weights, transformed_shared_l2_weights = (
                 deep_gemm.transform_weights_for_mega_moe(shared_l1_weights, shared_l2_weights))
@@ -178,13 +187,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
-    def run_fused():
+    def run_fused(use_tile_packed=None):
         cumulative_local_expert_recv_stats_fused.copy_(initial_cumulative_local_expert_recv_stats_fused)
         copy_inputs_to_buffer()
 
         y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        if use_tile_packed is None:
+            use_tile_packed = args.tile_packed_weights
+        selected_l1_weights = (
+            tile_packed_l1_weights if use_tile_packed
+            else transformed_l1_weights)
+        selected_l2_weights = (
+            tile_packed_l2_weights if use_tile_packed
+            else transformed_l2_weights)
         kernel_kwargs = dict(
-            y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
+            y=y, l1_weights=selected_l1_weights,
+            l2_weights=selected_l2_weights,
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
@@ -330,6 +348,20 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     else:
         create_inputs()
 
+    if args.compare_tile_packed:
+        assert not is_bf16xbf16
+        assert num_shared_experts == 0
+        stock_y, stock_stats = run_fused(use_tile_packed=False)
+        stock_y = stock_y.clone()
+        stock_stats = stock_stats.clone()
+        packed_y, packed_stats = run_fused(use_tile_packed=True)
+        assert torch.equal(packed_y, stock_y)
+        assert torch.equal(packed_stats, stock_stats)
+        dist_print(
+            'Bitwise layout A/B passed: row-major -> tile-packed',
+            once_in_node=True,
+        )
+
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
     gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
@@ -338,6 +370,34 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Benchmark
     barrier_fn = lambda: ep_buffer.barrier(use_comm_stream=False) if ep_buffer else dist.all_reduce(torch.empty(1, device='cuda'))
+    if args.benchmark_tile_packed_ab:
+        baseline_times, candidate_times = [], []
+
+        def bench_tile_packed(enabled: bool) -> float:
+            return bench_kineto(
+                lambda: run_fused(use_tile_packed=enabled),
+                'mega_moe',
+                num_tests=args.ab_num_tests,
+                barrier=barrier_fn,
+                with_multiple_kernels=True,
+            )
+
+        for repeat_idx in range(args.ab_repeats):
+            if repeat_idx % 2 == 0:
+                baseline_times.append(bench_tile_packed(False))
+                candidate_times.append(bench_tile_packed(True))
+            else:
+                candidate_times.append(bench_tile_packed(True))
+                baseline_times.append(bench_tile_packed(False))
+
+        baseline_csv = ','.join(
+            f'{value * 1e6:.3f}' for value in baseline_times)
+        candidate_csv = ','.join(
+            f'{value * 1e6:.3f}' for value in candidate_times)
+        dist_print(
+            f'TILE_PACKED_AB rank={rank_idx} '
+            f'baseline_us={baseline_csv} candidate_us={candidate_csv}')
+
     trace_path = None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json'
     t_fused = bench_kineto(run_fused, 'mega_moe', barrier=barrier_fn, trace_path=trace_path)
     t_baseline = tilelang_bench(
@@ -426,6 +486,16 @@ if __name__ == '__main__':
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
+    parser.add_argument('--tile-packed-weights', action='store_true',
+                        help='Run with cluster-paired FP4 weight packets')
+    parser.add_argument('--compare-tile-packed', action='store_true',
+                        help='Check row-major versus tile-packed output')
+    parser.add_argument('--benchmark-tile-packed-ab', action='store_true',
+                        help='Benchmark alternating row-major/tile-packed runs')
+    parser.add_argument('--ab-repeats', type=int, default=4)
+    parser.add_argument('--ab-num-tests', type=int, default=20)
+    parser.add_argument('--seed-offset', type=int, default=0,
+                        help='Offset deterministic input generation')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--local-rank-idx', type=int, default=None, help='Run as single process with this local rank (e.g. for NCU prof)')
     args = parser.parse_args()

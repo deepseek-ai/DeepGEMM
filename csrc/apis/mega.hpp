@@ -172,9 +172,28 @@ static void fp8_fp4_mega_moe(
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+    constexpr int kWeightTileN = kMegaMoEPacketBlockN;
+    constexpr int kWeightTileK = 256;
+    constexpr int kPackedWeightTileK = kWeightTileK / 2;
+    constexpr int kPackedSFTileK = kWeightTileK / 128;
+    constexpr int kWeightPacketBytes =
+        kWeightTileN * kPackedWeightTileK +
+        kPackedSFTileK * kWeightTileN * sizeof(int32_t);
+    const bool tile_packed_weights =
+        l1_weights.dim() == 3 and l2_weights.dim() == 3 and
+        l1_weights.size(1) == kWeightTileN and
+        l2_weights.size(1) == kWeightTileN and
+        l1_weights.size(2) == kPackedWeightTileK and
+        l2_weights.size(2) == kPackedWeightTileK and
+        l1_weights_sf.dim() == 3 and l2_weights_sf.dim() == 3 and
+        l1_weights_sf.size(1) == kPackedSFTileK and
+        l2_weights_sf.size(1) == kPackedSFTileK and
+        l1_weights_sf.size(2) == kWeightTileN and
+        l2_weights_sf.size(2) == kWeightTileN;
 
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
     DG_HOST_ASSERT(activation == "swiglu");
@@ -186,27 +205,66 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(activation_clamp >= 0);
 
     // Tensor checks
-    DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
-    DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
-        check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
-    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
-        check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
+    int num_experts_per_rank, intermediate_hidden_2, hidden;
+    int num_experts_per_rank_, hidden_, intermediate_hidden;
+    if (tile_packed_weights) {
+        DG_HOST_ASSERT(num_experts % num_ranks == 0);
+        num_experts_per_rank = num_experts_per_rank_ = num_experts / num_ranks;
+        hidden = hidden_ = static_cast<int>(y.size(1));
+        const auto l2_logical_elements =
+            static_cast<int64_t>(l2_weights.size(0)) *
+            kWeightTileN * kWeightTileK;
+        DG_HOST_ASSERT(
+            l2_logical_elements %
+                (static_cast<int64_t>(num_experts_per_rank) * hidden) == 0);
+        intermediate_hidden = static_cast<int>(
+            l2_logical_elements /
+            (static_cast<int64_t>(num_experts_per_rank) * hidden));
+        intermediate_hidden_2 = intermediate_hidden * 2;
+        DG_HOST_ASSERT(l1_weights.size(0) == l2_weights.size(0) * 2);
+        DG_HOST_ASSERT(l1_weights.stride(0) == kWeightPacketBytes);
+        DG_HOST_ASSERT(l2_weights.stride(0) == kWeightPacketBytes);
+        DG_HOST_ASSERT(l1_weights.stride(1) == kPackedWeightTileK);
+        DG_HOST_ASSERT(l2_weights.stride(1) == kPackedWeightTileK);
+        DG_HOST_ASSERT(l1_weights_sf.stride(0) == kWeightPacketBytes / 4);
+        DG_HOST_ASSERT(l2_weights_sf.stride(0) == kWeightPacketBytes / 4);
+        DG_HOST_ASSERT(
+            reinterpret_cast<const uint8_t*>(l1_weights_sf.data_ptr<int32_t>()) ==
+            reinterpret_cast<const uint8_t*>(l1_weights.data_ptr<int8_t>()) +
+                kWeightTileN * kPackedWeightTileK);
+        DG_HOST_ASSERT(
+            reinterpret_cast<const uint8_t*>(l2_weights_sf.data_ptr<int32_t>()) ==
+            reinterpret_cast<const uint8_t*>(l2_weights.data_ptr<int8_t>()) +
+                kWeightTileN * kPackedWeightTileK);
+    } else {
+        DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
+        DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
+        std::tie(num_experts_per_rank, intermediate_hidden_2, hidden) =
+            check_grouped_ab_fp8_fp4(
+                l1_weights, cute::UMMA::Major::K, arch_major);
+        std::tie(num_experts_per_rank_, hidden_, intermediate_hidden) =
+            check_grouped_ab_fp8_fp4(
+                l2_weights, cute::UMMA::Major::K, arch_major);
+    }
     DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
     DG_HOST_ASSERT(l2_weights.scalar_type() == kPackedFP4);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
-    DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+    DG_HOST_ASSERT(
+        tile_packed_weights or
+        (l1_weights.is_contiguous() and l2_weights.is_contiguous()));
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::kInt);
-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, true, false, torch::kInt);
+    if (not tile_packed_weights) {
+        check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                        num_experts_per_rank, true, false, torch::kInt);
+        check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+                        num_experts_per_rank, true, false, torch::kInt);
+    }
 
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
     torch::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
@@ -240,7 +298,6 @@ static void fp8_fp4_mega_moe(
     }
 
     // Check buffer bytes
-    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts,
@@ -274,7 +331,8 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math,
+                               tile_packed_weights);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
