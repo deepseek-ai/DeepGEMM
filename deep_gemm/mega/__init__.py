@@ -23,7 +23,7 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu'):
-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        assert activation in ('swiglu', 'situ'), f'Unsupported activation `{activation}`'
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -133,8 +133,8 @@ def transform_weights_for_mega_moe(
     l2_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     activation: str = 'swiglu'
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-           Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
+    assert activation in ('swiglu', 'situ'), f'Unsupported activation `{activation}`'
     if isinstance(l1_weights, tuple):
         # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])
@@ -160,6 +160,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
+                     activation_beta: Optional[float] = None,
+                     activation_linear_beta: Optional[float] = None,
                      fast_math: bool = True):
     _C.fp8_fp4_mega_moe(
         y,
@@ -171,7 +173,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
-        activation, activation_clamp,
+        activation, activation_clamp, activation_beta, activation_linear_beta,
         fast_math
     )
 

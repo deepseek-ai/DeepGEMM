@@ -7,7 +7,13 @@ import torch.distributed as dist
 from typing import Optional, Tuple
 
 import deep_gemm
-from deep_gemm.utils import align, per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import (
+    align,
+    cast_back_from_fp4,
+    per_token_cast_to_fp4,
+    per_token_cast_to_fp8,
+    unpack_ue8m0_from_int,
+)
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto, calc_diff
 
@@ -95,32 +101,41 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts=num_shared_experts,
-        mma_type=args.mma_type
+        mma_type=args.mma_type, activation=args.activation
     )
 
     # Cast weights into FP4
-    def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _cast_weights_to_fp4(
+        bf16_weights: torch.Tensor,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
         w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
         for i in range(num_groups):
             w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
+        restored = torch.stack([
+            cast_back_from_fp4(w[i], w_sf[i], gran_k=32)
+            for i in range(num_groups)
+        ])
         w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
-        return w, w_sf
+        return (w, w_sf), restored
 
     # Create inputs
     # noinspection PyGlobalUndefined
     def create_inputs():
-        global x, shared_x, shared_l1_x_sf, topk_idx, topk_weights, l1_weights, l2_weights
-        global transformed_l1_weights, transformed_l2_weights
+        global x, x_ref, shared_x, shared_l1_x_sf, topk_idx, topk_weights, l1_weights, l2_weights
+        global l1_weights_ref, l2_weights_ref, transformed_l1_weights, transformed_l2_weights
         global shared_l1_weights, shared_l2_weights, transformed_shared_l1_weights, transformed_shared_l2_weights
         global cumulative_local_expert_recv_stats_fused, cumulative_local_expert_recv_stats_baseline
         global initial_cumulative_local_expert_recv_stats_fused, initial_cumulative_local_expert_recv_stats_baseline
-        x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        x = (torch.randn((num_tokens, hidden), dtype=torch.bfloat16,
+                         device='cuda') * args.input_scale)
         l1_weights = torch.randn(
-            (num_experts_per_rank, intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
+            (num_experts_per_rank, intermediate_hidden * 2, hidden),
+            dtype=torch.bfloat16, device='cuda') * args.weight_scale
         l2_weights = torch.randn(
-            (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
+            (num_experts_per_rank, hidden, intermediate_hidden),
+            dtype=torch.bfloat16, device='cuda') * args.weight_scale
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
         cumulative_local_expert_recv_stats_fused = torch.randint(
@@ -135,9 +150,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         if num_shared_experts > 0:
             shared_l1_weights = torch.randn(
-                (shared_intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
+                (shared_intermediate_hidden * 2, hidden),
+                dtype=torch.bfloat16, device='cuda') * args.weight_scale
             shared_l2_weights = torch.randn(
-                (hidden, shared_intermediate_hidden), dtype=torch.bfloat16, device='cuda')
+                (hidden, shared_intermediate_hidden),
+                dtype=torch.bfloat16, device='cuda') * args.weight_scale
         else:
             shared_l1_weights = shared_l2_weights = None
 
@@ -147,21 +164,25 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             block_m = deep_gemm.get_block_m_for_mega_moe(
                 num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
             x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
+            unpacked_x_sf = unpack_ue8m0_from_int(x_sf).reshape(num_tokens, -1)
+            x_ref = x_fp8.float() * unpacked_x_sf.repeat_interleave(32, dim=-1)[:, :hidden]
             x = (x_fp8, x_sf)
             shared_x = (x_fp8, x_sf_tma)
             if num_shared_experts > 0:
                 shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
-            l1_weights = _cast_weights_to_fp4(l1_weights)
-            l2_weights = _cast_weights_to_fp4(l2_weights)
+            l1_weights, l1_weights_ref = _cast_weights_to_fp4(l1_weights)
+            l2_weights, l2_weights_ref = _cast_weights_to_fp4(l2_weights)
             if num_shared_experts > 0:
                 shared_l1_weights = _cast_fp8_for_mega_moe(shared_l1_weights)[0::2]
                 shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
 
         transformed_l1_weights, transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
+            deep_gemm.transform_weights_for_mega_moe(
+                l1_weights, l2_weights, activation=args.activation))
         if num_shared_experts > 0:
             transformed_shared_l1_weights, transformed_shared_l2_weights = (
-                deep_gemm.transform_weights_for_mega_moe(shared_l1_weights, shared_l2_weights))
+                deep_gemm.transform_weights_for_mega_moe(
+                    shared_l1_weights, shared_l2_weights, activation=args.activation))
         else:
             transformed_shared_l1_weights = transformed_shared_l2_weights = None
 
@@ -187,8 +208,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
+            activation=args.activation,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
+        if not is_bf16xbf16:
+            kernel_kwargs.update(
+                activation_beta=args.activation_beta,
+                activation_linear_beta=args.activation_linear_beta)
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
@@ -330,6 +356,39 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     else:
         create_inputs()
 
+    if (not is_legacy_loaded and not is_bf16xbf16 and num_ranks == 1 and
+            num_topk == 1 and num_shared_experts == 0):
+        fused_y = run_fused()[0]
+        ref_y = torch.empty_like(fused_y)
+        for token in range(num_tokens):
+            expert = topk_idx[token, 0].item()
+            l1 = x_ref[token] @ l1_weights_ref[expert].T
+            gate, up = l1.to(torch.bfloat16).float().chunk(2)
+            if args.activation == 'situ':
+                gate = (args.activation_beta *
+                        torch.tanh(gate / args.activation_beta) *
+                        torch.sigmoid(gate))
+                if args.activation_linear_beta > 0:
+                    up = (args.activation_linear_beta *
+                          torch.tanh(up / args.activation_linear_beta))
+            else:
+                gate = torch.nn.functional.silu(gate)
+            act = gate * up * topk_weights[token, 0]
+            act_q, act_sf = per_token_cast_to_fp8(
+                act[None], use_ue8m0=True, gran_k=32,
+                use_packed_ue8m0=True)
+            act_sf = unpack_ue8m0_from_int(act_sf).reshape(1, -1)
+            act_ref = (act_q.float() *
+                       act_sf.repeat_interleave(32, dim=-1)[:, :intermediate_hidden])
+            ref_y[token] = (act_ref @ l2_weights_ref[expert].T).to(torch.bfloat16)
+        dist_print(
+            f' > {args.activation} diagnostics: fused mean/max={fused_y.float().abs().mean().item():.3f}/'
+            f'{fused_y.float().abs().max().item():.3f}, ref mean/max='
+            f'{ref_y.float().abs().mean().item():.3f}/{ref_y.float().abs().max().item():.3f}',
+            once_in_node=True)
+        torch.testing.assert_close(fused_y, ref_y, rtol=0.08, atol=5e-4)
+        dist_print(f' > {args.activation} PyTorch reference test passed', once_in_node=True)
+
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
     gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
@@ -418,6 +477,11 @@ if __name__ == '__main__':
     parser.add_argument('--intermediate-hidden', type=int, default=3072, help='Intermediate hidden size')
     parser.add_argument('--num-shared-experts', type=int, default=1, help='Number of shared experts (use 0 to disable)')
     parser.add_argument('--activation-clamp', type=float, default=10, help='Clamp value for activation')
+    parser.add_argument('--activation', choices=('swiglu', 'situ'), default='swiglu')
+    parser.add_argument('--activation-beta', type=float, default=4.0)
+    parser.add_argument('--activation-linear-beta', type=float, default=25.0)
+    parser.add_argument('--input-scale', type=float, default=1.0)
+    parser.add_argument('--weight-scale', type=float, default=1.0)
     parser.add_argument('--num-experts', type=int, default=384, help='Number of experts')
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
