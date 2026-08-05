@@ -97,7 +97,7 @@ public:
         fsync_path(path);
     }
 
-    // Remove a single exact token from a whitespace-separated flag string
+    // Remove every exact occurrence of a token from a whitespace-separated flag string
     static std::string strip_flag_token(const std::string& compile_flags, const std::string& token) {
         std::string out;
         size_t i = 0;
