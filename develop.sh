@@ -12,8 +12,9 @@ rm -rf build dist
 rm -rf *.egg-info
 python setup.py build
 
-# Find the .so file in build directory and create symlink in current directory
-so_file=$(find build -name "*.so" -type f | head -n 1)
+# Find the Python extension specifically; the build also contains the
+# Torch-independent native runtime library.
+so_file=$(find build -name "_C*.so" -type f -print -quit)
 if [ -n "$so_file" ]; then
     ln -sf "../$so_file" deep_gemm/
 else
