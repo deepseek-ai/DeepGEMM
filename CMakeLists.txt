@@ -1,11 +1,17 @@
 # NOTES: current just for CMake-based IDE (e.g. CLion) indexing, the real compilation is done via JIT
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.15)
 project(deep_gemm LANGUAGES CXX CUDA)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
 option(DG_BUILD_PYTHON "Build the PyTorch/pybind Python extension" ON)
 option(DG_BUILD_NATIVE_CORE "Build the standalone native-core shared library" OFF)
 set(DG_NATIVE_INSTALL_DIR "deep_gemm/lib" CACHE STRING "Native-core install directory")
+set(DG_NATIVE_CUDA_ARCH "" CACHE STRING "CUDA architecture override for native-core builds")
+
+if(DG_NATIVE_CUDA_ARCH)
+    set(CUDA_ARCH_LIST "${DG_NATIVE_CUDA_ARCH}" CACHE STRING
+        "List of CUDA architectures to compile" FORCE)
+endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fPIC -Wno-psabi -Wno-deprecated-declarations")
 set(CUDA_SEPARABLE_COMPILATION ON)

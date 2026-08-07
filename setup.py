@@ -142,6 +142,13 @@ class CustomBuildPy(build_py):
             f'-DCMAKE_INSTALL_PREFIX={install_root}',
             '-DDG_NATIVE_INSTALL_DIR=deep_gemm/lib',
         ]
+        native_arch = (
+            os.environ.get('DG_NATIVE_CUDA_ARCH')
+            or os.environ.get('TORCH_CUDA_ARCH_LIST')
+            or os.environ.get('CUDA_ARCH_LIST')
+        )
+        if native_arch:
+            cmake_configure.append(f'-DDG_NATIVE_CUDA_ARCH={native_arch}')
         subprocess.check_call(cmake_configure)
         subprocess.check_call(['cmake', '--build', str(build_temp), '--target', 'deep_gemm_native', '--parallel'])
         subprocess.check_call(['cmake', '--install', str(build_temp)])

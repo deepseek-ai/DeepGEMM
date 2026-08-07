@@ -20,10 +20,23 @@ typedef struct deep_gemm_native_tensor_view {
     deep_gemm_native_dtype dtype;
 } deep_gemm_native_tensor_view;
 
-// Computes D[M,N] = A[M,K] @ B[N,K]^T for row-major tensors.
+// Computes D[M,N] = A[M,K] @ B[K,N] for row-major tensors.
+// The caller must select the active CUDA device before the first call on a
+// device. The library creates per-device/per-stream state and serializes
+// calls that use the same stream; calls on different streams may overlap.
 // The caller owns all storage and must keep it alive until the CUDA work
-// completes. `stream` is a cudaStream_t passed as an opaque pointer.
+// completes, and must synchronize `stream` before reading D. `stream` is a
+// cudaStream_t passed as an opaque pointer.
 int deep_gemm_native_cublaslt_gemm_nn(
+    const deep_gemm_native_tensor_view* a,
+    const deep_gemm_native_tensor_view* b,
+    const deep_gemm_native_tensor_view* d,
+    void* stream,
+    int accumulate);
+
+// Compatibility entry for row-major A[M,K], B[N,K], D[M,N]. This computes
+// D = A @ B^T and preserves the layout used by existing LAMP artifacts.
+int deep_gemm_native_cublaslt_gemm_nt(
     const deep_gemm_native_tensor_view* a,
     const deep_gemm_native_tensor_view* b,
     const deep_gemm_native_tensor_view* d,
