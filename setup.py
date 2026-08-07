@@ -122,8 +122,29 @@ class CustomBuildPy(build_py):
         # Third, generate and copy .pyi file to build root directory
         self.generate_pyi_file()
 
+        # Build a Torch/Python-independent ABI library alongside the Python
+        # extension. Consumers such as LAMP link this library directly; the
+        # pybind module remains exclusively the Python frontend.
+        if not DG_SKIP_CUDA_BUILD:
+            self.build_native_core()
+
         # Finally, run the regular build
         build_py.run(self)
+
+    def build_native_core(self):
+        build_temp = Path(self.build_lib).parent / 'temp.deep_gemm_native'
+        build_temp.mkdir(parents=True, exist_ok=True)
+        install_root = Path(self.build_lib)
+        cmake_configure = [
+            'cmake', '-S', current_dir, '-B', str(build_temp),
+            '-DDG_BUILD_PYTHON=OFF',
+            '-DDG_BUILD_NATIVE_CORE=ON',
+            f'-DCMAKE_INSTALL_PREFIX={install_root}',
+            '-DDG_NATIVE_INSTALL_DIR=deep_gemm/lib',
+        ]
+        subprocess.check_call(cmake_configure)
+        subprocess.check_call(['cmake', '--build', str(build_temp), '--target', 'deep_gemm_native', '--parallel'])
+        subprocess.check_call(['cmake', '--install', str(build_temp)])
 
     def generate_pyi_file(self):
         generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
@@ -203,6 +224,8 @@ if __name__ == '__main__':
                 'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',
+                'lib/libdeep_gemm_native.so',
+                'lib/include/native_api.h',
             ]
         },
         ext_modules=get_ext_modules(),
