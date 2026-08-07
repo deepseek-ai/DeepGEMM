@@ -1,17 +1,11 @@
 # NOTES: current just for CMake-based IDE (e.g. CLion) indexing, the real compilation is done via JIT
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.17)
 project(deep_gemm LANGUAGES CXX CUDA)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
 option(DG_BUILD_PYTHON "Build the PyTorch/pybind Python extension" ON)
 option(DG_BUILD_NATIVE_CORE "Build the standalone native-core shared library" OFF)
 set(DG_NATIVE_INSTALL_DIR "deep_gemm/lib" CACHE STRING "Native-core install directory")
-set(DG_NATIVE_CUDA_ARCH "" CACHE STRING "CUDA architecture override for native-core builds")
-
-if(DG_NATIVE_CUDA_ARCH)
-    set(CUDA_ARCH_LIST "${DG_NATIVE_CUDA_ARCH}" CACHE STRING
-        "List of CUDA architectures to compile" FORCE)
-endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fPIC -Wno-psabi -Wno-deprecated-declarations")
 set(CUDA_SEPARABLE_COMPILATION ON)
@@ -20,8 +14,10 @@ list(APPEND CUDA_NVCC_FLAGS "-O3")
 list(APPEND CUDA_NVCC_FLAGS "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage")
 
 set(USE_SYSTEM_NVTX on)
-set(CUDA_ARCH_LIST "9.0" CACHE STRING "List of CUDA architectures to compile")
-set(TORCH_CUDA_ARCH_LIST "${CUDA_ARCH_LIST}")
+if(DG_BUILD_PYTHON)
+    set(CUDA_ARCH_LIST "9.0" CACHE STRING "List of CUDA architectures to compile")
+    set(TORCH_CUDA_ARCH_LIST "${CUDA_ARCH_LIST}")
+endif()
 
 find_package(CUDAToolkit REQUIRED)
 if(DG_BUILD_PYTHON)
@@ -49,10 +45,8 @@ endif()
 if(DG_BUILD_NATIVE_CORE)
     add_library(deep_gemm_native SHARED csrc/native_api.cpp)
     target_compile_features(deep_gemm_native PRIVATE cxx_std_17)
-    target_include_directories(deep_gemm_native PRIVATE
-        "${CUDA_TOOLKIT_ROOT_DIR}/include")
     target_link_libraries(deep_gemm_native PRIVATE
-        CUDA::cudart CUDA::cublas CUDA::cublasLt)
+        CUDA::cudart CUDA::cublasLt)
     set_target_properties(deep_gemm_native PROPERTIES
         OUTPUT_NAME "deep_gemm_native"
         BUILD_RPATH "$ORIGIN"

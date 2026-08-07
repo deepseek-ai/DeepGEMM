@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -20,10 +21,27 @@ struct StreamState {
     std::mutex mutex;
 };
 
-struct DeviceState {
-    std::unordered_map<uintptr_t, std::unique_ptr<StreamState>> streams;
+struct StreamKey {
+    uintptr_t stream;
+    size_t thread;
+
+    bool operator==(const StreamKey& other) const {
+        return stream == other.stream && thread == other.thread;
+    }
 };
 
+struct StreamKeyHash {
+    size_t operator()(const StreamKey& key) const {
+        return std::hash<uintptr_t>{}(key.stream) ^
+               (std::hash<size_t>{}(key.thread) << 1);
+    }
+};
+
+struct DeviceState {
+    std::unordered_map<StreamKey, std::unique_ptr<StreamState>, StreamKeyHash> streams;
+};
+
+constexpr size_t kMaxStreamStatesPerDevice = 8;
 std::mutex g_devices_mutex;
 std::unordered_map<int, DeviceState> g_devices;
 thread_local std::string g_last_error;
@@ -69,13 +87,26 @@ cudaDataType_t CudaType(deep_gemm_native_dtype dtype) {
     }
 }
 
+StreamKey MakeStreamKey(cudaStream_t stream) {
+    // cudaStreamPerThread has one logical stream per host thread even though
+    // the opaque handle value is shared. Explicit streams are process-wide.
+    const size_t thread = stream == cudaStreamPerThread
+        ? std::hash<std::thread::id>{}(std::this_thread::get_id()) : 0;
+    return {reinterpret_cast<uintptr_t>(stream), thread};
+}
+
 StreamState& GetStreamState(int device, cudaStream_t stream) {
     auto [device_it, inserted] = g_devices.try_emplace(device);
     (void)inserted;
     DeviceState& device_state = device_it->second;
-    const uintptr_t stream_key = reinterpret_cast<uintptr_t>(stream);
+    const StreamKey stream_key = MakeStreamKey(stream);
     auto stream_it = device_state.streams.find(stream_key);
     if (stream_it != device_state.streams.end()) return *stream_it->second;
+    if (device_state.streams.size() >= kMaxStreamStatesPerDevice) {
+        throw std::runtime_error(
+            "DeepGEMM native stream-state limit reached; call "
+            "deep_gemm_native_release_stream before creating more streams");
+    }
 
     auto state = std::make_unique<StreamState>();
     CheckCublas(cublasLtCreate(&state->handle), "cublasLtCreate");
@@ -91,10 +122,12 @@ StreamState& GetStreamState(int device, cudaStream_t stream) {
 }
 
 void DestroyStates() {
+    std::lock_guard<std::mutex> devices_lock(g_devices_mutex);
     for (auto& [device, state] : g_devices) {
         (void)device;
         for (auto& [stream, stream_state] : state.streams) {
             (void)stream;
+            std::lock_guard<std::mutex> stream_lock(stream_state->mutex);
             if (stream_state->workspace != nullptr) cudaFree(stream_state->workspace);
             if (stream_state->handle != nullptr) cublasLtDestroy(stream_state->handle);
         }
@@ -147,12 +180,13 @@ void Run(const deep_gemm_native_tensor_view& a,
 
     int device = 0;
     CheckCuda(cudaGetDevice(&device), "cudaGetDevice");
-    StreamState* state = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_devices_mutex);
-        state = &GetStreamState(device, cuda_stream);
-    }
-    std::lock_guard<std::mutex> stream_lock(state->mutex);
+    // Keep the map locked until the per-stream lock is held. This prevents a
+    // concurrent release call from erasing the map entry between pointer
+    // lookup and lock acquisition.
+    std::unique_lock<std::mutex> devices_lock(g_devices_mutex);
+    StreamState* state = &GetStreamState(device, cuda_stream);
+    std::unique_lock<std::mutex> stream_lock(state->mutex);
+    devices_lock.unlock();
 
     const int64_t m = d.rows;
     cublasLtMatrixLayout_t layout_a = nullptr;
@@ -162,9 +196,11 @@ void Run(const deep_gemm_native_tensor_view& a,
     cublasLtMatmulPreference_t preference = nullptr;
     try {
         const cudaDataType_t type = CudaType(a.dtype);
-        // Row-major matrices are represented as column-major transposes. For
-        // NN, B[K,N] becomes NxK and is consumed as-is; for NT, B[N,K]
-        // becomes KxN and is transposed by cuBLASLt.
+        // Row-major matrices are represented as column-major transposes. The
+        // public ABI uses the historical B[N,K] row-major layout and computes
+        // A @ B.T. The internal non-transposed branch remains available only
+        // to keep the implementation straightforward for future versioned
+        // APIs.
         const int64_t b_layout_rows = b_transposed ? k : n;
         const int64_t b_layout_cols = b_transposed ? n : k;
         CheckCublas(cublasLtMatrixLayoutCreate(
@@ -231,7 +267,7 @@ extern "C" int deep_gemm_native_cublaslt_gemm_nn(
         if (a == nullptr || b == nullptr || d == nullptr) {
             throw std::runtime_error("DeepGEMM native GEMM tensor view is null");
         }
-        Run(*a, *b, *d, stream, accumulate != 0, false);
+        Run(*a, *b, *d, stream, accumulate != 0, true);
         return 0;
     } catch (const std::exception& error) {
         g_last_error = error.what();
@@ -242,18 +278,30 @@ extern "C" int deep_gemm_native_cublaslt_gemm_nn(
     }
 }
 
-extern "C" int deep_gemm_native_cublaslt_gemm_nt(
-    const deep_gemm_native_tensor_view* a,
-    const deep_gemm_native_tensor_view* b,
-    const deep_gemm_native_tensor_view* d,
-    void* stream,
-    int accumulate) {
+extern "C" int deep_gemm_native_release_stream(void* stream) {
     try {
         g_last_error.clear();
-        if (a == nullptr || b == nullptr || d == nullptr) {
-            throw std::runtime_error("DeepGEMM native GEMM tensor view is null");
+        int device = 0;
+        CheckCuda(cudaGetDevice(&device), "cudaGetDevice");
+        const StreamKey key = MakeStreamKey(reinterpret_cast<cudaStream_t>(stream));
+        std::lock_guard<std::mutex> devices_lock(g_devices_mutex);
+        auto device_it = g_devices.find(device);
+        if (device_it == g_devices.end()) return 0;
+        auto stream_it = device_it->second.streams.find(key);
+        if (stream_it == device_it->second.streams.end()) return 0;
+        StreamState& state = *stream_it->second;
+        std::lock_guard<std::mutex> stream_lock(state.mutex);
+        CheckCuda(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)),
+                  "cudaStreamSynchronize(release stream)");
+        if (state.workspace != nullptr) {
+            CheckCuda(cudaFree(state.workspace), "cudaFree(workspace)");
+            state.workspace = nullptr;
         }
-        Run(*a, *b, *d, stream, accumulate != 0, true);
+        if (state.handle != nullptr) {
+            CheckCublas(cublasLtDestroy(state.handle), "cublasLtDestroy");
+            state.handle = nullptr;
+        }
+        device_it->second.streams.erase(stream_it);
         return 0;
     } catch (const std::exception& error) {
         g_last_error = error.what();

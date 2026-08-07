@@ -16,11 +16,12 @@ typedef struct deep_gemm_native_tensor_view {
     void* data;
     int64_t rows;
     int64_t cols;
+    // Leading dimension in elements (not bytes); must be >= cols.
     int64_t row_stride;
     deep_gemm_native_dtype dtype;
 } deep_gemm_native_tensor_view;
 
-// Computes D[M,N] = A[M,K] @ B[K,N] for row-major tensors.
+// Computes D[M,N] = A[M,K] @ B[N,K]^T for row-major tensors.
 // The caller must select the active CUDA device before the first call on a
 // device. The library creates per-device/per-stream state and serializes
 // calls that use the same stream; calls on different streams may overlap.
@@ -34,14 +35,11 @@ int deep_gemm_native_cublaslt_gemm_nn(
     void* stream,
     int accumulate);
 
-// Compatibility entry for row-major A[M,K], B[N,K], D[M,N]. This computes
-// D = A @ B^T and preserves the layout used by existing LAMP artifacts.
-int deep_gemm_native_cublaslt_gemm_nt(
-    const deep_gemm_native_tensor_view* a,
-    const deep_gemm_native_tensor_view* b,
-    const deep_gemm_native_tensor_view* d,
-    void* stream,
-    int accumulate);
+// Release cached state for a stream after all work submitted to it has
+// completed. This call synchronizes the stream before releasing its handle and
+// workspace. For cudaStreamPerThread, release must be called from the same
+// host thread that used the stream.
+int deep_gemm_native_release_stream(void* stream);
 
 // Returns a thread-local diagnostic for the most recent non-zero return.
 const char* deep_gemm_native_last_error(void);
