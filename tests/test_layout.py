@@ -45,22 +45,29 @@ def get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(x: torch.Tensor) -> 
 
 def test_transform_sf_into_required_layout() -> None:
     if get_arch_major() not in (10, 12):
+        print(' > Skipped (SF transform only supported on SM100/SM120)')
         return
 
     num_groups, mn, k = 2, 129, 512
-    for gran_k in (32, 128):
-        sf = ceil_to_ue8m0(torch.rand(
-            (num_groups, mn, ceil_div(k, gran_k)), dtype=torch.float, device='cuda') + 0.5)
-        expected = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(sf)
-        recipe = (1, 1, gran_k)
-        transformed = deep_gemm.transform_sf_into_required_layout(sf, mn, k, recipe, num_groups, False)
-        assert torch.equal(transformed, expected)
-        assert transformed.shape == expected.shape
-        assert transformed.stride() == expected.stride()
+    for gran_mn in (1, 128):
+        for gran_k in (32, 128):
+            sf = ceil_to_ue8m0(torch.rand(
+                (num_groups, ceil_div(mn, gran_mn), ceil_div(k, gran_k)), dtype=torch.float, device='cuda') + 0.5)
+            broadcasted = sf.index_select(-2, torch.arange(mn, device='cuda').floor_divide_(gran_mn))
+            expected = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(broadcasted)
+            recipe = (1, gran_mn, gran_k)
+            transformed = deep_gemm.transform_sf_into_required_layout(
+                sf, mn, k, recipe, num_groups=num_groups, is_sfa=False)
+            assert torch.equal(transformed, expected)
+            assert transformed.shape == expected.shape
+            assert transformed.stride() == expected.stride()
 
-        already_packed = deep_gemm.transform_sf_into_required_layout(
-            transformed, mn, k, recipe, num_groups, False)
-        assert already_packed.data_ptr() == transformed.data_ptr()
+            if gran_mn == 1:
+                already_packed = deep_gemm.transform_sf_into_required_layout(
+                    transformed, mn, k, recipe, num_groups=num_groups, is_sfa=False)
+                assert already_packed.data_ptr() == transformed.data_ptr()
+                assert already_packed.shape == transformed.shape
+                assert already_packed.stride() == transformed.stride()
 
 
 def test_sf_layout_kernels() -> None:
