@@ -1,5 +1,6 @@
 import torch
 import random
+import deep_gemm
 from deep_gemm.testing import bench_kineto, count_bytes, get_arch_major
 from deep_gemm.utils import (
     align, ceil_div, ceil_to_ue8m0,
@@ -40,6 +41,26 @@ def get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(x: torch.Tensor) -> 
     transposed[:, :, :] = padded
     aligned_x = transposed[:, :mn, :]
     return aligned_x.squeeze(0) if remove_dim else aligned_x
+
+
+def test_transform_sf_into_required_layout() -> None:
+    if get_arch_major() not in (10, 12):
+        return
+
+    num_groups, mn, k = 2, 129, 512
+    for gran_k in (32, 128):
+        sf = ceil_to_ue8m0(torch.rand(
+            (num_groups, mn, ceil_div(k, gran_k)), dtype=torch.float, device='cuda') + 0.5)
+        expected = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(sf)
+        recipe = (1, 1, gran_k)
+        transformed = deep_gemm.transform_sf_into_required_layout(sf, mn, k, recipe, num_groups, False)
+        assert torch.equal(transformed, expected)
+        assert transformed.shape == expected.shape
+        assert transformed.stride() == expected.stride()
+
+        already_packed = deep_gemm.transform_sf_into_required_layout(
+            transformed, mn, k, recipe, num_groups, False)
+        assert already_packed.data_ptr() == transformed.data_ptr()
 
 
 def test_sf_layout_kernels() -> None:
@@ -154,6 +175,7 @@ if __name__ == '__main__':
     torch.manual_seed(1)
     random.seed(1)
 
+    test_transform_sf_into_required_layout()
     test_sf_layout_kernels()
     test_k_grouped_sf_layout_kernels()
     test_k_grouped_psum_sf_layout_kernels()
