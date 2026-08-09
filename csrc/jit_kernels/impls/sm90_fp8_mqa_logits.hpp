@@ -159,6 +159,7 @@ public:
         int aligned_batch_size;
         int split_kv;
         int num_sms;
+        int num_next_n_atoms;
         bool is_varlen;
 
         int batch_size;
@@ -179,10 +180,11 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sched::sm90_paged_mqa_logits_metadata<
-        {}, {}, {}, {}
+        {}, {}, {}, {}, {}
     >);
 }};
-)", args.aligned_batch_size, args.split_kv, args.num_sms, args.is_varlen ? "true" : "false");
+)", args.aligned_batch_size, args.split_kv, args.num_sms, args.num_next_n_atoms,
+    args.is_varlen ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -206,6 +208,9 @@ static void sm90_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
     constexpr int split_kv = 256;
     constexpr int num_threads = 32;
     const int aligned_batch_size = align(batch_size, 32);
+    const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
+    const int num_next_n_atoms = (next_n == 3 and not is_varlen)
+        ? 1 : ceil_div(next_n, next_n_atom);
     DG_HOST_ASSERT(split_kv % block_kv == 0);
 
     const int num_smem_ints = is_varlen ? 3 * aligned_batch_size + 1 : aligned_batch_size;
@@ -216,6 +221,7 @@ static void sm90_paged_mqa_logits_metadata(const torch::Tensor& context_lens,
         .aligned_batch_size = aligned_batch_size,
         .split_kv = split_kv,
         .num_sms = num_sms,
+        .num_next_n_atoms = num_next_n_atoms,
         .is_varlen = is_varlen,
         .batch_size = batch_size,
         .next_n = next_n,
@@ -329,7 +335,8 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
     constexpr int mma_m = 64;
     const int num_math_warp_groups = split_kv / mma_m;
     const int num_math_threads = num_math_warp_groups * 128;
-    constexpr int num_q_stages = 3, num_kv_stages = 3;
+    const int num_q_stages = (next_n == 3 and not is_varlen) ? 4 : 3;
+    constexpr int num_kv_stages = 3;
     DG_HOST_ASSERT(device_runtime->get_arch_major() == 9);
     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
 
@@ -351,8 +358,8 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
                                                      static_cast<int>(weights.stride(0)), 0);
 
     const int swizzle_alignment = head_dim * 8;
-    const int smem_q_size_per_stage = next_n * num_heads * head_dim * static_cast<int>(q.element_size());
-    const int aligned_smem_weight_size_per_stage = align(next_n * num_heads * static_cast<int>(weights.element_size()), swizzle_alignment);
+    const int smem_q_size_per_stage = next_n_atom * num_heads * head_dim * static_cast<int>(q.element_size());
+    const int aligned_smem_weight_size_per_stage = align(next_n_atom * num_heads * static_cast<int>(weights.element_size()), swizzle_alignment);
     const int smem_q_pipe_size = num_q_stages * (smem_q_size_per_stage + aligned_smem_weight_size_per_stage) + align(num_q_stages * 8 * 2, swizzle_alignment);
     const int smem_kv_size_per_stage = block_kv * head_dim * static_cast<int>(kv_cache.element_size());
     const int aligned_smem_kv_scale_size_per_stage = align(block_kv * static_cast<int>(kv_cache_scales.element_size()), swizzle_alignment);
@@ -361,7 +368,7 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
     const int smem_tmem_ptr = 4;
     const int smem_size = smem_q_pipe_size + num_math_warp_groups * smem_kv_pipe_size + smem_umma_barriers + smem_tmem_ptr;
     DG_HOST_ASSERT(smem_size <= SM90ArchSpec::smem_capacity);
-    DG_HOST_ASSERT(next_n == 1 or next_n == 2);
+    DG_HOST_ASSERT(next_n == 1 or next_n == 2 or next_n == 3);
 
     const SM90FP8PagedMQALogitsRuntime::Args args = {
         .batch_size = batch_size,
