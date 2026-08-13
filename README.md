@@ -205,6 +205,7 @@ Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` varia
     - `DG_JIT_DUMP_ASM`: `0` or `1`, dump both PTX and SASS, `0` by default
     - `DG_JIT_DUMP_PTX`: `0` or `1`, dump PTX output, `0` by default
     - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
+    - `DG_JIT_FORCE_LAYOUT`: development-only `BMxBNxBK` override; the layout must be a valid candidate for the GEMM
     - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero the entire symmetric buffer after each Mega MoE call for debugging; refill caller-produced inputs before the next call, `0` by default
     - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
 - Build options
@@ -212,6 +213,9 @@ Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` varia
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
 
 For additional examples and details, please refer to [the test code](tests) or review the corresponding Python documentation.
+
+SM120 heuristic constants and the calibration workflow are documented in
+[SM120 heuristic calibration](docs/sm120-heuristic-calibration.md).
 
 ## Acknowledgement
 
