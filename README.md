@@ -179,6 +179,8 @@ The library also provides some environment variables, which may be useful:
     - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
     - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero symmetric buffer before each Mega MoE call for debugging, `0` by default
     - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
+- Mega MoE
+    - `DG_MEGA_MOE_WEIGHT_EVICT_FIRST`: `0` or `1`, use the `EVICT_FIRST` GPU L2 replacement hint for routed expert-weight demand loads at `num_tokens <= 512`, `0` by default; larger batches use the normal cache policy
 - Build options
     - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
