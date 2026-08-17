@@ -18,8 +18,14 @@ CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     cute::cluster_wait();
 }
 
-template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename sync_scope_t>
-CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
+// NOTES: `WorkspaceT` is templated (rather than hard-coded to `layout::Workspace`) so that
+// architectures with a different workspace layout (e.g. SM90 MegaMoE's pool-based
+// `layout::MegaMoESM90Workspace`) can reuse the same grid/NVLink barrier logic, as long as they
+// expose the same `get_grid_sync_count_ptr`/`get_nvl_barrier_counter_ptr`/`get_nvl_barrier_signal_ptr`
+// accessors. This is purely a signature generalization; existing SM100 call sites are unaffected
+// since `layout::Workspace` is still deduced automatically.
+template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0, typename sync_scope_t, typename WorkspaceT>
+CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
                               const uint32_t& sm_idx, const uint32_t& thread_idx,
                               const sync_scope_t& sync_scope) {
     // NOTES: the implementation idea is from `cooperative_groups::this_grid().sync()`
@@ -43,8 +49,8 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
     sync_scope();
 }
 
-template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
-CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t, typename WorkspaceT>
+CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
                                    const layout::SymBuffer<kNumRanks>& sym_buffer,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
@@ -75,9 +81,18 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             const auto start_clock = clock64();
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1000) && \
+        !(defined(DG_NVLINK_BARRIER_VERBOSE_TIMEOUT) && DG_NVLINK_BARRIER_VERBOSE_TIMEOUT)
+                    // NOTES: on SM90, a bare `trap` is used instead of the verbose `printf` +
+                    // assert path below, mirroring upstream PR #36. This avoids pulling in extra
+                    // device-side formatting code on the Hopper MegaMoE hot path; define
+                    // `DG_NVLINK_BARRIER_VERBOSE_TIMEOUT=1` to opt back into the verbose message.
+                    DG_TRAP_ONLY_DEVICE_ASSERT(false);
+#else
                     printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+#endif
                 }
             }
         }
