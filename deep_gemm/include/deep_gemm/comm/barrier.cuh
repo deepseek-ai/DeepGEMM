@@ -32,7 +32,7 @@ CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
     static constexpr uint32_t kFinishSumTag = 0x80000000u;
     sync_scope();
     if (thread_idx == 0) {
-        const auto count_ptr = workspace.get_grid_sync_count_ptr<kGridSyncIndex>();
+        const auto count_ptr = workspace.template get_grid_sync_count_ptr<kGridSyncIndex>();
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
