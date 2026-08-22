@@ -28,6 +28,7 @@ epilogue, and shape distribution can change fitted values.
 Build DeepGEMM from the source under test, then run:
 
 ```bash
+python -m pip install numpy
 ./develop.sh
 python scripts/calibrate_sm120_heuristic.py \
     --dtype fp8 \
