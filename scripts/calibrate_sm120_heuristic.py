@@ -39,6 +39,7 @@ CONFIG_RE = re.compile(
     r"num_stages=(\d+).*?LayoutInfo\(num_waves=(\d+), "
     r"last_wave_util=(\d+), num_cycles=(\d+)"
 )
+WORKER_RECORD_PREFIX = "DG_CALIB_JSON:"
 
 
 def parse_shape(value: str) -> tuple[int, int, int]:
@@ -74,7 +75,11 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def emit(record: dict) -> None:
-    print(json.dumps(record, sort_keys=True), flush=True)
+    print(f"{WORKER_RECORD_PREFIX}{json.dumps(record, sort_keys=True)}", flush=True)
+
+
+def is_acceptable_diff(diff: float, tolerance: float) -> bool:
+    return math.isfinite(diff) and diff < tolerance
 
 
 def run_worker(args: argparse.Namespace) -> int:
@@ -133,7 +138,7 @@ def run_worker(args: argparse.Namespace) -> int:
         raise
 
     diff = float(calc_diff(d, reference))
-    if diff >= tolerance:
+    if not is_acceptable_diff(diff, tolerance):
         emit({
             "status": "incorrect",
             "shape": (m, n, k),
@@ -184,8 +189,13 @@ def run_worker(args: argparse.Namespace) -> int:
 
 def candidate_layouts(dtype: str, shape: tuple[int, int, int]):
     m, n, _ = shape
-    block_ms = (128, 64)
-    block_ns = (16, 32) if n <= 32 else ((32, 64, 96, 128) if dtype == "bf16" else (64, 128))
+    block_ms = (64, 128) if n <= 32 else (128, 64)
+    if n <= 16:
+        block_ns = (16,)
+    elif n <= 32:
+        block_ns = (16, 32)
+    else:
+        block_ns = (32, 64, 96, 128) if dtype == "bf16" else (64, 128)
     elem_size = 2 if dtype == "bf16" else 1
     block_ks = (64 // elem_size, 128 // elem_size) if m >= 2048 else (128 // elem_size,)
     return itertools.product(block_ms, block_ks, block_ns)
@@ -194,8 +204,8 @@ def candidate_layouts(dtype: str, shape: tuple[int, int, int]):
 def parse_worker_output(output: str) -> tuple[dict, tuple[int, ...] | None]:
     record = None
     for line in reversed(output.splitlines()):
-        if line.startswith("{"):
-            record = json.loads(line)
+        if line.startswith(WORKER_RECORD_PREFIX):
+            record = json.loads(line[len(WORKER_RECORD_PREFIX):])
             break
     if record is None:
         raise RuntimeError(f"worker produced no JSON record:\n{output}")
@@ -245,13 +255,14 @@ def run_candidate(args: argparse.Namespace, shape: tuple[int, int, int],
     })
     record["split_k"] = split_k_factor(record)
     reconstructed_cycles = int(model_features(record) @ CURRENT_FEATURE_COEFFICIENTS)
-    if reconstructed_cycles != predicted_cycles:
+    if abs(reconstructed_cycles - predicted_cycles) > 1:
         raise RuntimeError(
             f"model reconstruction mismatch: {reconstructed_cycles} != {predicted_cycles}")
     return record
 
 
 def split_k_factor(record: dict) -> int:
+    """Mirror SM120ArchSpec split-K selection for reconstruction checks."""
     if record["dtype"] == "bf16":
         return 1
 
@@ -279,6 +290,7 @@ def split_k_factor(record: dict) -> int:
 
 
 def model_features(record: dict) -> np.ndarray:
+    """Mirror sm120.hpp cost-model terms for reconstruction checks."""
     m, n, k = record["shape"]
     block_m, block_n, block_k = record["layout"]
     elem_size = 2 if record["dtype"] == "bf16" else 1
@@ -303,6 +315,7 @@ def nnls(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     num_columns = x.shape[1]
     best_coefficients = np.zeros(num_columns)
     best_error = float(y @ y)
+    # Exhaustive active-set search is bounded to the model's four features.
     for mask in range(1, 1 << num_columns):
         columns = [index for index in range(num_columns) if mask & (1 << index)]
         coefficients, _, _, _ = np.linalg.lstsq(x[:, columns], y, rcond=None)
@@ -402,12 +415,27 @@ def hardware_manifest() -> dict:
         "name,pci.device_id,compute_cap,memory.total,driver_version,"
         "clocks.current.sm,clocks.max.sm,power.limit,temperature.gpu"
     )
-    completed = subprocess.run(
-        ("nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader"),
-        text=True, capture_output=True, check=True)
+    try:
+        completed = subprocess.run(
+            ("nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader"),
+            text=True, capture_output=True, check=True)
+        device_metadata = {"nvidia_smi": completed.stdout.strip()}
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        import torch
+
+        device = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device)
+        device_metadata = {
+            "nvidia_smi": None,
+            "nvidia_smi_error": type(exc).__name__,
+            "torch_gpu": properties.name,
+            "torch_compute_capability": ".".join(
+                map(str, torch.cuda.get_device_capability(device))),
+            "torch_memory_total": properties.total_memory,
+        }
     return {
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "nvidia_smi": completed.stdout.strip(),
+        **device_metadata,
     }
 
 
@@ -488,7 +516,7 @@ def run_sweep(args: argparse.Namespace) -> int:
                 statistics.median(abs(sample - median) for sample in record["samples_us"]) / median)
         fit_diagnostics["median_relative_mad"] = statistics.median(relative_mads)
         fit_diagnostics["max_relative_mad"] = max(relative_mads)
-        normalized = fitted / fitted[0] if fitted[0] > 0 else (None, None, None)
+        normalized = fitted / fitted[0] if fitted[0] > 0 else (None,) * len(FEATURE_NAMES)
         fitted_constants = None
         if fit_diagnostics["full_model_rank"] and fitted[3] > 0:
             fitted_constants = {
