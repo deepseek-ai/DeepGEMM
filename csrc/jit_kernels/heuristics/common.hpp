@@ -1,7 +1,7 @@
 #pragma once
 
-#include <algorithm>
 #include <cstdio>
+#include <sstream>
 #include <unordered_set>
 #include <deep_gemm/common/types.cuh>
 
@@ -34,12 +34,26 @@ static GemmConfig get_best_config(const GemmDesc& desc) {
         if (std::sscanf(forced_layout.c_str(), "%dx%dx%d%c", &block_m, &block_n, &block_k, &trailing) != 3)
             DG_HOST_UNREACHABLE("DG_JIT_FORCE_LAYOUT must use BMxBNxBK format");
 
-        const auto it = std::find_if(layout_candidates.begin(), layout_candidates.end(), [&](const Layout& candidate) {
-            return candidate.block_m == block_m and candidate.block_n == block_n and candidate.block_k == block_k;
-        });
-        if (it == layout_candidates.end())
-            DG_HOST_UNREACHABLE("DG_JIT_FORCE_LAYOUT is not a valid candidate");
-        layout = *it;
+        const Layout* matched_layout = nullptr;
+        for (const auto& candidate: layout_candidates) {
+            if (candidate.block_m != block_m or candidate.block_n != block_n or candidate.block_k != block_k)
+                continue;
+            if (matched_layout != nullptr and (
+                candidate.swap_ab != matched_layout->swap_ab or
+                candidate.cluster_m != matched_layout->cluster_m or
+                candidate.cluster_n != matched_layout->cluster_n))
+                DG_HOST_UNREACHABLE("DG_JIT_FORCE_LAYOUT is ambiguous; BMxBNxBK does not identify swap or cluster layout");
+            matched_layout = &candidate;
+        }
+        if (matched_layout == nullptr) {
+            std::stringstream details;
+            details << "DG_JIT_FORCE_LAYOUT is not a valid candidate: " << forced_layout
+                    << " for " << desc << "; valid candidates:";
+            for (const auto& candidate: layout_candidates)
+                details << " " << candidate;
+            DG_HOST_UNREACHABLE(details.str());
+        }
+        layout = *matched_layout;
         layout_info = ArchSpec::get_layout_info(desc, layout);
     }
 
