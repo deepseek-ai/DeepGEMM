@@ -247,8 +247,10 @@ def enumerate_k_grouped_contiguous(dtype: torch.dtype):
     else:
         cd_options = [(True, torch.float), (False, torch.float), (False, torch.bfloat16)]
 
-    # NOTES: the first shape has many small groups, for stressing the SM90 in-place tensor map update
+    # NOTES: the first shape has many small groups, for stressing the SM90 in-place tensor map update;
+    #        the second shape has an odd per-group block grid, for stressing SM90 TMA multicast legality
     for num_groups, m, n, expected_k_per_group in (( 8,  768, 2048,  128),
+                                                   ( 2,  192, 3072,  128),
                                                    ( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
                                                    ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
                                                    (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
