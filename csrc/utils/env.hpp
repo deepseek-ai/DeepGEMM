@@ -28,7 +28,7 @@ static std::optional<int> parse_env_int(std::string_view input) noexcept {
     // Preserve that conventional integer spelling explicitly.
     if (*begin == '+') {
         ++begin;
-        if (begin == end)
+        if (begin == end or *begin < '0' or *begin > '9')
             return std::nullopt;
     }
 

@@ -39,11 +39,16 @@ int main() {
     expect_invalid("");
     expect_invalid("   ");
     expect_invalid("+");
+    expect_invalid("++5");
+    expect_invalid("+-1");
+    expect_invalid("+-2147483648");
+    expect_invalid("--5");
     expect_invalid("true");
     expect_invalid("false");
     expect_invalid("c++17");
     expect_invalid("0x10");
     expect_invalid("16abc");
+    expect_invalid("1 2");
     expect_invalid("3000000000");
     expect_invalid("-3000000000");
     expect_invalid("99999999999999999999");
