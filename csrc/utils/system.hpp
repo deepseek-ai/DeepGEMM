@@ -8,6 +8,7 @@
 #include <memory>
 #include <unistd.h>
 
+#include "env.hpp"
 #include "exception.hpp"
 #include "format.hpp"
 
@@ -24,9 +25,10 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
     if constexpr (std::is_same_v<dtype_t, std::string>) {
         return std::string(c_str);
     } else if constexpr (std::is_same_v<dtype_t, int>) {
-        int value;
-        std::sscanf(c_str, "%d", &value);
-        return value;
+        const auto value = detail::parse_env_int(c_str);
+        if (not value.has_value())
+            DG_HOST_UNREACHABLE(fmt::format("Invalid integer value for environment variable: {}", name));
+        return *value;
     } else {
         DG_HOST_ASSERT(false and "Unexpected type");
     }
