@@ -105,6 +105,14 @@ CUTLASS_DEVICE uint32_t ld_shared(const uint32_t* ptr) {
     return ret;
 }
 
+CUTLASS_DEVICE uint2 ld_shared(const uint2* ptr) {
+    uint2 ret;
+    asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];"
+                 : "=r"(ret.x), "=r"(ret.y)
+                 : "l"(__cvta_generic_to_shared(ptr)));
+    return ret;
+}
+
 CUTLASS_DEVICE float2 ld_shared(const float2* ptr) {
     float2 ret;
     asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(ret.x), "=f"(ret.y) : "l"(__cvta_generic_to_shared(ptr)));
@@ -202,6 +210,12 @@ CUTLASS_DEVICE uint32_t ld_volatile(const uint32_t* ptr) {
 CUTLASS_DEVICE uint32_t ld_acq(const uint32_t* ptr) {
     uint32_t ret;
     asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+CUTLASS_DEVICE uint32_t ld_relaxed_gpu(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));
     return ret;
 }
 

@@ -111,18 +111,20 @@ static CUtensorMapSwizzle mode_into_tensor_map_swizzle(const int& mode, const in
     }
 }
 
+// `force_uint8` is reserved for staging packed SM90 MXFP4 int8 payloads as raw bytes.
 static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
                                     int gmem_inner_dim, int gmem_outer_dim,
                                     int smem_inner_dim, int smem_outer_dim,
                                     const int& gmem_outer_stride,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
                                     const bool& allow_tf32 = false,
-                                    const bool& fp4_unpacked_smem = true) {
+                                    const bool& fp4_unpacked_smem = true,
+                                    const bool& force_uint8 = false) {
     const auto elem_size = static_cast<int>(t.element_size());
     if (swizzle_mode != 0)
         smem_inner_dim = swizzle_mode / elem_size;
 
-    if (t.scalar_type() == kPackedFP4) {
+    if (t.scalar_type() == kPackedFP4 and not force_uint8) {
         // Inner dim must be a multiple of 64B for .b4x16_p64
         DG_HOST_ASSERT(not fp4_unpacked_smem or gmem_inner_dim % 128 == 0);
 
@@ -143,7 +145,8 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
                reinterpret_cast<unsigned long long>(t.data_ptr()));
     }
     DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
-        &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32, fp4_unpacked_smem),
+        &tensor_map, force_uint8 ? CU_TENSOR_MAP_DATA_TYPE_UINT8 :
+            aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32, fp4_unpacked_smem),
         2, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
         CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));

@@ -49,15 +49,18 @@ CUTLASS_HOST_DEVICE constexpr int get_num_max_live_pool_blocks(
     const int& num_total_m_blocks,
     const int& num_sms,
     const int& hidden,
-    const int& intermediate_hidden) {
-    constexpr int kMegaMoEBlockN = 128;
-    constexpr int kNumCTAsPerCluster = 2;
+    const int& intermediate_hidden,
+    const int& block_n = 128,
+    const int& num_ctas_per_task = 2) {
 
-    DG_UNIFIED_ASSERT((intermediate_hidden * 2) % (kNumCTAsPerCluster * kMegaMoEBlockN) == 0);
-    DG_UNIFIED_ASSERT(hidden % (kNumCTAsPerCluster * kMegaMoEBlockN) == 0);
-    const int num_clusters = num_sms / kNumCTAsPerCluster;
-    const int num_l1_n_clusters = intermediate_hidden * 2 / (kNumCTAsPerCluster * kMegaMoEBlockN);
-    const int num_l2_n_clusters = hidden / (kNumCTAsPerCluster * kMegaMoEBlockN);
+    DG_UNIFIED_ASSERT(block_n > 0);
+    DG_UNIFIED_ASSERT(num_ctas_per_task > 0);
+    DG_UNIFIED_ASSERT(num_sms % num_ctas_per_task == 0);
+    DG_UNIFIED_ASSERT((intermediate_hidden * 2) % (num_ctas_per_task * block_n) == 0);
+    DG_UNIFIED_ASSERT(hidden % (num_ctas_per_task * block_n) == 0);
+    const int num_clusters = num_sms / num_ctas_per_task;
+    const int num_l1_n_clusters = intermediate_hidden * 2 / (num_ctas_per_task * block_n);
+    const int num_l2_n_clusters = hidden / (num_ctas_per_task * block_n);
     const int num_l1_clusters = num_total_m_blocks * num_l1_n_clusters;
     const int num_l1_waves = math::constexpr_ceil_div(num_l1_clusters, num_clusters);
     const int num_min_l1_warmup_waves = get_num_l1_warmup_waves(
@@ -144,11 +147,13 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumSMs, uint32_t kNumRanks,
           uint32_t kNumRingBlocks,
           uint32_t kNumSharedExperts = 0,
+          uint32_t kNumCTAsPerTask = 2,
+          bool kSingleBlockTaskFastPath = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
-          uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
-          uint32_t kNumL2Clusters = kNumL2BlockNs / 2>
+          uint32_t kNumL1Clusters = kNumL1BlockNs / kNumCTAsPerTask,
+          uint32_t kNumL2Clusters = kNumL2BlockNs / kNumCTAsPerTask>
 struct MegaMoEScheduler {
     static constexpr bool kHasShared = kNumSharedExperts > 0;
     static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
@@ -157,18 +162,23 @@ struct MegaMoEScheduler {
     static constexpr uint32_t SHARED_L2_SHAPE_K = L2_SHAPE_K * kNumSharedExperts;
     using task_info_t = TaskInfo<kHasShared>;
 
-    DG_STATIC_ASSERT(L1_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shape");
-    DG_STATIC_ASSERT(L2_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shape");
+    DG_STATIC_ASSERT(kNumCTAsPerTask == 1 or kNumCTAsPerTask == 2,
+                     "MegaMoE task groups support one or two CTAs");
+    DG_STATIC_ASSERT(L1_SHAPE_N % (BLOCK_N * kNumCTAsPerTask) == 0, "Invalid shape");
+    DG_STATIC_ASSERT(L2_SHAPE_N % (BLOCK_N * kNumCTAsPerTask) == 0, "Invalid shape");
     DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
-    DG_STATIC_ASSERT(SHARED_L1_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shared shape");
-    DG_STATIC_ASSERT(SHARED_L2_SHAPE_N % (BLOCK_N * 2) == 0, "Invalid shared shape");
+    DG_STATIC_ASSERT(SHARED_L1_SHAPE_N % (BLOCK_N * kNumCTAsPerTask) == 0,
+                     "Invalid shared shape");
+    DG_STATIC_ASSERT(SHARED_L2_SHAPE_N % (BLOCK_N * kNumCTAsPerTask) == 0,
+                     "Invalid shared shape");
     DG_STATIC_ASSERT(SHARED_L1_SHAPE_K % BLOCK_K == 0, "Invalid shared shape");
     DG_STATIC_ASSERT(SHARED_L2_SHAPE_K % BLOCK_K == 0, "Invalid shared shape");
 
-    // NOTES: N block counts must be even so that 2 adjacent CTAs in a cluster
-    // always land on the same m_block_idx with n_block_idx differing by 1
-    DG_STATIC_ASSERT(kNumSMs % 2 == 0, "Number of SMs must be even for 2-CTA cluster");
+    // SM100 groups two adjacent cluster CTAs; SM90 can publish the same task
+    // payload to one CTA-local consumer group.
+    DG_STATIC_ASSERT(kNumSMs % kNumCTAsPerTask == 0,
+                     "Number of workers must divide into complete task groups");
     DG_STATIC_ASSERT(kNumRingBlocks > 0, "Invalid ring buffer config");
 
     // Workspace
@@ -212,6 +222,7 @@ struct MegaMoEScheduler {
 
     CUTLASS_DEVICE bool get_next_task(task_info_t& task_info) {
         task_info_full_barriers[sched_stage_idx].wait(sched_phase);
+        asm volatile("" ::: "memory");
         task_info = task_infos[sched_stage_idx];
         advance_sched_pipeline();
         return task_info.is_valid();
@@ -246,8 +257,19 @@ struct MegaMoEScheduler {
         return get_pool_block_offset(kNumExpertsPerRank);
     }
 
-    CUTLASS_DEVICE void fetch_expert_recv_count() {
-        // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
+    CUTLASS_DEVICE void finalize_expert_recv_count() {
+        __syncwarp();
+
+        num_total_m_blocks = get_num_total_pool_blocks();
+        const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1Clusters;
+        const uint32_t num_task_groups = kNumSMs / kNumCTAsPerTask;
+        const uint32_t num_total_l1_waves = math::ceil_div(num_total_l1_tasks, num_task_groups);
+        const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
+            num_total_m_blocks, num_task_groups, kNumL1Clusters, kNumL2Clusters);
+        num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
+    }
+
+    CUTLASS_DEVICE void cache_expert_recv_count(uint32_t* smem_counts) const {
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
@@ -256,17 +278,40 @@ struct MegaMoEScheduler {
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                ptx::st_shared(smem_counts + expert_idx,
+                               static_cast<uint32_t>(value));
+            }
+        }
+    }
+
+    CUTLASS_DEVICE void fetch_expert_recv_count() {
+        // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            uint64_t value = 0;
+            if (expert_idx < kNumExpertsPerRank) {
+                do {
+                    value = ptx::ld_volatile(
+                        workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } while (static_cast<uint32_t>(value >> 32) !=
+                         kNumSMs * kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
-        __syncwarp();
+        finalize_expert_recv_count();
+    }
 
-        num_total_m_blocks = get_num_total_pool_blocks();
-        const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1Clusters;
-        const uint32_t num_total_l1_waves = math::ceil_div(num_total_l1_tasks, kNumSMs / 2);
-        const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
-            num_total_m_blocks, kNumSMs / 2, kNumL1Clusters, kNumL2Clusters);
-        num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
+    CUTLASS_DEVICE void fetch_cached_expert_recv_count(
+            const uint32_t* smem_counts) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            stored_num_tokens_per_expert[i] =
+                expert_idx < kNumExpertsPerRank ?
+                    ptx::ld_shared(smem_counts + expert_idx) : 0u;
+        }
+        finalize_expert_recv_count();
     }
 
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
@@ -279,6 +324,30 @@ struct MegaMoEScheduler {
         const uint32_t n_cluster_idx = task_idx % num_clusters;
 
         task_info_t result(block_phase, 0, 0, n_cluster_idx, m_block_idx, 0, shape_n, shape_k);
+        // DSV4 Flash places one local expert on each lane. At small M, an
+        // expert normally owns at most one M64 block, so the pool-block index
+        // is just its ordinal in the nonempty-lane mask. Avoid rebuilding the
+        // same warp prefix sum for every L1/L2 N tile. A skewed expert with
+        // more than BLOCK_M tokens takes the general multi-block path below.
+        if constexpr (kSingleBlockTaskFastPath and
+                      kNumExpertsPerLane == 1) {
+            const uint32_t expert_idx = lane_idx;
+            const uint32_t num_tokens = stored_num_tokens_per_expert[0];
+            const uint32_t multi_block_mask = __ballot_sync(
+                0xffffffff, expert_idx < kNumExpertsPerRank and
+                                num_tokens > BLOCK_M);
+            if (multi_block_mask == 0) {
+                const uint32_t owner_mask = __ballot_sync(
+                    0xffffffff, expert_idx < kNumExpertsPerRank and
+                                    num_tokens != 0);
+                const uint32_t owner_lane_idx = __fns(
+                    owner_mask, 0, m_block_idx + 1);
+                result.local_expert_idx = owner_lane_idx;
+                result.valid_m = ptx::exchange(num_tokens, owner_lane_idx);
+                return result;
+            }
+        }
+
         uint32_t block_offset = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
@@ -350,20 +419,33 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE void publish_task(const task_info_t& task_info, const uint32_t& lane_idx) {
-        if (lane_idx < 2) {
-            task_info_full_barriers[sched_stage_idx].arrive_and_expect_tx(sizeof(task_info_t), lane_idx);
-            ptx::st_async_cluster(
-                task_infos + sched_stage_idx, task_info,
-                lane_idx, task_info_full_barriers[sched_stage_idx]
-            );
+        if constexpr (kNumCTAsPerTask == 1) {
+            if (cute::elect_one_sync()) {
+                task_infos[sched_stage_idx] = task_info;
+                __threadfence_block();
+                task_info_full_barriers[sched_stage_idx].arrive();
+            }
+        } else {
+            if (lane_idx < kNumCTAsPerTask) {
+                task_info_full_barriers[sched_stage_idx].arrive_and_expect_tx(
+                    sizeof(task_info_t), lane_idx);
+                ptx::st_async_cluster(
+                    task_infos + sched_stage_idx, task_info,
+                    lane_idx, task_info_full_barriers[sched_stage_idx]);
+            }
         }
         __syncwarp();
         advance_sched_pipeline();
     }
 
+    CUTLASS_DEVICE static uint32_t get_n_block_idx(
+            const task_info_t& task_info, const uint32_t& cta_rank = 0) {
+        return task_info.n_cluster_idx * kNumCTAsPerTask + cta_rank;
+    }
+
     template <BlockPhase kBlockPhase, uint32_t kShapeN, uint32_t kShapeK>
     CUTLASS_DEVICE void shared_mainloop(const uint32_t& num_tokens, const uint32_t& lane_idx, const uint32_t* task_count_ptr) {
-        constexpr uint32_t kNumNClusters = kShapeN / BLOCK_N / 2;
+        constexpr uint32_t kNumNClusters = kShapeN / BLOCK_N / kNumCTAsPerTask;
         const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
         const uint32_t num_tasks = num_m_blocks * kNumNClusters;
         while (true) {
@@ -411,6 +493,78 @@ struct MegaMoEScheduler {
         // Sentinel.
         task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
         publish_task(task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
+    }
+
+    // SM90 reuses the weight-loader warp as the task producer. It must publish
+    // each payload before issuing the matching B load so the A loader and math
+    // consumers observe exactly the same dynamic schedule. SM100 keeps using
+    // `mainloop()` above from its dedicated scheduler warp.
+    template <BlockPhase kBlockPhase, uint32_t kShapeN, uint32_t kShapeK,
+              typename Func>
+    CUTLASS_DEVICE void shared_mainloop_with_task(
+            const uint32_t& num_tokens,
+            const uint32_t& lane_idx,
+            const uint32_t* task_count_ptr,
+            Func&& process_task) {
+        constexpr uint32_t kNumNClusters =
+            kShapeN / BLOCK_N / kNumCTAsPerTask;
+        const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
+        const uint32_t num_tasks = num_m_blocks * kNumNClusters;
+        while (true) {
+            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            const uint32_t task_idx = get_next_task_idx(task_count_ptr);
+            if (task_idx >= num_tasks)
+                break;
+            const uint32_t m_block_idx = task_idx / kNumNClusters;
+            const uint32_t n_cluster_idx = task_idx % kNumNClusters;
+            const uint32_t valid_m =
+                cute::min(num_tokens - m_block_idx * BLOCK_M, BLOCK_M);
+            const task_info_t task_info(
+                kBlockPhase, 0, m_block_idx, n_cluster_idx, m_block_idx,
+                valid_m, kShapeN, kShapeK);
+            publish_task(task_info, lane_idx);
+            process_task(task_info);
+        }
+    }
+
+    template <bool kFetchExpertRecvCount = true, typename Func>
+    CUTLASS_DEVICE void mainloop_with_task(
+            const uint32_t& num_tokens, Func&& process_task) {
+        const auto lane_idx = ptx::get_lane_idx();
+
+        if constexpr (kHasShared) {
+            shared_mainloop_with_task<
+                BlockPhase::SharedLinear1,
+                SHARED_L1_SHAPE_N,
+                SHARED_L1_SHAPE_K>(
+                    num_tokens, lane_idx,
+                    workspace.get_shared_l1_task_count_ptr(), process_task);
+        }
+
+        if constexpr (kFetchExpertRecvCount)
+            fetch_expert_recv_count();
+        task_info_t task_info;
+        do {
+            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+            task_info = get_next_task();
+            if (task_info.is_valid()) {
+                publish_task(task_info, lane_idx);
+                process_task(task_info);
+            }
+        } while (task_info.is_valid());
+
+        if constexpr (kHasShared) {
+            shared_mainloop_with_task<
+                BlockPhase::SharedLinear2,
+                SHARED_L2_SHAPE_N,
+                SHARED_L2_SHAPE_K>(
+                    num_tokens, lane_idx,
+                    workspace.get_shared_l2_task_count_ptr(), process_task);
+        }
+
+        task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
+        publish_task(
+            task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
     }
 };
 

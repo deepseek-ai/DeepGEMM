@@ -36,6 +36,7 @@ static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorName);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorString);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuFuncSetAttribute);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuOccupancyMaxActiveBlocksPerMultiprocessor);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleLoad);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleUnload);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleGetFunction);
@@ -74,7 +75,9 @@ static void unload_library(const LibraryHandle& library) {
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                   const cudaStream_t& stream, const int& smem_size,
-                                                  const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl) {
+                                                  const dim3& grid_dim, const dim3& block_dim,
+                                                  const int& cluster_dim, const bool& enable_pdl,
+                                                  const bool& cooperative) {
     if (smem_size > 0)
         DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -85,8 +88,9 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.stream = stream;
 
     // Create attributes
-    // NOTES: must use `static` or the `attr` will be deconstructed
-    static LaunchAttrHandle attrs[2];
+    // The launch config only borrows this array until the immediate launch.
+    // Thread-local storage preserves that lifetime without cross-thread races.
+    static thread_local LaunchAttrHandle attrs[3];
     config.numAttrs = 0;
     config.attrs = attrs;
 
@@ -104,7 +108,30 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
         attr.val.programmaticStreamSerializationAllowed = 1;
     }
 
+    // Cooperative launch makes the all-CTA residency contract explicit for
+    // kernels that use a software grid barrier.
+    if (cooperative) {
+        auto& attr = attrs[config.numAttrs ++];
+        attr.id = cudaLaunchAttributeCooperative;
+        attr.val.cooperative = 1;
+    }
+
     return config;
+}
+
+static void prefer_max_shared_memory_carveout(const KernelHandle& kernel) {
+    DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared));
+}
+
+static int get_max_active_blocks_per_sm(
+    const KernelHandle& kernel, const int num_threads, const int smem_size) {
+    int num_blocks = 0;
+    DG_CUDA_RUNTIME_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks, reinterpret_cast<const void*>(kernel),
+        num_threads, smem_size));
+    return num_blocks;
 }
 
 template<typename... ActTypes>
@@ -173,7 +200,9 @@ static void unload_library(const LibraryHandle& library) {
 
 static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
                                                  const cudaStream_t& stream, const int& smem_size,
-                                                 const dim3& grid_dim, const dim3& block_dim, const int& cluster_dim, const bool& enable_pdl) {
+                                                 const dim3& grid_dim, const dim3& block_dim,
+                                                 const int& cluster_dim, const bool& enable_pdl,
+                                                 const bool& cooperative) {
     if (smem_size > 0)
         DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
 
@@ -188,8 +217,9 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     config.hStream = stream;
     
     // Create attributes
-    // NOTES: must use `static` or the `attr` will be deconstructed
-    static LaunchAttrHandle attrs[2];
+    // The launch config only borrows this array until the immediate launch.
+    // Thread-local storage preserves that lifetime without cross-thread races.
+    static thread_local LaunchAttrHandle attrs[3];
     config.numAttrs = 0;
     config.attrs = attrs;
 
@@ -209,7 +239,29 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
         attr.value.programmaticStreamSerializationAllowed = 1;
     }
 
+    // Cooperative launch makes the all-CTA residency contract explicit for
+    // kernels that use a software grid barrier.
+    if (cooperative) {
+        auto& attr = attrs[config.numAttrs ++];
+        attr.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
+        attr.value.cooperative = 1;
+    }
+
     return config;
+}
+
+static void prefer_max_shared_memory_carveout(const KernelHandle& kernel) {
+    DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(
+        kernel, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        CU_SHAREDMEM_CARVEOUT_MAX_SHARED));
+}
+
+static int get_max_active_blocks_per_sm(
+    const KernelHandle& kernel, const int num_threads, const int smem_size) {
+    int num_blocks = 0;
+    DG_CUDA_DRIVER_CHECK(lazy_cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks, kernel, num_threads, smem_size));
+    return num_blocks;
 }
 
 template<typename... ActTypes>

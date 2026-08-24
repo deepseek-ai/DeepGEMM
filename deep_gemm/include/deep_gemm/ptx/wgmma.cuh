@@ -16,6 +16,10 @@ CUTLASS_DEVICE void warpgroup_fence_operand(float& reg) {
     asm volatile("" : "+f"(reg) :: "memory");
 }
 
+CUTLASS_DEVICE void warpgroup_fence_operand(uint32_t& reg) {
+    asm volatile("" : "+r"(reg) :: "memory");
+}
+
 template <int N>
 CUTLASS_DEVICE void warpgroup_wait() {
     DG_STATIC_ASSERT(N >= 0 and N <= 7, "WGMMA wait: N must be in range [0, 7]");
