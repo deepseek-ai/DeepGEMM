@@ -30,8 +30,10 @@ def pack_ue8m0_to_int(x: torch.Tensor):
     # region we still validate them so direct callers get a loud error; during
     # capture we skip the check to avoid a device->host sync.
     if not torch.cuda.is_current_stream_capturing():
-        assert (x >= 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
-        assert (x == x.round()).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
+        # Validate ue8m0 invariants at the bit level: sign=0, mantissa=0.
+        x_bits = x.view(torch.int)
+        assert ((x_bits >> 31) == 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
+        assert ((x_bits & 0x7FFFFF) == 0).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
