@@ -25,11 +25,13 @@ def pack_ue8m0_to_int(x: torch.Tensor):
     # Host-side structural checks only:
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
     x_int = x.view(torch.int)
-    # The value invariants (non-negative exponent, zero mantissa) are guaranteed
-    # by `ceil_to_ue8m0`, the only producer of these scale factors, so we must
-    # NOT re-check them here on device. The kernel itself traps on malformed
-    # scales, so a bad upstream caller still fails loudly, just not on the
-    # capture path.
+    # Value invariants (non-negative exponent, zero mantissa) are guaranteed by
+    # `ceil_to_ue8m0`, the only internal producer. When NOT inside a captured
+    # region we still validate them so direct callers get a loud error; during
+    # capture we skip the check to avoid a device->host sync.
+    if not torch.cuda.is_current_stream_capturing():
+        assert (x >= 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
+        assert (x == x.round()).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
