@@ -17,9 +17,19 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 def pack_ue8m0_to_int(x: torch.Tensor):
+    # NOTE: keep this helper CUDA-graph-capture safe. Calling `.all()` on a
+    # device tensor forces a device->host sync, which raises
+    # cudaErrorStreamCaptureUnsupported when invoked inside a captured region
+    # (e.g. SGLang's decode graph via the MegaMoE FP8 staging path).
+    #
+    # Host-side structural checks only:
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
     x_int = x.view(torch.int)
-    assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
+    # The value invariants (non-negative exponent, zero mantissa) are guaranteed
+    # by `ceil_to_ue8m0`, the only producer of these scale factors, so we must
+    # NOT re-check them here on device. The kernel itself traps on malformed
+    # scales, so a bad upstream caller still fails loudly, just not on the
+    # capture path.
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
