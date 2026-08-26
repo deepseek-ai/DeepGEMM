@@ -56,7 +56,7 @@ static std::vector<std::filesystem::path> collect_files(const std::filesystem::p
         for (const auto& entry: std::filesystem::directory_iterator(dir)) {
             if (entry.is_directory()) {
                 impl(entry.path());
-            } else if (entry.is_regular_file() and entry.path().extension() == ".cuh") {
+            } else if (entry.is_regular_file()) {
                 files.emplace_back(entry.path());
             }
         }

@@ -24,19 +24,14 @@ class IncludeParser {
             return library_hash.value();
 
         // Key the installed header tree by relative path and content, not its install prefix.
-        std::vector<std::filesystem::path> files;
-        for (const auto& entry: std::filesystem::recursive_directory_iterator(library_include_path)) {
-            if (entry.is_regular_file())
-                files.emplace_back(entry.path());
-        }
-        std::sort(files.begin(), files.end());
+        const auto files = collect_files(library_include_path);
 
         std::stringstream ss;
         for (const auto& path: files) {
             std::ifstream in(path);
             DG_HOST_ASSERT(in.is_open());
             const std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            ss << std::filesystem::relative(path, library_include_path).generic_string()
+            ss << path.lexically_relative(library_include_path).generic_string()
                << "$" << get_hex_digest(content) << "$";
         }
         return (library_hash = get_hex_digest(ss.str())).value();
