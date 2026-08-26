@@ -97,8 +97,31 @@ public:
         fsync_path(path);
     }
 
+    // Remove every exact occurrence of a token from a whitespace-separated flag string
+    static std::string strip_flag_token(const std::string& compile_flags, const std::string& token) {
+        std::string out;
+        size_t i = 0;
+        while (i < compile_flags.size()) {
+            size_t j = compile_flags.find(' ', i);
+            if (j == std::string::npos)
+                j = compile_flags.size();
+            if (j > i and compile_flags.compare(i, j - i, token) != 0) {
+                if (not out.empty())
+                    out += ' ';
+                out += compile_flags.substr(i, j - i);
+            }
+            i = j + 1;
+        }
+        return out;
+    }
+
     std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
-        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
+        // Exclude the library include path from the cache key: it is location identity,
+        // not kernel identity, as its headers' content is already hashed into `code`.
+        // Every other flag stays keyed, including other `-I` paths (e.g. the CUDA home
+        // include, whose headers are not content-hashed) and the compiler `signature`.
+        const auto key_flags = strip_flag_token(flags, "-I" + library_include_path.string());
+        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, key_flags, code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache

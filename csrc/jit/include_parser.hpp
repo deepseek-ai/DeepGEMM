@@ -1,8 +1,13 @@
 #pragma once
 
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <optional>
 #include <regex>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../utils/format.hpp"
@@ -12,6 +17,25 @@ namespace deep_gemm {
 
 class IncludeParser {
     std::unordered_map<std::string, std::optional<std::string>> cache;
+    std::optional<std::string> library_hash;
+
+    std::string get_library_hash_value() {
+        if (library_hash.has_value())
+            return library_hash.value();
+
+        // Key the installed header tree by relative path and content, not its install prefix.
+        const auto files = collect_files(library_include_path);
+
+        std::stringstream ss;
+        for (const auto& path: files) {
+            std::ifstream in(path);
+            DG_HOST_ASSERT(in.is_open());
+            const std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            ss << path.lexically_relative(library_include_path).generic_string()
+               << "$" << get_hex_digest(content) << "$";
+        }
+        return (library_hash = get_hex_digest(ss.str())).value();
+    }
 
     static std::vector<std::string> get_includes(const std::string& code, const std::filesystem::path& file_path = "") {
         std::vector<std::string> includes;
@@ -46,6 +70,8 @@ public:
 
     std::string get_hash_value(const std::string& code, const bool& exclude_code = true) {
         std::stringstream ss;
+        if (exclude_code)
+            ss << get_library_hash_value() << "$";
         for (const auto& i: get_includes(code))
             ss << get_hash_value_by_path(library_include_path / i) << "$";
         if (not exclude_code)
