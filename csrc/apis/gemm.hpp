@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm100_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm120_bf16_gemm.hpp"
@@ -143,6 +144,19 @@ static void fp8_fp4_gemm_nt_sm120(const std::pair<torch::Tensor, torch::Tensor>&
         sf_a_raw, sf_b_raw, eff_m, eff_n, k, eff_recipe,
         eff_recipe_a, eff_recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
 
+    // Pure fp8xfp8 must not run the fp8xfp4 kernel (fp8 weights are
+    // misread as fp4: silent corruption). Route to the fp8 1d1d kernel.
+    if (a_data.scalar_type() != kPackedFP4 and b_data.scalar_type() != kPackedFP4) {
+        if (swap_ab) {
+            sm100_fp8_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
+                                eff_m, eff_n, k, gran_k_a, gran_k_b,
+                                k_major, k_major, compiled_dims);
+        } else {
+            sm100_fp8_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k,
+                                gran_k_a, gran_k_b, k_major, k_major, compiled_dims);
+        }
+        return;
+    }
     if (swap_ab) {
         sm120_fp8_fp4_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
                                 eff_m, eff_n, k, gran_k_a, gran_k_b,
@@ -201,8 +215,13 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                 sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
             }
         } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-            sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                    major_a, major_b, compiled_dims);
+            if (b.first.scalar_type() != kPackedFP4) {
+                sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k,
+                                    gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
+            } else {
+                sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
+                                        major_a, major_b, compiled_dims);
+            }
         } else {
             DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
         }
