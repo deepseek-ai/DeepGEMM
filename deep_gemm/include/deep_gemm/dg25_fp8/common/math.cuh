@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda/std/cstdint>
+#include <cuda_bf16.h>
 #include <deep_gemm/dg25_fp8/common/compile.cuh>
 #include <deep_gemm/dg25_fp8/common/exception.cuh>
 

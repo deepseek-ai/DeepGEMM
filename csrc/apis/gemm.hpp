@@ -105,11 +105,18 @@ static void fp8_fp4_gemm_nt_sm120(const std::pair<torch::Tensor, torch::Tensor>&
                               (a_data.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
     DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0);
 
+    // Pure fp8xfp8 must not run the fp8xfp4 kernel (fp8 weights are misread
+    // as fp4: silent corruption), and the restored sm100_fp8_gemm_1d1d has no
+    // AB-swap/transposed-store support - force the non-swapped path (the
+    // SM100 heuristics already cover small M with block_m<=32 candidates).
+    const bool pure_fp8 = (a_data.scalar_type() != kPackedFP4) and
+                          (b_data.scalar_type() != kPackedFP4);
+
     // AB-swap for small-M decode: swap A↔B so small M becomes N (BN=16).
     // K-major B has N as TMA outer dim — no minimum size restriction.
     constexpr int kSwapAbMMax = 16;
     const bool swap_ab = (m >= 1 and m <= kSwapAbMMax
-        and d.stride(-1) == 1 and !is_mixed_fp4 and !c.has_value());
+        and d.stride(-1) == 1 and !is_mixed_fp4 and !pure_fp8 and !c.has_value());
 
     // Resolve actual granularities, swap if needed
     int ga, gb, gk;
@@ -144,17 +151,10 @@ static void fp8_fp4_gemm_nt_sm120(const std::pair<torch::Tensor, torch::Tensor>&
         sf_a_raw, sf_b_raw, eff_m, eff_n, k, eff_recipe,
         eff_recipe_a, eff_recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
 
-    // Pure fp8xfp8 must not run the fp8xfp4 kernel (fp8 weights are
-    // misread as fp4: silent corruption). Route to the fp8 1d1d kernel.
-    if (a_data.scalar_type() != kPackedFP4 and b_data.scalar_type() != kPackedFP4) {
-        if (swap_ab) {
-            sm100_fp8_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
-                                eff_m, eff_n, k, gran_k_a, gran_k_b,
-                                k_major, k_major, compiled_dims);
-        } else {
-            sm100_fp8_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k,
-                                gran_k_a, gran_k_b, k_major, k_major, compiled_dims);
-        }
+    // Route pure fp8xfp8 to the fp8 1d1d kernel (swap_ab is false for it).
+    if (pure_fp8) {
+        sm100_fp8_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k,
+                            gran_k_a, gran_k_b, k_major, k_major, compiled_dims);
         return;
     }
     if (swap_ab) {
@@ -215,7 +215,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                 sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
             }
         } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-            if (b.first.scalar_type() != kPackedFP4) {
+            if (b.first.scalar_type() != kPackedFP4 and a.first.scalar_type() != kPackedFP4) {
                 sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k,
                                     gran_k_a, gran_k_b, major_a, major_b, compiled_dims);
             } else {

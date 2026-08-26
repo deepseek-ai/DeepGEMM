@@ -45,6 +45,12 @@ struct SM100ArchSpec {
         // Enumerate all candidates
         std::vector<Layout> candidates;
         for (int swap_ab = 0; swap_ab < 2; ++ swap_ab) {
+            // Kernels without AB-swap support (e.g. the restored pure-fp8
+            // sm100_fp8_gemm_1d1d) must not see swapped layouts: the swap
+            // store/smem configs would silently miscompute or trip the
+            // multicast static assert at JIT time.
+            if (swap_ab == 1 and not desc.allow_swap_ab)
+                continue;
             // Block M/N candidates
             std::vector<int> block_m_candidates;
             std::vector<int> block_n_candidates;            

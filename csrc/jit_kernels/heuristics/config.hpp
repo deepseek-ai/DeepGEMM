@@ -29,6 +29,10 @@ struct GemmDesc {
     // cannot express it, so the kernel falls back to the strided-store epilogue.
     bool cd_n_contiguous = true;
 
+    // False for kernels without AB-swap support: skips the swap_ab==1 layout
+    // candidates in get_layout_candidates (default true preserves all callers).
+    bool allow_swap_ab = true;
+
     // SM100 m-grouped psum layout padding contract
     bool ensure_zero_padding = true;
 

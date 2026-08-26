@@ -83,7 +83,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_sms,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.a_dtype), to_string(args.gemm_desc.b_dtype), to_string(args.gemm_desc.cd_dtype),
-        "EpilogueIdentity");
+        get_default_epilogue_type(args.epilogue_type));
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -113,10 +113,14 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
+        // The restored kernel has no AB-swap/transposed-store support.
+        .allow_swap_ab = false,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims
     };
+    // SM100ArchSpec smem_capacity is reused for sm_12x; GB10 per-SM dynamic
+    // smem matches SM100 (227 KB), so stage sizing is safe there.
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
     const auto cd = c.value_or(d);
