@@ -17,20 +17,24 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 def pack_ue8m0_to_int(x: torch.Tensor):
-    # NOTE: keep this helper CUDA-graph-capture safe. Calling `.all()` on a
-    # device tensor forces a device->host sync, which raises
-    # cudaErrorStreamCaptureUnsupported when invoked inside a captured region
-    # (e.g. SGLang's decode graph via the MegaMoE FP8 staging path).
-    #
-    # Host-side structural checks only:
+    """Pack a float32 tensor of UE8M0 scale factors into int32 (4 bytes per int).
+
+    Precondition: every element must be a power-of-two with zero mantissa and
+    non-negative sign (i.e. produced by ``ceil_to_ue8m0`` or the literal 1.0
+    padding). Violating this precondition silently produces wrong packed values
+    because the downstream GEMM/MHA kernels only validate shape/dtype, not
+    numerical content.
+
+    CUDA-graph-capture safe: ``.all()`` triggers a device→host sync which raises
+    ``cudaErrorStreamCaptureUnsupported`` inside a capture region. We therefore
+    skip the value assertions during capture and run them otherwise so that
+    direct callers outside capture still get a loud error on bad input.
+    """
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
     x_int = x.view(torch.int)
-    # Value invariants (non-negative exponent, zero mantissa) are guaranteed by
-    # `ceil_to_ue8m0`, the only internal producer. When NOT inside a captured
-    # region we still validate them so direct callers get a loud error; during
-    # capture we skip the check to avoid a device->host sync.
     if not torch.cuda.is_current_stream_capturing():
-        # Validate ue8m0 invariants at the bit level: sign=0, mantissa=0.
+        # Bit-level check: sign bit == 0, mantissa bits == 0.
+        # (float round-based checks fail for subnormals like 2^-126.)
         x_bits = x.view(torch.int)
         assert ((x_bits >> 31) == 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
         assert ((x_bits & 0x7FFFFF) == 0).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
