@@ -119,8 +119,9 @@ static void sm100_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims
     };
-    // SM100ArchSpec smem_capacity is reused for sm_12x; GB10 per-SM dynamic
-    // smem matches SM100 (227 KB), so stage sizing is safe there.
+    // SM12x (GB10) has only 100 KiB of opt-in SMEM per block (vs 227 KiB on
+    // SM100); get_pipeline_config now sizes stages from the device's actual
+    // sharedMemPerBlockOptin so the restored kernel fits both archs.
     const auto config = get_best_config<SM100ArchSpec>(desc);
 
     const auto cd = c.value_or(d);
