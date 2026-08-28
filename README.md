@@ -184,7 +184,7 @@ The library also provides some environment variables, which may be useful:
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
     - `DG_JIT_USE_RUNTIME_API`: `0` or `1`, use CUDA Runtime API for kernel loading (requires CUDA runtime >= 12.8), `0` by default
 
-For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
+For additional examples and details, please refer to [the test code](tests/test_fp8_fp4.py) and [tests/test_bf16.py](tests/test_bf16.py) or review the corresponding Python documentation.
 
 ## Acknowledgement
 
