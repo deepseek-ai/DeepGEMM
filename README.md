@@ -33,7 +33,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
     - CUDA 12.3 or higher for SM90
         - **We highly recommend 12.9 or higher for the best performance**
     - CUDA 12.9 or higher for SM100
-- PyTorch 2.1 or higher
+- PyTorch 2.1 or higher (PyTorch >= 2.9 is required for Mega MoE, which relies on `torch.distributed._symmetric_memory`)
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
 - `{fmt}` library (could be cloned by Git submodule)
 
