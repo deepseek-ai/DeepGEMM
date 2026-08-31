@@ -15,6 +15,11 @@ except Exception as exception:
 from .. import _C
 
 
+def supports_bf16_shared_independent_tokens() -> bool:
+    """Return whether BF16 shared and routed work may use different M."""
+    return True
+
+
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
@@ -22,7 +27,8 @@ class SymmBuffer:
                  hidden: int, intermediate_hidden: int,
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 bf16_shared_intermediate_hidden: int = 0):
         assert activation == 'swiglu' or (mma_type == 'fp8xfp4' and activation == 'situ'), \
             f'Only FP8xFP4 MegaMoE supports `situ`, got mma_type={mma_type!r}, activation={activation!r}'
         self.group = group
@@ -34,6 +40,7 @@ class SymmBuffer:
         self.num_shared_experts = num_shared_experts
         self.mma_type = mma_type
         self.activation = activation
+        self.bf16_shared_intermediate_hidden = bf16_shared_intermediate_hidden
 
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
@@ -61,6 +68,13 @@ class SymmBuffer:
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+        self.shared_bf16_l2_acts = (
+            torch.empty(
+                (num_max_tokens_per_rank, bf16_shared_intermediate_hidden),
+                dtype=torch.bfloat16,
+                device='cuda')
+            if bf16_shared_intermediate_hidden > 0 else None
+        )
 
     def destroy(self):
         self.handle = None
@@ -68,6 +82,7 @@ class SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
+        self.shared_bf16_l2_acts = None
 
 
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
@@ -77,7 +92,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 bf16_shared_intermediate_hidden: int = 0) -> SymmBuffer:
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -94,7 +110,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation,
+        bf16_shared_intermediate_hidden=bf16_shared_intermediate_hidden
     )
 
 
@@ -139,8 +156,10 @@ def transform_weights_for_mega_moe(
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
     assert activation in ('swiglu', 'situ'), f'Unsupported activation: {activation!r}'
-    assert activation != 'situ' or (isinstance(l1_weights, tuple) and isinstance(l2_weights, tuple)), \
-        '`situ` requires FP8xFP4 `(weight, sf)` tuples for both L1 and L2 weights'
+    assert activation != 'situ' or (
+        (isinstance(l1_weights, tuple) and isinstance(l2_weights, tuple))
+        or (isinstance(l1_weights, torch.Tensor) and isinstance(l2_weights, torch.Tensor))
+    ), '`situ` requires matching tensor or `(weight, sf)` weight pairs'
     if isinstance(l1_weights, tuple):
         # Scaled FP8xFP4/NVFP4: both formats use the same MN-major SF layout.
         # Interleave gate/up for weight and SF, then transpose L1 SF for UTCCP.
@@ -241,6 +260,154 @@ def fp4_fp4_mega_moe(y: torch.Tensor,
         fast_math,
         l1_alphas, l2_alphas, a2_scales, routed_scaling_factor
     )
+
+
+def _fp8_fp4_mega_moe_bf16_shared(
+        y: torch.Tensor,
+        shared_y: Optional[torch.Tensor],
+        l1_weights: Tuple[torch.Tensor, torch.Tensor],
+        l2_weights: Tuple[torch.Tensor, torch.Tensor],
+        shared_x: torch.Tensor,
+        shared_l1_weights: torch.Tensor,
+        shared_l2_weights: torch.Tensor,
+        rms_weight: torch.Tensor,
+        rms_epsilon: float,
+        sym_buffer: SymmBuffer,
+        shared_rs_workspace: Optional[torch.Tensor],
+        shared_rs_flags: Optional[torch.Tensor],
+        shared_rs_peer_ptrs: Optional[torch.Tensor],
+        publish_shared_sp_rs: bool,
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+        recipe: Tuple[int, int, int] = (1, 1, 32),
+        activation: str = 'situ',
+        fast_math: bool = True,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None):
+    if sym_buffer.num_shared_experts != 0:
+        raise ValueError(
+            'BF16 shared MegaMoE requires num_shared_experts=0 because its '
+            'intermediate is stored outside the symmetric routed buffer')
+    assert sym_buffer.shared_bf16_l2_acts is not None, \
+        'SymmBuffer was not initialized with a BF16 shared intermediate'
+    _C.fp8_fp4_mega_moe_bf16_shared(
+        y, shared_y,
+        l1_weights, l2_weights,
+        shared_x, sym_buffer.shared_bf16_l2_acts,
+        shared_l1_weights, shared_l2_weights,
+        rms_weight, rms_epsilon,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe, activation, fast_math,
+        situ_beta, situ_linear_beta,
+        shared_rs_workspace, shared_rs_flags, shared_rs_peer_ptrs,
+        publish_shared_sp_rs
+    )
+
+
+def fp8_fp4_mega_moe_bf16_shared(
+        y: torch.Tensor,
+        shared_y: torch.Tensor,
+        l1_weights: Tuple[torch.Tensor, torch.Tensor],
+        l2_weights: Tuple[torch.Tensor, torch.Tensor],
+        shared_x: torch.Tensor,
+        shared_l1_weights: torch.Tensor,
+        shared_l2_weights: torch.Tensor,
+        rms_weight: torch.Tensor,
+        rms_epsilon: float,
+        sym_buffer: SymmBuffer,
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+        recipe: Tuple[int, int, int] = (1, 1, 32),
+        activation: str = 'situ',
+        fast_math: bool = True,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None):
+    _fp8_fp4_mega_moe_bf16_shared(
+        y, shared_y,
+        l1_weights, l2_weights,
+        shared_x, shared_l1_weights, shared_l2_weights,
+        rms_weight, rms_epsilon,
+        sym_buffer,
+        None, None, None, False,
+        cumulative_local_expert_recv_stats,
+        recipe, activation, fast_math,
+        situ_beta, situ_linear_beta
+    )
+
+
+def fp8_fp4_mega_moe_bf16_shared_rs(
+        y: torch.Tensor,
+        l1_weights: Tuple[torch.Tensor, torch.Tensor],
+        l2_weights: Tuple[torch.Tensor, torch.Tensor],
+        shared_x: torch.Tensor,
+        shared_l1_weights: torch.Tensor,
+        shared_l2_weights: torch.Tensor,
+        rms_weight: torch.Tensor,
+        rms_epsilon: float,
+        shared_rs_workspace: torch.Tensor,
+        shared_rs_flags: torch.Tensor,
+        shared_rs_peer_ptrs: torch.Tensor,
+        sym_buffer: SymmBuffer,
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+        recipe: Tuple[int, int, int] = (1, 1, 32),
+        activation: str = 'situ',
+        fast_math: bool = True,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None):
+    """Publish BF16 shared outputs into a symmetric ReduceScatter buffer.
+
+    ``shared_rs_flags[0]`` selects one of at least three workspace generations
+    and ``shared_rs_flags[2]`` is the byte stride between generations. This
+    kernel only writes the selected generation; the caller must make remote
+    stores visible and publish its own completion signal before consuming it.
+    """
+    _fp8_fp4_mega_moe_bf16_shared(
+        y, None,
+        l1_weights, l2_weights,
+        shared_x, shared_l1_weights, shared_l2_weights,
+        rms_weight, rms_epsilon,
+        sym_buffer,
+        shared_rs_workspace, shared_rs_flags, shared_rs_peer_ptrs, False,
+        cumulative_local_expert_recv_stats,
+        recipe, activation, fast_math,
+        situ_beta, situ_linear_beta
+    )
+
+
+def fp8_fp4_mega_moe_bf16_shared_sp_rs(
+        y: torch.Tensor,
+        l1_weights: Tuple[torch.Tensor, torch.Tensor],
+        l2_weights: Tuple[torch.Tensor, torch.Tensor],
+        shared_x: torch.Tensor,
+        shared_l1_weights: torch.Tensor,
+        shared_l2_weights: torch.Tensor,
+        rms_weight: torch.Tensor,
+        rms_epsilon: float,
+        shared_rs_workspace: torch.Tensor,
+        shared_rs_flags: torch.Tensor,
+        shared_rs_peer_ptrs: torch.Tensor,
+        sym_buffer: SymmBuffer,
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+        recipe: Tuple[int, int, int] = (1, 1, 32),
+        activation: str = 'situ',
+        fast_math: bool = True,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None):
+    """Publish TP partials to the owning sequence-parallel token rank."""
+    _fp8_fp4_mega_moe_bf16_shared(
+        y, None,
+        l1_weights, l2_weights,
+        shared_x, shared_l1_weights, shared_l2_weights,
+        rms_weight, rms_epsilon,
+        sym_buffer,
+        shared_rs_workspace, shared_rs_flags, shared_rs_peer_ptrs, True,
+        cumulative_local_expert_recv_stats,
+        recipe, activation, fast_math,
+        situ_beta, situ_linear_beta
+    )
+
 
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,

@@ -88,6 +88,10 @@ from .mega import (
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
+    fp8_fp4_mega_moe_bf16_shared,
+    fp8_fp4_mega_moe_bf16_shared_rs,
+    fp8_fp4_mega_moe_bf16_shared_sp_rs,
+    supports_bf16_shared_independent_tokens,
     fp4_fp4_mega_moe,
     bf16_mega_moe,
 )

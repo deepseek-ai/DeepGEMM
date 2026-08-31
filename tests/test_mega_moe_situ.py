@@ -11,6 +11,7 @@ sys.path.insert(
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 import deep_gemm
 from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
@@ -20,9 +21,13 @@ from deep_gemm.utils.dist import init_dist
 NUM_RANKS = 1
 NUM_EXPERTS = 4
 NUM_TOPK = 1
+NUM_MAX_TOKENS = 96
 NUM_TOKENS = 64
+NUM_SHARED_TOKENS = 72
 HIDDEN = 1024
 INTERMEDIATE = 512
+SHARED_HIDDEN = 2048
+SHARED_INTERMEDIATE = 1024
 
 
 class Case(NamedTuple):
@@ -151,7 +156,7 @@ def _worker(local_rank: int, master_port: int) -> None:
         buffer = deep_gemm.get_symm_buffer_for_mega_moe(
             group,
             NUM_EXPERTS,
-            NUM_TOKENS,
+            NUM_MAX_TOKENS,
             NUM_TOPK,
             HIDDEN,
             INTERMEDIATE,
@@ -199,6 +204,225 @@ def _worker(local_rank: int, master_port: int) -> None:
             dist.destroy_process_group()
 
 
+def _bf16_shared_worker(local_rank: int, master_port: int) -> None:
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = str(master_port)
+    os.environ['WORLD_SIZE'] = '1'
+    os.environ['RANK'] = '0'
+
+    buffer = None
+    try:
+        _, _, group = init_dist(local_rank, NUM_RANKS)
+        generator = torch.Generator(device='cuda')
+        generator.manual_seed(20260823)
+
+        def randn(shape: Tuple[int, ...], scale: float) -> torch.Tensor:
+            return torch.randn(
+                shape,
+                dtype=torch.bfloat16,
+                device='cuda',
+                generator=generator).mul_(scale)
+
+        routed_x = randn((NUM_TOKENS, HIDDEN), 0.5)
+        routed_l1 = randn(
+            (NUM_EXPERTS, INTERMEDIATE * 2, HIDDEN), 0.04)
+        routed_l2 = randn(
+            (NUM_EXPERTS, HIDDEN, INTERMEDIATE), 0.04)
+        shared_x = randn((NUM_SHARED_TOKENS, SHARED_HIDDEN), 0.25)
+        shared_l1 = randn(
+            (SHARED_INTERMEDIATE * 2, SHARED_HIDDEN), 0.02)
+        shared_l2 = randn(
+            (SHARED_HIDDEN, SHARED_INTERMEDIATE), 0.02)
+        rms_weight = randn((HIDDEN,), 0.1).add_(1.0)
+        rms_epsilon = 1e-6
+        situ_beta = 1.25
+        situ_linear_beta = 1.5
+
+        routed_x_fp8, routed_x_sf = per_token_cast_to_fp8(
+            routed_x,
+            use_ue8m0=True,
+            gran_k=32,
+            use_packed_ue8m0=True)
+        transformed_routed_l1, transformed_routed_l2 = (
+            deep_gemm.transform_weights_for_mega_moe(
+                _cast_weights_to_fp4(routed_l1),
+                _cast_weights_to_fp4(routed_l2),
+                activation='situ'))
+        transformed_shared_l1, transformed_shared_l2 = (
+            deep_gemm.transform_weights_for_mega_moe(
+                shared_l1, shared_l2, activation='situ'))
+        topk_idx = (
+            torch.arange(NUM_TOKENS, device='cuda', dtype=torch.long)
+            % NUM_EXPERTS
+        ).view(NUM_TOKENS, NUM_TOPK)
+        topk_weights = torch.ones(
+            (NUM_TOKENS, NUM_TOPK), device='cuda', dtype=torch.float)
+
+        buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+            group,
+            NUM_EXPERTS,
+            NUM_TOKENS,
+            NUM_TOPK,
+            HIDDEN,
+            INTERMEDIATE,
+            mma_type='fp8xfp4',
+            activation='situ',
+            bf16_shared_intermediate_hidden=SHARED_INTERMEDIATE)
+
+        def prepare_inputs() -> None:
+            buffer.buffer.zero_()
+            buffer.x[:NUM_TOKENS].copy_(routed_x_fp8)
+            buffer.x_sf[:NUM_TOKENS].copy_(routed_x_sf)
+            buffer.topk_idx[:NUM_TOKENS].copy_(topk_idx)
+            buffer.topk_weights[:NUM_TOKENS].copy_(topk_weights)
+
+        # Reference routed output: existing routed-only kernel followed by the
+        # BF16-input RMSNorm contract used by Kimi K3.
+        prepare_inputs()
+        routed_unnormalized = torch.empty(
+            (NUM_TOKENS, HIDDEN), dtype=torch.bfloat16, device='cuda')
+        deep_gemm.fp8_fp4_mega_moe(
+            routed_unnormalized,
+            transformed_routed_l1,
+            transformed_routed_l2,
+            buffer,
+            activation='situ',
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta)
+        routed_fp32 = routed_unnormalized.float()
+        routed_reference = (
+            routed_fp32
+            * torch.rsqrt(routed_fp32.square().mean(-1, keepdim=True)
+                          + rms_epsilon)
+            * rms_weight.float()).to(torch.bfloat16)
+
+        prepare_inputs()
+        routed_actual = torch.empty_like(routed_unnormalized)
+        shared_actual = torch.empty(
+            (NUM_SHARED_TOKENS, SHARED_HIDDEN),
+            dtype=torch.bfloat16,
+            device='cuda')
+        deep_gemm.fp8_fp4_mega_moe_bf16_shared(
+            routed_actual,
+            shared_actual,
+            transformed_routed_l1,
+            transformed_routed_l2,
+            shared_x,
+            transformed_shared_l1,
+            transformed_shared_l2,
+            rms_weight,
+            rms_epsilon,
+            buffer,
+            activation='situ',
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta)
+        torch.cuda.synchronize()
+
+        gate, up = F.linear(shared_x, shared_l1).chunk(2, dim=-1)
+        gate_fp32, up_fp32 = gate.float(), up.float()
+        shared_intermediate = (
+            torch.sigmoid(gate_fp32)
+            * (situ_beta * torch.tanh(gate_fp32 / situ_beta))
+            * (situ_linear_beta
+               * torch.tanh(up_fp32 / situ_linear_beta))).to(torch.bfloat16)
+        shared_reference = F.linear(
+            shared_intermediate, shared_l2).to(torch.bfloat16)
+
+        routed_error = _relative_l2(routed_actual, routed_reference)
+        shared_error = _relative_l2(shared_actual, shared_reference)
+        if routed_error >= 2e-3:
+            raise AssertionError(
+                f'fused RMSNorm relative L2 too high: {routed_error:.6f}')
+        if shared_error >= 1e-2:
+            raise AssertionError(
+                f'BF16 shared expert relative L2 too high: {shared_error:.6f}')
+
+        shared_rs_workspace = torch.full(
+            (3, NUM_SHARED_TOKENS, NUM_RANKS, SHARED_HIDDEN),
+            float('nan'),
+            dtype=torch.bfloat16,
+            device='cuda')
+        shared_rs_flags = torch.zeros(9, dtype=torch.int, device='cuda')
+        shared_rs_flags[2] = shared_rs_workspace[0].nbytes
+        shared_rs_peer_ptrs = torch.tensor(
+            [shared_rs_workspace.data_ptr()], dtype=torch.long, device='cuda')
+        for generation in range(3):
+            prepare_inputs()
+            routed_rs = torch.empty_like(routed_unnormalized)
+            shared_rs_flags[0] = generation
+            deep_gemm.fp8_fp4_mega_moe_bf16_shared_rs(
+                routed_rs,
+                transformed_routed_l1,
+                transformed_routed_l2,
+                shared_x,
+                transformed_shared_l1,
+                transformed_shared_l2,
+                rms_weight,
+                rms_epsilon,
+                shared_rs_workspace,
+                shared_rs_flags,
+                shared_rs_peer_ptrs,
+                buffer,
+                activation='situ',
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta)
+            torch.cuda.synchronize()
+            published = shared_rs_workspace[generation, :, 0]
+            if not torch.equal(published, shared_actual):
+                mismatch = torch.count_nonzero(
+                    published.view(torch.int16)
+                    != shared_actual.view(torch.int16)).item()
+                raise AssertionError(
+                    f'generation {generation} RS publication differs from '
+                    f'dense output in {mismatch} BF16 values')
+
+        shared_sp_rs_workspace = torch.full(
+            (1, NUM_SHARED_TOKENS // NUM_RANKS, NUM_RANKS, SHARED_HIDDEN),
+            float('nan'),
+            dtype=torch.bfloat16,
+            device='cuda')
+        shared_sp_rs_flags = torch.zeros(9, dtype=torch.int, device='cuda')
+        shared_sp_rs_flags[2] = shared_sp_rs_workspace[0].nbytes
+        shared_sp_rs_peer_ptrs = torch.tensor(
+            [shared_sp_rs_workspace.data_ptr()],
+            dtype=torch.long,
+            device='cuda')
+        for generation in range(1):
+            prepare_inputs()
+            routed_sp_rs = torch.empty_like(routed_unnormalized)
+            shared_sp_rs_flags[0] = generation
+            deep_gemm.fp8_fp4_mega_moe_bf16_shared_sp_rs(
+                routed_sp_rs,
+                transformed_routed_l1,
+                transformed_routed_l2,
+                shared_x,
+                transformed_shared_l1,
+                transformed_shared_l2,
+                rms_weight,
+                rms_epsilon,
+                shared_sp_rs_workspace,
+                shared_sp_rs_flags,
+                shared_sp_rs_peer_ptrs,
+                buffer,
+                activation='situ',
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta)
+            torch.cuda.synchronize()
+            published = shared_sp_rs_workspace[generation].sum(dim=1)
+            if not torch.equal(published, shared_actual):
+                mismatch = torch.count_nonzero(
+                    published.view(torch.int16)
+                    != shared_actual.view(torch.int16)).item()
+                raise AssertionError(
+                    f'generation {generation} SP RS publication differs from '
+                    f'dense output in {mismatch} BF16 values')
+    finally:
+        if buffer is not None:
+            buffer.destroy()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(('127.0.0.1', 0))
@@ -217,5 +441,18 @@ def test_situ_metamorphic() -> None:
         join=True)
 
 
+def test_bf16_shared_and_rms_norm() -> None:
+    if torch.cuda.device_count() < NUM_RANKS:
+        raise unittest.SkipTest('requires one CUDA device')
+    if torch.cuda.get_device_capability(0)[0] != 10:
+        raise unittest.SkipTest('requires an SM100 CUDA device')
+    torch.multiprocessing.spawn(
+        _bf16_shared_worker,
+        args=(_find_free_port(),),
+        nprocs=NUM_RANKS,
+        join=True)
+
+
 if __name__ == '__main__':
     test_situ_metamorphic()
+    test_bf16_shared_and_rms_norm()

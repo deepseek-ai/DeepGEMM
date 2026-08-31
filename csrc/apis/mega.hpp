@@ -514,6 +514,200 @@ static void fp4_fp4_mega_moe(
         sym_buffer.zero_();
 }
 
+static void fp8_fp4_mega_moe_bf16_shared(
+    const torch::Tensor& y,
+    const std::optional<torch::Tensor>& shared_y_opt,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const torch::Tensor& shared_x,
+    const torch::Tensor& shared_l2_acts,
+    const torch::Tensor& shared_l1_weights,
+    const torch::Tensor& shared_l2_weights,
+    const torch::Tensor& rms_weight,
+    const float& rms_epsilon,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const bool& fast_math,
+    const std::optional<float>& situ_beta_opt,
+    const std::optional<float>& situ_linear_beta_opt,
+    const std::optional<torch::Tensor>& shared_rs_workspace_opt,
+    const std::optional<torch::Tensor>& shared_rs_flags_opt,
+    const std::optional<torch::Tensor>& shared_rs_peer_ptrs_opt,
+    const bool& publish_shared_sp_rs
+) {
+    const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+    const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+    const auto num_tokens = static_cast<int>(y.size(0));
+    const auto num_shared_tokens = static_cast<int>(shared_x.size(0));
+    const auto [rm, rn, rk] = recipe;
+    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
+    DG_HOST_ASSERT(activation == "situ");
+    DG_HOST_ASSERT(std::isfinite(rms_epsilon) and rms_epsilon > 0);
+    const auto situ_beta = situ_beta_opt.value_or(0.0f);
+    const auto situ_linear_beta = situ_linear_beta_opt.value_or(0.0f);
+    DG_HOST_ASSERT(std::isfinite(situ_beta) and situ_beta > 0);
+    DG_HOST_ASSERT(std::isfinite(situ_linear_beta) and situ_linear_beta > 0);
+
+    // Routed FP8 x FP4 tensors.
+    DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
+    const auto arch_major = device_runtime->get_arch_major();
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
+        check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
+        check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
+    DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(l2_weights.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
+    DG_HOST_ASSERT(hidden == hidden_);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+    constexpr int kGranMN = 1, kGranK = 32;
+    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                    num_experts_per_rank, true, false, torch::kInt);
+    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+                    num_experts_per_rank, true, false, torch::kInt);
+
+    // Independent BF16 shared expert. Its input/output width intentionally does
+    // not have to match the routed latent width.
+    DG_HOST_ASSERT(y.is_cuda() and y.scalar_type() == torch::kBFloat16 and y.is_contiguous());
+    DG_HOST_ASSERT(y.dim() == 2 and y.size(1) == hidden);
+    DG_HOST_ASSERT(shared_x.is_cuda() and shared_x.scalar_type() == torch::kBFloat16 and shared_x.is_contiguous());
+    DG_HOST_ASSERT(shared_x.dim() == 2 and shared_x.size(0) >= num_tokens);
+    const auto shared_hidden = static_cast<int>(shared_x.size(1));
+    DG_HOST_ASSERT(num_shared_tokens <= num_max_tokens_per_rank);
+    const auto publish_shared_rs = shared_rs_workspace_opt.has_value();
+    DG_HOST_ASSERT(publish_shared_rs == shared_rs_flags_opt.has_value());
+    DG_HOST_ASSERT(publish_shared_rs == shared_rs_peer_ptrs_opt.has_value());
+    DG_HOST_ASSERT(publish_shared_rs != shared_y_opt.has_value());
+    torch::Tensor shared_y;
+    torch::Tensor shared_rs_workspace;
+    torch::Tensor shared_rs_flags;
+    torch::Tensor shared_rs_peer_ptrs;
+    if (publish_shared_rs) {
+        shared_rs_workspace = shared_rs_workspace_opt.value();
+        shared_rs_flags = shared_rs_flags_opt.value();
+        shared_rs_peer_ptrs = shared_rs_peer_ptrs_opt.value();
+        const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+        DG_HOST_ASSERT(not publish_shared_sp_rs or num_shared_tokens % num_ranks == 0);
+        DG_HOST_ASSERT(publish_shared_sp_rs or shared_hidden % num_ranks == 0);
+        DG_HOST_ASSERT(shared_rs_workspace.is_cuda());
+        DG_HOST_ASSERT(shared_rs_workspace.scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(shared_rs_workspace.is_contiguous());
+        DG_HOST_ASSERT(shared_rs_workspace.dim() == 4);
+        DG_HOST_ASSERT(shared_rs_workspace.size(0) >=
+                       (publish_shared_sp_rs ? 1 : 3));
+        DG_HOST_ASSERT(shared_rs_workspace.size(1) >=
+                       (publish_shared_sp_rs ? num_shared_tokens / num_ranks : num_shared_tokens));
+        DG_HOST_ASSERT(shared_rs_workspace.size(2) == static_cast<int64_t>(sym_buffer_ptrs.size()));
+        DG_HOST_ASSERT(publish_shared_sp_rs ?
+            shared_rs_workspace.size(3) == shared_hidden :
+            shared_rs_workspace.size(3) * shared_rs_workspace.size(2) == shared_hidden);
+        // Cross-repository ABI with the ReduceScatter consumer: flags[0] is
+        // the generation index and flags[2] is the byte stride per generation.
+        DG_HOST_ASSERT(shared_rs_flags.is_cuda());
+        DG_HOST_ASSERT(shared_rs_flags.scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(shared_rs_flags.is_contiguous() and shared_rs_flags.numel() >= 9);
+        DG_HOST_ASSERT(shared_rs_peer_ptrs.is_cuda());
+        DG_HOST_ASSERT(shared_rs_peer_ptrs.scalar_type() == torch::kInt64);
+        DG_HOST_ASSERT(shared_rs_peer_ptrs.is_contiguous());
+        DG_HOST_ASSERT(shared_rs_peer_ptrs.dim() == 1);
+        DG_HOST_ASSERT(shared_rs_peer_ptrs.numel() == static_cast<int64_t>(sym_buffer_ptrs.size()));
+    } else {
+        shared_y = shared_y_opt.value();
+        DG_HOST_ASSERT(shared_y.is_cuda() and shared_y.scalar_type() == torch::kBFloat16 and shared_y.is_contiguous());
+        DG_HOST_ASSERT(shared_y.dim() == 2 and shared_y.size(0) == num_shared_tokens and shared_y.size(1) == shared_hidden);
+    }
+    DG_HOST_ASSERT(shared_l2_acts.is_cuda() and shared_l2_acts.scalar_type() == torch::kBFloat16 and shared_l2_acts.is_contiguous());
+    DG_HOST_ASSERT(shared_l2_acts.dim() == 2 and shared_l2_acts.size(0) >= num_shared_tokens);
+    const auto shared_intermediate_hidden = static_cast<int>(shared_l2_acts.size(1));
+    DG_HOST_ASSERT(shared_intermediate_hidden > 0);
+    DG_HOST_ASSERT(shared_l1_weights.is_cuda() and shared_l1_weights.scalar_type() == torch::kBFloat16 and shared_l1_weights.is_contiguous());
+    DG_HOST_ASSERT(shared_l2_weights.is_cuda() and shared_l2_weights.scalar_type() == torch::kBFloat16 and shared_l2_weights.is_contiguous());
+    DG_HOST_ASSERT(shared_l1_weights.dim() == 2 and shared_l1_weights.size(0) == shared_intermediate_hidden * 2 and shared_l1_weights.size(1) == shared_hidden);
+    DG_HOST_ASSERT(shared_l2_weights.dim() == 2 and shared_l2_weights.size(0) == shared_hidden and shared_l2_weights.size(1) == shared_intermediate_hidden);
+    DG_HOST_ASSERT(get_major_type_ab(shared_l1_weights) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(get_major_type_ab(shared_l2_weights) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(rms_weight.is_cuda() and rms_weight.scalar_type() == torch::kBFloat16 and rms_weight.is_contiguous());
+    DG_HOST_ASSERT(rms_weight.dim() == 1 and rms_weight.size(0) == hidden);
+
+    const auto output_device = y.device();
+    const auto is_local_cuda_tensor = [&output_device](const torch::Tensor& tensor) {
+        return tensor.is_cuda() and tensor.device() == output_device;
+    };
+    DG_HOST_ASSERT(is_local_cuda_tensor(l1_weights) and is_local_cuda_tensor(l2_weights));
+    DG_HOST_ASSERT(is_local_cuda_tensor(l1_weights_sf) and is_local_cuda_tensor(l2_weights_sf));
+    DG_HOST_ASSERT(is_local_cuda_tensor(shared_x));
+    DG_HOST_ASSERT(publish_shared_rs ?
+        (is_local_cuda_tensor(shared_rs_workspace) and is_local_cuda_tensor(shared_rs_flags) and
+         is_local_cuda_tensor(shared_rs_peer_ptrs)) :
+        is_local_cuda_tensor(shared_y));
+    DG_HOST_ASSERT(is_local_cuda_tensor(shared_l2_acts));
+    DG_HOST_ASSERT(is_local_cuda_tensor(shared_l1_weights) and is_local_cuda_tensor(shared_l2_weights));
+    DG_HOST_ASSERT(is_local_cuda_tensor(rms_weight) and is_local_cuda_tensor(sym_buffer));
+
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+        DG_HOST_ASSERT(is_local_cuda_tensor(cumulative_local_expert_recv_stats.value()));
+    }
+
+    // The BF16 shared intermediate and output are external, so the symmetric
+    // communication buffer only needs routed slots.
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
+        num_ranks, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        "fp8xfp4", activation, 0);
+    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+    DG_HOST_ASSERT(num_experts == num_experts_per_rank * num_ranks);
+    const auto [x, x_sf, topk_idx, topk_weights,
+                unused_shared_l1_acts, unused_shared_l1_acts_sf,
+                unused_shared_l2_acts, unused_shared_l2_acts_sf,
+                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+
+    if (arch_major == 10) {
+        sm100_fp8_fp4_mega_moe(
+            y,
+            l1_acts, l1_acts_sf,
+            l2_acts, l2_acts_sf,
+            unused_shared_l1_acts, unused_shared_l1_acts_sf,
+            unused_shared_l2_acts, unused_shared_l2_acts_sf,
+            l1_weights, l2_weights,
+            l1_weights_sf, l2_weights_sf,
+            torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
+            cumulative_local_expert_recv_stats,
+            sym_buffer_ptrs,
+            rank_idx, num_max_tokens_per_rank,
+            num_experts_per_rank,
+            /*num_shared_experts=*/ 1,
+            num_tokens, num_topk,
+            hidden, intermediate_hidden,
+            std::numeric_limits<float>::infinity(), fast_math,
+            /*use_situ=*/ true, situ_beta, situ_linear_beta,
+            shared_x, shared_l2_acts,
+            shared_l1_weights, shared_l2_weights,
+            shared_y, rms_weight, rms_epsilon,
+            /*use_bf16_shared=*/ true,
+            /*apply_rms_norm=*/ true,
+            shared_rs_flags, shared_rs_peer_ptrs,
+            publish_shared_rs, publish_shared_sp_rs);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+
+    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+        sym_buffer.zero_();
+}
+
 static void bf16_mega_moe(
     const torch::Tensor& y,
     const torch::Tensor& l1_weights,
@@ -628,6 +822,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("fp8_fp4_mega_moe_bf16_shared", &fp8_fp4_mega_moe_bf16_shared);
     m.def("fp4_fp4_mega_moe", &fp4_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 #endif

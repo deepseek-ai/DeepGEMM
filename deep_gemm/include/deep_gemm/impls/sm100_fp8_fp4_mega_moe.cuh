@@ -38,6 +38,12 @@ template <
     bool kUseSiTU,
     float kSiTUBeta,
     float kSiTULinearBeta,
+    uint32_t kSharedHidden,
+    uint32_t kSharedIntermediateHidden,
+    bool kUseBF16Shared,
+    bool kApplyRMSNorm,
+    bool kPublishSharedRS,
+    bool kPublishSharedSPRS,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -57,8 +63,14 @@ template <
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
+                            void* shared_y,
+                            const uint32_t* shared_rs_flags,
+                            const int64_t* shared_rs_peer_ptrs,
+                            const void* rms_weight,
+                            const float rms_epsilon,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
+                            const uint32_t num_shared_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
@@ -88,6 +100,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(not kUseSiTU or (kSiTUBeta > 0 and kSiTULinearBeta > 0), "Invalid SiTU beta");
+    DG_STATIC_ASSERT(not kUseBF16Shared or kNumSharedExperts > 0, "BF16 shared mode requires shared work");
+    DG_STATIC_ASSERT(not kApplyRMSNorm or kUseBF16Shared, "Fused RMSNorm is only supported with BF16 shared mode");
+    DG_STATIC_ASSERT(not kPublishSharedRS or kUseBF16Shared, "Shared ReduceScatter publication requires BF16 shared mode");
+    DG_STATIC_ASSERT(not kPublishSharedSPRS or kPublishSharedRS,
+                     "SP publication requires shared ReduceScatter publication");
+    DG_STATIC_ASSERT(not kPublishSharedRS or kPublishSharedSPRS or kSharedHidden % kNumRanks == 0,
+                     "Shared hidden must shard evenly across ranks");
+    DG_STATIC_ASSERT(not kPublishSharedRS or kPublishSharedSPRS or (kSharedHidden / kNumRanks) % 8 == 0,
+                     "Shared ReduceScatter shards must align to vector stores");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -126,7 +147,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, kNumSFRingTokens,
         /*with_sf=*/ true,
-        kNumSharedExperts
+        kUseBF16Shared ? 0u : kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
 
@@ -148,6 +169,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     using a_dtype_t = cutlass::float_e4m3_t;
     using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
     using shared_b_dtype_t = cutlass::float_e4m3_t;
+    using bf16_shared_dtype_t = cutlass::bfloat16_t;
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
@@ -156,10 +178,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
     constexpr uint32_t UMMA_BLOCK_K = 128;
     constexpr uint32_t UMMA_K = 32;
+    constexpr uint32_t SHARED_BLOCK_K = kUseBF16Shared ? BLOCK_K / 2 : BLOCK_K;
+    constexpr uint32_t SHARED_UMMA_BLOCK_K = UMMA_BLOCK_K / 2;
+    constexpr uint32_t SHARED_UMMA_K = 16;
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
+    DG_STATIC_ASSERT(not kUseBF16Shared or BLOCK_K % 2 == 0, "Invalid BF16 shared block K");
+    DG_STATIC_ASSERT(not kUseBF16Shared or kSharedHidden % SHARED_BLOCK_K == 0, "Invalid BF16 shared hidden");
+    DG_STATIC_ASSERT(not kUseBF16Shared or kSharedIntermediateHidden % SHARED_BLOCK_K == 0, "Invalid BF16 shared intermediate hidden");
 
     // Swizzle configs
     constexpr uint32_t kSwizzleAMode = 128;
@@ -189,6 +217,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
         union {
             alignas(kSharedMemoryAlignment) cutlass::float_e4m3_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M * L1_OUT_BLOCK_N];
+            alignas(kSharedMemoryAlignment) nv_bfloat16 shared_l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M * L1_OUT_BLOCK_N];
             alignas(kSharedMemoryAlignment) nv_bfloat16 l2[kNumEpilogueWarpgroups][STORE_BLOCK_M * BLOCK_N];
         } smem_d;
         alignas(kSharedMemoryAlignment) a_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K];
@@ -286,7 +315,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
         kNumRingBlocks,
-        kNumSharedExperts>(
+        kNumSharedExperts,
+        kSharedIntermediateHidden * 2, kSharedHidden,
+        kSharedHidden, kSharedIntermediateHidden,
+        SHARED_BLOCK_K>(
             workspace,
             shared_storage.task_info_full_barriers,
             shared_storage.task_info_empty_barriers,
@@ -660,6 +692,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+
         }
 
         // Wait for all ranks to finish cleaning
@@ -685,7 +718,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                             task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_acts_sf :
                                             task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_acts_sf :
                                           /*task_info.block_phase == sched::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_acts_sf;
-            const auto num_k_blocks = math::ceil_div(task_info.shape_k, BLOCK_K);
+            const auto task_block_k = task_info.is_shared() ? SHARED_BLOCK_K : BLOCK_K;
+            const auto num_k_blocks = math::ceil_div(task_info.shape_k, task_block_k);
 
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = task_info.pool_block_idx;
@@ -703,8 +737,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
             } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
                 const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
-                const auto num_expected_blocks = (SHARED_L2_SHAPE_K / BLOCK_N) * 2;
-                while (ptx::ld_acq(ptr) != num_expected_blocks);
+                constexpr uint32_t kSharedL2ShapeK = kUseBF16Shared ?
+                    kSharedIntermediateHidden : SHARED_L2_SHAPE_K;
+                const auto num_expected_blocks = (kSharedL2ShapeK / BLOCK_N) * 2;
+                // The counter is monotonic and another shared task may advance
+                // it past this task's readiness threshold before we observe it.
+                while (ptx::ld_acq(ptr) < num_expected_blocks);
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -713,7 +751,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Compute token offsets from block index
                 uint32_t m_idx = block_idx * BLOCK_M;
-                uint32_t k_idx = k_block_idx * BLOCK_K;
+                uint32_t k_idx = k_block_idx * task_block_k;
                 const uint32_t sfa_m_idx = block_idx * SF_BLOCK_M;
                 uint32_t sfa_k_idx = k_block_idx * (BLOCK_K / 128);
 
@@ -723,18 +761,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                        tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
-                    tma::copy<SF_BLOCK_M, 1, 0>(
-                        tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
-                    if (is_leader_cta) {
-                        shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_a[0]) * 2 + sizeof(SharedStorage::smem_sfa[0]) * 2);
+                    if constexpr (kUseBF16Shared) {
+                        if (task_info.is_shared()) {
+                            tma::copy<SHARED_BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, bf16_shared_dtype_t>(
+                                tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx],
+                                reinterpret_cast<bf16_shared_dtype_t*>(shared_storage.smem_a[stage_idx]),
+                                k_idx, m_idx, 2);
+                            if (is_leader_cta) {
+                                shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                    LOAD_BLOCK_M * SHARED_BLOCK_K * sizeof(bf16_shared_dtype_t) * 2);
+                            } else {
+                                shared_storage.full_barriers[stage_idx].arrive(0u);
+                            }
+                        } else {
+                            tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                                tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                            tma::copy<SF_BLOCK_M, 1, 0>(
+                                tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
+                            if (is_leader_cta) {
+                                shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_a[0]) * 2 + sizeof(SharedStorage::smem_sfa[0]) * 2);
+                            } else {
+                                shared_storage.full_barriers[stage_idx].arrive(0u);
+                            }
+                        }
                     } else {
-                        shared_storage.full_barriers[stage_idx].arrive(0u);
+                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                            tensor_map_a_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_a[stage_idx], k_idx, m_idx, 2);
+                        tma::copy<SF_BLOCK_M, 1, 0>(
+                            tensor_map_sfa_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
+                        if (is_leader_cta) {
+                            shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_a[0]) * 2 + sizeof(SharedStorage::smem_sfa[0]) * 2);
+                        } else {
+                            shared_storage.full_barriers[stage_idx].arrive(0u);
+                        }
                     }
                 }
                 __syncwarp();
             }
+
         }
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Adjust registers
@@ -756,7 +820,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const auto shape_n = task_info.shape_n;
             const auto shape_sfb_k = math::ceil_div(shape_k, kGranK * 4u);
             const auto n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
-            const auto num_k_blocks = math::ceil_div(shape_k, BLOCK_K);
+            const auto task_block_k = task_info.is_shared() ? SHARED_BLOCK_K : BLOCK_K;
+            const auto num_k_blocks = math::ceil_div(shape_k, task_block_k);
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
@@ -764,13 +829,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Compute weight offset
                 uint32_t n_idx = task_info.is_shared() ? n_block_idx * BLOCK_N : task_info.local_expert_idx * shape_n + n_block_idx * BLOCK_N;
-                uint32_t k_idx = k_block_idx * BLOCK_K;
+                uint32_t k_idx = k_block_idx * task_block_k;
                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
                 uint32_t sfb_k_idx = task_info.is_shared() ? k_block_idx * (BLOCK_K / 128) : task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / 128);
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
-                    if (task_info.is_shared()) {
+                    if constexpr (kUseBF16Shared) {
+                        if (task_info.is_shared()) {
+                            tma::copy<SHARED_BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, bf16_shared_dtype_t>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx],
+                                reinterpret_cast<bf16_shared_dtype_t*>(shared_storage.smem_b[stage_idx]),
+                                k_idx, n_idx, 2);
+                            if (is_leader_cta) {
+                                shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(
+                                    LOAD_BLOCK_N * SHARED_BLOCK_K * sizeof(bf16_shared_dtype_t) * 2);
+                            } else {
+                                shared_storage.full_barriers[stage_idx].arrive(0u);
+                            }
+                        } else {
+                            tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
+                                tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
+                            tma::copy<BLOCK_N, 1, 0>(
+                                tensor_map_sfb_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                            if (is_leader_cta) {
+                                shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(SharedStorage::smem_b[0]) + sizeof(SharedStorage::smem_sfb[0]) * 2);
+                            } else {
+                                shared_storage.full_barriers[stage_idx].arrive(0u);
+                            }
+                        }
+                    } else if (task_info.is_shared()) {
                         tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, shared_b_dtype_t>(
                             tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[stage_idx]), k_idx, n_idx, 2);
                         tma::copy<BLOCK_N, 1, 0>(
@@ -813,15 +901,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 UMMA_M, UMMA_N,
                 cute::UMMA::Major::K, cute::UMMA::Major::K
             >();
+            auto bf16_shared_instr_desc = cute::UMMA::make_instr_desc<
+                bf16_shared_dtype_t, bf16_shared_dtype_t, float,
+                UMMA_M, UMMA_N,
+                cute::UMMA::Major::K, cute::UMMA::Major::K
+            >();
             auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
             auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, UMMA_BLOCK_K, kSwizzleAMode>(shared_storage.smem_a[0], 0, 0);
             auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, UMMA_BLOCK_K, kSwizzleBMode>(shared_storage.smem_b[0], 0, 0);
             auto shared_b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, UMMA_BLOCK_K, kSwizzleBMode>(reinterpret_cast<shared_b_dtype_t*>(shared_storage.smem_b[0]), 0, 0);
+            auto bf16_shared_a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, SHARED_UMMA_BLOCK_K, kSwizzleAMode>(
+                reinterpret_cast<bf16_shared_dtype_t*>(shared_storage.smem_a[0]), 0, 0);
+            auto bf16_shared_b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, SHARED_UMMA_BLOCK_K, kSwizzleBMode>(
+                reinterpret_cast<bf16_shared_dtype_t*>(shared_storage.smem_b[0]), 0, 0);
             uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * sizeof(SharedStorage::smem_a[0]) / 16 : 0u;
             uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * sizeof(SharedStorage::smem_b[0]) / 16 : 0u;
             uint32_t shared_b_desc_lo = lane_idx < kNumStages ? shared_b_desc.lo + lane_idx * sizeof(SharedStorage::smem_b[0]) / 16 : 0u;
+            uint32_t bf16_shared_a_desc_lo = lane_idx < kNumStages ? bf16_shared_a_desc.lo + lane_idx * sizeof(SharedStorage::smem_a[0]) / 16 : 0u;
+            uint32_t bf16_shared_b_desc_lo = lane_idx < kNumStages ? bf16_shared_b_desc.lo + lane_idx * sizeof(SharedStorage::smem_b[0]) / 16 : 0u;
 
             // Checks for MMA instructions
             DG_STATIC_ASSERT((UMMA_M == 64  and UMMA_N %  8 == 0 and  8 <= UMMA_N and UMMA_N <= 256) or
@@ -833,11 +932,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t current_iter_idx = 0;
             task_info_t task_info;
             while (scheduler.get_next_task(task_info)) {
-                const auto num_k_blocks = task_info.shape_k / BLOCK_K;
+                const auto num_k_blocks = task_info.shape_k /
+                    (task_info.is_shared() ? SHARED_BLOCK_K : BLOCK_K);
 
                 // Dynamic update of UMMA N based on effective M
                 auto& instr_desc = task_info.is_shared() ? shared_instr_desc : routed_instr_desc;
-                mma::sm100::update_instr_desc_with_umma_n(instr_desc, task_info.get_umma_aligned_valid_m());
+                if constexpr (kUseBF16Shared) {
+                    if (task_info.is_shared()) {
+                        mma::sm100::update_instr_desc_with_umma_n(
+                            bf16_shared_instr_desc, task_info.get_umma_aligned_valid_m());
+                    } else {
+                        mma::sm100::update_instr_desc_with_umma_n(
+                            routed_instr_desc, task_info.get_umma_aligned_valid_m());
+                    }
+                } else {
+                    mma::sm100::update_instr_desc_with_umma_n(
+                        instr_desc, task_info.get_umma_aligned_valid_m());
+                }
 
                 // Wait tensor memory empty barrier arrival
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
@@ -866,8 +977,47 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     shared_storage.full_barriers[stage_idx].wait(phase);
                     ptx::tcgen05_after_thread_sync();
 
-                    const auto a_desc_base_lo = ptx::exchange(a_desc_lo, stage_idx);
-                    const auto b_desc_base_lo = ptx::exchange(task_info.is_shared() ? shared_b_desc_lo : b_desc_lo, stage_idx);
+                    const auto a_desc_base_lo = ptx::exchange(
+                        kUseBF16Shared and task_info.is_shared() ? bf16_shared_a_desc_lo : a_desc_lo,
+                        stage_idx);
+                    const auto b_desc_base_lo = ptx::exchange(
+                        kUseBF16Shared and task_info.is_shared() ? bf16_shared_b_desc_lo :
+                        (task_info.is_shared() ? shared_b_desc_lo : b_desc_lo),
+                        stage_idx);
+                    if constexpr (kUseBF16Shared) {
+                        if (task_info.is_shared()) {
+                            const auto bf16_runtime_instr_desc =
+                                static_cast<uint64_t>(static_cast<uint32_t>(bf16_shared_instr_desc)) << 32;
+                            if (cute::elect_one_sync()) {
+                                #pragma unroll
+                                for (uint32_t umma_k_block_idx = 0;
+                                     umma_k_block_idx < SHARED_BLOCK_K / SHARED_UMMA_BLOCK_K;
+                                     ++ umma_k_block_idx) {
+                                    #pragma unroll
+                                    for (uint32_t k = 0; k < SHARED_UMMA_BLOCK_K / SHARED_UMMA_K; ++ k) {
+                                        bf16_shared_a_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                            cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, bf16_shared_dtype_t>(
+                                                a_desc_base_lo,
+                                                umma_k_block_idx * SHARED_UMMA_BLOCK_K * LOAD_BLOCK_M,
+                                                k * SHARED_UMMA_K);
+                                        bf16_shared_b_desc.lo = mma::sm100::advance_umma_desc_lo<
+                                            cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, bf16_shared_dtype_t>(
+                                                b_desc_base_lo,
+                                                umma_k_block_idx * SHARED_UMMA_BLOCK_K * LOAD_BLOCK_N,
+                                                k * SHARED_UMMA_K);
+                                        ptx::SM100_MMA_F16BF16_2x1SM_SS::fma(
+                                            bf16_shared_b_desc, bf16_shared_a_desc,
+                                            accum_stage_idx * UMMA_N,
+                                            k_block_idx > 0 or umma_k_block_idx > 0 or k > 0,
+                                            bf16_runtime_instr_desc);
+                                    }
+                                }
+                            }
+                            __syncwarp();
+                            empty_barrier_arrive(k_block_idx == num_k_blocks - 1);
+                            continue;
+                        }
+                    }
                     if (cute::elect_one_sync()) {
                         #pragma unroll
                         for (uint32_t umma_k_block_idx = 0; umma_k_block_idx < BLOCK_K / UMMA_BLOCK_K; ++ umma_k_block_idx) {
@@ -927,7 +1077,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta)
-            scheduler.mainloop(num_tokens);
+            scheduler.mainloop(num_tokens, num_shared_tokens);
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
@@ -987,6 +1137,121 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;  // Full-pool offset for non-ring metadata
             const uint32_t n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
             uint32_t n_idx = n_block_idx * BLOCK_N;
+
+            if constexpr (kUseBF16Shared) {
+                if (task_info.block_phase == sched::BlockPhase::SharedLinear1) {
+                    // BF16 shared L1 epilogue: gated activation without routing
+                    // weights, followed by a BF16 TMA store for shared L2.
+                    constexpr uint32_t SHARED_L1_OUT_BLOCK_N = BLOCK_N / 2;
+
+                    #pragma unroll
+                    for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
+                        if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
+                            ptx::tcgen05_before_thread_sync();
+                            shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                            break;
+                        }
+
+                        nv_bfloat162 bf16x2_output[kNumAtomsPerStore * 2];
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            const uint32_t j = s * kNumAtomsPerStore + i;
+                            uint32_t tmem_addr = accum_stage_idx * UMMA_N +
+                                epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                            uint32_t values[ATOM_M];
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(
+                                tmem_addr, values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(
+                                tmem_addr | 0x00100000,
+                                values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+
+                            if (j == WG_BLOCK_M / ATOM_M - 1) {
+                                ptx::tcgen05_before_thread_sync();
+                                shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
+                            }
+
+                            // Plain BF16 UMMA places gate/up pairs at
+                            // (0, 2), (1, 3), (4, 6), and (5, 7).
+                            auto fp32_values = reinterpret_cast<float*>(values);
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 2; ++ k) {
+                                const auto bf16_gate = __float22bfloat162_rn(
+                                    make_float2(fp32_values[k * 4], fp32_values[k * 4 + 1]));
+                                const auto bf16_up = __float22bfloat162_rn(
+                                    make_float2(fp32_values[k * 4 + 2], fp32_values[k * 4 + 3]));
+                                const auto raw_gate = __bfloat1622float2(bf16_gate);
+                                const auto raw_up = __bfloat1622float2(bf16_up);
+                                float2 activated;
+                                if constexpr (kUseSiTU) {
+                                    const auto neg_gate_exp = make_float2(
+                                        kFastMath ? __expf(-raw_gate.x) : expf(-raw_gate.x),
+                                        kFastMath ? __expf(-raw_gate.y) : expf(-raw_gate.y));
+                                    const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                                    const float2 sigmoid = kFastMath ?
+                                        make_float2(math::fast_rcp(denom.x), math::fast_rcp(denom.y)) :
+                                        make_float2(1.0f / denom.x, 1.0f / denom.y);
+                                    const auto gate = __fmul2_rn(sigmoid, {
+                                        kSiTUBeta * tanhf(raw_gate.x / kSiTUBeta),
+                                        kSiTUBeta * tanhf(raw_gate.y / kSiTUBeta)});
+                                    const auto up = make_float2(
+                                        kSiTULinearBeta * tanhf(raw_up.x / kSiTULinearBeta),
+                                        kSiTULinearBeta * tanhf(raw_up.y / kSiTULinearBeta));
+                                    activated = __fmul2_rn(gate, up);
+                                } else {
+                                    const auto neg_gate_exp = make_float2(
+                                        kFastMath ? __expf(-raw_gate.x) : expf(-raw_gate.x),
+                                        kFastMath ? __expf(-raw_gate.y) : expf(-raw_gate.y));
+                                    const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                                    const float2 sigmoid = kFastMath ?
+                                        make_float2(math::fast_rcp(denom.x), math::fast_rcp(denom.y)) :
+                                        make_float2(1.0f / denom.x, 1.0f / denom.y);
+                                    activated = __fmul2_rn(__fmul2_rn(raw_gate, sigmoid), raw_up);
+                                }
+                                bf16x2_output[i * 2 + k] = __float22bfloat162_rn(activated);
+                            }
+                        }
+
+                        const uint32_t tma_stage_idx = s % kNumTMAStoreStages;
+                        ptx::tma_store_wait<kNumTMAStoreStages - 1>();
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                            const uint32_t row = lane_idx % 8;
+                            const uint32_t col = warp_idx_in_wg * 2 + lane_idx / 8;
+                            const auto smem_ptr =
+                                shared_storage.smem_d.shared_l1[epilogue_wg_idx][tma_stage_idx]
+                                + (i * ATOM_M + row) * SHARED_L1_OUT_BLOCK_N
+                                + (col ^ row) * (kNumBankGroupBytes / sizeof(nv_bfloat16));
+                            ptx::SM90_U32x2_STSM_T<__nv_bfloat162>::copy(
+                                bf16x2_output[i * 2], bf16x2_output[i * 2 + 1], smem_ptr);
+                        }
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                        if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                            const uint32_t out_n_idx = n_block_idx * SHARED_L1_OUT_BLOCK_N;
+                            cute::tma_store_fence();
+                            cute::SM90_TMA_STORE_2D::copy(
+                                &tensor_map_shared_l1_output,
+                                shared_storage.smem_d.shared_l1[epilogue_wg_idx][tma_stage_idx],
+                                out_n_idx,
+                                m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M);
+                            cute::tma_store_arrive();
+                        }
+                        __syncwarp();
+                    }
+
+                    ptx::tma_store_wait<0>();
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        ptx::red_add_rel(
+                            workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
+                    }
+                    __syncwarp();
+                    continue;
+                }
+            }
 
             if (task_info.block_phase == sched::BlockPhase::Linear1 or task_info.block_phase == sched::BlockPhase::SharedLinear1) {
                 if (not task_info.is_shared()) {
@@ -1303,7 +1568,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if (task_info.is_shared()) {
                             dst_rank_idx = sym_buffer.rank_idx;
                             dst_token_idx = pool_m_idx + m_idx_in_block;
-                            dst_topk_idx = kNumTopk;
+                            dst_topk_idx = kUseBF16Shared ? 0u : kNumTopk;
                         } else {
                             const auto src_metadata = *workspace.get_token_src_metadata_ptr(pool_m_idx + m_idx_in_block);
                             dst_rank_idx = src_metadata.rank_idx;
@@ -1317,6 +1582,63 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             row_in_store * kSwizzleCDMode +
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
                         const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+
+                        if constexpr (kUseBF16Shared) {
+                            if (task_info.is_shared()) {
+                                void* shared_output_base = shared_y;
+                                uint64_t shared_output_offset = 0;
+                                uint32_t shared_output_row = dst_token_idx;
+                                uint64_t shared_column_offset =
+                                    n_idx + (lane_idx % 16) * 8;
+                                if constexpr (kPublishSharedRS) {
+                                    // This path publishes payload only. The
+                                    // caller owns cross-rank visibility and
+                                    // completion signaling before consumption.
+                                    const auto current_index = __ldg(shared_rs_flags);
+                                    const auto bytes_per_buffer = __ldg(shared_rs_flags + 2);
+                                    const auto vector_n =
+                                        n_idx + (lane_idx % 16) * 8;
+                                    if constexpr (kPublishSharedSPRS) {
+                                        const auto tokens_per_rank =
+                                            num_shared_tokens / kNumRanks;
+                                        const auto destination_rank =
+                                            dst_token_idx / tokens_per_rank;
+                                        const auto destination_token =
+                                            dst_token_idx - destination_rank * tokens_per_rank;
+                                        shared_output_base = reinterpret_cast<void*>(
+                                            __ldg(shared_rs_peer_ptrs + destination_rank));
+                                        shared_output_offset =
+                                            static_cast<uint64_t>(current_index) * bytes_per_buffer
+                                            + static_cast<uint64_t>(sym_buffer.rank_idx)
+                                                  * kSharedHidden * sizeof(nv_bfloat16);
+                                        shared_output_row = destination_token;
+                                        shared_column_offset = vector_n;
+                                    } else {
+                                        constexpr uint32_t kSharedShard =
+                                            kSharedHidden / kNumRanks;
+                                        const auto destination_rank =
+                                            vector_n / kSharedShard;
+                                        shared_output_base = reinterpret_cast<void*>(
+                                            __ldg(shared_rs_peer_ptrs + destination_rank));
+                                        shared_output_offset =
+                                            static_cast<uint64_t>(current_index) * bytes_per_buffer
+                                            + static_cast<uint64_t>(sym_buffer.rank_idx) * kSharedShard
+                                                  * sizeof(nv_bfloat16);
+                                        shared_column_offset =
+                                            vector_n - destination_rank * kSharedShard;
+                                    }
+                                }
+                                const auto dst_ptr = math::advance_ptr<float4>(
+                                    shared_output_base,
+                                    shared_output_offset
+                                    + static_cast<uint64_t>(shared_output_row)
+                                          * (kPublishSharedSPRS ? kNumRanks : 1)
+                                          * kSharedHidden * sizeof(nv_bfloat16)
+                                    + shared_column_offset * sizeof(nv_bfloat16));
+                                *dst_ptr = packed;
+                                continue;
+                            }
+                        }
 
                         // Write into remote
                         const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx)
@@ -1370,7 +1692,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(kNumChunkBytes % 16 == 0, "Combine chunk must be TMA-aligned (16 bytes)");
         DG_STATIC_ASSERT(kNumChunkBytes % sizeof(uint4) == 0, "Combine chunk must be divisible by 16 bytes");
         DG_STATIC_ASSERT(kNumChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements (one per lane)");
-        DG_STATIC_ASSERT(kNumTopk + (kNumSharedExperts > 0 ? 1u : 0u) <= 32u, "Top-k + shared must fit in a single warp");
+        DG_STATIC_ASSERT(kNumTopk + (kNumSharedExperts > 0 and not kUseBF16Shared ? 1u : 0u) <= 32u,
+                         "Top-k + in-combine shared must fit in a single warp");
 
         // Verify combined shared memory budget at runtime
         DG_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <= kNumReusableSmemBytes);
@@ -1395,7 +1718,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) :
-                (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
+                (kNumSharedExperts > 0 and not kUseBF16Shared and lane_idx == kNumTopk ?
+                    static_cast<int>(kNumTopk) : -1);
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             // Iterate all chunks
@@ -1474,6 +1798,52 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset),
                         combine_store_buffer, kNumChunkBytes);
                     cute::tma_store_arrive();
+                }
+                __syncwarp();
+            }
+
+            if constexpr (kApplyRMSNorm) {
+                // Preserve the unfused contract: combine first rounds routed
+                // values to BF16, then RMSNorm consumes those BF16 values.
+                ptx::tma_store_wait<0>();
+                __syncwarp();
+
+                constexpr uint32_t kNumTokenUint4 = kNumHiddenBytes / sizeof(uint4);
+                auto token_ptr = math::advance_ptr<uint4>(
+                    y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes);
+                const auto gamma_ptr = reinterpret_cast<const uint4*>(rms_weight);
+                float local_sum_sq = 0.0f;
+                #pragma unroll
+                for (uint32_t vec_idx = lane_idx; vec_idx < kNumTokenUint4; vec_idx += 32) {
+                    const auto raw = token_ptr[vec_idx];
+                    const auto bf16x2 = reinterpret_cast<const nv_bfloat162*>(&raw);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumElemsPerUint4; ++ i) {
+                        const auto values = __bfloat1622float2(bf16x2[i]);
+                        local_sum_sq = fmaf(values.x, values.x, local_sum_sq);
+                        local_sum_sq = fmaf(values.y, values.y, local_sum_sq);
+                    }
+                }
+                const float sum_sq = math::warp_reduce_sum(local_sum_sq);
+                const float inv_rms = rsqrtf(
+                    sum_sq / static_cast<float>(kHidden) + rms_epsilon);
+
+                #pragma unroll
+                for (uint32_t vec_idx = lane_idx; vec_idx < kNumTokenUint4; vec_idx += 32) {
+                    const auto raw = token_ptr[vec_idx];
+                    const auto gamma_raw = gamma_ptr[vec_idx];
+                    const auto bf16x2 = reinterpret_cast<const nv_bfloat162*>(&raw);
+                    const auto gamma_bf16x2 = reinterpret_cast<const nv_bfloat162*>(&gamma_raw);
+                    uint4 normalized;
+                    auto normalized_bf16x2 = reinterpret_cast<nv_bfloat162*>(&normalized);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumElemsPerUint4; ++ i) {
+                        const auto values = __bfloat1622float2(bf16x2[i]);
+                        const auto gamma = __bfloat1622float2(gamma_bf16x2[i]);
+                        normalized_bf16x2[i] = __float22bfloat162_rn(
+                            __fmul2_rn(__fmul2_rn(values, gamma), {inv_rms, inv_rms}));
+                    }
+                    token_ptr[vec_idx] = normalized;
                 }
                 __syncwarp();
             }
