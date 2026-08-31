@@ -116,12 +116,13 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
         DG_HOST_ASSERT(sf.stride(-1) == get_tma_aligned_size(mn, sf.element_size()));
     }
 
-    // SM90 SFB must be contiguous, or contiguous after transposing the last two dimensions
+    // SM90 SFB must be K-major contiguous: the kernel indexes it with a fixed
+    // `expert * per_expert + n_block * k_blocks + k_block` formula that ignores tensor
+    // stride, so an MN-major (transposed) input would silently read the wrong scale.
     if (sm90_sfb_check) {
         if (num_groups.has_value())
             DG_HOST_ASSERT(sf.stride(-3) == sf.size(-2) * sf.size(-1));
-        DG_HOST_ASSERT((sf.stride(-1) == 1 and sf.stride(-2) == sf.size(-1)) or
-                       (sf.stride(-1) == sf.size(-2) and sf.stride(-2) == 1));
+        DG_HOST_ASSERT(sf.stride(-1) == 1 and sf.stride(-2) == sf.size(-1));
     }
     return sf;
 }

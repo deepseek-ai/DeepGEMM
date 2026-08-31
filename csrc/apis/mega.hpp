@@ -539,6 +539,11 @@ get_symm_buffer_size_for_sm90_mega_moe(
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(use_fp8_dispatch);
     DG_HOST_ASSERT(activation == "swiglu");
+    // `get_mega_moe_config_sm90` may pick `num_dispatch_threads == 64`, and the SM90
+    // `nvlink_barrier` only has one signaling thread per rank (`thread_idx < kNumRanks`),
+    // so more than 64 ranks either fails the kernel's `kNumRanks <= kNumThreads`
+    // static_assert at JIT time or, if that were relaxed, would hang on missed signals.
+    DG_HOST_ASSERT(num_ranks <= 64);
 
     const auto workspace = layout::MegaMoESM90Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
 
@@ -565,8 +570,13 @@ get_symm_buffer_size_for_sm90_mega_moe(
         input_topk_idx_buffer.get_end_ptr());
 
     const auto num_max_pool_tokens = static_cast<int>(workspace.num_max_pool_tokens);
+    // Unlike SM100 (which can select any of `layout::kCandidateBlockM`), SM90's
+    // `get_block_config_for_mega_moe_sm90` only ever picks block_m in {64, 128}. Sizing the
+    // SF pool against the full shared candidate set (which includes block_m=8) would
+    // over-allocate the SF pool by ~8x.
+    constexpr int kSm90CandidateBlockM[] = {64, 128};
     int num_max_padded_sf_pool_tokens = 0;
-    for (int block_m: layout::kCandidateBlockM) {
+    for (int block_m: kSm90CandidateBlockM) {
         num_max_padded_sf_pool_tokens = std::max(
             num_max_padded_sf_pool_tokens,
             layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m)
@@ -594,7 +604,9 @@ get_symm_buffer_size_for_sm90_mega_moe(
         bf16_token_layout, num_topk, num_max_tokens_per_rank,
         l2_sf_buffer.get_end_ptr());
 
-    DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
+    // Kept in sync with the stricter check in `fp8_mega_moe_sm90` (see comment there):
+    // hidden must be a multiple of 256 for the scheduler's BLOCK_N=256 case to compile.
+    DG_HOST_ASSERT(hidden % 256 == 0 and intermediate_hidden % 128 == 0);
 
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
         auto x = torch::from_blob(
@@ -676,7 +688,12 @@ static void fp8_mega_moe_sm90(
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
-    DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
+    // `get_mega_moe_config_sm90` may pick BLOCK_N=256 for either the L1 (2 * intermediate_hidden)
+    // or L2 (hidden) GEMM depending on the runtime token distribution, and the scheduler
+    // requires L1_SHAPE_N/L2_SHAPE_N to be an exact multiple of BLOCK_N or the JIT compile
+    // fails. Require hidden % 256 == 0 so this holds regardless of which BLOCK_N is chosen;
+    // intermediate_hidden % 128 == 0 already implies (2 * intermediate_hidden) % 256 == 0.
+    DG_HOST_ASSERT(hidden % 256 == 0 and intermediate_hidden % 128 == 0);
     DG_HOST_ASSERT(intermediate_hidden / 64 <= 64);
 
     constexpr int kGranMN = 128, kGranK = 128;
