@@ -76,6 +76,25 @@ class suppress_stdout_stderr:
         self.errnull_file.close()
 
 
+_is_kineto_warmed_up = False
+
+
+def _warmup_kineto() -> None:
+    """Initialize CUPTI once per process.
+
+    The first `torch.profiler.profile(activities=[CUDA])` session in a process records
+    no device activity, so `key_averages()` returns an empty table and every kernel
+    parses as a zero time. Opening and closing one throwaway (empty) session first
+    initializes CUPTI, after which every real session records normally.
+    """
+    global _is_kineto_warmed_up
+    if _is_kineto_warmed_up:
+        return
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]):
+        pass
+    _is_kineto_warmed_up = True
+
+
 def bench_kineto(fn, kernel_names, num_tests: int = 30,
                  suppress_kineto_output: bool = False,
                  trace_path: str = None, flush_l2: bool = True,
@@ -98,6 +117,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
     with suppress():
+        _warmup_kineto()
         schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1)
         profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule, acc_events=True)
@@ -117,6 +137,9 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
 
     # Parse the profiling table
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
+    # NOTES: an empty table means no device activity was recorded at all; without this
+    # check every kernel below would silently parse as a zero time
+    assert any(line.strip() for line in prof_lines), 'The profiler recorded no device activity'
     kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
     if not with_multiple_kernels:
         for name in kernel_names:
