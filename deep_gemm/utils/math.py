@@ -32,12 +32,11 @@ def pack_ue8m0_to_int(x: torch.Tensor):
     """
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
     x_int = x.view(torch.int)
-    if not torch.cuda.is_current_stream_capturing():
+    if not (x.is_cuda and torch.cuda.is_current_stream_capturing()):
         # Bit-level check: sign bit == 0, mantissa bits == 0.
         # (float round-based checks fail for subnormals like 2^-126.)
-        x_bits = x.view(torch.int)
-        assert ((x_bits >> 31) == 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
-        assert ((x_bits & 0x7FFFFF) == 0).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
+        assert ((x_int >> 31) == 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
+        assert ((x_int & 0x7FFFFF) == 0).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
