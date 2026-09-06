@@ -54,8 +54,25 @@ public:
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
-        const auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
-        DG_HOST_ASSERT(exit_code == 0);
+
+        // `cuobjdump` lives in the CUDA toolkit but is packaged separately from `nvcc`
+        // (e.g. conda's `cuda-cuobjdump`, or `cuda-command-line-tools`). A JIT-only CUDA
+        // install that has `nvcc` but not `cuobjdump` compiles kernels fine and then fails
+        // here, so check for it explicitly with an actionable message instead of a bare
+        // `exit_code == 0` assertion.
+        if (not std::filesystem::exists(cuobjdump_path))
+            DG_HOST_UNREACHABLE(fmt::format(
+                "`cuobjdump` not found at `{}`. Install it (e.g. `cuda-cuobjdump` / "
+                "`cuda-command-line-tools`) or point `CUDA_HOME` at a full CUDA toolkit.",
+                cuobjdump_path.c_str()));
+
+        const auto command = fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str());
+        const auto [exit_code, symbols] = call_external_command(command);
+        // On failure `symbols` holds the combined stdout+stderr of the command; surface it
+        // rather than discarding it behind an opaque `exit_code == 0` assertion.
+        if (exit_code != 0)
+            DG_HOST_UNREACHABLE(fmt::format(
+                "Command `{}` failed with exit code {}. Output:\n{}", command, exit_code, symbols));
         std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;
         for (std::string line; std::getline(iss, line); ) {
