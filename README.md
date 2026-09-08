@@ -207,6 +207,7 @@ The library also provides some environment variables, which may be useful:
     - `DG_JIT_DUMP_ASM`: `0` or `1`, dump both PTX and SASS, `0` by default
     - `DG_JIT_DUMP_PTX`: `0` or `1`, dump PTX output, `0` by default
     - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
+    - `DG_JIT_FORCE_LAYOUT`: development-only `BMxBNxBK` override; the layout must be a valid candidate for the GEMM
     - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero symmetric buffer before each Mega MoE call for debugging, `0` by default
     - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
 - Build options
@@ -215,6 +216,9 @@ The library also provides some environment variables, which may be useful:
     - `DG_JIT_USE_RUNTIME_API`: `0` or `1`, use CUDA Runtime API for kernel loading (requires CUDA runtime >= 12.8), `0` by default
 
 For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
+
+SM120 heuristic constants and the calibration workflow are documented in
+[SM120 heuristic calibration](docs/sm120-heuristic-calibration.md).
 
 ## Acknowledgement
 
