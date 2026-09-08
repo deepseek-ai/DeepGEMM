@@ -46,6 +46,12 @@ struct SM100ArchSpec {
         // Enumerate all candidates
         std::vector<Layout> candidates;
         for (int swap_ab = 0; swap_ab < 2; ++ swap_ab) {
+            // Kernels without AB-swap support (e.g. the restored pure-fp8
+            // sm100_fp8_gemm_1d1d) must not see swapped layouts: the swap
+            // store/smem configs would silently miscompute or trip the
+            // multicast static assert at JIT time.
+            if (swap_ab == 1 and not desc.allow_swap_ab)
+                continue;
             // Block M/N candidates
             std::vector<int> block_m_candidates;
             std::vector<int> block_n_candidates;            
@@ -208,8 +214,12 @@ struct SM100ArchSpec {
         // Calculate stages
         int smem_extra = smem_cd + smem_barriers + smem_tmem_ptr;
         int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
+        // Use the device's actual per-block opt-in SMEM capacity: SM100 is
+        // 227 KiB but SM12x (GB10) is only 100 KiB - sizing stages from the
+        // hardcoded SM100 value would over-allocate on SM12x.
+        const int device_smem = device_runtime->get_prop()->sharedMemPerBlockOptin;
         int num_stages = std::min(
-            (smem_capacity - smem_extra) / smem_per_stage,
+            (device_smem - smem_extra) / smem_per_stage,
             kNumMaxStages);
         return {
             smem_extra + num_stages * smem_per_stage,
