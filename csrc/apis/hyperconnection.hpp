@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp"
 #endif
+#include <torch/library.h>
 
 namespace deep_gemm::hyperconnection {
 
@@ -59,15 +60,37 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 }
-
 #endif
 
-static void register_apis(pybind11::module_& m) {
+}  // namespace deep_gemm::hyperconnection
+
+namespace deep_gemm::torch_registration {
+
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-    m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm,
-          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("sqr_sum"),
-          py::arg("num_splits") = std::nullopt);
+static void tf32_hc_prenorm_gemm(const torch::Tensor& a, const torch::Tensor& b,
+                                  const torch::Tensor& d, const torch::Tensor& sqr_sum,
+                                  const c10::optional<int64_t>& num_splits) {
+    hyperconnection::tf32_hc_prenorm_gemm(
+        a, b, d, sqr_sum,
+        num_splits.has_value()
+            ? std::make_optional(static_cast<int>(num_splits.value()))
+            : std::nullopt);
+}
+#endif
+
+}  // namespace deep_gemm::torch_registration
+
+TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+    m.def(
+        "tf32_hc_prenorm_gemm(Tensor a, Tensor b, Tensor(d!) d, Tensor(sqr_sum!) sqr_sum, int? num_splits=None) -> ()");
 #endif
 }
 
-} // namespace deep_gemm::hyperconnection
+TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    using namespace deep_gemm::torch_registration;
+
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+    m.impl("tf32_hc_prenorm_gemm", TORCH_FN(tf32_hc_prenorm_gemm));
+#endif
+}

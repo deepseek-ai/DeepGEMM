@@ -4,6 +4,8 @@
 #include <torch/version.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#include <torch/all.h>
+
 #include "../utils/exception.hpp"
 #include "../utils/lazy_init.hpp"
 

@@ -1,6 +1,5 @@
 import os
 import subprocess
-import torch
 
 # Set some default environment provided at setup
 try:

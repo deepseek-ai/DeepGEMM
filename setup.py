@@ -26,7 +26,8 @@ DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
 
 # Compiler flags
 cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
-             f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
+             f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}',
+             '-DPy_LIMITED_API=0x030a0000']
 if DG_JIT_USE_RUNTIME_API:
     cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
 
@@ -103,12 +104,13 @@ def get_ext_modules():
     if DG_SKIP_CUDA_BUILD:
         return []
 
-    return [CUDAExtension(name='deep_gemm._C',
+    return [CUDAExtension(name='deep_gemm._C_extension',
                           sources=sources,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
                           library_dirs=build_library_dirs,
-                          extra_compile_args=cxx_flags)]
+                          extra_compile_args=cxx_flags,
+                          py_limited_api=True)]
 
 
 class CustomBuildPy(build_py):
@@ -126,7 +128,12 @@ class CustomBuildPy(build_py):
         build_py.run(self)
 
     def generate_pyi_file(self):
-        generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')
+        generate_pyi_file(
+            name='_C',
+            root='./csrc',
+            output_dir='./stubs',
+            c_py_path='./deep_gemm/_C.py',
+        )
         pyi_source = os.path.join(current_dir, 'stubs', '_C.pyi')
         pyi_target = os.path.join(self.build_lib, 'deep_gemm', '_C.pyi')
 
@@ -207,6 +214,7 @@ if __name__ == '__main__':
         },
         ext_modules=get_ext_modules(),
         zip_safe=False,
+        options={'bdist_wheel': {'py_limited_api': 'cp310'}},
         cmdclass={
             'build_py': CustomBuildPy,
             'bdist_wheel': CachedWheelsCommand,

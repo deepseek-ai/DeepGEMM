@@ -1,7 +1,6 @@
 #pragma once
 
-#include <pybind11/pybind11.h>
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
@@ -19,6 +18,8 @@
 #include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 #endif
+#include <torch/library.h>
+#include "../torch_library_utils.hpp"
 
 namespace deep_gemm::einsum {
 
@@ -268,17 +269,45 @@ static void fp8_einsum(const std::string& expr,
 }
 #endif
 
-static void register_apis(pybind11::module_& m) {
+}  // namespace deep_gemm::einsum
+
+namespace deep_gemm::torch_registration {
+
+using namespace deep_gemm::torch_utils;
+
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-    m.def("einsum", &einsum,
-          py::arg("expr"), py::arg("a"), py::arg("b"),
-          py::arg("d"), py::arg("c") = std::nullopt,
-          py::arg("use_cublaslt") = false);
-    m.def("fp8_einsum", &fp8_einsum,
-          py::arg("expr"), py::arg("a"), py::arg("b"),
-          py::arg("d"),  py::arg("c") = std::nullopt,
-          py::arg("recipe") = std::make_tuple(1, 128, 128));
+static void einsum(const std::string& expr,
+                   const torch::Tensor& a, const torch::Tensor& b,
+                   const torch::Tensor& d, const c10::optional<torch::Tensor>& c,
+                   const bool& use_cublaslt) {
+    einsum::einsum(expr, a, b, d, c, use_cublaslt);
+}
+
+static void fp8_einsum(const std::string& expr,
+                       const torch::Tensor& a, const torch::Tensor& sfa,
+                       const torch::Tensor& b, const torch::Tensor& sfb,
+                       const torch::Tensor& d, const c10::optional<torch::Tensor>& c,
+                       const std::vector<int64_t>& recipe) {
+    einsum::fp8_einsum(expr, {a, sfa}, {b, sfb}, d, c, list_to_tuple3(recipe));
+}
+#endif
+
+}  // namespace deep_gemm::torch_registration
+
+TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+    m.def(
+        "einsum(str expr, Tensor a, Tensor b, Tensor(d!) d, Tensor? c=None, bool use_cublaslt=False) -> ()");
+    m.def(
+        "fp8_einsum(str expr, Tensor a, Tensor sfa, Tensor b, Tensor sfb, Tensor(d!) d, Tensor? c=None, int[3] recipe) -> ()");
 #endif
 }
 
-} // namespace deep_gemm::einsum
+TORCH_LIBRARY_IMPL(deep_gemm, CUDA, m) {
+    using namespace deep_gemm::torch_registration;
+
+#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+    m.impl("einsum", TORCH_FN(einsum));
+    m.impl("fp8_einsum", TORCH_FN(fp8_einsum));
+#endif
+}
