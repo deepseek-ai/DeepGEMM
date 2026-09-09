@@ -273,6 +273,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 smem_tm_b, scheduler.current_shape_k, b_new_stride);
                         }
 
+                        // Make sure the tensor maps are not used by in-flight TMA loads before updating GMEM
+                        cute::tma_desc_commit_group();
+                        cute::tma_desc_wait_group();
+                        // Only used to prevent `ptxas` from moving the following GMEM stores before `cute::tma_desc_wait_group()`.
+                        // Shouldn't be needed otherwise, since we only use one thread
+                        __syncwarp(1u << lane_idx);
+
                         *gmem_tm_a = *smem_tm_a;
                         *gmem_tm_b = *smem_tm_b;
                         ptx::tensor_map_release_gpu();
