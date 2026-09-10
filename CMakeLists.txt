@@ -29,4 +29,4 @@ pybind11_add_module(_C csrc/python_api.cpp)
 target_link_libraries(_C PRIVATE ${TORCH_LIBRARIES} torch_python)
 
 # Enable kernel code indexing with CMake-based IDEs
-cuda_add_library(deep_gemm_indexing_cuda STATIC csrc/indexing/main.cu)
+add_library(deep_gemm_indexing_cuda STATIC csrc/indexing/main.cu)
