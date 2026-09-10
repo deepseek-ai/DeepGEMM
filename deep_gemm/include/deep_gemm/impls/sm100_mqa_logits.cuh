@@ -151,6 +151,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     constexpr uint32_t kNumMathRegisters = 224;
 
     const auto clean_logits = [&]() {
+        // Paged schedulers lack make_cleaner(), so discard this body when cleaning is disabled.
         if constexpr (kCleanLogits) {
             const auto cleaner = epilogue::LogitsCleaner<logits_dtype_t>(lane_idx);
 
@@ -372,6 +373,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     } else if (warp_idx == kSpecWarpStart + 3) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
+        // Keep FP8 cleanup concurrent; MX cleanup waits for all CTA roles below.
         if constexpr (kCleanLogits and not kIsMXSF)
             clean_logits();
     } else if (warp_idx < kSpecWarpStart) {
@@ -537,15 +539,17 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             smem.empty_q_barriers[q_stage_idx].arrive();
         }
 
+        // User barrier 0 is math-only; user barrier 1 below synchronizes the full CTA.
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (warp_idx == 0)
             cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
     }
 
     if constexpr (kCleanLogits and kIsMXSF) {
-        // Keep MX cleaning outside the concurrent producer/consumer branches
-        // for better main-loop performance.
-        // Barrier 0 is reserved for the math-only TMEM release above.
+        // Deferring MX cleanup improves main-loop performance on GB200 with NVCC 13.3.33.
+        // This is a tuning choice; FP8 intentionally keeps concurrent cleanup above.
+        // All warp roles must reach this barrier; no early returns from the branches above.
+        // User barrier 1 is separate from the math-only TMEM release on user barrier 0.
         cutlass::arch::NamedBarrier(kNumSpecializedThreads + kNumMathThreads, 1).sync();
         if (warp_idx == kSpecWarpStart + 3)
             clean_logits();
