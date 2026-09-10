@@ -1,12 +1,16 @@
 #pragma once
 
+#include <iostream>
+#include <sstream>
+#include <string>
 #include <unordered_set>
+
 #include <deep_gemm/common/types.cuh>
+#include <deep_jit/utils/env.hpp>
 
 #include "config.hpp"
 #include "runtime.hpp"
 #include "../../utils/layout.hpp"
-#include "../../utils/system.hpp"
 
 namespace deep_gemm {
 
@@ -37,7 +41,7 @@ static GemmConfig get_best_config(const GemmDesc& desc) {
     };
 
     // Print configs for the first time
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         std::stringstream ss;
         ss << desc;
         const auto key = ss.str();

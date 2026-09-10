@@ -137,6 +137,34 @@ DG_STATIC_ASSERT(sizeof(sched::TaskInfo<true>) == sizeof(sched::TaskInfo<false>)
 
 #if defined(__CUDACC__) or defined(__CLION_IDE__)
 
+// Each finished L1 N block toggles its bit in `l2_full_mask`, so L2 K blocks can start as soon as they are fed
+// NOTES: the mask parity per ring generation relies on the ring capacity, see `get_num_max_live_pool_blocks`
+template <uint32_t L1_SHAPE_N, uint32_t BLOCK_N, uint32_t BLOCK_K>
+struct L2KBlockDependency {
+    static constexpr uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N;
+    static constexpr uint32_t kNumL1BlockNsPerL2KBlock = BLOCK_K / (BLOCK_N / 2);
+    static constexpr uint64_t kFullMask = kNumL1BlockNs == 64 ? ~0ull : (1ull << kNumL1BlockNs) - 1;
+    DG_STATIC_ASSERT(kNumL1BlockNs <= 64, "Too many L1 N blocks for the L2 readiness mask");
+    DG_STATIC_ASSERT(BLOCK_K % (BLOCK_N / 2) == 0, "Invalid L1/L2 shape relationship");
+
+    const uint64_t* mask_ptr;
+    uint64_t expected_mask, pending_mask = kFullMask;
+
+    CUTLASS_DEVICE L2KBlockDependency(const uint64_t* mask_ptr, const uint32_t& generation_idx):
+        mask_ptr(mask_ptr), expected_mask(generation_idx & 1 ? 0ull : kFullMask) {}
+
+    CUTLASS_DEVICE static void arrive(const uint64_t* mask_ptr, const uint32_t& n_block_idx) {
+        ptx::red_xor_rel(mask_ptr, 1ull << n_block_idx);
+    }
+
+    // Re-read the mask only when the K block is not fed yet
+    CUTLASS_DEVICE void wait(const uint32_t& k_block_idx) {
+        const auto k_block_mask = ((1ull << kNumL1BlockNsPerL2KBlock) - 1) << (k_block_idx * kNumL1BlockNsPerL2KBlock);
+        while (pending_mask & k_block_mask)
+            pending_mask = ptx::ld_acq_gpu(mask_ptr) ^ expected_mask;
+    }
+};
+
 template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L1_SHAPE_N, uint32_t L1_SHAPE_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
@@ -383,10 +411,16 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE void mainloop(const uint32_t& num_tokens) {
         const auto lane_idx = ptx::get_lane_idx();
 
+        // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap, else at the tail
+        constexpr uint32_t kNumSharedL2Clusters = SHARED_L2_SHAPE_N / BLOCK_N / 2;
+        const bool is_shared_l2_early = math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
         if constexpr (kHasShared) {
             // Shared expert L1 tasks do not depend on dispatch.
             shared_mainloop<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
                 num_tokens, lane_idx, workspace.get_shared_l1_task_count_ptr());
+            if (is_shared_l2_early)
+                shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
+                    num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
         }
 
         // Wait dispatch's results
@@ -403,9 +437,9 @@ struct MegaMoEScheduler {
         } while (task_info.is_valid());
 
         if constexpr (kHasShared) {
-            // Shared expert L2 tasks depend on SharedLinear1 completion.
-            shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
-                num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
+            if (not is_shared_l2_early)
+                shared_mainloop<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
+                    num_tokens, lane_idx, workspace.get_shared_l2_task_count_ptr());
         }
 
         // Sentinel.

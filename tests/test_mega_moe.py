@@ -98,13 +98,22 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         mma_type=args.mma_type
     )
 
-    # Cast weights into FP4
+    # Cast routed weights into FP4 or FP8
     def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
         w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
         for i in range(num_groups):
             w[i], w_sf[i] = per_token_cast_to_fp4(bf16_weights[i], use_ue8m0=True, gran_k=32)
+        w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
+        return w, w_sf
+
+    def _cast_weights_to_fp8(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_groups, n, k = bf16_weights.shape
+        w = torch.empty((num_groups, n, k), device='cuda', dtype=torch.float8_e4m3fn)
+        w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
+        for i in range(num_groups):
+            w[i], w_sf[i] = per_token_cast_to_fp8(bf16_weights[i], use_ue8m0=True, gran_k=32)
         w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups)
         return w, w_sf
 
@@ -142,7 +151,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             shared_l1_weights = shared_l2_weights = None
 
         if not is_bf16xbf16:
-            # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
+            # FP8 path: cast inputs and weights with per-32 UE8M0 SF
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
             block_m = deep_gemm.get_block_m_for_mega_moe(
                 num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
@@ -151,8 +160,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             shared_x = (x_fp8, x_sf_tma)
             if num_shared_experts > 0:
                 shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
-            l1_weights = _cast_weights_to_fp4(l1_weights)
-            l2_weights = _cast_weights_to_fp4(l2_weights)
+            cast_weights = _cast_weights_to_fp8 if args.mma_type == 'fp8xfp8' else _cast_weights_to_fp4
+            l1_weights = cast_weights(l1_weights)
+            l2_weights = cast_weights(l2_weights)
             if num_shared_experts > 0:
                 shared_l1_weights = _cast_fp8_for_mega_moe(shared_l1_weights)[0::2]
                 shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
@@ -352,22 +362,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
-    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (1, 0.5)
+    act_elem_size = 2 if is_bf16xbf16 else 1
+    routed_weight_elem_size = 2 if is_bf16xbf16 else (1 if args.mma_type == 'fp8xfp8' else 0.5)
+    shared_weight_elem_size = 2 if is_bf16xbf16 else 1
     num_routed_hbm_bytes = (
-        num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size      # L1 weights
-        + num_touched_experts * hidden * intermediate_hidden * weight_elem_size        # L2 weights
-        + num_recv_tokens * hidden * act_elem_size                                     # L1 acts read
-        + num_recv_tokens * intermediate_hidden * act_elem_size                        # L1 output write
-        + num_recv_tokens * intermediate_hidden * act_elem_size                        # L2 acts read
-        + num_recv_tokens * hidden * 2                                                 # L2 output write (always BF16)
+        num_touched_experts * intermediate_hidden * 2 * hidden * routed_weight_elem_size      # L1 weights
+        + num_touched_experts * hidden * intermediate_hidden * routed_weight_elem_size        # L2 weights
+        + num_recv_tokens * hidden * act_elem_size                                            # L1 acts read
+        + num_recv_tokens * intermediate_hidden * act_elem_size                               # L1 output write
+        + num_recv_tokens * intermediate_hidden * act_elem_size                               # L2 acts read
+        + num_recv_tokens * hidden * 2                                                        # L2 output write (always BF16)
     )
     num_shared_hbm_bytes = 0 if num_shared_experts == 0 else (
-        shared_intermediate_hidden * 2 * hidden * weight_elem_size      # Shared L1 weights
-        + hidden * shared_intermediate_hidden * weight_elem_size        # Shared L2 weights
-        + num_tokens * hidden * act_elem_size                           # Shared L1 acts read
-        + num_tokens * shared_intermediate_hidden * act_elem_size       # Shared L1 output write
-        + num_tokens * shared_intermediate_hidden * act_elem_size       # Shared L2 acts read
-        + num_tokens * hidden * 2                                       # Shared L2 output write
+        shared_intermediate_hidden * 2 * hidden * shared_weight_elem_size      # Shared L1 weights
+        + hidden * shared_intermediate_hidden * shared_weight_elem_size        # Shared L2 weights
+        + num_tokens * hidden * act_elem_size                                  # Shared L1 acts read
+        + num_tokens * shared_intermediate_hidden * act_elem_size              # Shared L1 output write
+        + num_tokens * shared_intermediate_hidden * act_elem_size              # Shared L2 acts read
+        + num_tokens * hidden * 2                                              # Shared L2 output write
     )
     num_hbm_bytes = num_routed_hbm_bytes + num_shared_hbm_bytes
 
@@ -422,7 +434,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

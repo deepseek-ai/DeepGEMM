@@ -5,32 +5,38 @@
 
 #include "math.hpp"
 #include "exception.hpp"
-#include "../jit/device_runtime.hpp"
+#include "../runtime/jit.hpp"
 
 namespace deep_gemm {
 
 // Major-ness stuffs
+template <bool kRequireContiguousBatch = true>
 static void major_check(const torch::Tensor& t) {
     const auto dim = t.dim();
     DG_HOST_ASSERT(dim == 2 or dim == 3);
-    if (dim == 3)
-        DG_HOST_ASSERT(t.stride(0) == t.size(-2) * t.size(-1));
+    if constexpr (kRequireContiguousBatch) {
+        if (dim == 3)
+            DG_HOST_ASSERT(t.stride(0) == t.size(-2) * t.size(-1));
+    }
     DG_HOST_ASSERT(t.stride(-2) == 1 or t.stride(-1) == 1);
 }
 
+template <bool kRequireContiguousBatch = true>
 static cute::UMMA::Major get_major_type_ab(const torch::Tensor& t) {
-    major_check(t);
+    major_check<kRequireContiguousBatch>(t);
     return t.stride(-1) == 1 ? cute::UMMA::Major::K : cute::UMMA::Major::MN;
 }
 
+template <bool kRequireContiguousBatch = true>
 static void check_major_type_cd(const torch::Tensor& t) {
     // NOTES: the library only supports row-major output layouts
-    major_check(t);
+    major_check<kRequireContiguousBatch>(t);
     DG_HOST_ASSERT(t.stride(-1) == 1);
 }
 
-static bool fp8_requires_k_major() {
-    return device_runtime->get_arch_major() == 9;
+static bool fp8_fp4_requires_k_major(const torch::Tensor& a, const torch::Tensor& b) {
+    return jit->device.get_arch_major() == 9 or
+           (a.scalar_type() == kPackedFP4 and b.scalar_type() == kPackedFP4);
 }
 
 // Tensor utils
@@ -73,7 +79,7 @@ static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& a
 // Recipe
 static std::tuple<int, int, int>
 get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& sfb_dtype) {
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};

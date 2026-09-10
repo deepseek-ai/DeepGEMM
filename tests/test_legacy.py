@@ -19,7 +19,7 @@ def test_m_grouped_gemm_contiguous_tl() -> None:
 
         for expand in (False, True):
             for test_alias in (False, True):
-                m, a, b, m_indices, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b, use_bf16=True)
+                m, a, b, m_indices, d, ref_d, _ = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b, use_bf16=True)
                 func_name = f"{'a_fused_' if expand else ''}m_grouped_bf16_gemm_{major_opt.lower() if test_alias else 'nt'}_contiguous_tl"
                 if test_alias:
                     assert major_a.is_k_major()
@@ -33,7 +33,7 @@ def test_m_grouped_gemm_contiguous_tl() -> None:
                 d = torch.where((m_indices == -1).unsqueeze(1), torch.zeros_like(d), d)
                 diff = calc_diff(d, ref_d)
                 assert diff < 0.001, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}'
-        m, a, b, m_indices, d, ref_d = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b, use_bf16=True)
+        m, a, b, m_indices, d, ref_d, _ = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b, use_bf16=True)
 
         # noinspection PyShadowingNames
         def test_func():
@@ -49,9 +49,10 @@ def test_m_grouped_gemm_contiguous_tl() -> None:
 
 def test_k_grouped_gemm_contiguous_tl() -> None:    
     print('Testing k-grouped contiguous Triton GEMM:')
-    for num_groups, m, n, major_a, major_b, _, aligned_ks_cpu, expected_k_per_group, _, k_alignment, use_psum_layout in enumerate_k_grouped_contiguous(torch.bfloat16):
+    for num_groups, m, n, major_a, major_b, _, aligned_ks_cpu, expected_k_per_group, _, k_alignment, use_psum_layout, accumulate, out_dtype in \
+            enumerate_k_grouped_contiguous(torch.bfloat16):
         # Legacy Triton kernels do not mask per-group K tails inside the BLOCK_SIZE_K loop.
-        if use_psum_layout or k_alignment != 128:
+        if use_psum_layout or k_alignment != 128 or not accumulate or out_dtype != torch.float:
             continue
 
         major_opt  = 'N' if major_a.is_k_major() else 'T'

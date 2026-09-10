@@ -4,13 +4,10 @@
 #include "../utils/layout.hpp"
 #include "../utils/compatibility.hpp"
 
-#if DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/smxx_layout.hpp"
-#endif
 
 namespace deep_gemm::layout {
 
-#if DG_TENSORMAP_COMPATIBLE
 static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
                                                        const int& mn, const int& k,
                                                        const std::variant<std::tuple<int, int, int>,
@@ -19,7 +16,7 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
                                                        const std::optional<bool>& is_sfa,
                                                        const bool& disable_ue8m0_cast,
                                                        const std::optional<torch::Tensor>& psum_layout = std::nullopt) {
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
 
     // Get granularity MN/K from recipe
     int gran_mn, gran_k;
@@ -99,10 +96,9 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     DG_HOST_ASSERT(std::get<0>(recipe) == 1 and std::get<1>(recipe) == 1);
 
     const int gran_k = std::get<2>(recipe);
-    DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
-    DG_HOST_ASSERT(k_alignment % 32 == 0);
-
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT((arch_major == 9 and gran_k == 128 and k_alignment == 128) or
+                   (arch_major == 10 and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0));
 
     // FP32 on SM90
     if (sf.scalar_type() == torch::kFloat and arch_major == 9)
@@ -112,17 +108,14 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     if (sf.scalar_type() == torch::kFloat and arch_major == 10)
         return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
 
-    // INT (already packed UE8M0) on SM100
-    if (sf.scalar_type() == torch::kInt and arch_major == 10)
+    // Pre-packed UE8M0 is only accepted for gran_k=32 on SM100.
+    if (sf.scalar_type() == torch::kInt and arch_major == 10 and gran_k == 32)
         return check_k_grouped_packed_ue8m0_tensor(sf, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
 
     DG_HOST_UNREACHABLE("Unknown cases");
 }
 
-#endif
-
 static void register_apis(pybind11::module_& m) {
-#if DG_TENSORMAP_COMPATIBLE
     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
       py::arg("sf"), py::arg("mn"), py::arg("k"), py::arg("recipe"),
       py::arg("num_groups") = std::nullopt,
@@ -137,8 +130,6 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", &get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor,
       py::arg("sf"), py::arg("grouped_layout"), py::arg("ks_cpu"), py::arg("gran_k"), py::arg("k_alignment"),
       py::arg("use_psum_layout") = false);
-#endif
-
     m.def("set_mk_alignment_for_contiguous_layout", [&](const int& new_value) {
         heuristics_runtime->set_mk_alignment_for_contiguous_layout(new_value);
     });

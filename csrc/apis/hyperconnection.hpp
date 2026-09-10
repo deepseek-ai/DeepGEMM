@@ -2,14 +2,11 @@
 
 #include "../utils/compatibility.hpp"
 
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp"
-#endif
 
 namespace deep_gemm::hyperconnection {
 
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
                                  const torch::Tensor& b,
                                  const torch::Tensor& d,
@@ -47,7 +44,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         return;
 
     // Dispatch into different implements
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         sm90_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else if (arch_major == 10) {
@@ -57,14 +54,11 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
     }
 }
 
-#endif
 
 static void register_apis(pybind11::module_& m) {
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("sqr_sum"),
           py::arg("num_splits") = std::nullopt);
-#endif
 }
 
 } // namespace deep_gemm::hyperconnection

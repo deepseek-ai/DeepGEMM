@@ -1,20 +1,30 @@
 #pragma once
 
-#include "../../jit/device_runtime.hpp"
+#include <deep_jit/utils/lazy.hpp>
+
+#include "../../runtime/jit.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/lazy_init.hpp"
 
 namespace deep_gemm {
 
 class HeuristicsRuntime {
+public:
     static constexpr int kLegacyMKAlignmentForContiguousLayout = 128;
 
     bool ignore_compile_dims = false;
+    bool deterministic_algorithms = false;
     int block_m_multiple_of = 1;
     int block_n_multiple_of = 1;
     int mk_alignment_for_contiguous_layout = kLegacyMKAlignmentForContiguousLayout;
 
-public:
+    void use_deterministic_algorithms(const bool enabled) {
+        deterministic_algorithms = enabled;
+    }
+
+    bool get_deterministic_algorithms() const {
+        return deterministic_algorithms;
+    }
+
     void set_ignore_compile_dims(const bool& new_value) {
         ignore_compile_dims = new_value;
     }
@@ -45,18 +55,15 @@ public:
     }
 
     static int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) {
-        if (device_runtime->get_arch_major() != 10)
+        if (jit->device.get_arch_major() != 10)
             return kLegacyMKAlignmentForContiguousLayout;
 
-        int block_m = 224, mma_step = 32;
-        if (expected_m.has_value()) {
-            // Reduce `block_m` while ensuring it covers `m`
-            for (; block_m > 32 and block_m - mma_step >= expected_m.value(); block_m -= mma_step);
-        }
-        return block_m;
+        // The newly supported UMMA_N=256 allows a fixed alignment of 256, which is friendlier to MoE cast, M-grouped, and K-grouped operators.
+        // NOTES: `expected_m` is ignored, so small values may incur performance loss; use Mega MoE directly for such workloads.
+        return 256;
     }
 };
 
-static auto heuristics_runtime = LazyInit<HeuristicsRuntime>([](){ return std::make_shared<HeuristicsRuntime>(); });
+inline auto heuristics_runtime = deep_jit::LazyInit<HeuristicsRuntime>([](){ return std::make_shared<HeuristicsRuntime>(); });
 
 } // namespace deep_gemm

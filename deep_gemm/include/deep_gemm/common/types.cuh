@@ -7,15 +7,8 @@ namespace deep_gemm {
 enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,
+    MXF4        = 2,
 };
-
-constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
-    switch (mma_kind) {
-        case MmaKind::BF16:     return 2;
-        case MmaKind::MXFP8FP4: return 1;
-        default: return 0;
-    }
-}
 
 enum class GemmType {
     Normal                              = 0,
@@ -47,6 +40,16 @@ enum class KernelType {
     Kernel1D1D = 0,
     Kernel1D2D = 1,
     KernelNoSF = 2
+};
+
+// Host-visible runtime state of the `epilogue::transform` operators, which derive from
+// this struct without adding members, so the host fully determines the operator on launch.
+// Only the fields consumed by the selected epilogue type are meaningful
+struct EpilogueArgs {
+    uint32_t* sfd = nullptr;
+    uint32_t sfd_stride = 0;
+    uint32_t shape_m = 0, shape_n = 0;
+    float alpha = 1.0f;
 };
 
 } // namespace deep_gemm

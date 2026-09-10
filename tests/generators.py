@@ -2,6 +2,7 @@ import enum
 import itertools
 import random
 import torch
+from math import prod
 from typing import Generator, List, Optional, Tuple
 
 from deep_gemm.testing import get_arch_major
@@ -53,6 +54,9 @@ class QuantConfig:
     def is_legacy(self) -> bool:
         return (self.gran_k_a, self.gran_k_b, self.is_fp4_a, self.is_fp4_b) == self._legacy_quant_config
 
+    def is_fp4_fp4(self) -> bool:
+        return self.is_fp4_a and self.is_fp4_b
+
     def get_recipes(self, is_wgrad: bool = False) -> Tuple[Tuple, Tuple, Tuple]:
         recipe, recipe_a, recipe_b = None, None, None
         if self.is_legacy():
@@ -73,9 +77,12 @@ class QuantConfig:
     def get_list_from_dtype(dtype: torch.dtype) -> List:
         if dtype == torch.bfloat16:
             return [None]
+        if dtype == torch.float4_e2m1fn_x2:
+            return [QuantConfig((32, 32, True, True))]
         quant_config_list = [QuantConfig()]
         if get_arch_major() == 10:
             quant_config_list.append(QuantConfig((128, 32, False, True)))
+            quant_config_list.append(QuantConfig((32, 32, True, True)))
         return quant_config_list
 
 
@@ -112,8 +119,9 @@ def get_psum_layout_usage() -> tuple:
     return True, False
 
 
-def enumerate_normal(dtype: torch.dtype) -> Generator:
-    assert dtype in (torch.float8_e4m3fn, torch.bfloat16)
+def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) -> Generator:
+    assert dtype in (torch.float8_e4m3fn, torch.float4_e2m1fn_x2, torch.bfloat16)
+    assert not collect_cublas_scores or dtype != torch.bfloat16
 
     quant_config_list = QuantConfig.get_list_from_dtype(dtype)
     fp32_output_nk = [(256, 7168), (129280, 7168)]
@@ -127,31 +135,60 @@ def enumerate_normal(dtype: torch.dtype) -> Generator:
 
     for kernel_type in get_kernel_types(dtype):
         for quant_config in quant_config_list:
+            scores = []
             if len(quant_config_list) > 1:
                 quant_config.print()
             reset_seed()
 
+            def emit(*args):
+                return (*args, scores) if collect_cublas_scores else args
+
             # Forward
             for m in m_fwd_list:
-                for i in range(len(nk_list)):
-                    n, k = nk_list[i]
+                for i, (n, k) in enumerate(nk_list):
                     out_dtype = torch.bfloat16 if i < len(bf16_output_nk) else torch.float
-                    yield kernel_type, quant_config, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, out_dtype
+                    yield emit(kernel_type, quant_config, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, False, out_dtype)
                     # BF16 accumulation: supported on all BF16 GEMMs, and SM100 FP8/FP4 GEMMs
                     if out_dtype == torch.bfloat16 and (dtype == torch.bfloat16 or get_arch_major() == 10):
-                        yield kernel_type, quant_config, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, out_dtype
+                        yield emit(kernel_type, quant_config, m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor, True, out_dtype)
 
             # Backward
-            for m in m_bwd_list:
-                for n, k in nk_list:
-                    override_major = MajorTypeAB.MNMajor
-                    override_kernel_type = kernel_type
-                    if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
-                        override_major = MajorTypeAB.KMajor
-                        override_kernel_type = KernelType.Kernel1D1D
-                    yield kernel_type,          quant_config, m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16     # Dgrad
-                    yield override_kernel_type, quant_config, n, m, k, override_major,     override_major, True,  torch.float        # Wgrad
-                    yield override_kernel_type, quant_config, n, m, k, override_major,     override_major, False, torch.bfloat16     # Wgrad
+            if quant_config is None or not quant_config.is_fp4_fp4():
+                for m in m_bwd_list:
+                    for n, k in nk_list:
+                        override_major = MajorTypeAB.MNMajor
+                        override_kernel_type = kernel_type
+                        if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
+                            override_major = MajorTypeAB.KMajor
+                            override_kernel_type = KernelType.Kernel1D1D
+                        yield emit(kernel_type,          quant_config, m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16)  # Dgrad
+                        yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, True,  torch.float)         # Wgrad
+                        yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, False, torch.bfloat16)      # Wgrad
+                        if dtype == torch.bfloat16 or get_arch_major() == 10:
+                            yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, False, torch.float)     # Wgrad
+
+            if collect_cublas_scores and scores:
+                quant_type = f'FP{4 if quant_config.is_fp4_a else 8}xFP{4 if quant_config.is_fp4_b else 8}'
+                print(f'Average {quant_type} GEMM speedup over cuBLASLt: '
+                      f'{prod(scores) ** (1.0 / len(scores)):.3f}x\n')
+
+
+def enumerate_batched_syrk_symm() -> Generator:
+    # Real Muon parameter shapes from 5120/7168 models. Batch merging is capped at 16 in hai-llm.
+    b_m_k_list = [
+        (16, 4608, 5120),
+        (16, 1536, 5120),
+        (16, 576, 5120),
+        (8, 24576, 1536),
+        (8, 32768, 512),
+        (4, 5120, 16384),
+        (8, 4096, 7168),
+        (8, 7168, 2048),
+    ]
+    for dtype in (torch.bfloat16, torch.float):
+        reset_seed()
+        for b, m, k in b_m_k_list:
+            yield b, m, k, dtype
 
 
 def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
@@ -168,6 +205,8 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
                     for num_groups, expected_m_per_group in m_group_list:
                         for n, k in n_k_list:
                             for major_a, major_b in get_major_ab(False, get_arch_major() != 9 or dtype != torch.float8_e4m3fn):
+                                if quant_config is not None and quant_config.is_fp4_fp4() and major_b.is_mn_major():
+                                    continue
                                 yield kernel_type, quant_config, num_groups, expected_m_per_group, n, k, major_a, major_b, use_psum_layout, ensure_zero_padding
 
 
@@ -189,14 +228,25 @@ def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
 
 def enumerate_k_grouped_contiguous(dtype: torch.dtype):
     if dtype == torch.bfloat16:
-        k_alignment_options = [(128, 128)] if get_arch_major() == 9 else [(32, 32), (128, 128), (192, 192)]
+        sf_layout_list = [(128, 128)] if get_arch_major() == 9 else [(128, 128), (256, 256), (384, 384)]
+    elif dtype == torch.float4_e2m1fn_x2:
+        sf_layout_list = [(32, 256), (32, 512), (32, 768)]
     else:
-        k_alignment_options = [(128, 128)] if get_arch_major() == 9 else [(32, 32), (32, 128), (32, 160), (32, 224), (128, 128), (128, 160), (128, 224)]
+        sf_layout_list = ([(128, 128)] if get_arch_major() == 9 else
+                          [(32, 128), (128, 128), (32, 256), (128, 256), (32, 384), (128, 384)])
     # Only K-major is supported for SM90 FP8
-    major_a, major_b = (MajorTypeAB.KMajor, MajorTypeAB.KMajor) if get_arch_major() == 9 and dtype == torch.float8_e4m3fn \
-                       else (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
+    if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
+        major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
+    elif dtype == torch.float4_e2m1fn_x2:
+        major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
+    else:
+        major_a, major_b = MajorTypeAB.MNMajor, MajorTypeAB.MNMajor
     psum_list = (False, True) if get_arch_major() == 10 else (False, )
-    # Must with FP32 accumulation and 1D1D kernels
+    if get_arch_major() == 9:
+        cd_options = [(True, torch.float)]
+    else:
+        cd_options = [(True, torch.float), (False, torch.float), (False, torch.bfloat16)]
+
     # NOTES: the first shape has many small groups, for stressing the SM90 in-place tensor map update
     for num_groups, m, n, expected_k_per_group in (( 8,  768, 2048,  128),
                                                    ( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
@@ -204,28 +254,23 @@ def enumerate_k_grouped_contiguous(dtype: torch.dtype):
                                                    (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
         real_ks_cpu = [max(1, int(expected_k_per_group * random.uniform(0.7, 1.3))) for _ in range(num_groups)]
         for use_psum_layout in psum_list:
-            for gran_k, k_alignment in k_alignment_options:
+            for gran_k, k_alignment in sf_layout_list:
                 set_mk_alignment_for_contiguous_layout(k_alignment)
                 aligned_ks_cpu = [align(k, k_alignment) for k in real_ks_cpu]
-                yield num_groups, m, n, major_a, major_b, real_ks_cpu, aligned_ks_cpu, expected_k_per_group, gran_k, k_alignment, use_psum_layout
+                for accumulate, out_dtype in cd_options:
+                    yield (num_groups, m, n, major_a, major_b, real_ks_cpu, aligned_ks_cpu,
+                           expected_k_per_group, gran_k, k_alignment, use_psum_layout, accumulate, out_dtype)
 
 
-def enumerate_k_grouped_contiguous_test_variants(real_ks_cpu: List[int], k_alignment: int,
-                                                 use_psum_layout: bool, include_k_tail: bool = False):
-    test_variants = [(False, False), (True, False)]
-    if include_k_tail:
-        test_variants.append((False, True))
+def enumerate_k_grouped_contiguous_test_variants(real_ks_cpu: List[int]):
+    yield list(real_ks_cpu)
 
-    for test_empty_groups, test_k_tail in test_variants:
-        test_real_ks_cpu = list(real_ks_cpu)
-        if test_empty_groups and len(real_ks_cpu) > 1:
-            test_real_ks_cpu[random.randint(0, len(real_ks_cpu) - 1)] = 0
-        if test_k_tail and len(test_real_ks_cpu) > 1:
-            test_real_ks_cpu[0] = k_alignment
-        elif use_psum_layout and not test_empty_groups and len(test_real_ks_cpu) > 1 and test_real_ks_cpu[0] > 1:
-            test_real_ks_cpu[0] -= random.randint(1, min(k_alignment - 1, test_real_ks_cpu[0] - 1))
-        test_aligned_ks_cpu = [align(k, k_alignment) for k in test_real_ks_cpu]
-        yield test_real_ks_cpu, test_aligned_ks_cpu, test_empty_groups, test_k_tail
+    empty_ks_cpu = [0 if random.random() < 0.25 else k for k in real_ks_cpu]
+    empty_ks_cpu[0], empty_ks_cpu[-1] = 0, real_ks_cpu[-1]
+    yield empty_ks_cpu
+
+    single_group_ks_cpu = [k if i == len(real_ks_cpu) // 2 else 0 for i, k in enumerate(real_ks_cpu)]
+    yield single_group_ks_cpu
 
 
 def enumerate_sf_layout():
@@ -239,26 +284,28 @@ def enumerate_sf_layout():
                             set_mk_alignment_for_contiguous_layout(gran_k)
                             yield mn, k, with_transpose, use_ue8m0, num_groups, gran_k
 
+    if get_arch_major() == 10:
+        for sf_k, use_ue8m0 in ((908, False), (1211, True)):
+            set_mk_alignment_for_contiguous_layout(32)
+            yield 4096, sf_k * 32, True, use_ue8m0, 1, 32
+
 
 def enumerate_k_grouped_sf_layout():
-    gran_k_list = (128, ) if get_arch_major() == 9 else (32, 128)
     for mn in (4096, 7168):
         for num_groups, avg_k in ((16, 2048), (8, 4096), (72, 384), (128, 256)):
-            for gran_k in gran_k_list:
-                set_mk_alignment_for_contiguous_layout(gran_k)
-                ks_cpu = [align(int(random.uniform(0.7, 1.3) * avg_k), gran_k) for _ in range(num_groups)]
-                yield mn, ks_cpu, num_groups, gran_k
+            for gran_k, k_alignment in ((32, 128), (128, 128), (32, 256), (128, 256), (32, 384), (128, 384)):
+                set_mk_alignment_for_contiguous_layout(k_alignment)
+                ks_cpu = [align(int(random.uniform(0.7, 1.3) * avg_k), k_alignment)
+                          for _ in range(num_groups)]
+                yield mn, ks_cpu, num_groups, gran_k, k_alignment
 
 
 def enumerate_k_grouped_psum_sf_layout():
-    for mn, ks_cpu, num_groups, gran_k in enumerate_k_grouped_sf_layout():
-        k_alignment_list = (32, 128, 160, 224)
-        for k_alignment in k_alignment_list:
-            # Generate non-aligned K sizes to test ceil_div path in pack kernel.
-            real_ks_cpu = [k + (gran_k // 2 if i % 2 else 0) for i, k in enumerate(ks_cpu)]
-            psum_layout = build_psum_layout_from_ks(real_ks_cpu, k_alignment)
-            aligned_ks_cpu = [align(k, k_alignment) for k in real_ks_cpu]
-            yield mn, real_ks_cpu, aligned_ks_cpu, psum_layout, num_groups, gran_k, k_alignment
+    for mn, ks_cpu, num_groups, gran_k, k_alignment in enumerate_k_grouped_sf_layout():
+        real_ks_cpu = [k - (gran_k // 2 if i % 2 else 0) for i, k in enumerate(ks_cpu)]
+        aligned_ks_cpu = [align(k, k_alignment) for k in real_ks_cpu]
+        psum_layout = build_psum_layout_from_ks(real_ks_cpu, k_alignment)
+        yield mn, real_ks_cpu, aligned_ks_cpu, psum_layout, num_groups, gran_k, k_alignment
 
 
 def enumerate_transpose():
@@ -305,13 +352,15 @@ def generate_normal(m: int, n: int, k: int,
                     accumulate: bool, out_dtype: torch.dtype,
                     kernel_type: KernelType,
                     use_ue8m0: bool = False, use_bf16: bool = False,
-                    quant_config: Optional[QuantConfig] = None):
+                    quant_config: Optional[QuantConfig] = None,
+                    alpha: Optional[float] = None):
     a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
         torch.empty((m, n), device='cuda', dtype=out_dtype)
     c = d if accumulate else None
-    ref_d = (a.float() @ b.float().t() + (c if accumulate else 0)).to(out_dtype)
+    alpha_value = alpha if alpha is not None else 1.0
+    ref_d = (alpha_value * (a.float() @ b.float().t()) + (c if accumulate else 0)).to(out_dtype)
 
     if use_bf16:
         a = a if major_a.is_k_major() else a.T.contiguous().T
@@ -341,6 +390,7 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
                      else torch.empty(m, device='cuda', dtype=torch.int32)
     d = torch.empty((m, n), device='cuda', dtype=torch.bfloat16)
     ref_d = torch.randn((m, n), device='cuda', dtype=torch.bfloat16)
+    valid_mask = torch.zeros(m, device='cuda', dtype=torch.bool)
 
     start = 0
     for i, (actual_m, aligned_m) in enumerate(zip(actual_ms, aligned_ms)):
@@ -351,6 +401,7 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
         else:
             grouped_layout[start: actual_end] = i
             grouped_layout[actual_end: aligned_end] = -1
+        valid_mask[start:actual_end] = True
         # Zero BF16 padding so quantized SFA padding is regular, never uninitialized
         a[actual_end: aligned_end] = 0
         ref_d[start: aligned_end] = a[start: aligned_end] @ b[i].t()
@@ -358,25 +409,38 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
 
     if use_bf16:
         b = b if major_b.is_k_major() else b.mT.contiguous().mT
-        return m, a, b, grouped_layout, d, ref_d
+        return m, a, b, grouped_layout, d, ref_d, valid_mask
 
     assert major_a.is_k_major()
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
     b = grouped_cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0, use_block_cast_for_fp8=True)    
 
-    return m, a, b, grouped_layout, d, ref_d
+    return m, a, b, grouped_layout, d, ref_d, valid_mask
 
 
 def layout_masked_to_psum(x: torch.Tensor, psum_m: torch.Tensor):
-    num_groups, max_m, _ = x.size()
+    num_groups, _, k = x.size()
     # PSUM gaps are intentionally left uninitialized to verify the pack kernel skips them
-    x_psum = torch.empty_like(x).view(num_groups * max_m, -1)
+    x_psum = torch.empty((align(psum_m[-1].item(), get_mk_alignment_for_contiguous_layout()), k),
+                         dtype=x.dtype, device=x.device)
     last_psum_m = 0
     for i in range(num_groups):
         x_psum[last_psum_m: psum_m[i]] = x[i, :psum_m[i] - last_psum_m]
         last_psum_m = align(psum_m[i], get_mk_alignment_for_contiguous_layout())
     return x_psum
+
+
+def masked_valid_mask_to_psum(masked_m: torch.Tensor, psum_m: torch.Tensor) -> torch.Tensor:
+    # Build the PSUM-layout valid mask directly: gaps must be `False` (never uninitialized),
+    # otherwise selecting `d[valid_mask]` would read skipped rows and break determinism checks
+    total_m = align(psum_m[-1].item(), get_mk_alignment_for_contiguous_layout())
+    valid_mask = torch.zeros(total_m, device=masked_m.device, dtype=torch.bool)
+    last_psum_m = 0
+    for i in range(masked_m.numel()):
+        valid_mask[last_psum_m: psum_m[i]] = True
+        last_psum_m = align(psum_m[i], get_mk_alignment_for_contiguous_layout())
+    return valid_mask
 
 
 def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group: int, n: int, k: int,
@@ -394,9 +458,15 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
         masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
         psum_m[j] = (0 if j == 0 else align(psum_m[j - 1], get_mk_alignment_for_contiguous_layout())) + masked_m[j]
     assert masked_m.amax().item() <= max_m
+    valid_mask = torch.arange(max_m, device='cuda')[None, :] < masked_m[:, None]
 
     if use_bf16:
-        return a, b, masked_m, psum_m, d, ref_d
+        if use_psum_layout:
+            a = layout_masked_to_psum(a, psum_m)
+            d = layout_masked_to_psum(d, psum_m)
+            ref_d = layout_masked_to_psum(ref_d, psum_m)
+            valid_mask = masked_valid_mask_to_psum(masked_m, psum_m)
+        return a, b, psum_m if use_psum_layout else masked_m, d, ref_d, valid_mask
 
     quant_config = QuantConfig() if quant_config is None else quant_config
     a = grouped_cast_fp8_fp4_with_major(a, MajorTypeAB.KMajor, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
@@ -406,81 +476,70 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
         # Zero SFA padding rows (beyond `masked_m`) so the pack kernel reads regular zeros
         for j in range(num_groups):
             a[1][j, masked_m[j].item():] = 0
+    else:
+        a = (layout_masked_to_psum(a[0], psum_m), layout_masked_to_psum(a[1], psum_m))
+        d = layout_masked_to_psum(d, psum_m)
+        ref_d = layout_masked_to_psum(ref_d, psum_m)
+        valid_mask = masked_valid_mask_to_psum(masked_m, psum_m)
 
-    return a, b, masked_m, psum_m, d, ref_d
+    return a, b, psum_m if use_psum_layout else masked_m, d, ref_d, valid_mask
 
 
-def k_grouped_per_channel_cast_to_fp8(x: torch.Tensor, ks_cpu: List[int], use_ue8m0: bool, gran_k: int,
-                                      group_ends: Optional[List[int]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Cast each group independently so that the SF rows stay compact (`ceil_div(k, gran_k)` rows per group);
-    # `group_ends` gives per-group end offsets (psum layouts), `None` means a contiguous prefix-sum layout
+def k_grouped_cast_fp8_fp4_with_major(x: torch.Tensor, ks_cpu: List[int], major: MajorTypeAB,
+                                      use_ue8m0: bool, gran_k: int, is_fp4: bool,
+                                      group_ends: Optional[List[int]] = None,
+                                      sf_ks_cpu: Optional[List[int]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     if group_ends is None:
         group_ends = list(itertools.accumulate(ks_cpu))
         assert (group_ends[-1] if ks_cpu else 0) == x.size(0)
+    if sf_ks_cpu is None:
+        sf_ks_cpu = ks_cpu
+    assert len(ks_cpu) == len(group_ends) == len(sf_ks_cpu)
 
-    n = x.size(1)
+    mn = x.size(1)
+    if is_fp4:
+        assert major.is_k_major() and gran_k == 32
+        data = torch.zeros((mn, x.size(0) // 2), dtype=torch.int8, device=x.device)
+        sf_groups = []
+        for k, sf_k, end in zip(ks_cpu, sf_ks_cpu, group_ends):
+            if sf_k == 0:
+                continue
+            start = end - k
+            x_group = torch.zeros((sf_k, mn), dtype=x.dtype, device=x.device)
+            x_group[:k] = x[start:end]
+            x_group_fp4, x_group_sf = per_token_cast_to_fp4(
+                x_group.T.contiguous(), use_ue8m0=use_ue8m0, gran_k=gran_k)
+            data[:, start // 2:(start + sf_k) // 2] = x_group_fp4
+            sf_groups.append(x_group_sf.T.contiguous())
+        sf = torch.cat(sf_groups) if sf_groups else torch.empty((0, mn), dtype=torch.float, device=x.device)
+        return data, sf
+
+    # Cast each group independently. SF rows are compact by group and padded to
+    # k_alignment, matching the K-grouped pack kernel's input contract.
     x_fp8 = torch.zeros(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
     sf_groups = []
-    for k, end in zip(ks_cpu, group_ends):
-        if k == 0:
+    for k, sf_k, end in zip(ks_cpu, sf_ks_cpu, group_ends):
+        if sf_k == 0:
             continue
         start = end - k
-        x_group = torch.zeros((align(k, gran_k), n), dtype=x.dtype, device=x.device)
+        x_group = torch.zeros((sf_k, mn), dtype=x.dtype, device=x.device)
         x_group[:k] = x[start:end]
         x_group_fp8, x_group_sf = per_channel_cast_to_fp8(x_group, use_ue8m0=use_ue8m0, gran_k=gran_k)
         x_fp8[start:end] = x_group_fp8[:k]
         sf_groups.append(x_group_sf)
-    sf = torch.cat(sf_groups) if sf_groups else torch.empty((0, n), dtype=torch.float, device=x.device)
-    return x_fp8, sf
+    sf = torch.cat(sf_groups) if sf_groups else torch.empty((0, mn), dtype=torch.float, device=x.device)
+    if major.is_mn_major():
+        return x_fp8, sf
 
-
-def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, ks_cpu: List[int],
-                                  use_ue8m0: bool = False, use_bf16: bool = False, gran_k = 128):
-    k = sum(ks_cpu)
-    grouped_layout = torch.tensor(ks_cpu, device='cuda', dtype=torch.int32)
-
-    a = torch.randn((k, m), device='cuda', dtype=torch.bfloat16)
-    b = torch.randn((k, n), device='cuda', dtype=torch.bfloat16)
-    c = torch.randn((num_groups, m, n), device='cuda', dtype=torch.float) * 32
-    d = c
-    ref_d = torch.empty_like(c)
-
-    start = 0
-    for i, group_k in enumerate(ks_cpu):
-        end = start + group_k
-        ref_d[i] = c[i] + (a[start:end].T @ b[start:end])
-        start = end
-
-    if use_bf16:
-        assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
-        return k, a, b, c, d, ref_d, grouped_layout, ks_cpu
-
-    assert get_mk_alignment_for_contiguous_layout() % 32 == 0
-
-    a_fp8 = k_grouped_per_channel_cast_to_fp8(a, ks_cpu, use_ue8m0=use_ue8m0, gran_k=gran_k)
-    b_fp8 = k_grouped_per_channel_cast_to_fp8(b, ks_cpu, use_ue8m0=use_ue8m0, gran_k=gran_k)
-
-    # Transpose for K Major A/B
-    if (major_a, major_b) == (MajorTypeAB.KMajor, MajorTypeAB.KMajor):
-        a, sfa = a_fp8
-        b, sfb = b_fp8
-        new_a = torch.empty((sum(ks_cpu) * m, ), dtype=a.dtype, device=a.device)
-        new_b = torch.empty((sum(ks_cpu) * n, ), dtype=b.dtype, device=b.device)
-        prefix = 0
-        for K in ks_cpu:
-            new_a[prefix * m : (prefix + K) * m] = a[prefix : prefix + K, ].T.flatten()
-            new_b[prefix * n : (prefix + K) * n] = b[prefix : prefix + K, ].T.flatten()
-            prefix += K
-        a_fp8, b_fp8 = (new_a, sfa.T), (new_b, sfb.T)
-    else:
-        assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
-
-    return k, a_fp8, b_fp8, c, d, ref_d, grouped_layout, ks_cpu
+    data = torch.zeros((x.size(0) * mn, ), dtype=x_fp8.dtype, device=x.device)
+    for k, end in zip(ks_cpu, group_ends):
+        start = end - k
+        data[start * mn:end * mn] = x_fp8[start:end].T.flatten()
+    return data, sf.T
 
 
 def build_psum_layout_from_ks(real_ks: List[int], k_alignment: int) -> List[int]:
-    # Convert raw per-group K sizes to psum end offsets
     psum, prev_end = [], 0
     for k in real_ks:
         end = align(prev_end, k_alignment) + k
@@ -489,44 +548,61 @@ def build_psum_layout_from_ks(real_ks: List[int], k_alignment: int) -> List[int]
     return psum
 
 
-def generate_k_grouped_contiguous_psum(num_groups: int, m: int, n: int,
-                                        major_a: MajorTypeAB, major_b: MajorTypeAB,
-                                        real_ks: List[int], k_alignment: int,
-                                        use_ue8m0: bool = False, use_bf16: bool = False,
-                                        gran_k: int = 128):
-    # psum k-grouped is SM100 MN-major only
-    assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
-    assert k_alignment % 32 == 0
+def generate_k_grouped_contiguous(num_groups: int, m: int, n: int, major_a: MajorTypeAB, major_b: MajorTypeAB, logical_ks_cpu: List[int],
+                                  use_ue8m0: bool = False, use_bf16: bool = False, gran_k = 128,
+                                  quant_config: Optional[QuantConfig] = None,
+                                  use_psum_layout: bool = False, k_alignment: Optional[int] = None,
+                                  accumulate: bool = True, out_dtype: torch.dtype = torch.float):
+    assert num_groups == len(logical_ks_cpu)
+    k_alignment = get_mk_alignment_for_contiguous_layout() if k_alignment is None else k_alignment
+    host_ks_cpu = [align(k, k_alignment) for k in logical_ks_cpu]
+    if use_psum_layout:
+        assert k_alignment % 32 == 0
+        logical_group_ends = build_psum_layout_from_ks(logical_ks_cpu, k_alignment)
+        total_k = sum(host_ks_cpu)
+        grouped_layout_cpu = logical_group_ends
+    else:
+        total_k = sum(host_ks_cpu)
+        logical_group_ends = []
+        physical_start = 0
+        for logical_k, host_k in zip(logical_ks_cpu, host_ks_cpu):
+            logical_group_ends.append(physical_start + logical_k)
+            physical_start += host_k
+        grouped_layout_cpu = host_ks_cpu
+    grouped_layout = torch.tensor(grouped_layout_cpu, device='cuda', dtype=torch.int32)
 
-    # NOTES: `aligned_ks` round each group's K up to `k_alignment` (the group-start alignment),
-    # so the host-side `k % k_alignment == 0` check passes and matches the psum layout below.
-    aligned_ks = [align(k, k_alignment) for k in real_ks]
-
-    grouped_layout = build_psum_layout_from_ks(real_ks, k_alignment)
-    total_k = align(grouped_layout[-1] if num_groups > 0 else 0, k_alignment)
-
-    # Keep padded K gaps zeroed
+    # Physical psum gaps are guaranteed to be zero. A partial block must still
+    # stop before the next group's nonzero data.
     a = torch.zeros((total_k, m), device='cuda', dtype=torch.bfloat16)
     b = torch.zeros((total_k, n), device='cuda', dtype=torch.bfloat16)
-    c = torch.randn((num_groups, m, n), device='cuda', dtype=torch.float) * 32
-    d = c
-    ref_d = torch.empty_like(c)
+    d = torch.randn((num_groups, m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
+        torch.empty((num_groups, m, n), device='cuda', dtype=out_dtype)
+    c = d if accumulate else None
+    ref_d = torch.empty_like(d)
 
-    for i, k in enumerate(real_ks):
-        if k == 0:
-            ref_d[i] = c[i]
-            continue
-        start = grouped_layout[i] - k
-        a_g = torch.randn((k, m), device='cuda', dtype=torch.bfloat16)
-        b_g = torch.randn((k, n), device='cuda', dtype=torch.bfloat16)
-        a[start:start + k] = a_g
-        b[start:start + k] = b_g
-        ref_d[i] = c[i] + (a_g.T @ b_g)
+    for i, (group_k, end) in enumerate(zip(logical_ks_cpu, logical_group_ends)):
+        start = end - group_k
+        a[start:end] = torch.randn((group_k, m), device='cuda', dtype=torch.bfloat16)
+        b[start:end] = torch.randn((group_k, n), device='cuda', dtype=torch.bfloat16)
+        ref_d[i] = (a[start:end].float().T @ b[start:end].float() + (c[i] if accumulate else 0)).to(out_dtype)
 
-    grouped_layout_tensor = torch.tensor(grouped_layout, device='cuda', dtype=torch.int32)
     if use_bf16:
-        return total_k, a, b, c, d, ref_d, grouped_layout_tensor, aligned_ks
+        assert (major_a, major_b) == (MajorTypeAB.MNMajor, MajorTypeAB.MNMajor)
+        return total_k, a, b, c, d, ref_d, grouped_layout, host_ks_cpu
 
-    a_fp8 = k_grouped_per_channel_cast_to_fp8(a, real_ks, use_ue8m0=use_ue8m0, gran_k=gran_k, group_ends=grouped_layout)
-    b_fp8 = k_grouped_per_channel_cast_to_fp8(b, real_ks, use_ue8m0=use_ue8m0, gran_k=gran_k, group_ends=grouped_layout)
-    return total_k, a_fp8, b_fp8, c, d, ref_d, grouped_layout_tensor, aligned_ks
+    is_fp4 = quant_config is not None and (quant_config.is_fp4_a or quant_config.is_fp4_b)
+    if is_fp4:
+        assert quant_config.is_fp4_a and quant_config.is_fp4_b
+        assert (quant_config.gran_k_a, quant_config.gran_k_b) == (32, 32)
+        assert (major_a, major_b) == (MajorTypeAB.KMajor, MajorTypeAB.KMajor)
+        assert k_alignment % 256 == 0
+    else:
+        assert k_alignment % 128 == 0
+
+    quantized_a = k_grouped_cast_fp8_fp4_with_major(
+        a, logical_ks_cpu if use_psum_layout else host_ks_cpu, major_a, use_ue8m0, gran_k, is_fp4,
+        logical_group_ends if use_psum_layout else None, host_ks_cpu)
+    quantized_b = k_grouped_cast_fp8_fp4_with_major(
+        b, logical_ks_cpu if use_psum_layout else host_ks_cpu, major_b, use_ue8m0, gran_k, is_fp4,
+        logical_group_ends if use_psum_layout else None, host_ks_cpu)
+    return total_k, quantized_a, quantized_b, c, d, ref_d, grouped_layout, host_ks_cpu

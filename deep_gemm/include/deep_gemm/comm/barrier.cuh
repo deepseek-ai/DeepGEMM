@@ -11,6 +11,18 @@ namespace deep_gemm::comm {
 // 60s timeout, at 2 GHz
 constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
 
+// Spin until `pred()` holds; on timeout, `print_timeout()` runs before the assertion
+template <typename pred_t, typename print_timeout_t>
+CUTLASS_DEVICE void wait_until(const pred_t& pred, const print_timeout_t& print_timeout) {
+    const auto start_clock = clock64();
+    while (not pred()) {
+        if (clock64() - start_clock >= kNumTimeoutCycles) {
+            print_timeout();
+            DG_DEVICE_ASSERT(false and "Timeout");
+        }
+    }
+}
+
 CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
     // This is slightly faster than `cute::cluster_sync` but has weaker memory ordering guarantee
@@ -30,15 +42,10 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
-        const auto start_clock = clock64();
-        do {
-            new_value = ptx::ld_acq(count_ptr);
-            if (clock64() - start_clock >= kNumTimeoutCycles) {
-                printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
-                       sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
-                DG_DEVICE_ASSERT(false and "Grid sync timeout");
-            }
-        } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+        wait_until([&]() { return ((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag; }, [&]() {
+            printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
+                   sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+        });
     }
     sync_scope();
 }
@@ -72,14 +79,10 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
         if (thread_idx == 0) {
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
-            const auto start_clock = clock64();
-            while (ptx::ld_acq_sys(signal_ptr) != target) {
-                if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
-                    DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
-                }
-            }
+            wait_until([&]() { return ptx::ld_acq_sys(signal_ptr) == target; }, [&]() {
+                printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                       sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+            });
         }
     }
 

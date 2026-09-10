@@ -2,15 +2,19 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
+#include <iostream>
 #include <string>
+#include <tuple>
 #include <unordered_set>
+#include <utility>
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_jit/utils/env.hpp>
 
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
-#include "../../utils/system.hpp"
 #include "sm100.hpp"
 
 namespace deep_gemm {
@@ -61,7 +65,7 @@ struct MegaMoEConfig {
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16")
         return MmaKind::BF16;
-    DG_HOST_ASSERT(mma_type_str == "fp8xfp4");
+    DG_HOST_ASSERT(mma_type_str == "fp8xfp4" or mma_type_str == "fp8xfp8");
     return MmaKind::MXFP8FP4;
 }
 
@@ -78,29 +82,26 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
     const MmaKind& mma_kind) {
-    auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups] = [&]() -> std::tuple<int, int, int, int, int> {
-        float num_expected_tokens_per_expert = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
-        if (num_expected_tokens_per_expert <= 8.5) {
-            // Really small token-per-expert (e.g. RL long-tail rollout), use the smallest block_m and larger BLOCK_K for less synchronization
-            return {2, 16, 8, 256, 2};
-        } else if (num_expected_tokens_per_expert <= 16.5) {
-            // Small batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 128
-            return {2, 32, 16, 128, 2};
-        } else if (num_expected_tokens_per_expert <= 32.5) {
-            // Medium batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 256
-            return {2, 64, 32, 128, 1};
-        } else if (num_expected_tokens_per_expert <= 64.5) {
-            // Large batch size, small EP, decoding, e.g. 6/384 experts, EP8, bsz 512
-            return {2, 96, 16, 128, 2};
-        } else if (num_expected_tokens_per_expert <= 96.5) {
-            // Medium batch size, Medium EP, decoding, e.g. 6/384 experts, EP16, bsz 256, or EP32, bsz128
-            return {2, 128, 32, 128, 2};
-        } else {
-            // Prefill, or large EP decoding
-            return {2, 192, 32, 128, 2};
+    // Expected tokens per expert, plus a one-sigma routing margin for the tile choice
+    const float num_expected_tokens = static_cast<float>(num_tokens) * num_ranks * num_topk / num_experts;
+    const float num_covered_tokens = num_expected_tokens + std::sqrt(num_expected_tokens);
+
+    // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
+    // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
+    // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
+    int block_m = num_expected_tokens <= 10 ? 16 : 32;
+    if (num_expected_tokens > 24) {
+        int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
+        if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
+            num_blocks = 2;
+        for (const int& candidate: {64, 128, 192, 240}) {
+            block_m = candidate;
+            if (num_blocks * candidate >= num_covered_tokens)
+                break;
         }
-    }();
-    block_k /= get_num_mma_elem_bytes(mma_kind);
+    }
+    const int store_block_m = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 : 40;
+    const int block_k = 128 / get_num_mma_elem_bytes(mma_kind);
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -108,8 +109,8 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
         [=](const auto& candidate) { return candidate == block_m; })
     );
 
-    // Return configs
-    return {cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups * 128};
+    // Return configs: 2-CTA clusters and 2 epilogue warpgroups
+    return {2, block_m, store_block_m, block_k, 2 * 128};
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
@@ -191,12 +192,13 @@ static MegaMoEConfig get_mega_moe_config(
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+    DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
         SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, MmaKind::MXFP8FP4) : std::pair(0, 0);
-    // NOTES: FP8 activations and FP4 weights (unpacked to 8-bit in smem) both use 128B swizzle
+    // NOTES: FP8 activations, FP8 weights, and FP4 weights unpacked to 8-bit in smem all use 128B swizzle
     const int swizzle_acts_mode = 128;
     const int swizzle_weights_mode = 128;
     const int gran_k = 32;
@@ -205,10 +207,10 @@ static MegaMoEConfig get_mega_moe_config(
     const int num_dispatch_threads = 128;
     const int num_non_epilogue_threads = 128;
 
-    // Pull: divide token bytes by 2 until <= kPullThreshold
-    constexpr int kPullThreshold = 4096;
+    // Pull: divide token bytes by 2 until <= num_max_pull_bytes
+    const int num_max_pull_bytes = is_mma_with_sf(mma_kind) ? 8192 : 4096;
     int num_bytes_per_pull = hidden * get_num_mma_elem_bytes(mma_kind);
-    while (num_bytes_per_pull > kPullThreshold) {
+    while (num_bytes_per_pull > num_max_pull_bytes) {
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;
     }
@@ -234,8 +236,8 @@ static MegaMoEConfig get_mega_moe_config(
     };
 
     // Print configs for the first time
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        const auto key = fmt::format(
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+        const auto key = std::format(
             "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
             num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
         static std::unordered_set<std::string> printed;

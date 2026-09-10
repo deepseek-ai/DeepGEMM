@@ -38,6 +38,23 @@ CUTLASS_DEVICE void mbarrier_arrive(
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
 }
 
+CUTLASS_DEVICE void mbarrier_arrive_count(
+    cutlass::arch::ClusterTransactionBarrier& barrier, const uint32_t count) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0], %1;" ::
+                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&barrier))), "r"(count));
+}
+
+CUTLASS_DEVICE void mbarrier_arrive_count_pred(
+    cutlass::arch::ClusterTransactionBarrier& barrier, const uint32_t count, const bool pred) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %2, 0;\n\t"
+        "@p mbarrier.arrive.shared::cta.b64 _, [%0], %1;\n\t"
+        "}" ::
+        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(&barrier))), "r"(count), "r"(static_cast<uint32_t>(pred)));
+}
+
 CUTLASS_DEVICE void mbarrier_arrive_and_set_tx(
     cutlass::arch::ClusterTransactionBarrier* ptr, const uint32_t& num_bytes) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t" ::
@@ -64,7 +81,7 @@ CUTLASS_DEVICE void tma_load_1d(
     const void* dst_ptr, const void* src_ptr,
     cutlass::arch::ClusterTransactionBarrier* mbarrier_ptr,
     const uint32_t& num_bytes,
-    const cute::TMA::CacheHintSm90& hint = cute::TMA::CacheHintSm90::EVICT_FIRST) {
+    const cute::TMA::CacheHintSm100& hint = cute::TMA::CacheHintSm100::EVICT_FIRST) {
     // NOTES: normally, the loaded part will be evicted soon
     asm volatile(
         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n" ::
@@ -78,7 +95,7 @@ CUTLASS_DEVICE void tma_load_1d(
 
 CUTLASS_DEVICE void tma_store_1d(
     const void* dst_ptr, const void* src_ptr, const uint32_t& num_bytes,
-    const cute::TMA::CacheHintSm90& hint = cute::TMA::CacheHintSm90::EVICT_NORMAL) {
+    const cute::TMA::CacheHintSm100& hint = cute::TMA::CacheHintSm100::EVICT_NORMAL) {
     // NOTES: normally, the stored part will be used soon
     asm volatile("cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;\n" ::
                  "l"(dst_ptr),
@@ -86,6 +103,32 @@ CUTLASS_DEVICE void tma_store_1d(
                  "r"(num_bytes),
                  "l"(hint)
                  : "memory");
+}
+
+CUTLASS_DEVICE void tma_store_2d(
+    const void* desc_ptr, const void* smem_ptr,
+    const uint32_t& crd_0, const uint32_t& crd_1,
+    const cute::TMA::CacheHintSm100& hint = cute::TMA::CacheHintSm100::EVICT_NORMAL) {
+    const auto gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+    const auto smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint "
+        "[%0, {%2, %3}], [%1], %4;\n" ::
+        "l"(gmem_int_desc), "r"(smem_int_ptr),
+        "r"(crd_0), "r"(crd_1), "l"(hint)
+        : "memory");
+}
+
+CUTLASS_DEVICE void tma_store_3d(
+    const void* desc_ptr, const void* smem_ptr,
+    const uint32_t& crd_0, const uint32_t& crd_1, const uint32_t& crd_2,
+    const cute::TMA::CacheHintSm100& hint) {
+    const auto gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+    const auto smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint "
+        "[%0, {%2, %3, %4}], [%1], %5;\n" ::
+        "l"(gmem_int_desc), "r"(smem_int_ptr), "r"(crd_0), "r"(crd_1), "r"(crd_2), "l"(hint) : "memory");
 }
 
 template <int kNumRemainingWaits = 0>

@@ -19,33 +19,32 @@ struct RequestInfo {
     uint32_t num_kv_splits;       // request_num_kv_splits  = ceil(context_len / SPLIT_KV)
     uint32_t num_kv_pages;        // = ceil(context_len / PAGE_KV); page-level bound for the last partial split
 
+    CUTLASS_DEVICE RequestInfo() = default;
+
+    CUTLASS_DEVICE RequestInfo(const uint32_t& q_token_start, const uint32_t& num_q_tokens,
+                               const uint32_t& context_len)
+        : q_token_start(q_token_start), num_q_tokens(num_q_tokens),
+          num_q_blocks(math::ceil_div(num_q_tokens, BLOCK_Q)),
+          num_kv_splits(math::ceil_div(context_len, SPLIT_KV)),
+          num_kv_pages(math::ceil_div(context_len, PAGE_KV)) {}
+
     // Resolve the request that starts at `q_token_idx`
     CUTLASS_DEVICE static RequestInfo from_q_token(const uint32_t& q_token_idx,
                                                    const uint32_t& num_q_tokens_total,
                                                    const uint32_t* context_lens,
                                                    const uint32_t* indices) {
-        RequestInfo info;
-        info.q_token_start = q_token_idx;
-        uint32_t context_len;
         if constexpr (kIsVarlen) {
             // Varlen request = maximal run of equal `indices`
             const uint32_t request_id = indices[q_token_idx];
             uint32_t t = q_token_idx;
             while (t + 1 < num_q_tokens_total and indices[t + 1] == request_id)
                 ++ t;
-            info.num_q_tokens = t - q_token_idx + 1;
-            context_len = context_lens[t];
+            return RequestInfo(q_token_idx, t - q_token_idx + 1, context_lens[t]);
         } else {
             // Regular grid: request = q_token_idx / next_n, next_n tokens each
-            const uint32_t request_id = q_token_idx / kNextN;
-            info.num_q_tokens = kNextN;
-            const uint32_t lens_idx = kIsContextLens2D ? request_id * kNextN + kNextN - 1 : request_id;
-            context_len = context_lens[lens_idx];
+            const uint32_t lens_idx = kIsContextLens2D ? q_token_idx + kNextN - 1 : q_token_idx / kNextN;
+            return RequestInfo(q_token_idx, kNextN, context_lens[lens_idx]);
         }
-        info.num_q_blocks = math::ceil_div(info.num_q_tokens, BLOCK_Q);
-        info.num_kv_splits = math::ceil_div(context_len, SPLIT_KV);
-        info.num_kv_pages = math::ceil_div(context_len, PAGE_KV);
-        return info;
     }
 
     // Average q-token partition across Q-blocks; returns both offset and count
@@ -64,99 +63,155 @@ struct RequestInfo {
     }
 };
 
-// Metadata kernel balances work across SMs via a prefix sum over request work
+inline constexpr uint32_t kNumMetadataThreads = 1024;
+inline constexpr uint32_t kNumMetadataWarps = kNumMetadataThreads / 32;
+DG_STATIC_ASSERT(kNumMetadataWarps <= 32 and kNumMetadataThreads % 32 == 0, "Invalid metadata thread count");
+
+// Inclusive prefix sum
+CUTLASS_DEVICE void metadata_prefix_scan(const uint32_t thread_idx, const uint32_t num_items,
+                                         uint32_t* values, uint32_t* warp_sums) {
+    const uint32_t num_items_per_thread = math::ceil_div(num_items, kNumMetadataThreads) | 1u;
+    const uint32_t item_begin_idx = cute::min(thread_idx * num_items_per_thread, num_items);
+    const uint32_t item_end_idx = cute::min(item_begin_idx + num_items_per_thread, num_items);
+    uint32_t even_sum = 0, odd_sum = 0;
+    uint32_t item_idx = item_begin_idx;
+    for (; item_idx + 2 <= item_end_idx; item_idx += 2) {
+        even_sum += values[item_idx];
+        values[item_idx] = even_sum + odd_sum;
+        odd_sum += values[item_idx + 1];
+        values[item_idx + 1] = odd_sum + even_sum;
+    }
+    if (item_idx < item_end_idx) {
+        even_sum += values[item_idx];
+        values[item_idx] = even_sum + odd_sum;
+    }
+    const uint32_t thread_offset = math::cta_exclusive_sum<kNumMetadataThreads>(even_sum + odd_sum, warp_sums);
+    for (item_idx = item_begin_idx; item_idx < item_end_idx; ++item_idx)
+        values[item_idx] += thread_offset;
+    __syncthreads();
+}
+
+// Balance work across SMs by request prefix sum
 template <uint32_t kNextN, bool kIsContextLens2D, bool kIsVarlen,
-          uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t kNumSMs>
-CUTLASS_GLOBAL __launch_bounds__(256, 1)
+          uint32_t SPLIT_KV, uint32_t kNumSMs>
+CUTLASS_GLOBAL __launch_bounds__(kNumMetadataThreads, 1)
 void sm100_paged_mqa_logits_metadata(const uint32_t num_requests,
                                      const uint32_t num_q_tokens_total,
                                      const uint32_t* context_lens,
                                      const uint32_t* indices,
                                      uint32_t* schedule_meta) {
-    // PAGE_KV is unused for metadata; pass SPLIT_KV as a placeholder
-    using Info = RequestInfo<kNextN, kIsContextLens2D, kIsVarlen, BLOCK_Q, SPLIT_KV, SPLIT_KV>;
-
+    const uint32_t thread_idx = threadIdx.x;
+    DG_DEVICE_ASSERT(blockDim.x == kNumMetadataThreads);
     cudaGridDependencySynchronize();  // wait for the primary kernel (CDP launch)
 
-    const uint32_t thread_idx = threadIdx.x;
-    const uint32_t lane_idx = ptx::get_lane_idx();
-    const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
-    const uint32_t num_threads = blockDim.x;
-
-    // smem: per-request work prefix sum + request start token
     extern __shared__ uint32_t smem[];
-    uint32_t* prefix_work = smem;                       // [num_requests]
-    uint32_t* request_q_token_start = smem + num_requests;  // [num_requests]
+    const auto request_q_token_start_idx = smem;                            // [num_requests], varlen only
+    const auto request_work_prefix = smem + (kIsVarlen ? num_requests : 0); // [num_requests]
+    const auto warp_sums = request_work_prefix + num_requests;              // [kNumMetadataWarps]
+    const auto num_logical_requests_shared = warp_sums + kNumMetadataWarps;
 
-    // Logical requests are regular requests for non-varlen and index runs for varlen
     uint32_t num_logical_requests;
     if constexpr (kIsVarlen) {
-        if (thread_idx == 0) {
-            uint32_t r = 0, t = 0;
-            while (t < num_q_tokens_total) {
-                request_q_token_start[r] = t;
-                const uint32_t request_id = indices[t];
-                while (t < num_q_tokens_total and indices[t] == request_id)
-                    ++ t;
-                ++ r;
-            }
-            // Temporarily stash run count for broadcast
-            prefix_work[0] = r;  // temporary: run count
+        // Extract request starts
+        DG_DEVICE_ASSERT(reinterpret_cast<uintptr_t>(indices) % 8 == 0);
+        const uint32_t num_tokens_per_thread = (math::ceil_div(num_q_tokens_total, kNumMetadataThreads * 2) | 1u) * 2;
+        const uint32_t lo = cute::min(thread_idx * num_tokens_per_thread, num_q_tokens_total);
+        const uint32_t hi = cute::min(lo + num_tokens_per_thread, num_q_tokens_total);
+        uint32_t num_request_starts = 0;
+        uint32_t prev_id = lo > 0 and lo < hi ? indices[lo - 1] : 0u;
+        const auto indices_vec2 = reinterpret_cast<const uint2*>(indices);
+        uint32_t token_idx = lo;
+        for (; token_idx + 2 <= hi; token_idx += 2) {
+            const uint2 ids = indices_vec2[token_idx / 2];
+            const bool is_x_start = (token_idx == 0) or (ids.x != prev_id);
+            const bool is_y_start = ids.y != ids.x;
+            num_request_starts += is_x_start + is_y_start;
+            prev_id = ids.y;
         }
+        if (token_idx < hi) {
+            const bool is_request_start = (token_idx == 0) or (indices[token_idx] != prev_id);
+            num_request_starts += is_request_start;
+        }
+        uint32_t request_idx = math::cta_exclusive_sum<kNumMetadataThreads>(num_request_starts, warp_sums);
+        prev_id = lo > 0 and lo < hi ? indices[lo - 1] : 0u;
+        token_idx = lo;
+        for (; token_idx + 2 <= hi; token_idx += 2) {
+            const uint2 ids = indices_vec2[token_idx / 2];
+            const bool is_x_start = (token_idx == 0) or (ids.x != prev_id);
+            const bool is_y_start = ids.y != ids.x;
+            if (is_x_start)
+                request_q_token_start_idx[request_idx ++] = token_idx;
+            if (is_y_start)
+                request_q_token_start_idx[request_idx ++] = token_idx + 1;
+            prev_id = ids.y;
+        }
+        if (token_idx < hi) {
+            const bool is_request_start = (token_idx == 0) or (indices[token_idx] != prev_id);
+            if (is_request_start)
+                request_q_token_start_idx[request_idx ++] = token_idx;
+        }
+        if (thread_idx == kNumMetadataThreads - 1)
+            *num_logical_requests_shared = request_idx;
         __syncthreads();
-        num_logical_requests = prefix_work[0];
-        __syncthreads();
+        num_logical_requests = *num_logical_requests_shared;
     } else {
         num_logical_requests = num_requests;
-        for (uint32_t r = thread_idx; r < num_logical_requests; r += num_threads)
-            request_q_token_start[r] = r * kNextN;
-        __syncthreads();
     }
 
-    // Work per request before prefix sum
-    for (uint32_t r = thread_idx; r < num_logical_requests; r += num_threads) {
-        const auto info = Info::from_q_token(request_q_token_start[r],
-                                             num_q_tokens_total, context_lens, indices);
-        prefix_work[r] = info.num_kv_splits * info.num_q_tokens;
-    }
-    __syncthreads();
-
-    // Inclusive prefix sum by one warp
-    if (warp_idx == 0) {
-        uint32_t carry = 0;
-        for (uint32_t base = 0; base < num_logical_requests; base += 32) {
-            const uint32_t r = base + lane_idx;
-            const uint32_t v = (r < num_logical_requests) ? prefix_work[r] : 0u;
-            const uint32_t scanned = math::warp_inclusive_sum(v, lane_idx) + carry;
-            if (r < num_logical_requests)
-                prefix_work[r] = scanned;
-            carry = __shfl_sync(0xffffffff, scanned, 31);
+    const auto get_request_info = [&](const uint32_t& request_idx,
+                                      uint32_t& q_token_start_idx,
+                                      uint32_t& num_q_tokens,
+                                      uint32_t& context_len) {
+        if constexpr (kIsVarlen) {
+            q_token_start_idx = request_q_token_start_idx[request_idx];
+            const uint32_t q_token_end_idx = request_idx + 1 < num_logical_requests ?
+                                                 request_q_token_start_idx[request_idx + 1] : num_q_tokens_total;
+            num_q_tokens = q_token_end_idx - q_token_start_idx;
+            context_len = context_lens[q_token_end_idx - 1];
+        } else {
+            q_token_start_idx = request_idx * kNextN;
+            num_q_tokens = kNextN;
+            const uint32_t lens_idx = kIsContextLens2D ? request_idx * kNextN + kNextN - 1 : request_idx;
+            context_len = context_lens[lens_idx];
         }
+    };
+
+    // Compute per-request work
+    for (uint32_t request_idx = thread_idx; request_idx < num_logical_requests; request_idx += kNumMetadataThreads) {
+        uint32_t q_token_start_idx, num_q_tokens, context_len;
+        get_request_info(request_idx, q_token_start_idx, num_q_tokens, context_len);
+        request_work_prefix[request_idx] = math::ceil_div(context_len, SPLIT_KV) * num_q_tokens;
     }
     __syncthreads();
 
-    const uint32_t num_total_work = num_logical_requests > 0 ? prefix_work[num_logical_requests - 1] : 0u;
+    if (num_logical_requests > 0) {
+        metadata_prefix_scan(thread_idx, num_logical_requests, request_work_prefix, warp_sums);
+    }
+    const uint32_t num_total_work = num_logical_requests > 0 ? request_work_prefix[num_logical_requests - 1] : 0u;
 
-    // Each thread emits one SM start; remainder is assigned to earlier SMs
-    const uint32_t q = num_total_work / kNumSMs, rem = num_total_work % kNumSMs;
-    for (uint32_t sm_idx = thread_idx; sm_idx <= kNumSMs; sm_idx += num_threads) {
-        const uint32_t w = sm_idx * q + (sm_idx < rem ? sm_idx : rem);
-        // First request whose prefix_work owns work unit `w`
+    // Partition work across SMs
+    const uint32_t q = num_total_work / kNumSMs;
+    const uint32_t rem = num_total_work % kNumSMs;
+    for (uint32_t sm_idx = thread_idx; sm_idx <= kNumSMs; sm_idx += kNumMetadataThreads) {
+        const uint32_t w = sm_idx * q + cute::min(sm_idx, rem);
+        // Find the request containing `w`
         uint32_t lo = 0, hi = num_logical_requests;
         while (lo < hi) {
             const uint32_t mid = (lo + hi) / 2;
-            if (prefix_work[mid] <= w) lo = mid + 1; else hi = mid;
+            if (request_work_prefix[mid] <= w)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
         const uint32_t request_idx = lo;
         uint32_t q_token_idx, kv_split_idx;
         if (request_idx < num_logical_requests) {
-            const uint32_t work_before = (request_idx == 0) ? 0u : prefix_work[request_idx - 1];
-            const uint32_t w_in_request = w - work_before;
-            const auto info = Info::from_q_token(request_q_token_start[request_idx],
-                                                 num_q_tokens_total, context_lens, indices);
+            const uint32_t w_in_request = w - (request_idx == 0 ? 0u : request_work_prefix[request_idx - 1]);
+            uint32_t q_token_start_idx, num_q_tokens, context_len;
+            get_request_info(request_idx, q_token_start_idx, num_q_tokens, context_len);
             // Align SM starts to request/split boundaries
-            q_token_idx = info.q_token_start;
-            kv_split_idx = w_in_request / info.num_q_tokens;
+            q_token_idx = q_token_start_idx;
+            kv_split_idx = w_in_request / num_q_tokens;
         } else {
             // Tail sentinel: one-past-the-end
             q_token_idx = num_q_tokens_total;
@@ -246,7 +301,9 @@ struct SM100PagedMQALogitsScheduler : SM100IndicesStorage<kIsVarlen> {
     }
 
     // Emit the next (Q-block, chunk) task and stash its addressing geometry
-    CUTLASS_DEVICE bool next_q_block(uint32_t& q_block_idx, uint32_t& kv_split_base, uint32_t& num_kv_splits) {
+    template <bool kIsCompressedLogits = false>
+    CUTLASS_DEVICE bool next_q_block(uint32_t& q_block_idx, uint32_t& kv_split_base, uint32_t& num_kv_splits,
+                                     uint32_t* = nullptr, uint32_t* = nullptr) {
         q_block_idx = 0;  // addressing uses stashed state
         if (done)
             return false;

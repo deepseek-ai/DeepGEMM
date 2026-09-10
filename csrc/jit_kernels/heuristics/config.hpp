@@ -32,8 +32,18 @@ struct GemmDesc {
     int get_expected_k() const { return expected_k > 0 ? expected_k : k; }
     int get_expected_num_groups() const { return expected_num_groups > 0 ? expected_num_groups : num_groups; }
 
+    bool is_mxf4_mma() const {
+        return a_dtype == kPackedFP4 and b_dtype == kPackedFP4;
+    }
+
     MmaKind get_mma_kind() const {
-        return a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4;
+        if (a_dtype == torch::kBFloat16)
+            return MmaKind::BF16;
+        return is_mxf4_mma() ? MmaKind::MXF4 : MmaKind::MXFP8FP4;
+    }
+
+    int get_smem_pack_factor() const {
+        return is_mxf4_mma() ? 2 : 1;
     }
 
     void check_validity() const {
@@ -43,7 +53,10 @@ struct GemmDesc {
             DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
             DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
         }
-        DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
+        // FP8 D implies casting with dynamic per-32 UE8M0 SFD output, only exposed for batched GEMMs
+        DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat or
+                       (cd_dtype == torch::kFloat8_e4m3fn and gemm_type == GemmType::Batched and
+                        not with_accumulation));
         DG_HOST_ASSERT(num_sms % 2 == 0);
     }
 
@@ -110,11 +123,13 @@ struct StorageConfig {
 struct PipelineConfig {
     int smem_size;
     int num_stages;
+    int num_tma_store_stages;
 
     friend std::ostream& operator << (std::ostream& os, const PipelineConfig& config) {
         os << "PipelineConfig("
            << "smem_size=" << config.smem_size
-           << ", num_stages=" << config.num_stages << ")";
+           << ", num_stages=" << config.num_stages
+           << ", num_tma_store_stages=" << config.num_tma_store_stages << ")";
         return os;
     }
 };
