@@ -58,7 +58,14 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     DG_STATIC_ASSERT(BLOCK_KV == kNumMathWarps * MMA_M, "BLOCK_KV = warps × MMA_M");
     DG_STATIC_ASSERT(kHeadDim % MMA_K == 0 and kNumHeads % MMA_N == 0, "Alignment");
 
-    static constexpr uint32_t kSwizzleMode = 128;
+    // Must match the host-side TMA descriptors (swizzle_mode = head_dim bytes) and
+    // the `tma::copy<..., kHeadDim>` smem layout: the fp8 row is head_dim bytes, so
+    // the TMA writes are swizzled in head_dim-byte atoms (32B/64B/128B for D=32/64/128).
+    // A hardcoded 128 here only matches D=128; for D=32/64 the readers would un-swizzle
+    // with the wrong pattern and consume out-of-tile shared memory.
+    static constexpr uint32_t kSwizzleMode = kHeadDim;
+    DG_STATIC_ASSERT(kHeadDim == 32 or kHeadDim == 64 or kHeadDim == 128,
+                     "kSwizzleMode must stay within the hardware swizzle modes");
     static constexpr uint32_t kSwizzleAlignment = kHeadDim * 8;
     static constexpr uint32_t kSMEMKBytes = kHeadDim;
 

@@ -53,7 +53,12 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     static constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;
     static constexpr uint32_t kWarpsPerGroup = BLOCK_KV / MMA_M;
     static constexpr uint32_t kNumGroups = kNumMathWarps / kWarpsPerGroup;
-    static constexpr uint32_t kSwizzleMode = 128;
+    // Must match the host-side TMA descriptors (swizzle_mode = head_dim bytes) and the
+    // `tma::copy<..., kHeadDim>` smem layout: the fp8 row is head_dim bytes, so the TMA
+    // writes are swizzled in head_dim-byte atoms (32B/64B/128B for D=32/64/128).
+    static constexpr uint32_t kSwizzleMode = kHeadDim;
+    DG_STATIC_ASSERT(kHeadDim == 32 or kHeadDim == 64 or kHeadDim == 128,
+                     "kSwizzleMode must stay within the hardware swizzle modes");
     static constexpr uint32_t kSMEMKBytes = kHeadDim;
 
     DG_STATIC_ASSERT(kNumTMAThreads == 128, "Expected 128 TMA threads");
