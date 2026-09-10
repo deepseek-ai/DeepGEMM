@@ -8,6 +8,8 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## News
 
+- 2026.09.10: Sparse Indexer, Mega Gate, Mega mHC, DeepJIT, MoE and Indexer optimizations and more.
+    - Please see [#432](https://github.com/deepseek-ai/DeepGEMM/pull/432) for more details.
 - 2026.04.16: Mega MoE, FP8xFP4 GEMM, FP4 Indexer, PDL, faster JIT compilation and more.
     - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) for more details.
     - For Mega MoE benchmarks, refer to [#316](https://github.com/deepseek-ai/DeepGEMM/pull/316).
