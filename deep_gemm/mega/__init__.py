@@ -117,6 +117,75 @@ class SM90SymmBuffer:
         self.group = None
 
 
+# K granularity of the fused kernel's L2 activation scale factor (`l2_act_sf_gran_k`, 64 or 128); fixed when the buffer is
+# sized. Default (None): per-128 K where the 256-wide decode tile fits, i.e. hidden and 2 x intermediate_hidden are multiples
+# of 512 (the 2-CTA pairing needs even N block counts); otherwise per-64 K, whose 128-wide decode tile fits every
+# hidden % 256 == 0.
+def _default_l2_act_sf_gran_k_sm90_fused(hidden: int, intermediate_hidden: int) -> int:
+    return 128 if hidden % 512 == 0 and (2 * intermediate_hidden) % 512 == 0 else 64
+
+
+class SM90FusedSymmBuffer:
+    def __init__(self, group: dist.ProcessGroup,
+                 num_experts: int,
+                 num_max_tokens_per_rank: int, num_topk: int,
+                 hidden: int, intermediate_hidden: int,
+                 use_fp8_dispatch: bool = True,
+                 activation: str = 'swiglu',
+                 num_experts_per_wave: Optional[int] = None,
+                 l2_act_sf_gran_k: Optional[int] = None):
+        self.group = group
+        self.num_experts = num_experts
+        self.num_max_tokens_per_rank = num_max_tokens_per_rank
+        self.num_topk = num_topk
+        self.hidden = hidden
+        self.intermediate_hidden = intermediate_hidden
+        # Wave-size knob; it selects the schedule the buffer is sized for (get_buffer_schedule_sm90_fused in
+        # csrc/jit_kernels/heuristics/sm90_fused_mega_moe.hpp): None (0) = the default, a lag-sized ring running the L2-lag schedule
+        # from 1024 tokens per rank and full-pool buffers below that; -1 = wave schedule, ring sized by the occupancy heuristic;
+        # N > 0 = wave schedule, ring sized for a fixed wave of N experts
+        self.num_experts_per_wave = 0 if num_experts_per_wave is None else num_experts_per_wave
+        self.l2_act_sf_gran_k = l2_act_sf_gran_k if l2_act_sf_gran_k is not None else \
+            _default_l2_act_sf_gran_k_sm90_fused(hidden, intermediate_hidden)
+
+        num_bytes, slice_input_buffers, num_ring_tokens, l2_lag_encoded = \
+            _C.get_symm_buffer_size_for_sm90_fused_mega_moe(
+                group.size(), num_experts,
+                num_max_tokens_per_rank, num_topk,
+                hidden, intermediate_hidden,
+                use_fp8_dispatch, activation,
+                self.num_experts_per_wave, self.l2_act_sf_gran_k,
+            )
+        # Ring capacity (0 = full pool) and encoded L2-lag schedule the buffer was sized for; passed back at every launch
+        self.num_ring_tokens = num_ring_tokens
+        self.l2_lag_encoded = l2_lag_encoded
+        allocator = torch if group.size() == 1 else symm_mem
+        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+        self.handle = (
+            types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+            if group.size() == 1
+            else symm_mem.rendezvous(self.buffer, group=group)
+        )
+        self.buffer.zero_()
+        self.group.barrier()
+        torch.cuda.synchronize()
+
+        (self.x, self.x_sf,
+         self.topk_idx, self.topk_weights,
+         self.l1_acts, self.l1_acts_sf,
+         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+
+    def destroy(self):
+        self.handle = None
+        for name in (
+            'x', 'x_sf', 'topk_idx', 'topk_weights',
+            'l1_acts', 'l1_acts_sf', 'l2_acts', 'l2_acts_sf',
+        ):
+            setattr(self, name, None)
+        self.buffer = None
+        self.group = None
+
+
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
@@ -150,7 +219,23 @@ def get_symm_buffer_for_sm90_mega_moe(group: dist.ProcessGroup,
                                       num_max_tokens_per_rank: int, num_topk: int,
                                       hidden: int, intermediate_hidden: int,
                                       use_fp8_dispatch: bool = True,
-                                      activation: str = 'swiglu') -> SM90SymmBuffer:
+                                      activation: str = 'swiglu',
+                                      fused: bool = False,
+                                      num_experts_per_wave: Optional[int] = None,
+                                      l2_act_sf_gran_k: Optional[int] = None
+                                      ) -> Union[SM90SymmBuffer, SM90FusedSymmBuffer]:
+    if fused:
+        num_max_tokens_per_rank = align(
+            num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_fused_mega_moe())
+        return SM90FusedSymmBuffer(
+            group, num_experts,
+            num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden,
+            use_fp8_dispatch, activation,
+            num_experts_per_wave, l2_act_sf_gran_k,
+        )
+    if num_experts_per_wave is not None or l2_act_sf_gran_k is not None:
+        raise ValueError('`num_experts_per_wave` and `l2_act_sf_gran_k` apply to the fused buffer only')
     num_max_tokens_per_rank = align(
         num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_mega_moe())
     return SM90SymmBuffer(
@@ -389,19 +474,44 @@ def bf16_mega_moe(y: torch.Tensor,
 def fp8_mega_moe(y: torch.Tensor,
                  l1_weights: Tuple[torch.Tensor, torch.Tensor],
                  l2_weights: Tuple[torch.Tensor, torch.Tensor],
-                 sym_buffer: SM90SymmBuffer,
+                 sym_buffer: Union[SM90SymmBuffer, SM90FusedSymmBuffer],
                  cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
                  activation_clamp: Optional[float] = None,
-                 fast_math: bool = True):
+                 fast_math: bool = True,
+                 *,
+                 num_tokens_bound: Optional[int] = None):
     """SM90 (Hopper) MegaMoE entry point.
 
     Expects FP8 e4m3 weights and block-(128, 128) float scale factors. The
     weight SF layout matches the convention used by ``DeepSeekV4FlashFp8`` /
     DeepEP, so the same SF tensors can be physically shared between the
     DeepEP path and this kernel.
+
+    An ``SM90FusedSymmBuffer`` selects the single-kernel implementation.
+    ``num_tokens_bound`` (fused only) is an upper bound on this call's
+    per-rank token count on every rank; ``None`` uses the buffer capacity.
     """
+    if isinstance(sym_buffer, SM90FusedSymmBuffer):
+        _C.sm90_fused_fp8_mega_moe(
+            y,
+            l1_weights, l2_weights,
+            cumulative_local_expert_recv_stats,
+            sym_buffer.buffer,
+            sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank,
+            sym_buffer.num_experts, sym_buffer.num_topk,
+            recipe,
+            activation, activation_clamp,
+            fast_math,
+            sym_buffer.num_ring_tokens,
+            0 if num_tokens_bound is None else num_tokens_bound,
+            sym_buffer.l2_lag_encoded, sym_buffer.l2_act_sf_gran_k
+        )
+        return
+    if num_tokens_bound is not None:
+        raise ValueError('`num_tokens_bound` applies to the fused buffer only')
     _C.fp8_mega_moe(
         y,
         l1_weights, l2_weights,
