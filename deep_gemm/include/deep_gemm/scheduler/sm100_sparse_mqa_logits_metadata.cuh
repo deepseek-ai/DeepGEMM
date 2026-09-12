@@ -118,6 +118,7 @@ CUTLASS_DEVICE void balance_wave_entries(ScheduleEntry* schedule_entries, const 
                                         (rank + kNumSMs - wave_idx * kNumSMs / num_waves) % kNumSMs;
             wave_entries[dst_sm_idx] = entries[entry_idx];
         }
+        __syncwarp();
     }
 }
 

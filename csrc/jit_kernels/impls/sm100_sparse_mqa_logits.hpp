@@ -22,6 +22,7 @@ static int64_t get_num_metadata_bytes(const int num_q_tokens, const int num_max_
                                       const bool is_paged, const int num_sms) {
     DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
+    DG_HOST_ASSERT(num_sms > 0 and num_sms <= 256);
     const int64_t num_kv_blocks_per_split = split_kv / sparse_block_kv;
     const int64_t num_kv_split_bytes = sizeof(KVSplitHeader) + num_kv_blocks_per_split * sizeof(KVBlockInfo);
     const int64_t num_max_kv_splits = is_paged ?
@@ -132,27 +133,30 @@ static void __instantiate_kernel() {{
     }
 }
 
-static void launch_sm100_sparse_mqa_logits_metadata(const bool is_paged,
-                                                    const bool use_unaligned_ks,
-                                                    const int page_kv,
-                                                    const int num_kv_tokens,
-                                                    const int block_table_stride,
-                                                    const torch::Tensor& sparse_kv_block_indices,
-                                                    const torch::Tensor& metadata,
-                                                    const torch::Tensor& workspace,
-                                                    const int split_kv,
-                                                    const int sparse_block_kv,
-                                                    const int* cu_seq_len_k_start,
-                                                    const int* cu_seq_len_k_end,
-                                                    const int* context_lens,
-                                                    const int* block_table,
-                                                    const int* indices) {
+static void launch_sparse_mqa_logits_metadata(const bool is_paged,
+                                               const bool use_unaligned_ks,
+                                               const int page_kv,
+                                               const int num_kv_tokens,
+                                               const uint32_t block_table_stride,
+                                               const torch::Tensor& sparse_kv_block_indices,
+                                               const torch::Tensor& metadata,
+                                               const torch::Tensor& workspace,
+                                               const int split_kv,
+                                               const int sparse_block_kv,
+                                               const int* cu_seq_len_k_start,
+                                               const int* cu_seq_len_k_end,
+                                               const int* context_lens,
+                                               const int* block_table,
+                                               const int* indices) {
     constexpr int kNumMetadataThreads = 256;
     constexpr int kNumKVSplitsPerEntry = 8;
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 or arch_major == 12);
     DG_HOST_ASSERT(not is_paged or not use_unaligned_ks);
     const int num_q_tokens = static_cast<int>(sparse_kv_block_indices.size(0));
     const int num_max_sparse_blocks = static_cast<int>(sparse_kv_block_indices.size(1));
     const int num_sms = runtime->get_num_sms();
+    DG_HOST_ASSERT(num_sms > 0 and num_sms <= kNumMetadataThreads);
     const int num_ctas = std::min(is_paged ? num_q_tokens : ceil_div<int>(num_q_tokens, kBlockQ), num_sms * 4);
     const int num_max_merged_kv_blocks = kBlockQ * num_max_sparse_blocks;
     const int num_max_kv_splits = ceil_div<int>(num_max_merged_kv_blocks, split_kv / sparse_block_kv);
@@ -163,9 +167,10 @@ static void launch_sm100_sparse_mqa_logits_metadata(const bool is_paged,
     num_smem_bytes = align(num_smem_bytes, 16);
     const int num_q_block_bytes = align<int>((3 + kBlockQ) * static_cast<int>(sizeof(uint32_t)), 16);
     num_smem_bytes = align(num_smem_bytes + num_q_block_bytes + static_cast<int>(sizeof(uint32_t)), 128);
-    DG_HOST_ASSERT(num_ctas > 0 and num_smem_bytes <= SM100ArchSpec::smem_capacity);
+    const int smem_capacity = arch_major == 10 ? SM100ArchSpec::smem_capacity : jit->device.get_num_smem_bytes();
+    DG_HOST_ASSERT(num_ctas > 0 and num_smem_bytes <= smem_capacity);
 
-    const auto kernel = jit->compile("sm100_sparse_mqa_logits_metadata", std::format(R"(
+    const auto kernel = jit->compile("sparse_mqa_logits_metadata", std::format(R"(
 #include <deep_gemm/scheduler/sm100_sparse_mqa_logits_metadata.cuh>
 
 using namespace deep_gemm;
@@ -191,7 +196,7 @@ static void __instantiate_kernel() {{
             .grid_dim = dim3(num_ctas, 1, 1),
             .block_dim = dim3(kNumMetadataThreads, 1, 1),
         },
-        num_q_tokens, num_kv_tokens,
+        static_cast<uint32_t>(num_q_tokens), static_cast<uint32_t>(num_kv_tokens),
         cu_seq_len_k_start, cu_seq_len_k_end,
         context_lens, block_table, block_table_stride,
         indices,

@@ -17,9 +17,12 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 def pack_ue8m0_to_int(x: torch.Tensor):
+    """Pack non-negative, zero-mantissa scales; validate values only outside capture."""
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
     x_int = x.view(torch.int)
-    assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
+    if not (x.is_cuda and torch.cuda.is_current_stream_capturing()):
+        assert ((x_int >> 31) == 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
+        assert ((x_int & 0x7FFFFF) == 0).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
