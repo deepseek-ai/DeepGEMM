@@ -248,7 +248,7 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
                 group_k = layout_value;
             }
             const auto aligned_group_k = kUsePsumLayout ? math::align(group_k, k_alignment) : group_k;
-            const auto num_group_sf_rows = aligned_group_k / gran_k;
+            const auto num_group_sf_rows = math::ceil_div(aligned_group_k, gran_k);
             group_sf_row_start = num_prefix_sf_rows;
             group_sf_row_end = group_sf_row_start + num_group_sf_rows;
             num_prefix_sf_rows += num_group_sf_rows;

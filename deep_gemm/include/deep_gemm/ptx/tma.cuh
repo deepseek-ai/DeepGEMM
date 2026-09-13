@@ -21,6 +21,11 @@ CUTLASS_DEVICE void tensor_map_replace_global_addr_in_smem(cute::TmaDescriptor* 
     asm volatile ("tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;" :: "r"(smem_int_desc), "l"(new_int64_addr));
 }
 
+CUTLASS_DEVICE void tensor_map_replace_global_dim_in_smem(cute::TmaDescriptor* smem_desc, const uint32_t& new_dim) {
+    auto smem_int_desc = __cvta_generic_to_shared(smem_desc);
+    asm volatile ("tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 0, %1;" :: "l"(smem_int_desc), "r"(new_dim));
+}
+
 CUTLASS_DEVICE void tensor_map_replace_global_inner_dim_stride_in_smem(cute::TmaDescriptor* smem_desc, const uint32_t& new_dim, const uint64_t& new_stride) {
     auto smem_int_desc = __cvta_generic_to_shared(smem_desc);
     asm volatile ("tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 0, %1;" :: "l"(smem_int_desc), "r"(new_dim));

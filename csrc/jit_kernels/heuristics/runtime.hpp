@@ -55,6 +55,11 @@ public:
     }
 
     static int get_theoretical_mk_alignment_for_contiguous_layout(const std::optional<int>& expected_m) {
+        if (jit->device.get_arch_major() == 12) {
+            if (not expected_m.has_value() or expected_m.value() > 64)
+                return 128;
+            return expected_m.value() <= 32 ? 32 : 64;
+        }
         if (jit->device.get_arch_major() != 10)
             return kLegacyMKAlignmentForContiguousLayout;
 

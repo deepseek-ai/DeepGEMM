@@ -31,6 +31,24 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
         DG_HOST_UNREACHABLE("Invalid recipe");
     }
 
+    if (arch_major == 12) {
+        DG_HOST_ASSERT(not psum_layout.has_value() or not num_groups.has_value());
+        if (psum_layout.has_value()) {
+            DG_HOST_ASSERT(psum_layout->is_cuda() and psum_layout->device() == sf.device());
+            DG_HOST_ASSERT(psum_layout->dim() == 1 and psum_layout->is_contiguous() and psum_layout->scalar_type() == torch::kInt);
+        }
+        DG_HOST_ASSERT((gran_mn == 1 or gran_mn == 128) and (gran_k == 32 or gran_k == 128));
+        check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
+        if (sf.scalar_type() == torch::kFloat) {
+            DG_HOST_ASSERT(not disable_ue8m0_cast and "SM120 MMA requires UE8M0 scales");
+            const auto broadcasted = gran_mn == 1 ? sf :
+                sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(gran_mn));
+            return get_mn_major_tma_aligned_packed_ue8m0_tensor(broadcasted, psum_layout);
+        }
+        DG_HOST_ASSERT(gran_mn == 1 and "SM120 prepacked UE8M0 scales must already be per-row");
+        return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, true, false, torch::kInt);
+    }
+
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
@@ -98,18 +116,33 @@ static torch::Tensor transform_k_grouped_sf_into_required_layout(const torch::Te
     const int gran_k = std::get<2>(recipe);
     const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT((arch_major == 9 and gran_k == 128 and k_alignment == 128) or
-                   (arch_major == 10 and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0));
+                   ((arch_major == 10 or arch_major == 12) and (gran_k == 32 or gran_k == 128) and
+                    k_alignment % (arch_major == 12 ? 32 : 128) == 0));
 
     // FP32 on SM90
     if (sf.scalar_type() == torch::kFloat and arch_major == 9)
         return get_mn_major_tma_aligned_tensor(sf);
 
-    // FP32 on SM100
-    if (sf.scalar_type() == torch::kFloat and arch_major == 10)
-        return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(sf, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
+    // FP32 on SM100/SM120
+    if (sf.scalar_type() == torch::kFloat and (arch_major == 10 or arch_major == 12)) {
+        auto sf_input = sf;
+        if (arch_major == 12) {
+            const auto sf_contiguous = sf.is_contiguous() ? sf : sf.contiguous();
+            if (ks_cpu.has_value() and not ks_cpu.value().empty()) {
+                int expected_sf_k = 0;
+                for (const auto k: ks_cpu.value())
+                    expected_sf_k += ceil_div(k, gran_k);
+                sf_input = sf_contiguous.size(0) == expected_sf_k ? sf_contiguous : sf_contiguous.t().contiguous();
+            } else {
+                sf_input = sf_contiguous;
+            }
+        }
+        return get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
+            sf_input, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
+    }
 
-    // Pre-packed UE8M0 is only accepted for gran_k=32 on SM100.
-    if (sf.scalar_type() == torch::kInt and arch_major == 10 and gran_k == 32)
+    // SM120 also retains the legacy gran_k=128 packed input.
+    if (sf.scalar_type() == torch::kInt and ((arch_major == 10 and gran_k == 32) or arch_major == 12))
         return check_k_grouped_packed_ue8m0_tensor(sf, grouped_layout, ks_cpu, gran_k, k_alignment, use_psum_layout);
 
     DG_HOST_UNREACHABLE("Unknown cases");

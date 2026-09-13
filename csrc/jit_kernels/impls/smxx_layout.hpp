@@ -221,7 +221,9 @@ static torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(cons
                                                                             const int gran_k,
                                                                             const int k_alignment,
                                                                             const bool& use_psum_layout) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and (gran_k == 32 or gran_k == 128) and k_alignment % 128 == 0);
+    DG_HOST_ASSERT((jit->device.get_arch_major() == 10 or jit->device.get_arch_major() == 12) and
+                   (gran_k == 32 or gran_k == 128) and
+                   k_alignment % (jit->device.get_arch_major() == 12 ? 32 : 128) == 0);
     const auto [sf_k, mn] = get_shape<2>(sf);
     const auto num_groups = static_cast<int>(grouped_layout.numel());
 
@@ -240,12 +242,13 @@ static torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(cons
     if (has_synced_ks) {
         int ref_sf_k = 0;
         for (const auto k: ks_cpu.value()) {
-            DG_HOST_ASSERT(k % k_alignment == 0 and k % gran_k == 0);
-            const auto group_sf_k = k / gran_k;
+            DG_HOST_ASSERT(k % k_alignment == 0);
+            DG_HOST_ASSERT(jit->device.get_arch_major() == 12 or k % gran_k == 0);
+            const auto group_sf_k = ceil_div(k, gran_k);
             ref_sf_k += group_sf_k;
             packed_sf_k += ceil_div(group_sf_k, 4);
         }
-        DG_HOST_ASSERT(ref_sf_k == sf_k);
+        DG_HOST_ASSERT((jit->device.get_arch_major() == 12 and use_psum_layout) or ref_sf_k == sf_k);
     } else {
         // Exact group sizes are read from the psum layout by the pack kernel.
         // This upper bound allows three tail-padding slots per group.
@@ -290,7 +293,7 @@ static torch::Tensor check_k_grouped_packed_ue8m0_tensor(const torch::Tensor& sf
                                                          const int k_alignment,
                                                          const bool& use_psum_layout) {
     DG_HOST_ASSERT(sf.scalar_type() == torch::kInt);
-    DG_HOST_ASSERT(gran_k == 32);
+    DG_HOST_ASSERT(gran_k == 32 or (jit->device.get_arch_major() == 12 and gran_k == 128));
     DG_HOST_ASSERT(sf.dim() == 2);
     DG_HOST_ASSERT(sf.is_contiguous());
 
