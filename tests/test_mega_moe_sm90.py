@@ -98,9 +98,11 @@ def _swiglu_fp32(
     alpha: float = 1.0,
     up_bias: float = 0.0,
 ) -> torch.Tensor:
-    """SwiGLU with one-sided gate clamp and two-sided up clamp.
+    """Parameterized SwiGLU with one-sided gate clamp and two-sided up clamp.
 
-    Matches the fused kernel: ``silu(min(gate, c)) * clamp(up, -c, c)``.
+    Matches the fused kernel:
+    ``min(gate, c) * sigmoid(alpha * min(gate, c))
+    * (clamp(up, -c, c) + up_bias)``.
     """
     n2 = gate_up.size(-1)
     half = n2 // 2

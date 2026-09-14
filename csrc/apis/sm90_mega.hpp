@@ -182,6 +182,11 @@ static void fp8_mega_moe(
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE requires recipe=(128, 128, 128)");
     if (activation != "swiglu" and activation != "swigluoai")
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE supports swiglu and swigluoai only");
+    if (activation == "swiglu" and
+        (activation_alpha != 1.0f or activation_up_bias != 0.0f))
+        DG_HOST_UNREACHABLE(
+            "SM90 FP8 MegaMoE swiglu requires activation_alpha=1.0 and "
+            "activation_up_bias=0.0; use swigluoai for parameterized SwiGLU");
 
     // Activation checks
     const auto activation_clamp =
