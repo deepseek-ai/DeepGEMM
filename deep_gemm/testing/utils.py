@@ -22,6 +22,9 @@ def test_filter(condition: Callable):
     return decorator
 
 
+test_filter.__test__ = False
+
+
 def ignore_env(name: str, condition: Callable):
     def decorator(func):
         @functools.wraps(func)
