@@ -92,7 +92,12 @@ def _stable_name_seed(name: str) -> int:
 
 # PyTorch reference
 
-def _swiglu_fp32(gate_up: torch.Tensor, clamp: float) -> torch.Tensor:
+def _swiglu_fp32(
+    gate_up: torch.Tensor,
+    clamp: float,
+    alpha: float = 1.0,
+    up_bias: float = 0.0,
+) -> torch.Tensor:
     """SwiGLU with one-sided gate clamp and two-sided up clamp.
 
     Matches the fused kernel: ``silu(min(gate, c)) * clamp(up, -c, c)``.
@@ -103,7 +108,7 @@ def _swiglu_fp32(gate_up: torch.Tensor, clamp: float) -> torch.Tensor:
     if math.isfinite(clamp):
         gate = gate.clamp(max=clamp)
         up = up.clamp(min=-clamp, max=clamp)
-    return torch.nn.functional.silu(gate) * up
+    return gate * torch.sigmoid(alpha * gate) * (up + up_bias)
 
 
 def _reference_fused(
@@ -115,6 +120,8 @@ def _reference_fused(
     num_experts: int, num_topk: int,
     hidden: int, intermediate_hidden: int,
     activation_clamp: float,
+    activation_alpha: float = 1.0,
+    activation_up_bias: float = 0.0,
 ) -> torch.Tensor:
     """Reference: returns (num_tokens, hidden) bf16 result for *this* rank.
 
@@ -190,7 +197,9 @@ def _reference_fused(
             del l1_w_sel
 
             # SwiGLU + clamp + multiply by topk weight
-            l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)   # (S, IH)
+            l1_y = _swiglu_fp32(
+                l1_y, activation_clamp, activation_alpha, activation_up_bias
+            ) * weights.unsqueeze(-1)   # (S, IH)
 
             # Per-row, per-64-col FP8 quantize -> dequantize
             s_, ih = l1_y.shape
@@ -235,6 +244,9 @@ def _run_scenario(
     num_topk = cfg['num_topk']
     masked_ratio = cfg.get('masked_ratio', 0.0)
     activation_clamp = cfg.get('activation_clamp', 10.0)
+    activation = cfg.get('activation', 'swiglu')
+    activation_alpha = cfg.get('activation_alpha', 1.0)
+    activation_up_bias = cfg.get('activation_up_bias', 0.0)
     fast_math = cfg.get('fast_math', True)
 
     assert num_experts % num_ranks == 0, f'{name}: experts {num_experts} not divisible by ranks {num_ranks}'
@@ -286,6 +298,7 @@ def _run_scenario(
         group, num_experts,
         num_max, num_topk,
         hidden, intermediate_hidden,
+        activation=activation,
     )
     cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
 
@@ -302,7 +315,9 @@ def _run_scenario(
         y_fused, transformed_l1, transformed_l2, buffer,
         cumulative_local_expert_recv_stats=cum_stats,
         recipe=(128, 128, 128),
-        activation='swiglu',
+        activation=activation,
+        activation_alpha=activation_alpha,
+        activation_up_bias=activation_up_bias,
         activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
         fast_math=fast_math,
     )
@@ -322,6 +337,8 @@ def _run_scenario(
         num_experts, num_topk,
         hidden, intermediate_hidden,
         activation_clamp,
+        activation_alpha,
+        activation_up_bias,
     )
 
     diff = calc_diff(y_fused, y_ref)
@@ -437,6 +454,15 @@ def _layer4_edges(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     for c in (1.0, 10.0, math.inf):
         cfg = dict(base); cfg.update(num_tokens=128, activation_clamp=c)
         out.append((f'L4.clamp{c}', cfg))
+    cfg = dict(base)
+    cfg.update(
+        num_tokens=128,
+        activation='swigluoai',
+        activation_alpha=1.702,
+        activation_up_bias=1.0,
+        activation_clamp=7.0,
+    )
+    out.append(('L4.oai_swiglu', cfg))
     # fast_math toggle
     for fm in (True, False):
         cfg = dict(base); cfg.update(num_tokens=128, fast_math=fm)
