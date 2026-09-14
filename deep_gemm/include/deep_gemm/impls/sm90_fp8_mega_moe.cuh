@@ -106,6 +106,8 @@ struct MegaMoEPhasePolicy {
     uint32_t kNumEpilogueThreads, \
     uint32_t kNumSMs, uint32_t kNumRanks, \
     float kActivationClamp, \
+    float kActivationAlpha, \
+    float kActivationUpBias, \
     bool kFastMath, \
     bool kFP8SwapAB = false, \
     bool kBF16ScaledAccumRequested = false
@@ -151,7 +153,8 @@ struct MegaMoEPhasePolicy {
     kNumExpertsPerWave, BLOCK_M, BLOCK_N, BLOCK_K, kNumMaxPoolTokens, \
     kNumPaddedSFPoolTokens, kSFPoolStrideTokens, kNumStages, kNumDispatchThreads, \
     kNumNonEpilogueThreads, kNumEpilogueThreads, kNumSMs, kNumRanks, \
-    kActivationClamp, kFastMath, kFP8SwapAB, kBF16ScaledAccumRequested
+    kActivationClamp, kActivationAlpha, kActivationUpBias, kFastMath, \
+    kFP8SwapAB, kBF16ScaledAccumRequested
 
 template <typename MegaMoEPhase, DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
 CUTLASS_DEVICE void
@@ -1686,7 +1689,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             if (is_linear1_phase) {
                 if constexpr (kSwapABActive) {
                     auto silu = [](float x) -> float {
-                        const float e = kFastMath ? __expf(-x) : expf(-x);
+                        const float e = kFastMath ? __expf(-kActivationAlpha * x) :
+                                                   expf(-kActivationAlpha * x);
                         const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
                         return x * sig;
                     };
@@ -1712,7 +1716,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 .get_data_buffer(m_idx + token_0)
                                 .template get_base_ptr<float>();
                             smem_cd_swap_l1_fp32[token_0 * L1_OUT_BLOCK_N + out_col_base] =
-                                silu(g0) * u0 * weight_0;
+                                silu(g0) * (u0 + kActivationUpBias) * weight_0;
                         }
                         if (token_1 < valid_m) {
                             float g1 = final_accum[i * 4 + 1];
@@ -1723,7 +1727,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 .get_data_buffer(m_idx + token_1)
                                 .template get_base_ptr<float>();
                             smem_cd_swap_l1_fp32[token_1 * L1_OUT_BLOCK_N + out_col_base] =
-                                silu(g1) * u1 * weight_1;
+                                silu(g1) * (u1 + kActivationUpBias) * weight_1;
                         }
                     };
 
@@ -1828,14 +1832,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         float u_r1_c1 = final_accum[up*4   + 3]; clamp_up(u_r1_c1);
 
                         auto silu = [](float x) {
-                            const float e = kFastMath ? __expf(-x) : expf(-x);
+                            const float e = kFastMath ? __expf(-kActivationAlpha * x) :
+                                                       expf(-kActivationAlpha * x);
                             const float sig = kFastMath ? math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
                             return x * sig;
                         };
 
                         if (valid_r0) {
-                            swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
-                            swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
+                            swiglu_r0[p][0] = silu(g_r0_c0) * (u_r0_c0 + kActivationUpBias);
+                            swiglu_r0[p][1] = silu(g_r0_c1) * (u_r0_c1 + kActivationUpBias);
                             amax_r0[sf_group] = cute::max(
                                 amax_r0[sf_group],
                                 cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
@@ -1844,8 +1849,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             swiglu_r0[p][1] = 0.0f;
                         }
                         if (valid_r1) {
-                            swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
-                            swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
+                            swiglu_r1[p][0] = silu(g_r1_c0) * (u_r1_c0 + kActivationUpBias);
+                            swiglu_r1[p][1] = silu(g_r1_c1) * (u_r1_c1 + kActivationUpBias);
                             amax_r1[sf_group] = cute::max(
                                 amax_r1[sf_group],
                                 cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
