@@ -17,12 +17,16 @@ struct LaunchArgs {
     int smem_size;
     int cluster_dim;
     bool enable_pdl;
+    // the kernel asked for programmatic dependent launch itself (matching griddepcontrol wait/trigger in its code); the attribute is then set even when the global `deep_gemm.set_pdl` flag is off
+    bool force_pdl;
 
-    LaunchArgs(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1, const bool& enable_pdl = true):
-        grid_dim({grid_dim_x, 1}), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim), enable_pdl(enable_pdl) {}
+    LaunchArgs(const int& grid_dim_x, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1, const bool& enable_pdl = true,
+               const bool& force_pdl = false):
+        grid_dim({grid_dim_x, 1}), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim), enable_pdl(enable_pdl), force_pdl(force_pdl) {}
 
-    LaunchArgs(const std::pair<int, int>& grid_dim, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1, const bool& enable_pdl = true):
-        grid_dim(grid_dim), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim), enable_pdl(enable_pdl) {}
+    LaunchArgs(const std::pair<int, int>& grid_dim, const int& num_threads, const int& smem_size = 0, const int& cluster_dim = 1, const bool& enable_pdl = true,
+               const bool& force_pdl = false):
+        grid_dim(grid_dim), num_threads(num_threads), smem_size(smem_size), cluster_dim(cluster_dim), enable_pdl(enable_pdl), force_pdl(force_pdl) {}
 };
 
 class KernelRuntime final {
@@ -143,7 +147,8 @@ public:
 
         // Allow runtime override from Python.
         // NOTES: the default is enabled.
-        launch_args.enable_pdl = device_runtime->get_pdl();
+        // a kernel compiled with griddepcontrol (force_pdl) keeps the attribute even with the global flag off
+        launch_args.enable_pdl = launch_args.force_pdl or device_runtime->get_pdl();
 
         const dim3 grid_dim = {static_cast<unsigned>(launch_args.grid_dim.first),
                                static_cast<unsigned>(launch_args.grid_dim.second),
