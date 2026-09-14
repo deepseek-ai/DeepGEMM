@@ -45,7 +45,7 @@ if __name__ == '__main__':
             (module_name, name)
             for module_name in [os.path.splitext(f)[0] for f in files if f not in exclude_files]
             for name, obj in inspect.getmembers(importlib.import_module(module_name))
-            if inspect.isfunction(obj) and name.startswith('test') and 'test_filter' not in name
+            if inspect.isfunction(obj) and name.startswith('test') and getattr(obj, '__test__', True)
         ]
     tools = [x.strip() for x in args.tools.split(',')]
 
