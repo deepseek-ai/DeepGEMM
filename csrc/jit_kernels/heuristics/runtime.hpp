@@ -34,6 +34,7 @@ public:
     }
 
     void set_block_size_multiple_of(const int& new_block_m_multiple_of, const int& new_block_n_multiple_of) {
+        DG_HOST_ASSERT(new_block_m_multiple_of > 0 and new_block_n_multiple_of > 0);
         block_m_multiple_of = new_block_m_multiple_of;
         block_n_multiple_of = new_block_n_multiple_of;
     }
