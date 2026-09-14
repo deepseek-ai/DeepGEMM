@@ -98,6 +98,11 @@ struct SM100_U8x8_STSM_T {
     }
 };
 
+/// Memory ordering
+CUTLASS_DEVICE void fence_acq_rel_cta() {
+    asm volatile("fence.acq_rel.cta;" ::: "memory");
+}
+
 /// Shared memory
 CUTLASS_DEVICE uint32_t ld_shared(const uint32_t* ptr) {
     uint32_t ret;
