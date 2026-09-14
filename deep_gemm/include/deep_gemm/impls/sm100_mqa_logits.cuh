@@ -150,6 +150,26 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     constexpr uint32_t kNumSpecializedRegisters = 56;
     constexpr uint32_t kNumMathRegisters = 224;
 
+    const auto clean_logits = [&]() {
+        // Paged schedulers do not provide make_cleaner()
+        if constexpr (kCleanLogits) {
+            const auto cleaner = epilogue::LogitsCleaner<logits_dtype_t>(lane_idx);
+
+            // Cleaning always runs grid-stride
+            auto scheduler = make_scheduler(sm_idx).make_cleaner(sm_idx);
+            uint32_t q_block_idx, kv_base, num_kv_splits;
+            while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
+                const auto coverage_end = cute::min(kv_base + num_kv_splits * SPLIT_KV, logits_stride);
+                #pragma unroll 1
+                for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
+                    const auto row = logits + scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
+                    cleaner.fill_row(row, 0, kv_base);
+                    cleaner.fill_row(row, coverage_end, logits_stride);
+                }
+            }
+        }
+    };
+
     cudaGridDependencySynchronize();
 
     if (warp_idx == kSpecWarpStart) {
@@ -353,22 +373,9 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     } else if (warp_idx == kSpecWarpStart + 3) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
-        if constexpr (kCleanLogits) {
-            const auto cleaner = epilogue::LogitsCleaner<logits_dtype_t>(lane_idx);
-
-            // Cleaning always runs grid-stride
-            auto scheduler = make_scheduler(sm_idx).make_cleaner(sm_idx);
-            uint32_t q_block_idx, kv_base, num_kv_splits;
-            while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
-                const auto coverage_end = cute::min(kv_base + num_kv_splits * SPLIT_KV, logits_stride);
-                #pragma unroll 1
-                for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                    const auto row = logits + scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
-                    cleaner.fill_row(row, 0, kv_base);
-                    cleaner.fill_row(row, coverage_end, logits_stride);
-                }
-            }
-        }
+        // Keep FP8 cleanup concurrent; MX reuses this warp and register budget at the tail
+        if constexpr (kCleanLogits and not kIsMXSF)
+            clean_logits();
     } else if (warp_idx < kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
@@ -532,13 +539,24 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             smem.empty_q_barriers[q_stage_idx].arrive();
         }
 
+        // Synchronize math warps before releasing TMEM
         cutlass::arch::NamedBarrier(kNumMathThreads, 0).sync();
         if (warp_idx == 0)
             cute::TMEM::Allocator1Sm().free(0, kNumTmemCols);
     }
+
+    if constexpr (kCleanLogits and kIsMXSF) {
+        // Deferring MX cleanup improves performance on GB200 with NVCC 13.3.33
+        // TODO: re-evaluate this scheduling choice on other GPUs and toolchains
+        // All warp roles must reach user barrier 1, separate from the math-only barrier 0
+        cutlass::arch::NamedBarrier(kNumSpecializedThreads + kNumMathThreads, 1).sync();
+        if (warp_idx == kSpecWarpStart + 3)
+            clean_logits();
+    }
 }
 
 // Unified contiguous-KV entry for FP8 / MXFP4 / MXFP8.
+// All launched threads must reach the core's deferred MX cleanup barrier; no early returns
 template <uint32_t kNumHeads, uint32_t kHeadDim,
           bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits,
           bool kUseSchedule,
