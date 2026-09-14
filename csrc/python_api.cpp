@@ -13,6 +13,7 @@
 #include "apis/mega_moe.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"
+#include "apis/torch_ops.hpp"   // registers torch.ops.deep_gemm.* (TORCH_LIBRARY)
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
