@@ -17,9 +17,26 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 def pack_ue8m0_to_int(x: torch.Tensor):
+    """Pack a float32 tensor of UE8M0 scale factors into int32 (4 bytes per int).
+
+    Precondition: every element must be a power-of-two with zero mantissa and
+    non-negative sign (i.e. produced by ``ceil_to_ue8m0`` or the literal 1.0
+    padding). Violating this precondition silently produces wrong packed values
+    because the downstream GEMM/MHA kernels only validate shape/dtype, not
+    numerical content.
+
+    CUDA-graph-capture safe: ``.all()`` triggers a device→host sync which raises
+    ``cudaErrorStreamCaptureUnsupported`` inside a capture region. We therefore
+    skip the value assertions during capture and run them otherwise so that
+    direct callers outside capture still get a loud error on bad input.
+    """
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
     x_int = x.view(torch.int)
-    assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
+    if not (x.is_cuda and torch.cuda.is_current_stream_capturing()):
+        # Bit-level check: sign bit == 0, mantissa bits == 0.
+        # (float round-based checks fail for subnormals like 2^-126.)
+        assert ((x_int >> 31) == 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
+        assert ((x_int & 0x7FFFFF) == 0).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
