@@ -2,24 +2,35 @@
 
 #include "../utils/compatibility.hpp"
 
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm100_tf32_hc_prenorm_gemm.hpp"
 #include "../jit_kernels/impls/sm120_tf32_hc_prenorm_gemm.hpp"
-#endif
+#include <c10/cuda/CUDAGuard.h>
+#include <limits>
 
 namespace deep_gemm::hyperconnection {
 
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
                                  const torch::Tensor& b,
                                  const torch::Tensor& d,
                                  const torch::Tensor& sqr_sum,
                                  const std::optional<int>& num_splits) {
+    DG_HOST_ASSERT(a.is_cuda());
+    for (const auto& t: {b, d, sqr_sum})
+        DG_HOST_ASSERT(t.is_cuda() and t.device() == a.device());
+    const c10::cuda::CUDAGuard device_guard(a.device());
+    const auto& prop = *at::cuda::getDeviceProperties(a.get_device());
+    const auto& cached = jit->device.get_prop();
+    DG_HOST_ASSERT(cached.major == prop.major and cached.minor == prop.minor
+                   and cached.multiProcessorCount == prop.multiProcessorCount
+                   and cached.sharedMemPerBlockOptin == prop.sharedMemPerBlockOptin);
     // A and B must be K-major, D must be N-major
     DG_HOST_ASSERT(get_major_type_ab(a) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(b) == cute::UMMA::Major::K);
-    check_major_type_cd(d);
+    // Empty split outputs have a nonzero batch stride in PyTorch; SM120 accepts them as a no-op.
+    // Keep the existing SM90/SM100 layout validation unchanged.
+    if (cached.major != 12 or a.size(0) != 0)
+        check_major_type_cd(d);
 
     // S must be contiguous
     DG_HOST_ASSERT(sqr_sum.is_contiguous());
@@ -48,26 +59,45 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         return;
 
     // Dispatch into different implements
-    const auto arch_major = device_runtime->get_arch_major();
-    if (arch_major == 12) {
-        sm120_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
-    } else if (arch_major == 9) {
+    const auto arch_major = jit->device.get_arch_major();
+    if (arch_major == 9) {
         sm90_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else if (arch_major == 10) {
         sm100_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
+    } else if (arch_major == 12) {
+        const int splits = num_splits.value_or(1);
+        for (const auto& t: {a, b, d, sqr_sum})
+            for (const auto size: t.sizes())
+                DG_HOST_ASSERT(size <= std::numeric_limits<int>::max());
+        DG_HOST_ASSERT(m <= std::numeric_limits<int>::max() - 127 and k <= std::numeric_limits<int>::max() / 4);
+        DG_HOST_ASSERT(n <= 128 and n % 8 == 0 and k % 64 == 0);
+        DG_HOST_ASSERT(static_cast<int64_t>(m) * splits <= std::numeric_limits<int>::max());
+        const auto aligned_input = [](const torch::Tensor& t) {
+            if (reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0 and
+                t.stride(0) > 0 and t.stride(0) <= std::numeric_limits<int>::max() / t.element_size() and
+                (t.stride(0) * t.element_size()) % 16 == 0)
+                return t;
+            auto copy = torch::empty(t.sizes(), t.options());
+            copy.copy_(t);
+            return copy;
+        };
+        const auto native_a = aligned_input(a);
+        const auto native_b = aligned_input(b);
+        const bool direct_d = d.is_contiguous() and reinterpret_cast<uintptr_t>(d.data_ptr()) % 8 == 0;
+        const auto native_d = direct_d ? d : torch::empty(d.sizes(), d.options());
+        sm120_tf32_hc_prenorm_gemm(native_a, native_b, native_d, sqr_sum, m, n, k, splits);
+        if (not direct_d)
+            d.copy_(native_d);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 }
 
-#endif
 
 static void register_apis(pybind11::module_& m) {
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     m.def("tf32_hc_prenorm_gemm", &tf32_hc_prenorm_gemm,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("sqr_sum"),
           py::arg("num_splits") = std::nullopt);
-#endif
 }
 
 } // namespace deep_gemm::hyperconnection

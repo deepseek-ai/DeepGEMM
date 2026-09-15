@@ -58,7 +58,8 @@ void sm120_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     DG_STATIC_ASSERT(BLOCK_KV == kNumMathWarps * MMA_M, "BLOCK_KV = warps × MMA_M");
     DG_STATIC_ASSERT(kHeadDim % MMA_K == 0 and kNumHeads % MMA_N == 0, "Alignment");
 
-    static constexpr uint32_t kSwizzleMode = 128;
+    // Must match the TMA descriptor's swizzle (host passes swizzle_mode = head_dim)
+    static constexpr uint32_t kSwizzleMode = kHeadDim;
     static constexpr uint32_t kSwizzleAlignment = kHeadDim * 8;
     static constexpr uint32_t kSMEMKBytes = kHeadDim;
 

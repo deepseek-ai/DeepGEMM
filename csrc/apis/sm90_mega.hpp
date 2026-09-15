@@ -7,14 +7,12 @@
 #include <tuple>
 #include <vector>
 #include <pybind11/functional.h>
+#include <c10/cuda/CUDAFunctions.h>
 
-#if DG_TENSORMAP_COMPATIBLE
-#include "../jit/compiler.hpp"
-#endif
-#include "../jit/device_runtime.hpp"
+#include <deep_jit/utils/env.hpp>
+#include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
 #include "../utils/layout.hpp"
-#include "../utils/system.hpp"
 
 namespace deep_gemm::mega {
 
@@ -44,9 +42,9 @@ get_symm_buffer_size_for_sm90_mega_moe(
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE requires intermediate_hidden to be a positive multiple of 128");
 
     // Workspace bytes
-    const auto num_max_pool_tokens = layout::get_num_max_pool_tokens(
+    const auto num_max_pool_tokens = layout::nv_moe::get_num_max_pool_tokens(
         num_ranks, num_max_tokens_per_rank, num_topk, num_experts / num_ranks);
-    const auto workspace = layout::Workspace(
+    const auto workspace = layout::nv_moe::Workspace(
         nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
         num_max_pool_tokens);
 
@@ -78,7 +76,7 @@ get_symm_buffer_size_for_sm90_mega_moe(
 
     // BLOCK_M=64 is the worst case for the allocated SF pool capacity.
     const auto num_max_padded_sf_pool_tokens =
-        layout::get_num_sf_ring_tokens(num_max_pool_tokens, 64);
+        layout::nv_moe::get_num_sf_ring_tokens(num_max_pool_tokens, 64);
 
     // L1 input buffer
     const auto l1_token_buffer = layout::Buffer(
@@ -167,8 +165,26 @@ static void fp8_mega_moe(
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
+    DG_HOST_ASSERT(y.dim() == 2);
+    DG_HOST_ASSERT(y.is_cuda() and y.scalar_type() == torch::kBFloat16 and y.is_contiguous());
+    DG_HOST_ASSERT(y.get_device() == c10::cuda::current_device());
+    DG_HOST_ASSERT(l1_weights.dim() == 3);
+    DG_HOST_ASSERT(y.size(1) == l1_weights.size(2));
+    const auto output_device = y.device();
+    const auto is_local_cuda_tensor = [&output_device](const torch::Tensor& tensor) {
+        return tensor.is_cuda() and tensor.device() == output_device;
+    };
+    DG_HOST_ASSERT(is_local_cuda_tensor(l1_weights) and is_local_cuda_tensor(l2_weights));
+    DG_HOST_ASSERT(is_local_cuda_tensor(l1_weights_sf) and is_local_cuda_tensor(l2_weights_sf));
+    DG_HOST_ASSERT(is_local_cuda_tensor(sym_buffer) and sym_buffer.is_contiguous());
+    if (cumulative_local_expert_recv_stats.has_value())
+        DG_HOST_ASSERT(is_local_cuda_tensor(cumulative_local_expert_recv_stats.value()));
+    DG_HOST_ASSERT(sym_buffer_ptrs.size() <= layout::kNumMaxRanks);
+    DG_HOST_ASSERT(rank_idx >= 0 and static_cast<size_t>(rank_idx) < sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(sym_buffer_ptrs[rank_idx] == reinterpret_cast<int64_t>(sym_buffer.data_ptr()));
+
     // Architecture check
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major != 9)
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE requires a compute capability 9.x GPU");
 
@@ -252,16 +268,14 @@ static void fp8_mega_moe(
                      hidden, intermediate_hidden,
                      activation_clamp, fast_math);
 
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG", 0))
         sym_buffer.zero_();
 }
 
 static void register_sm90_apis(pybind11::module_& m) {
-#if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_sm90_mega_moe", &get_token_alignment_for_sm90_mega_moe);
     m.def("get_symm_buffer_size_for_sm90_mega_moe", &get_symm_buffer_size_for_sm90_mega_moe);
     m.def("fp8_mega_moe", &fp8_mega_moe);
-#endif
 }
 
 } // namespace deep_gemm::mega

@@ -2,33 +2,40 @@
 
 #include "../utils/compatibility.hpp"
 
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
-#include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm120_bf16_gemm.hpp"
-#endif
+#include "../jit_kernels/impls/sm120_fp8_fp4_gemm_1d1d.hpp"
+#include <c10/cuda/CUDAGuard.h>
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 
 #include "layout.hpp"
+#include "sm120_gemm.hpp"
+#include "../jit_kernels/impls/sm120_padding.hpp"
 
 namespace deep_gemm::gemm {
 
 static bool early_return(const int& m, const int &n, const int& k,
-                         const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
+                         const torch::Tensor& d, const std::optional<torch::Tensor>& c,
+                         const std::optional<torch::Tensor>& sfd = std::nullopt) {
     // Do nothing if the problem is empty
     if (m == 0 or n == 0)
         return true;
 
     // Checks
+    // NOTES: quantized D never accumulates
+    DG_HOST_ASSERT(not sfd.has_value() or not c.has_value());
     const bool is_cd_same = c.has_value() and c->data_ptr() == d.data_ptr();
     if (is_cd_same)
         DG_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat or
+                   d.scalar_type() == torch::kFloat8_e4m3fn);
+    // NOTES: an FP8 D must come with SFD, and vice versa; kernels without SFD support must not receive FP8 D
+    DG_HOST_ASSERT((d.scalar_type() == torch::kFloat8_e4m3fn) == sfd.has_value());
     if (c.has_value()) {
         check_major_type_cd(c.value());
         DG_HOST_ASSERT(d.scalar_type() == c.value().scalar_type());
@@ -38,6 +45,9 @@ static bool early_return(const int& m, const int &n, const int& k,
     if (k == 0) {
         if (not is_cd_same)
             c.has_value() ? d.copy_(c.value()) : d.zero_();
+        // A zero D dequantizes to zero regardless of the SF content
+        if (sfd.has_value())
+            sfd->zero_();
         return true;
     }
 
@@ -46,16 +56,6 @@ static bool early_return(const int& m, const int &n, const int& k,
         d.copy_(c.value());
     return false;
 }
-
-#if DG_TENSORMAP_COMPATIBLE
-// SM120 MMA consumes K-major operands: repack packed-FP4 (needs `logical_mn`) or copy
-static torch::Tensor sm120_to_k_major(const torch::Tensor& t, const cute::UMMA::Major& major,
-                                      const int& logical_mn) {
-    if (major == cute::UMMA::Major::K)
-        return t;
-    return t.scalar_type() == kPackedFP4 ? fp4_repack_to_k_major(t, logical_mn) : t.contiguous();
-}
-#endif
 
 static int check_k_grouped_args(const std::optional<std::vector<int>>& ks_cpu,
                                 const torch::Tensor& grouped_layout,
@@ -80,80 +80,6 @@ static int check_k_grouped_args(const std::optional<std::vector<int>>& ks_cpu,
     return sum_k_if_ks_cpu_missing;
 }
 
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
-
-// SM120: AB-swap decision must precede the single SF transform, so it owns its own flow
-static void fp8_fp4_gemm_nt_sm120(const std::pair<torch::Tensor, torch::Tensor>& a,
-                                  const std::pair<torch::Tensor, torch::Tensor>& b,
-                                  const torch::Tensor& d,
-                                  const std::optional<torch::Tensor>& c,
-                                  const std::optional<std::tuple<int, int, int>>& recipe,
-                                  const std::optional<std::tuple<int, int>>& recipe_a,
-                                  const std::optional<std::tuple<int, int>>& recipe_b,
-                                  const std::string& compiled_dims,
-                                  const bool& disable_ue8m0_cast,
-                                  const cute::UMMA::Major& major_a,
-                                  const cute::UMMA::Major& major_b,
-                                  const int& m, const int& n, const int& k) {
-    // Force K-major operands
-    const auto a_data = sm120_to_k_major(a.first, major_a, m);
-    const auto b_data = sm120_to_k_major(b.first, major_b, n);
-    constexpr auto k_major = cute::UMMA::Major::K;
-
-    const bool is_mixed_fp4 = (a_data.scalar_type() != b_data.scalar_type()) and
-                              (a_data.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
-    DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0);
-
-    // AB-swap for small-M decode: swap A↔B so small M becomes N (BN=16).
-    // K-major B has N as TMA outer dim — no minimum size restriction.
-    constexpr int kSwapAbMMax = 16;
-    const bool swap_ab = (m >= 1 and m <= kSwapAbMMax
-        and d.stride(-1) == 1 and !is_mixed_fp4 and !c.has_value());
-
-    // Resolve actual granularities, swap if needed
-    int ga, gb, gk;
-    if (recipe.has_value()) {
-        std::tie(ga, gb, gk) = recipe.value();
-    } else if (recipe_a.has_value()) {
-        ga = std::get<0>(recipe_a.value());
-        gb = std::get<0>(recipe_b.value());
-        gk = std::get<1>(recipe_a.value());
-    } else {
-        std::tie(ga, gb, gk) = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
-    }
-
-    std::optional<std::tuple<int, int, int>> eff_recipe = std::nullopt;
-    std::optional<std::tuple<int, int>> eff_recipe_a, eff_recipe_b;
-    if (swap_ab) {
-        eff_recipe_a = std::make_tuple(gb, gk);
-        eff_recipe_b = std::make_tuple(ga, gk);
-    } else if (recipe_a.has_value()) {
-        eff_recipe_a = recipe_a;
-        eff_recipe_b = recipe_b;
-    } else {
-        eff_recipe = recipe;
-    }
-
-    const auto& sf_a_raw = swap_ab ? b.second : a.second;
-    const auto& sf_b_raw = swap_ab ? a.second : b.second;
-    const int eff_m = swap_ab ? n : m;
-    const int eff_n = swap_ab ? m : n;
-
-    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-        sf_a_raw, sf_b_raw, eff_m, eff_n, k, eff_recipe,
-        eff_recipe_a, eff_recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
-
-    if (swap_ab) {
-        sm120_fp8_fp4_gemm_1d1d(b_data, sfa, a_data, sfb, std::nullopt, d,
-                                eff_m, eff_n, k, gran_k_a, gran_k_b,
-                                k_major, k_major, compiled_dims,
-                                std::nullopt, true);
-    } else {
-        sm120_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                k_major, k_major, compiled_dims);
-    }
-}
-
 static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::pair<torch::Tensor, torch::Tensor>& b,
                             const torch::Tensor& d,
@@ -162,11 +88,50 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             std::optional<std::tuple<int, int>> recipe_a,
                             std::optional<std::tuple<int, int>> recipe_b,
                             const std::string& compiled_dims,
-                            const bool& disable_ue8m0_cast) {
+                            const bool& disable_ue8m0_cast,
+                            const std::optional<float>& alpha) {
+    if (a.first.is_cuda() and at::cuda::getDeviceProperties(a.first.get_device())->major == 12) {
+        const c10::cuda::CUDAGuard device_guard(a.first.device());
+        DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+        const auto major_a = get_major_type_ab(a.first), major_b = get_major_type_ab(b.first);
+        if (fp8_fp4_requires_k_major(a.first, b.first)) {
+            DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+        }
+        const auto [m, k] = check_ab_fp8_fp4(a.first, major_a, 12);
+        const auto [n, bk] = check_ab_fp8_fp4(b.first, major_b, 12);
+        const auto [dm, dn] = get_shape<2>(d);
+        DG_HOST_ASSERT(m == dm and n == dn and k == bk);
+        DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(d.stride(1) == 1 and d.stride(0) >= n);
+        for (const auto& tensor: {a.second, b.first, b.second, d})
+            DG_HOST_ASSERT(tensor.is_cuda() and tensor.device() == a.first.device());
+        if (c.has_value()) {
+            DG_HOST_ASSERT(c->device() == d.device() and c->sizes() == d.sizes() and c->scalar_type() == d.scalar_type());
+            DG_HOST_ASSERT(c->stride(1) == 1 and c->stride(0) >= n);
+        }
+        if (not recipe.has_value() and not recipe_a.has_value() and not recipe_b.has_value())
+            recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+        DG_HOST_ASSERT(recipe_a.has_value() == recipe_b.has_value() and recipe.has_value() != recipe_a.has_value());
+        const auto ra = recipe.has_value() ? std::make_tuple(std::get<0>(*recipe), std::get<2>(*recipe)) : *recipe_a;
+        const auto rb = recipe.has_value() ? std::make_tuple(std::get<1>(*recipe), std::get<2>(*recipe)) : *recipe_b;
+        DG_HOST_ASSERT(std::get<0>(ra) > 0 and std::get<0>(rb) > 0);
+        DG_HOST_ASSERT(a.second.scalar_type() != torch::kInt or std::get<0>(ra) == 1);
+        DG_HOST_ASSERT(b.second.scalar_type() != torch::kInt or std::get<0>(rb) == 1);
+        DG_HOST_ASSERT((std::get<1>(ra) == 32 or std::get<1>(ra) == 128) and
+                       (std::get<1>(rb) == 32 or std::get<1>(rb) == 128));
+        DG_HOST_ASSERT(not disable_ue8m0_cast or (a.second.scalar_type() == torch::kInt and b.second.scalar_type() == torch::kInt));
+        DG_HOST_ASSERT(a.first.scalar_type() == b.first.scalar_type() or k % 128 == 0);
+        if (early_return(m, n, k, d, c))
+            return;
+        fp8_fp4_gemm_nt_sm120(a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims,
+                              disable_ue8m0_cast, major_a, major_b, m, n, k, alpha);
+        return;
+    }
+
     // Shape must be `[M, K] @ [N, K].T`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
-    if (fp8_requires_k_major()) {
+    if (fp8_fp4_requires_k_major(a.first, b.first)) {
         DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
         DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
     }
@@ -175,7 +140,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     check_major_type_cd(d);
 
     // Type and shape checks
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
     const auto [n , k_] = check_ab_fp8_fp4(b.first, major_b, arch_major);
     const auto [m_, n_] = get_shape<2>(d);
@@ -186,31 +151,25 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     if (early_return(m, n, k, d, c))
         return;
 
-    // Dispatch into different arch implementations
-    if (arch_major == 9 or arch_major == 10) {
-        // SM90/SM100 share the "transform scaling factors, then dispatch" flow.
-        const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
-            a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
+    // Transform SFA and SFB into compute-required layout
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
 
-        if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
-            const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
-            if (gran_n == 1) {
-                sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
-            } else {
-                const auto major_sfb = get_major_type_ab(sfb);
-                sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
-            }
-        } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
-            sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
-                                    major_a, major_b, compiled_dims);
+    // Dispatch into different implements
+    if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+        DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
+        const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
+        if (gran_n == 1) {
+            sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
         } else {
-            DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
+            const auto major_sfb = get_major_type_ab(sfb);
+            sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, major_sfb, compiled_dims);
         }
-    } else if (arch_major == 12) {
-        fp8_fp4_gemm_nt_sm120(a, b, d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast,
-                              major_a, major_b, m, n, k);
+    } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
+        sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
+                                major_a, major_b, compiled_dims, std::nullopt, alpha);
     } else {
-        DG_HOST_UNREACHABLE("Unsupported architecture");
+        DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
 }
 
@@ -222,9 +181,10 @@ static void fp8_fp4_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::optional<std::tuple<int, int>>& recipe_a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
                             const std::string& compiled_dims,
-                            const bool& disable_ue8m0_cast) {
+                            const bool& disable_ue8m0_cast,
+                            const std::optional<float>& alpha) {
     fp8_fp4_gemm_nt(a, {b.first.transpose(0, 1), b.second.transpose(0, 1)},
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha);
 }
 
 static void fp8_fp4_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -235,10 +195,11 @@ static void fp8_fp4_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::optional<std::tuple<int, int>>& recipe_a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
                             const std::string& compiled_dims,
-                            const bool& disable_ue8m0_cast) {
+                            const bool& disable_ue8m0_cast,
+                            const std::optional<float>& alpha) {
     fp8_fp4_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)},
                     {b.first.transpose(0, 1), b.second.transpose(0, 1)},
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha);
 }
 
 static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -249,9 +210,10 @@ static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::optional<std::tuple<int, int>>& recipe_a,
                             const std::optional<std::tuple<int, int>>& recipe_b,
                             const std::string& compiled_dims,
-                            const bool& disable_ue8m0_cast) {
+                            const bool& disable_ue8m0_cast,
+                            const std::optional<float>& alpha) {
     fp8_fp4_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)}, b,
-                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast);
+                    d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha);
 }
 
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -266,16 +228,24 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const bool& use_psum_layout,
                                                  const bool& ensure_zero_padding,
                                                  const std::optional<int>& expected_m_for_psum_layout) {
+    c10::cuda::OptionalCUDAGuard sm120_guard;
+    if (a.first.is_cuda() and at::cuda::getDeviceProperties(a.first.get_device())->major == 12) {
+        sm120_guard.set_device(a.first.device());
+        DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+        for (const auto& t: {a.second, b.first, b.second, d, grouped_layout})
+            DG_HOST_ASSERT(t.is_cuda() and t.device() == a.first.device());
+        DG_HOST_ASSERT(not disable_ue8m0_cast or (a.second.scalar_type() == torch::kInt and b.second.scalar_type() == torch::kInt));
+    }
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
-    if (fp8_requires_k_major())
+    if (fp8_fp4_requires_k_major(a.first, b.first))
         DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
     DG_HOST_ASSERT(grouped_layout.is_contiguous());
 
     // Type and shape checks
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
     const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
     const auto [m_, n_] = get_shape<2>(d);
@@ -317,14 +287,15 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout);
-    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+    } else if (arch_major == 12) {
+
         const auto b_data = sm120_to_k_major(b.first, major_b, n);
-        const bool is_mixed_fp4 = (a.first.scalar_type() != b_data.scalar_type()) and
-                                  (a.first.scalar_type() == kPackedFP4 or b_data.scalar_type() == kPackedFP4);
-        DG_HOST_ASSERT(!is_mixed_fp4 or k % 128 == 0);
         sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b_data, sfb, d, grouped_layout,
-                                                     num_groups, m, n, k, gran_k_a, gran_k_b, major_a, cute::UMMA::Major::K,
-                                                     compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, cute::UMMA::Major::K,
+                                      compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+        if (ensure_zero_padding)
+            sm120_clear_padding(d, grouped_layout, m, n, num_groups, false, use_psum_layout,
+                                heuristics_runtime->get_mk_alignment_for_contiguous_layout());
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -356,6 +327,14 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
                                              std::optional<std::tuple<int, int>> recipe_b,
                                              const std::string& compiled_dims,
                                              const bool& disable_ue8m0_cast) {
+    c10::cuda::OptionalCUDAGuard sm120_guard;
+    if (a.first.is_cuda() and at::cuda::getDeviceProperties(a.first.get_device())->major == 12) {
+        sm120_guard.set_device(a.first.device());
+        DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+        for (const auto& t: {a.second, b.first, b.second, d, masked_m})
+            DG_HOST_ASSERT(t.is_cuda() and t.device() == a.first.device());
+        DG_HOST_ASSERT(not disable_ue8m0_cast or (a.second.scalar_type() == torch::kInt and b.second.scalar_type() == torch::kInt));
+    }
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -363,7 +342,7 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
     DG_HOST_ASSERT(masked_m.is_contiguous());
 
     // Type and shape checks
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     const auto [num_groups  , m , k ] = check_grouped_ab_fp8_fp4(a.first, major_a, arch_major);
     const auto [num_groups_ , n , k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
     const auto [num_groups__, m_, n_] = get_shape<3>(d);
@@ -390,13 +369,28 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
         sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
                                                  num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
                                                  major_a, major_b, compiled_dims);
-    } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
+    } else if (arch_major == 12) {
         sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(a.first, sfa, b.first, sfb, d, masked_m,
-                                                 num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
-                                                 major_a, major_b, compiled_dims);
+                                      num_groups, m, n, k, expected_m, gran_k_a, gran_k_b,
+                                      major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
+}
+
+static void sm120_check_k_grouped_inputs(const torch::Tensor& a, const torch::Tensor& b,
+                                          const torch::Tensor& d, const std::optional<torch::Tensor>& c,
+                                          const torch::Tensor& grouped_layout) {
+    DG_HOST_ASSERT(a.is_cuda() and jit->device.get_arch_major() == 12);
+    for (const auto& t: {a, b, d, grouped_layout})
+        DG_HOST_ASSERT(t.is_cuda() and t.device() == a.device() and t.is_contiguous());
+    DG_HOST_ASSERT(a.scalar_type() == b.scalar_type() and
+                   (a.scalar_type() == torch::kBFloat16 or a.scalar_type() == torch::kFloat8_e4m3fn));
+    DG_HOST_ASSERT(d.dim() == 3 and d.size(0) > 0 and
+                   (d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat));
+    DG_HOST_ASSERT(grouped_layout.dim() == 1 and grouped_layout.scalar_type() == torch::kInt and grouped_layout.numel() == d.size(0));
+    if (c.has_value())
+        DG_HOST_ASSERT(c->is_cuda() and c->device() == a.device() and c->is_contiguous() and c->sizes() == d.sizes() and c->scalar_type() == d.scalar_type());
 }
 
 static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
@@ -408,19 +402,31 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
                                              const std::tuple<int, int, int>& recipe,
                                              const std::string& compiled_dims,
                                              const bool& use_psum_layout) {
+    c10::cuda::OptionalCUDAGuard sm120_guard;
+    if (a.first.is_cuda() and at::cuda::getDeviceProperties(a.first.get_device())->major == 12) {
+        sm120_guard.set_device(a.first.device());
+        sm120_check_k_grouped_inputs(a.first, b.first, d, c, grouped_layout);
+        DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+        for (const auto& sf: {a.second, b.second})
+            DG_HOST_ASSERT(sf.is_cuda() and sf.device() == a.first.device());
+    }
     // Must be 1D1D kernel
     DG_HOST_ASSERT(std::get<0>(recipe) == 1 and std::get<1>(recipe) == 1);
 
+    // SM120 retains the legacy 32-element layout alignment; its host validates per-group kernel alignment.
+    // All A/B padding must be zero, and the corresponding SF padding must be valid
     const int gran_k = std::get<2>(recipe);
-    DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
     const int k_alignment = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
-    DG_HOST_ASSERT(k_alignment % 32 == 0);
+    DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
+    DG_HOST_ASSERT(k_alignment % (jit->device.get_arch_major() == 12 ? 32 : 128) == 0);
 
-    // Shape checks
+    // A/B use MN-major layouts `[sum_k, M]` and `[sum_k, N]`
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto [sum_k_ , m_] = get_shape<2>(a.first);
     const auto [sum_k__, n_] = get_shape<2>(b.first);
 
+    // Without PSUM layout, `grouped_layout[i]` is the padded K size of group i;
+    // With PSUM layout, it is the logical K end, and the group starts at `align(previous_end, k_alignment)`
     const int sum_k = check_k_grouped_args(ks_cpu, grouped_layout, num_groups,
                                            use_psum_layout, k_alignment, static_cast<int>(a.first.size(0)));
     DG_HOST_ASSERT(m == m_ and n == n_ and sum_k == sum_k_ and sum_k == sum_k__);
@@ -428,35 +434,33 @@ static void k_grouped_fp8_gemm_tn_contiguous(const std::pair<torch::Tensor, torc
     DG_HOST_ASSERT(a.first.is_contiguous());
     DG_HOST_ASSERT(b.first.is_contiguous());
     DG_HOST_ASSERT(d.is_contiguous());
-    DG_HOST_ASSERT(c.has_value() and c.value().is_contiguous());
+    DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
 
     // Early return for trivial cases
     if (early_return(m, n, sum_k, d, c))
         return;
 
-    // Transform SF with padding
-    const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
-    const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
-
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 10) {
+        const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
+        const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
         sm100_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, grouped_layout, gran_k, k_alignment,
-                                      cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout);
+                                       cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout);
     } else if (arch_major == 12) {
-        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
-        // SM120: single transpose [sum_k, M/N] → [M/N, sum_k] with constant stride=sum_k.
-        // Kernel uses kKGroupedConstantStride: per-group only replaces addr+dim, not stride.
-        const auto a_k = a.first.t().contiguous();
-        const auto b_k = b.first.t().contiguous();
-        const auto num_sms = device_runtime->get_num_sms();
-        const auto tensor_map_buffer = torch::empty({num_sms * 4 * static_cast<int>(sizeof(CUtensorMap))},
-                                                    a.first.options().dtype(torch::kByte));
-        sm120_k_grouped_fp8_fp4_gemm_1d1d(a_k, sfa, b_k, sfb, c, d, m, n,
-                                           ks_cpu.value(), grouped_layout, tensor_map_buffer,
-                                           gran_k, gran_k,
-                                           cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims,
-                                           true, sum_k);
+        DG_HOST_ASSERT(use_psum_layout or ks_cpu.has_value());
+        const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
+        const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
+        const auto a_data = a.first.t().contiguous();
+        const auto b_data = b.first.t().contiguous();
+        const auto tensor_map_buffer = torch::empty({runtime->get_num_sms() * 2 * static_cast<int>(sizeof(CUtensorMap))},
+                                                   a.first.options().dtype(torch::kByte));
+        sm120_k_grouped_fp8_fp4_gemm_1d1d(a_data, sfa, b_data, sfb, c, d, m, n,
+                              ks_cpu.value_or(std::vector<int>{}), grouped_layout,
+                              tensor_map_buffer, gran_k, gran_k, cute::UMMA::Major::K, cute::UMMA::Major::K,
+                              compiled_dims, true, sum_k, use_psum_layout, k_alignment);
+        if (not c.has_value())
+            sm120_clear_padding(d, grouped_layout, m, n, num_groups, true, use_psum_layout, k_alignment);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -471,13 +475,33 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                              const std::tuple<int, int, int>& recipe,
                                              const std::string& compiled_dims,
                                              const bool& use_psum_layout) {
+    if (a.first.is_cuda() and at::cuda::getDeviceProperties(a.first.get_device())->major == 12) {
+        const c10::cuda::CUDAGuard guard(a.first.device());
+        sm120_check_k_grouped_inputs(a.first, b.first, d, c, grouped_layout);
+        DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu->empty());
+        DG_HOST_ASSERT(std::get<0>(recipe) == 1 and std::get<1>(recipe) == 1 and
+                       (std::get<2>(recipe) == 32 or std::get<2>(recipe) == 128));
+        const auto [groups, m, n] = get_shape<3>(d);
+        const int total_k = check_k_grouped_args(ks_cpu, grouped_layout, groups, false, 128);
+        DG_HOST_ASSERT(a.first.numel() == static_cast<int64_t>(total_k) * m and b.first.numel() == static_cast<int64_t>(total_k) * n);
+        for (const auto& sf: {a.second, b.second})
+            DG_HOST_ASSERT(sf.is_cuda() and sf.device() == a.first.device());
+        if (early_return(m, n, total_k, d, c)) return;
+        const auto sa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, 128, false);
+        const auto sb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, 128, false);
+        const auto tensor_map_buffer = torch::empty({runtime->get_num_sms() * 2 * static_cast<int>(sizeof(CUtensorMap))},
+                                                   a.first.options().dtype(torch::kByte));
+        sm120_k_grouped_fp8_fp4_gemm_1d1d(a.first, sa, b.first, sb, c, d, m, n, *ks_cpu, grouped_layout,
+                              tensor_map_buffer, std::get<2>(recipe), std::get<2>(recipe),
+                              cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
+        if (not c.has_value())
+            sm120_clear_padding(d, grouped_layout, m, n, groups, true, false, 128);
+        return;
+    }
     // Must be 1D1D kernel
-    DG_HOST_ASSERT(std::get<0>(recipe) == 1 and std::get<1>(recipe) == 1);
-    const int gran_k = std::get<2>(recipe);
-    DG_HOST_ASSERT(gran_k == 32 or gran_k == 128);
+    DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 128));
 
-    // Shape checks (K-grouped is FP8 only; FP4 K-grouped is not supported)
-    DG_HOST_ASSERT(a.first.scalar_type() != kPackedFP4 and b.first.scalar_type() != kPackedFP4);
     // No psum on FP8 NT
     DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
 
@@ -489,7 +513,6 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                            use_psum_layout, 128);
     DG_HOST_ASSERT(sum_mk == static_cast<int64_t>(sum_k) * m);
     DG_HOST_ASSERT(sum_nk == static_cast<int64_t>(sum_k) * n);
-    const auto arch_major = device_runtime->get_arch_major();
 
     // Contiguity checks
     DG_HOST_ASSERT(a.first.is_contiguous());
@@ -507,31 +530,85 @@ static void k_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
 
     // Allocate tensormap buffer
     // `4` means the double buffering for both A and B operands (2 * 2)
-    const auto num_sms = device_runtime->get_num_sms();
+    const auto num_sms = runtime->get_num_sms();
     const auto tensor_map_buffer = torch::empty({num_sms * 4 * static_cast<int>(sizeof(CUtensorMap))},
                                                 a.first.options().dtype(torch::kByte));
 
     // Dispatch implementation
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         sm90_k_grouped_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, ks_cpu.value(), grouped_layout, tensor_map_buffer,
                                      cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
-    } else if (arch_major == 12) {
-        sm120_k_grouped_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n,
-                                           ks_cpu.value(), grouped_layout, tensor_map_buffer,
-                                           gran_k, gran_k,
-                                           cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 }
-#endif
 
-#if DG_TENSORMAP_COMPATIBLE
+static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                             const std::pair<torch::Tensor, torch::Tensor>& b,
+                                             const torch::Tensor& d,
+                                             const std::optional<std::vector<int>>& ks_cpu,
+                                             const torch::Tensor& grouped_layout,
+                                             const std::optional<torch::Tensor>& c,
+                                             const std::tuple<int, int, int>& recipe,
+                                             const std::string& compiled_dims,
+                                             const bool& use_psum_layout) {
+    if (a.first.is_cuda() and at::cuda::getDeviceProperties(a.first.get_device())->major == 12)
+        DG_HOST_UNREACHABLE("SM120 K-grouped FP4 NT is not implemented; dense and M-grouped FP4 support does not imply K-grouped support");
+    // Must be 1D1D kernel
+    DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 32));
+    DG_HOST_ASSERT(a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4);
+
+    const auto major_a = get_major_type_ab(a.first);
+    const auto major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+
+    // `k_alignment` must be a multiple of `BLOCK_K = 256`
+    // All A/B padding codes must be zero, and the corresponding SF padding must be valid
+    const int k_alignment = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+    DG_HOST_ASSERT(k_alignment % 256 == 0);
+
+    // A/B use K-major logical layouts `[M, sum_k]`/`[N, sum_k]`,
+    // backed by packed-byte storage `[M, sum_k / 2]`/`[N, sum_k / 2]`
+    const auto arch_major = jit->device.get_arch_major();
+    const auto [num_groups, m, n] = get_shape<3>(d);
+    const auto [m_, sum_k_] = check_ab_fp8_fp4(a.first, major_a, arch_major);
+    const auto [n_, sum_k__] = check_ab_fp8_fp4(b.first, major_b, arch_major);
+
+    // Without PSUM layout, `grouped_layout[i]` is the padded K size of group i;
+    // With PSUM layout, it is the logical K end, and the group starts at `align(previous_end, k_alignment)`
+    const int sum_k = check_k_grouped_args(ks_cpu, grouped_layout, num_groups,
+                                           use_psum_layout, k_alignment, sum_k_);
+    DG_HOST_ASSERT(m == m_ and n == n_ and sum_k == sum_k_ and sum_k == sum_k__);
+
+    // Contiguity checks
+    DG_HOST_ASSERT(a.first.is_contiguous());
+    DG_HOST_ASSERT(b.first.is_contiguous());
+    DG_HOST_ASSERT(d.is_contiguous());
+    DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
+
+    // Early return for trivial cases
+    if (early_return(m, n, sum_k, d, c))
+        return;
+
+    // Transform SF with padding
+    const auto sfa = layout::transform_k_grouped_sf_into_required_layout(a.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
+    const auto sfb = layout::transform_k_grouped_sf_into_required_layout(b.second, ks_cpu, grouped_layout, recipe, k_alignment, use_psum_layout);
+
+    // Dispatch implementation
+    if (arch_major == 10) {
+        sm100_k_grouped_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, sum_k, grouped_layout,
+                                      k_alignment, major_a, major_b, compiled_dims, use_psum_layout);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+}
 static void bf16_gemm_nt(const torch::Tensor& a,
                          const torch::Tensor& b,
                          const torch::Tensor& d,
                          const std::optional<torch::Tensor>& c,
-                         const std::string& compiled_dims) {
+                         const std::string& compiled_dims,
+                         const std::optional<float>& alpha) {
     // Shape must be `[M, K] @ [N, K].T`
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
@@ -548,19 +625,35 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
 
+    if (at::cuda::getDeviceProperties(a.get_device())->major == 12) {
+        const c10::cuda::CUDAGuard device_guard(a.device());
+        DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+        DG_HOST_ASSERT(b.device() == a.device() and d.device() == a.device());
+        if (c.has_value())
+            DG_HOST_ASSERT(c->device() == a.device() and c->sizes() == d.sizes());
+        if (early_return(m, n, k, d, c))
+            return;
+        sm120_bf16_gemm(sm120_to_k_major(a, major_a, m), sm120_to_k_major(b, major_b, n),
+                        c, d, m, n, k, cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims, alpha);
+        return;
+    }
+
     // Early return for trivial cases
     if (early_return(m, n, k, d, c))
         return;
 
     // Dispatch into different implements
-    const auto arch_major = device_runtime->get_arch_major();
+    if (not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()) {
+        cublaslt_gemm(a, b, d, m, n, k, major_a, major_b, c.has_value(), alpha.value_or(1.0f));
+        return;
+    }
+
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
+        DG_HOST_ASSERT(not alpha.has_value() and "BF16 GEMM alpha requires SM100");
         sm90_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
     } else if (arch_major == 10) {
-        sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims);
-    } else if (arch_major == 12) {
-        sm120_bf16_gemm(sm120_to_k_major(a, major_a, m), sm120_to_k_major(b, major_b, n),
-                        c, d, m, n, k, cute::UMMA::Major::K, cute::UMMA::Major::K, compiled_dims);
+        sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, alpha);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -570,24 +663,27 @@ static void bf16_gemm_nn(const torch::Tensor& a,
                          const torch::Tensor& b,
                          const torch::Tensor& d,
                          const std::optional<torch::Tensor>& c,
-                         const std::string& compiled_dims) {
-    bf16_gemm_nt(a, b.transpose(0, 1), d, c, compiled_dims);
+                         const std::string& compiled_dims,
+                         const std::optional<float>& alpha) {
+    bf16_gemm_nt(a, b.transpose(0, 1), d, c, compiled_dims, alpha);
 }
 
 static void bf16_gemm_tn(const torch::Tensor& a,
                          const torch::Tensor& b,
                          const torch::Tensor& d,
                          const std::optional<torch::Tensor>& c,
-                         const std::string& compiled_dims) {
-    bf16_gemm_nt(a.transpose(0, 1), b.transpose(0, 1), d, c, compiled_dims);
+                         const std::string& compiled_dims,
+                         const std::optional<float>& alpha) {
+    bf16_gemm_nt(a.transpose(0, 1), b.transpose(0, 1), d, c, compiled_dims, alpha);
 }
 
 static void bf16_gemm_tt(const torch::Tensor& a,
                          const torch::Tensor& b,
                          const torch::Tensor& d,
                          const std::optional<torch::Tensor>& c,
-                         const std::string& compiled_dims) {
-    bf16_gemm_nt(a.transpose(0, 1), b, d, c, compiled_dims);
+                         const std::string& compiled_dims,
+                         const std::optional<float>& alpha) {
+    bf16_gemm_nt(a.transpose(0, 1), b, d, c, compiled_dims, alpha);
 }
 
 static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torch::Tensor& b,
@@ -596,6 +692,13 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
                                               const bool& use_psum_layout,
                                               const bool& ensure_zero_padding,
                                               const std::optional<int>& expected_m_for_psum_layout) {
+    c10::cuda::OptionalCUDAGuard sm120_guard;
+    if (a.is_cuda() and at::cuda::getDeviceProperties(a.get_device())->major == 12) {
+        sm120_guard.set_device(a.device());
+        DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+        for (const auto& t: {b, d, grouped_layout})
+            DG_HOST_ASSERT(t.is_cuda() and t.device() == a.device());
+    }
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
@@ -626,12 +729,24 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
     // D must be N-major
     check_major_type_cd(d);
 
+    if (at::cuda::getDeviceProperties(a.get_device())->major == 12) {
+        if (m == 0)
+            return;
+
+        sm120_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout, num_groups, m, n, k,
+                                  major_a, major_b, compiled_dims, use_psum_layout, expected_m_for_psum_layout);
+        if (ensure_zero_padding)
+            sm120_clear_padding(d, grouped_layout, m, n, num_groups, false, use_psum_layout,
+                                heuristics_runtime->get_mk_alignment_for_contiguous_layout());
+        return;
+    }
+
     // Do nothing if empty
     if (m == 0)
         return;
 
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         sm90_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                             num_groups, m, n, k, major_a, major_b, compiled_dims,
@@ -640,10 +755,6 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
         sm100_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
                                              use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout);
-    } else if (arch_major == 12) {
-        sm120_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
-                                             num_groups, m, n, k, major_a, major_b, compiled_dims,
-                                             use_psum_layout, expected_m_for_psum_layout);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -661,6 +772,13 @@ static void m_grouped_bf16_gemm_nn_contiguous(const torch::Tensor& a, const torc
 static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
                                           const torch::Tensor& d, const torch::Tensor& masked_m,
                                           const int& expected_m, const std::string& compiled_dims) {
+    c10::cuda::OptionalCUDAGuard sm120_guard;
+    if (a.is_cuda() and at::cuda::getDeviceProperties(a.get_device())->major == 12) {
+        sm120_guard.set_device(a.device());
+        DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+        for (const auto& t: {b, d, masked_m})
+            DG_HOST_ASSERT(t.is_cuda() and t.device() == a.device());
+    }
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
@@ -683,16 +801,19 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
     // D must be N-major
     check_major_type_cd(d);
 
+    if (at::cuda::getDeviceProperties(a.get_device())->major == 12) {
+        sm120_m_grouped_bf16_gemm_masked(a, b, d, masked_m, num_groups, m, n, k,
+                                  expected_m, major_a, major_b, compiled_dims);
+        return;
+    }
+
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
         sm90_bf16_m_grouped_gemm_masked(a, b, d, masked_m,
                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else if (arch_major == 10) {
         sm100_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
-                                         num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
-    } else if (arch_major == 12) {
-        sm120_m_grouped_bf16_gemm_masked(a, b, d, masked_m,
                                          num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -707,13 +828,19 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                                               const std::optional<torch::Tensor>& c,
                                               const std::string& compiled_dims,
                                               const bool& use_psum_layout) {
+    c10::cuda::OptionalCUDAGuard sm120_guard;
+    if (a.is_cuda() and at::cuda::getDeviceProperties(a.get_device())->major == 12) {
+        sm120_guard.set_device(a.device());
+        sm120_check_k_grouped_inputs(a, b, d, c, grouped_layout);
+        DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    }
     // Shape checks
     const auto [num_groups, m, n] = get_shape<3>(d);
     const auto [sum_k_ , m_] = get_shape<2>(a);
     const auto [sum_k__, n_] = get_shape<2>(b);
 
     const auto k_alignment = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
-    DG_HOST_ASSERT(k_alignment % 32 == 0);
+    DG_HOST_ASSERT(k_alignment % (jit->device.get_arch_major() == 12 ? 32 : 128) == 0);
     const int sum_k = check_k_grouped_args(ks_cpu, grouped_layout, num_groups,
                                            use_psum_layout, k_alignment, static_cast<int>(a.size(0)));
     DG_HOST_ASSERT(m == m_ and n == n_ and sum_k == sum_k_ and sum_k == sum_k__);
@@ -722,16 +849,17 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
     DG_HOST_ASSERT(a.is_contiguous());
     DG_HOST_ASSERT(b.is_contiguous());
     DG_HOST_ASSERT(d.is_contiguous());
-    DG_HOST_ASSERT(c.has_value() and c.value().is_contiguous());
+    DG_HOST_ASSERT(not c.has_value() or c.value().is_contiguous());
 
     // Early return for trivial cases
     if (early_return(m, n, sum_k, d, c))
         return;
 
     // Dispatch implementation
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
-        // No psum on SM90
+        // No direct output or psum on SM90
+        DG_HOST_ASSERT(c.has_value());
         DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
         sm90_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value(), grouped_layout,
                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
@@ -739,15 +867,15 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
         sm100_bf16_k_grouped_gemm(a, b, c, d, m, n, grouped_layout,
                                   cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout);
     } else if (arch_major == 12) {
-        DG_HOST_ASSERT(not use_psum_layout and ks_cpu.has_value() and not ks_cpu.value().empty());
-        sm120_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value(), grouped_layout,
-                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims);
+        DG_HOST_ASSERT(use_psum_layout or ks_cpu.has_value());
+        sm120_bf16_k_grouped_gemm(a, b, c, d, m, n, ks_cpu.value_or(std::vector<int>{}), grouped_layout,
+                                  cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout, k_alignment);
+        if (not c.has_value())
+            sm120_clear_padding(d, grouped_layout, m, n, num_groups, true, use_psum_layout, k_alignment);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 }
-#endif
-
 static void cublaslt_gemm_nt(const torch::Tensor& a, const torch::Tensor& b,
                              const torch::Tensor& d, const std::optional<torch::Tensor>& c) {
     // Shape must be `[M, K] @ [N, K].T`
@@ -782,34 +910,115 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
     cublaslt_gemm_nt(a.transpose(0, 1), b, d, c);
 }
 
+static void cublaslt_nvfp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                                   const std::pair<torch::Tensor, torch::Tensor>& b,
+                                   const torch::Tensor& d,
+                                   const std::optional<torch::Tensor>& c) {
+    // Shape must be `[M, K] @ [N, K].T` with both operands packed FP4 and K-major
+    DG_HOST_ASSERT(a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(a.first.is_contiguous() and b.first.is_contiguous());
+
+    // Type and shape checks
+    // NOTES: shapes are in logical FP4 elements (2 elements per packed byte)
+    const auto [m , packed_k ] = get_shape<2>(a.first);
+    const auto [n , packed_k_] = get_shape<2>(b.first);
+    const auto [m_, n_] = get_shape<2>(d);
+    const auto k = packed_k * 2;
+    DG_HOST_ASSERT(m == m_ and n == n_ and packed_k == packed_k_);
+    DG_HOST_ASSERT(k % 32 == 0);
+
+    // Scaling factors must be UE4M3 bytes (NVFP4 recipe, 16-element blocks) in the
+    // cuBLASLt tiled layout: `[ceil(mn / 128), ceil(k / 64), 32, 4, 4]` in bytes
+    const auto& check_sf = [&](const torch::Tensor& sf, const int& mn) {
+        DG_HOST_ASSERT(sf.scalar_type() == torch::kByte or sf.scalar_type() == torch::kChar);
+        DG_HOST_ASSERT(sf.is_contiguous());
+        DG_HOST_ASSERT(sf.numel() == static_cast<int64_t>(ceil_div(mn, 128)) * ceil_div(k, 64) * 512);
+    };
+    check_sf(a.second, m);
+    check_sf(b.second, n);
+
+    // Early return for trivial cases
+    if (early_return(m, n, k, d, c))
+        return;
+
+    cublaslt_nvfp4_gemm(a.first, a.second, b.first, b.second, d, m, n, k, c.has_value());
+}
+
+static auto get_cublaslt_batched_view(const torch::Tensor& tensor) {
+    DG_HOST_ASSERT(tensor.dim() == 2 or tensor.dim() == 3);
+    return tensor.dim() == 2 ? tensor.unsqueeze(0) : tensor;
+}
+
+static void batched_syrk(const torch::Tensor& a, const torch::Tensor& d) {
+    // D = A @ A.mT. A and D may be either unbatched 2D tensors or batched 3D tensors.
+    const auto a_3d = get_cublaslt_batched_view(a);
+    const auto d_3d = get_cublaslt_batched_view(d);
+    const auto [num_batches, m, k] = get_shape<3>(a_3d);
+    const auto [num_batches_, m_, n_] = get_shape<3>(d_3d);
+    const auto major_a = get_major_type_ab<false>(a_3d);
+    check_major_type_cd<false>(d_3d);
+    DG_HOST_ASSERT(num_batches == num_batches_ and m == m_ and m == n_);
+    DG_HOST_ASSERT(a_3d.scalar_type() == d_3d.scalar_type());
+
+    if (num_batches == 0 or early_return(m, m, k, d_3d, std::nullopt))
+        return;
+    cublaslt_batched_gemm(a_3d, a_3d, d_3d, m, m, k, num_batches, major_a, major_a);
+}
+
+static void batched_symm(const torch::Tensor& a, const torch::Tensor& b,
+                         const torch::Tensor& d) {
+    // D = A @ B. A is symmetric by contract; cuBLASLt executes this as strided-batched GEMM.
+    const auto a_3d = get_cublaslt_batched_view(a);
+    const auto b_3d = get_cublaslt_batched_view(b);
+    const auto d_3d = get_cublaslt_batched_view(d);
+    const auto [num_batches, m, m_] = get_shape<3>(a_3d);
+    const auto [num_batches_b, m_b, k] = get_shape<3>(b_3d);
+    const auto [num_batches_d, m_d, k_d] = get_shape<3>(d_3d);
+    const auto major_a = get_major_type_ab<false>(a_3d);
+    check_major_type_cd<false>(d_3d);
+    DG_HOST_ASSERT(num_batches == num_batches_b and num_batches == num_batches_d);
+    DG_HOST_ASSERT(m == m_ and m == m_b and m == m_d and k == k_d);
+    DG_HOST_ASSERT(a_3d.scalar_type() == b_3d.scalar_type() and a_3d.scalar_type() == d_3d.scalar_type());
+
+    if (num_batches == 0 or early_return(m, k, m, d_3d, std::nullopt))
+        return;
+
+    const auto b_transposed = b_3d.transpose(1, 2);
+    const auto major_b = get_major_type_ab<false>(b_transposed);
+    cublaslt_batched_gemm(a_3d, b_transposed, d_3d, m, k, m, num_batches, major_a, major_b);
+}
+
 static void register_apis(pybind11::module_& m) {
 
-#if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     // FP8 FP4 GEMMs
     m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk",
-          py::arg("disable_ue8m0_cast") = false);
+          py::arg("disable_ue8m0_cast") = false,
+          py::arg("alpha") = std::nullopt);
     m.def("fp8_fp4_gemm_nn", &fp8_fp4_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "nk",
-          py::arg("disable_ue8m0_cast") = false);
+          py::arg("disable_ue8m0_cast") = false,
+          py::arg("alpha") = std::nullopt);
     m.def("fp8_fp4_gemm_tn", &fp8_fp4_gemm_tn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "mn",
-          py::arg("disable_ue8m0_cast") = false);
+          py::arg("disable_ue8m0_cast") = false,
+          py::arg("alpha") = std::nullopt);
     m.def("fp8_fp4_gemm_tt", &fp8_fp4_gemm_tt,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
           py::arg("recipe_a") = std::nullopt, py::arg("recipe_b") = std::nullopt,
           py::arg("compiled_dims") = "mn",
-          py::arg("disable_ue8m0_cast") = false);
+          py::arg("disable_ue8m0_cast") = false,
+          py::arg("alpha") = std::nullopt);
     m.def("m_grouped_fp8_fp4_gemm_nt_contiguous", &m_grouped_fp8_fp4_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("recipe") = std::nullopt,
@@ -846,35 +1055,46 @@ static void register_apis(pybind11::module_& m) {
           py::arg("recipe") = std::make_tuple(1, 1, 128),
           py::arg("compiled_dims") = "mn",
           py::arg("use_psum_layout") = false);
+    m.def("k_grouped_fp4_gemm_nt_contiguous", &k_grouped_fp4_gemm_nt_contiguous,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("ks_cpu"), py::arg("grouped_layout"),
+          py::arg("c") = std::nullopt,
+          py::arg("recipe") = std::make_tuple(1, 1, 32),
+          py::arg("compiled_dims") = "mn",
+          py::arg("use_psum_layout") = false);
 
-    // FP8 GEMM alias names
+    // FP4 and FP8 GEMM alias names
+    m.attr("fp4_gemm_nt") = m.attr("fp8_fp4_gemm_nt");
     m.attr("fp8_gemm_nt") = m.attr("fp8_fp4_gemm_nt");
     m.attr("fp8_gemm_nn") = m.attr("fp8_fp4_gemm_nn");
     m.attr("fp8_gemm_tn") = m.attr("fp8_fp4_gemm_tn");
     m.attr("fp8_gemm_tt") = m.attr("fp8_fp4_gemm_tt");
+    m.attr("m_grouped_fp4_gemm_nt_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nt_contiguous");
     m.attr("m_grouped_fp8_gemm_nt_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nt_contiguous");
     m.attr("m_grouped_fp8_gemm_nn_contiguous") = m.attr("m_grouped_fp8_fp4_gemm_nn_contiguous");
+    m.attr("m_grouped_fp4_gemm_nt_masked") = m.attr("m_grouped_fp8_fp4_gemm_nt_masked");
     m.attr("m_grouped_fp8_gemm_nt_masked") = m.attr("m_grouped_fp8_fp4_gemm_nt_masked");
-#endif
-
-#if DG_TENSORMAP_COMPATIBLE
     // BF16 GEMMs
     m.def("bf16_gemm_nt", &bf16_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
-          py::arg("compiled_dims") = "nk");
+          py::arg("compiled_dims") = "nk",
+          py::arg("alpha") = std::nullopt);
     m.def("bf16_gemm_nn", &bf16_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
-          py::arg("compiled_dims") = "nk");
+          py::arg("compiled_dims") = "nk",
+          py::arg("alpha") = std::nullopt);
     m.def("bf16_gemm_tn", &bf16_gemm_tn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
-          py::arg("compiled_dims") = "mn");
+          py::arg("compiled_dims") = "mn",
+          py::arg("alpha") = std::nullopt);
     m.def("bf16_gemm_tt", &bf16_gemm_tt,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
-          py::arg("compiled_dims") = "mn");
+          py::arg("compiled_dims") = "mn",
+          py::arg("alpha") = std::nullopt);
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("compiled_dims") = "nk",
@@ -895,8 +1115,6 @@ static void register_apis(pybind11::module_& m) {
           py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "mn",
           py::arg("use_psum_layout") = false);
-#endif
-
     // cuBLASLt GEMMs
     m.def("cublaslt_gemm_nt", &cublaslt_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
@@ -906,6 +1124,12 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
     m.def("cublaslt_gemm_tt", &cublaslt_gemm_tt,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
+    m.def("cublaslt_nvfp4_gemm_nt", &cublaslt_nvfp4_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
+    m.def("batched_syrk", &batched_syrk,
+          py::arg("a"), py::arg("d"));
+    m.def("batched_symm", &batched_symm,
+          py::arg("a"), py::arg("b"), py::arg("d"));
 }
 
 } // namespace deep_gemm::gemm

@@ -1,5 +1,5 @@
 # NOTES: current just for CMake-based IDE (e.g. CLion) indexing, the real compilation is done via JIT
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.18)
 project(deep_gemm LANGUAGES CXX CUDA)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
@@ -18,9 +18,11 @@ find_package(pybind11 REQUIRED)
 find_package(Torch REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-include_directories(deep_gemm/include third-party/cutlass/include third-party/cutlass/tools/util/include third-party/fmt/include)
+include_directories(deep_gemm/include third-party/deep_jit/include third-party/cutlass/include third-party/cutlass/tools/util/include)
 include_directories(${CUDA_TOOLKIT_ROOT_DIR}/include/cccl ${TORCH_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS})
 link_directories(${TORCH_INSTALL_PREFIX}/lib ${CUDA_TOOLKIT_ROOT_DIR}/lib64 ${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs)
 

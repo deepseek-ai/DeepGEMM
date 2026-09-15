@@ -19,13 +19,35 @@
 
 namespace deep_gemm {
 
+namespace sm90_paged_mqa_detail {
+
+template <typename T>
+__device__ __forceinline__ T shfl_sync(unsigned mask, T var, int srcLane, int width = 32) {
+
+    using shfl_t = std::conditional_t<sizeof(T) == 4, int,
+                   std::conditional_t<sizeof(T) == 8, long long, long long>>;
+
+    T result;
+    shfl_t* var_ptr = reinterpret_cast<shfl_t*>(&var);
+    shfl_t* result_ptr = reinterpret_cast<shfl_t*>(&result);
+    *result_ptr = __shfl_sync(mask, *var_ptr, srcLane, width);
+
+    if constexpr (sizeof(T) == 16) {
+        *(result_ptr + 1) = __shfl_sync(mask, *(var_ptr + 1), srcLane, width);
+    }
+
+    return result;
+}
+
+} // namespace sm90_paged_mqa_detail
+
 template <uint32_t kNextN, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t BLOCK_KV,
           bool kIsContextLens2D, bool kIsVarlen,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t SPLIT_KV,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
-          uint32_t kNumKVMulticast,
+          uint32_t kNumCTAsPerCluster,
           typename logits_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
@@ -38,8 +60,8 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
                                const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
     DG_STATIC_ASSERT(not kIsVarlen, "Varlen is not supported for SM90 paged MQA logits");
-    constexpr uint32_t kNextNPerCTA = kNextN / kNumKVMulticast;
-    DG_STATIC_ASSERT(kNextN % kNumKVMulticast == 0, "Invalid `kNextN` or `kNumKVMulticast`");
+    constexpr uint32_t kNextNPerCTA = kNextN / kNumCTAsPerCluster;
+    DG_STATIC_ASSERT(kNextN % kNumCTAsPerCluster == 0, "Invalid `kNextN` or `kNumCTAsPerCluster`");
 
     // Types
     using WGMMA = typename mma::sm90::FP8MMASelector<kNextNPerCTA * kNumHeads>::type;
@@ -139,8 +161,8 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
     cudaGridDependencySynchronize();
 
     // Scheduler
-    // Multicast launches one cluster of kNumKVMulticast CTAs per task, so
-    // schedule by cluster while retaining the fixed 64-token compute block.
+    // Cluster CTAs split next_n and load KV independently, without TMA multicast.
+    // Schedule by cluster while retaining the fixed 64-token compute block.
     auto scheduler = sched::SM90PagedMQALogitsScheduler<kNextN, kIsContextLens2D, kIsVarlen, kComputeBlockKV, kNumMathWarpGroups, 1>(
         cute::cluster_id_in_grid().x, batch_size, context_lens, schedule_meta, nullptr);
     DG_STATIC_ASSERT(SPLIT_KV % kComputeBlockKV == 0, "Unaligned SPLIT_KV");
@@ -210,7 +232,7 @@ void sm90_fp8_paged_mqa_logits(const uint32_t batch_size,
                         : 0;
                 }
             }
-            idx_storage_t kv_block_idx = utils::shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
+            idx_storage_t kv_block_idx = sm90_paged_mqa_detail::shfl_sync(0xffffffff, kv_block_idx_storage, kv_block_idx_ptr ++);
 
             // Wait KV consumer release
             CUTE_TIE_DECL(get_kv_pipeline(kv_iter_idx ++), kv_stage_idx, kv_phase);

@@ -1,13 +1,9 @@
-"""Deterministic single-GPU metamorphic regression for FP8xFP4 MegaMoE SiTU."""
+"""Deterministic single-GPU metamorphic and decoded-oracle regression for MegaMoE SiTU."""
 
 import os
 import socket
-import sys
 import unittest
 from typing import Dict, NamedTuple, Optional, Tuple
-
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 import torch
 import torch.distributed as dist
@@ -103,15 +99,96 @@ def _validate_suite(
             f'({low_vs_low:.6f} <= {low_pair_floor:.6f})')
 
 
+def _decode_ue8m0(packed: torch.Tensor) -> torch.Tensor:
+    packed = packed.cpu().to(torch.int64)
+    exponents = torch.stack(
+        [(packed >> shift) & 255 for shift in (0, 8, 16, 24)], dim=-1)
+    return torch.pow(2.0, exponents.flatten(-2).double() - 127).float()
+
+
+def _decode_fp4(pair: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    packed, sf = pair
+    packed = packed.cpu().to(torch.int64)
+    codes = torch.stack((packed & 15, (packed >> 4) & 15), dim=-1).flatten(-2)
+    magnitudes = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device='cpu')
+    values = magnitudes[codes & 7] * torch.where(codes & 8 != 0, -1.0, 1.0)
+    return values * _decode_ue8m0(sf).repeat_interleave(32, dim=-1)
+
+
+def _requantize_fp8(x: torch.Tensor) -> torch.Tensor:
+    groups = x.reshape(x.shape[0], -1, 32)
+    amax = groups.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax.double() / 448.0))).float()
+    return ((groups / scale).to(torch.float8_e4m3fn).float() * scale).reshape_as(x)
+
+
+def _reference(
+        x: torch.Tensor, l1: torch.Tensor, l2: torch.Tensor,
+        topk_idx: torch.Tensor, topk_weights: torch.Tensor, case: Case,
+        *, bf16: bool = False, shared: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        activation_clamp: Optional[float] = None
+) -> torch.Tensor:
+    topk_idx, topk_weights = topk_idx.cpu(), topk_weights.cpu()
+    output = torch.zeros((x.shape[0], l2.shape[1]), dtype=torch.float32, device='cpu')
+    for expert_idx in range(l1.shape[0]):
+        rows, slots = torch.where(topk_idx == expert_idx)
+        if rows.numel() == 0:
+            continue
+        projected = (x[rows].double() @ l1[expert_idx].double().T).float()
+        gate, up = projected.to(torch.bfloat16).float().chunk(2, dim=-1)
+        if activation_clamp is not None:
+            gate = gate.clamp(max=activation_clamp)
+            up = up.clamp(-activation_clamp, activation_clamp)
+        if case.activation == 'situ':
+            gated = torch.sigmoid(gate) * (case.situ_beta * torch.tanh(gate / case.situ_beta))
+            linear = case.situ_linear_beta * torch.tanh(up / case.situ_linear_beta)
+        else:
+            gated, linear = torch.nn.functional.silu(gate), up
+        activated = (gated * linear) * topk_weights[rows, slots, None]
+        quantized = activated.to(torch.bfloat16).float() if bf16 else _requantize_fp8(activated)
+        down = (quantized.double() @ l2[expert_idx].double().T).float().to(torch.bfloat16).float()
+        output.index_add_(0, rows, down)
+    if shared is not None:
+        shared_idx = torch.zeros((x.shape[0], 1), dtype=torch.long, device='cpu')
+        shared_weights = torch.ones((x.shape[0], 1), device='cpu')
+        shared_output = _reference(
+            x, shared[0].unsqueeze(0), shared[1].unsqueeze(0),
+            shared_idx, shared_weights, case, bf16=bf16,
+            activation_clamp=activation_clamp)
+        output += shared_output.float()
+    return output.to(torch.bfloat16)
+
+
+def _validate_oracle(actual: torch.Tensor, reference: torch.Tensor, label: str) -> None:
+    actual = actual.cpu()
+    assert torch.isfinite(actual.float()).all(), label
+    assert torch.isfinite(reference.float()).all(), label
+    if torch.count_nonzero(reference) == 0:
+        assert torch.count_nonzero(actual) == 0, label
+    else:
+        error = _relative_l2(actual, reference)
+        assert error < 0.02, f'{label}: decoded reference relative L2={error:.6f}'
+
+
+def _assert_rejected(call, label: str) -> None:
+    try:
+        call()
+    except (AssertionError, RuntimeError, ValueError):
+        return
+    raise AssertionError(f'Invalid SiTU contract accepted: {label}')
+
+
 def _worker(local_rank: int, master_port: int) -> None:
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = str(master_port)
     os.environ['WORLD_SIZE'] = '1'
     os.environ['RANK'] = '0'
+    os.environ['DG_COMM_KERNEL_DEBUG'] = '0'
 
     buffer = None
     try:
         _, _, group = init_dist(local_rank, NUM_RANKS)
+        torch.set_default_device('cpu')
         generator = torch.Generator(device='cuda')
         generator.manual_seed(20260730)
 
@@ -143,10 +220,12 @@ def _worker(local_rank: int, master_port: int) -> None:
             use_ue8m0=True,
             gran_k=32,
             use_packed_ue8m0=True)
+        l1_fp4, l2_fp4 = _cast_weights_to_fp4(l1_bf16), _cast_weights_to_fp4(l2_bf16)
+        decoded_x = x_fp8.cpu().float() * _decode_ue8m0(x_sf).repeat_interleave(32, dim=-1)
+        decoded_l1, decoded_l2 = _decode_fp4(l1_fp4), _decode_fp4(l2_fp4)
         transformed_l1, transformed_l2 = (
             deep_gemm.transform_weights_for_mega_moe(
-                _cast_weights_to_fp4(l1_bf16),
-                _cast_weights_to_fp4(l2_bf16),
+                l1_fp4, l2_fp4,
                 activation='situ'))
         buffer = deep_gemm.get_symm_buffer_for_mega_moe(
             group,
@@ -158,8 +237,10 @@ def _worker(local_rank: int, master_port: int) -> None:
             mma_type='fp8xfp4',
             activation='situ')
 
-        def run_case(case: Case, fast_math: bool) -> torch.Tensor:
-            buffer.buffer.zero_()
+        stats = torch.arange(NUM_EXPERTS, dtype=torch.int, device='cuda')
+
+        def run_case(case: Case, fast_math: bool, **overrides) -> torch.Tensor:
+            before_stats = stats.clone()
             buffer.x[:NUM_TOKENS].copy_(x_fp8)
             buffer.x_sf[:NUM_TOKENS].copy_(x_sf)
             buffer.topk_idx[:NUM_TOKENS].copy_(topk_idx)
@@ -177,21 +258,57 @@ def _worker(local_rank: int, master_port: int) -> None:
                 'sym_buffer': buffer,
                 'activation': case.activation,
                 'fast_math': fast_math,
+                'cumulative_local_expert_recv_stats': stats,
             }
             if case.activation == 'situ':
                 kernel_kwargs.update(
                     situ_beta=case.situ_beta,
                     situ_linear_beta=case.situ_linear_beta)
+            kernel_kwargs.update(overrides)
             deep_gemm.fp8_fp4_mega_moe(**kernel_kwargs)
             torch.cuda.synchronize()
+            counts = torch.bincount(topk_idx[topk_idx >= 0], minlength=NUM_EXPERTS)
+            assert torch.equal(stats, before_stats + counts)
             return y
 
+        references = {
+            name: _reference(decoded_x, decoded_l1, decoded_l2, topk_idx, topk_weights, case)
+            for name, case in CASES.items()
+        }
         for fast_math in (True, False):
             results = {
                 case_name: run_case(case, fast_math)
                 for case_name, case in CASES.items()
             }
             _validate_suite(results, fast_math)
+            for name, result in results.items():
+                _validate_oracle(result, references[name], f'{fast_math=}/{name}')
+
+        for parameter in ('situ_beta', 'situ_linear_beta'):
+            for value in (None, 0.0, -1.0, float('nan'), float('inf'), -float('inf')):
+                _assert_rejected(
+                    lambda: run_case(CASES['situ_hi'], True, **{parameter: value}),
+                    f'{parameter}={value}')
+            _assert_rejected(
+                lambda: run_case(CASES['swiglu'], True, **{parameter: 1.0}),
+                f'SwiGLU with {parameter}')
+        for clamp in (0.0, 1.0, float('inf')):
+            _assert_rejected(
+                lambda: run_case(CASES['situ_hi'], True, activation_clamp=clamp),
+                f'explicit clamp {clamp}')
+        fp8_l1 = (l1_bf16.to(torch.float8_e4m3fn), transformed_l1[1])
+        fp8_l2 = (l2_bf16.to(torch.float8_e4m3fn), transformed_l2[1])
+        _assert_rejected(
+            lambda: run_case(CASES['situ_hi'], True, l1_weights=fp8_l1, l2_weights=fp8_l2),
+            'FP8xFP8 weights')
+
+        topk_weights[:, 0] = torch.linspace(-1.25, 1.75, NUM_TOKENS, device='cuda')
+        topk_idx[::7] = -1
+        for fast_math in (True, False):
+            for name in ('situ_gate_low', 'situ_linear_low'):
+                case = CASES[name]
+                reference = _reference(decoded_x, decoded_l1, decoded_l2, topk_idx, topk_weights, case)
+                _validate_oracle(run_case(case, fast_math), reference, f'routed/{fast_math=}/{name}')
     finally:
         if buffer is not None:
             buffer.destroy()

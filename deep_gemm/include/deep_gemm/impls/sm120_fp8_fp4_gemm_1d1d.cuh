@@ -22,7 +22,7 @@
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
-#include <deep_gemm/scheduler/gemm.cuh>
+#include <deep_gemm/scheduler/sm120_gemm.cuh>
 
 namespace deep_gemm {
 
@@ -44,7 +44,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
-          uint32_t kSplitKFactor = 1>
+          uint32_t kSplitKFactor = 1,
+          uint32_t kKAlignment = 128>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
@@ -53,6 +54,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              float* gmem_workspace,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
+                             uint32_t shape_cd_m,
+                             const epilogue_type_t epilogue,
+                             uint32_t stride_c_m,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
@@ -84,8 +88,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kNTiles = BLOCK_N / MMA_N;
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
 
-    // Cooperative warp layout: warps split across M and N dimensions
-    static constexpr uint32_t kNWarps = 2;
+    // Cooperative warp layout: warps split across M and N dimensions.
+    // BLOCK_M < 64 cannot feed 4 M-warps (kMTilesPerWarp would be 0), so swap to a 2x4 layout;
+    // it requires BLOCK_N % 32 == 0 (filtered in heuristics).
+    static constexpr uint32_t kNWarps = (BLOCK_M < 64) ? 4 : 2;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -112,7 +118,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kNumTMAStores = kUseTMAStoreEpilogue
         ? BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode : 0;
 
-    static constexpr uint32_t SMEM_TM = (kGemmType == GemmType::KGroupedContiguous ? sizeof(cute::TmaDescriptor) * 2 : 0);
+    static constexpr uint32_t SMEM_TM = (is_k_grouped_contiguous(kGemmType) ? sizeof(cute::TmaDescriptor) * 2 : 0);
     // FP4 uses packed SMEM (4-bit per element = 0.5 bytes), FP8 uses 1 byte per element.
     static constexpr uint32_t kSMEMKBytes = kIsFP4 ? (BLOCK_K / 2) : BLOCK_K;
     static constexpr uint32_t SMEM_A  = BLOCK_M * kSMEMKBytes;
@@ -189,7 +195,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
     // Barrier init (done by warp 1 before producer/consumer split)
     if (warp_idx == 1 and cute::elect_one_sync()) {
-        if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+        if constexpr (is_k_grouped_contiguous(kGemmType)) {
             *smem_tm_a = tensor_map_a_base;
             *smem_tm_b = tensor_map_b_base;
         }
@@ -207,8 +213,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = (kGranKA > kGranKB ? kGranKA : kGranKB) * 4;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs,
-        false, 128u, kSFKAlignment, sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, false>(), kSplitKFactor>(
+    auto scheduler = sched_sm120::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs,
+        false, kKAlignment, kSFKAlignment, sched_sm120::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, false>(), kSplitKFactor>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
@@ -234,7 +240,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     if (__ldg(grouped_layout + m_block_idx * BLOCK_M) < 0)
                         continue;
                 }
-                if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+                if constexpr (is_k_grouped_contiguous(kGemmType)) {
                     if (last_group_idx != scheduler.current_group_idx) {
                         last_group_idx = scheduler.current_group_idx;
 
@@ -243,22 +249,22 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                         if constexpr (kKGroupedConstantStride) {
                             const uint64_t a_k_byte_offset = kIsFP4
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                                ? (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) / 2)
+                                : (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)));
                             const uint64_t b_k_byte_offset = (kIsFP4 || kBIsFP4)
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                                ? (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) / 2)
+                                : (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)));
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_k_byte_offset);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_k_byte_offset);
                             ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
                             ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
                         } else {
                             const uint64_t a_offset = kIsFP4
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
+                                ? (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) * shape_m / 2)
+                                : (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) * shape_m);
                             const uint64_t b_offset = (kIsFP4 || kBIsFP4)
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
+                                ? (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) * shape_n / 2)
+                                : (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) * shape_n);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
                             const uint64_t a_new_stride = kIsFP4
@@ -273,6 +279,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 smem_tm_b, scheduler.current_shape_k, b_new_stride);
                         }
 
+                        // Make sure the tensor maps are not used by in-flight TMA loads before updating GMEM
+                        cute::tma_desc_commit_group();
+                        cute::tma_desc_wait_group();
+                        // Only used to prevent `ptxas` from moving the following GMEM stores before `cute::tma_desc_wait_group()`.
+                        // Shouldn't be needed otherwise, since we only use one thread
+                        __syncwarp(1u << lane_idx);
+
                         *gmem_tm_a = *smem_tm_a;
                         *gmem_tm_b = *smem_tm_b;
                         ptx::tensor_map_release_gpu();
@@ -281,7 +294,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
                 }
 
-                const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
+                const uint32_t current_shape_k = (is_k_grouped_contiguous(kGemmType) ? scheduler.current_shape_k : shape_k);
                 const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
                 uint32_t kb_start = 0, kb_end = num_k_blocks;
                 if constexpr (kSplitKFactor > 1) {
@@ -291,10 +304,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 }
                 constexpr bool kAGroupOffset = (kGemmType == GemmType::MGroupedMasked);
                 const uint32_t m_idx = scheduler.template get_global_idx<kAGroupOffset>(shape_m, BLOCK_M, m_block_idx);
-                constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous);
+                constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or is_k_grouped_contiguous(kGemmType));
                 const uint32_t n_idx = scheduler.template get_global_idx<kBGroupOffset>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
-                const auto tma_a_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_a : &tensor_map_a_base);
-                const auto tma_b_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_b : &tensor_map_b_base);
+                const auto tma_a_desc = (is_k_grouped_contiguous(kGemmType) ? gmem_tm_a : &tensor_map_a_base);
+                const auto tma_b_desc = (is_k_grouped_contiguous(kGemmType) ? gmem_tm_b : &tensor_map_b_base);
 
                 constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
                 const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
@@ -305,17 +318,17 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                     const uint32_t k_idx = kb * BLOCK_K;
                     uint32_t sfa_k, sfb_k;
-                    if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+                    if constexpr (is_k_grouped_contiguous(kGemmType)) {
                         sfa_k = scheduler.current_sf_k_cumsum + kb / kNumSFAStagesPerLoad;
                         sfb_k = scheduler.current_sf_k_cumsum + kb / kNumSFBStagesPerLoad;
                     } else {
                         const uint32_t shape_sfa_k = math::ceil_div(shape_k, BLOCK_K * kNumSFAStagesPerLoad);
                         const uint32_t shape_sfb_k = math::ceil_div(shape_k, BLOCK_K * kNumSFBStagesPerLoad);
                         constexpr bool kSFAGroupOffset = not is_m_grouped_contiguous(kGemmType);
-                        sfa_k = scheduler.template get_global_idx<kSFAGroupOffset, sched::IndexType::SF_K>(
+                        sfa_k = scheduler.template get_global_idx<kSFAGroupOffset, sched_sm120::IndexType::SF_K>(
                             shape_sfa_k, 1, kb / kNumSFAStagesPerLoad, m_block_idx);
                         constexpr bool kSFBGroupOffset = not (kGemmType == GemmType::Normal);
-                        sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched::IndexType::SF_K>(
+                        sfb_k = scheduler.template get_global_idx<kSFBGroupOffset, sched_sm120::IndexType::SF_K>(
                             shape_sfb_k, 1, kb / kNumSFBStagesPerLoad, m_block_idx);
                     }
                     tma::copy<BLOCK_M, BLOCK_K, 0>(&tensor_map_sfa, full_barriers[s], smem_sfa[s], m_block_idx * BLOCK_M, sfa_k, 1);
@@ -355,7 +368,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 if (__ldg(grouped_layout + m_block_idx * BLOCK_M) < 0)
                     continue;
             }
-            const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
+            const uint32_t current_shape_k = (is_k_grouped_contiguous(kGemmType) ? scheduler.current_shape_k : shape_k);
             const uint32_t num_k_blocks_total = math::ceil_div(current_shape_k, BLOCK_K);
             uint32_t num_k_blocks_start = 0, num_k_blocks = num_k_blocks_total;
             if constexpr (kSplitKFactor > 1) {
@@ -374,7 +387,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             // SF-major loop: when gran_k >= BLOCK_K, one packed int32 SF covers
             // kNumSFAStagesPerLoad K-blocks. Load SF into registers once per SF tile,
             // extract with compile-time byte index via cute::for_each.
-            static constexpr bool kUseSFMajorLoop = (kGranKA >= BLOCK_K) and (kGranKB >= BLOCK_K);
+            static constexpr bool kUseSFMajorLoop = (kGranKA >= BLOCK_K) and (kGranKB >= BLOCK_K)
+                and (kNumSFAStagesPerLoad == kNumSFBStagesPerLoad);
             static_assert(!kUseSFMajorLoop || kNumSFAStagesPerLoad == kNumSFBStagesPerLoad,
                 "SF-major loop requires matching A/B SF tile sizes");
             static constexpr uint32_t kSFTileKBlocks = kUseSFMajorLoop ? kNumSFAStagesPerLoad : 1;
@@ -808,6 +822,169 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             }
                         }
                     }
+                } else {
+                    sm120::SwizzleContext<kSwizzleBMode> b_ctx[kBKMajor ? kNTilesPerWarp : 1];
+                    if constexpr (kBKMajor) {
+                        #pragma unroll
+                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                            int b_row = (lane_idx & 7) + (n_tile_base + nt) * 8;
+                            b_ctx[nt].init(b_row, kSMEMKBytes);
+                        }
+                    }
+                    uint32_t a_frag[2][kMTilesPerWarp][4];
+                    uint32_t b_tile[2][kNTilesPerWarp][2];
+                    sf_t sfa_bytes[2][kMTilesPerWarp];
+                    sf_t sfb_bytes[2][kNTilesPerWarp];
+                    sf_t sfa_hoisted[kMTilesPerWarp];
+                    sf_t sfb_hoisted[kNTilesPerWarp];
+
+                    if constexpr (kGranKB >= BLOCK_K) {
+                        #pragma unroll
+                        for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                            auto packed = sm120::load_sf(smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id);
+                            if constexpr (kIsFP4) {
+                                uint8_t b = sm120_mma::extract_sf_byte(packed, sf_byte_b_base);
+                                sfb_hoisted[nt] = static_cast<uint16_t>(b) | (static_cast<uint16_t>(b) << 8);
+                            } else {
+                                sfb_hoisted[nt] = sm120_mma::extract_sf_byte(packed, sf_byte_b_base);
+                            }
+                        }
+                    }
+                    if constexpr (kGranKA >= BLOCK_K) {
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                            auto packed = sm120::load_sf(smem_sfa[stage],
+                                (m_tile_base + mt) * MMA_M + group_id + (thread_id & 1) * 8);
+                            if constexpr (kIsFP4) {
+                                uint8_t b = sm120_mma::extract_sf_byte(packed, sf_byte_a_base);
+                                sfa_hoisted[mt] = static_cast<uint16_t>(b) | (static_cast<uint16_t>(b) << 8);
+                            } else {
+                                sfa_hoisted[mt] = sm120_mma::extract_sf_byte(packed, sf_byte_a_base);
+                            }
+                        }
+                    }
+
+                    auto load_kstep = [&](int buf, uint32_t ks) {
+                        if constexpr (kBKMajor) {
+                            if constexpr (kBIsFP4) {
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                    sm120::load_b_fragment_b4x16_p64(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
+                                    b_tile[buf][nt][0] <<= 2;
+                                    b_tile[buf][nt][1] <<= 2;
+                                }
+                            } else {
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
+                                    sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
+                            }
+                        } else {
+                            static constexpr uint32_t kBSwizzleB = kSwizzleBMode > 0 ? (__builtin_ctz(kSwizzleBMode) - 4) : 0;
+                            static constexpr uint32_t kBSwizzleMask = kSwizzleBMode > 0 ? ((1u << kBSwizzleB) - 1) : 0;
+                            static constexpr uint32_t kBSwizzleRowShift = kSwizzleBMode > 0 ? (7 - __builtin_ctz(BLOCK_N)) : 0;
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                const uint32_t n_col = (n_tile_base + nt) * MMA_N + group_id;
+                                uint8_t v[8];
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i) {
+                                    const uint32_t k = ks * MMA_K + thread_id * 4 + i;
+                                    const uint32_t xor_bits = kSwizzleBMode > 0
+                                        ? (((k >> kBSwizzleRowShift) & kBSwizzleMask) << 4) : 0;
+                                    v[i] = static_cast<uint8_t>(smem_b[stage][k * BLOCK_N + (n_col ^ xor_bits)]);
+                                }
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i) {
+                                    const uint32_t k = ks * MMA_K + 16 + thread_id * 4 + i;
+                                    const uint32_t xor_bits = kSwizzleBMode > 0
+                                        ? (((k >> kBSwizzleRowShift) & kBSwizzleMask) << 4) : 0;
+                                    v[4+i] = static_cast<uint8_t>(smem_b[stage][k * BLOCK_N + (n_col ^ xor_bits)]);
+                                }
+                                b_tile[buf][nt][0] = v[0] | (uint32_t(v[1]) << 8) | (uint32_t(v[2]) << 16) | (uint32_t(v[3]) << 24);
+                                b_tile[buf][nt][1] = v[4] | (uint32_t(v[5]) << 8) | (uint32_t(v[6]) << 16) | (uint32_t(v[7]) << 24);
+                            }
+                        }
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                            if constexpr (kAIsFP4) {
+                                sm120::load_a_fragment_b4x16(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
+                                a_frag[buf][mt][0] <<= 2; a_frag[buf][mt][1] <<= 2;
+                                a_frag[buf][mt][2] <<= 2; a_frag[buf][mt][3] <<= 2;
+                            } else {
+                                sm120::load_a_fragment(a_frag[buf][mt], smem_a[stage], a_ctx[mt], lane_idx, ks, kLdmK);
+                            }
+
+                        if constexpr (kGranKA < BLOCK_K or kGranKB < BLOCK_K) {
+                            const uint32_t sf_step = (kb * kKSteps + ks);
+                            if constexpr (kIsFP4) {
+                                const uint32_t sf_byte_a = (sf_step * MMA_K / kGranKA) % 4;
+                                const uint32_t sf_byte_b = (sf_step * MMA_K / kGranKB) % 4;
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                    auto packed = sm120::load_sf(smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id);
+                                    if constexpr (kGranKB <= 32)
+                                        sfb_bytes[buf][nt] = sm120_mma::extract_sf_pair(packed, sf_byte_b);
+                                    else {
+                                        uint8_t b = sm120_mma::extract_sf_byte(packed, sf_byte_b);
+                                        sfb_bytes[buf][nt] = static_cast<uint16_t>(b) | (static_cast<uint16_t>(b) << 8);
+                                    }
+                                }
+                                #pragma unroll
+                                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                                    auto packed = sm120::load_sf(smem_sfa[stage],
+                                        (m_tile_base + mt) * MMA_M + group_id + (thread_id & 1) * 8);
+                                    if constexpr (kGranKA <= 32)
+                                        sfa_bytes[buf][mt] = sm120_mma::extract_sf_pair(packed, sf_byte_a);
+                                    else {
+                                        uint8_t b = sm120_mma::extract_sf_byte(packed, sf_byte_a);
+                                        sfa_bytes[buf][mt] = static_cast<uint16_t>(b) | (static_cast<uint16_t>(b) << 8);
+                                    }
+                                }
+                            } else {
+                                const uint32_t sf_byte_a = (sf_step * MMA_K / kGranKA) % 4;
+                                const uint32_t sf_byte_b = (sf_step * MMA_K / kGranKB) % 4;
+                                #pragma unroll
+                                for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
+                                    sfb_bytes[buf][nt] = sm120_mma::extract_sf_byte(
+                                        sm120::load_sf(smem_sfb[stage], (n_tile_base + nt) * MMA_N + group_id), sf_byte_b);
+                                #pragma unroll
+                                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt)
+                                    sfa_bytes[buf][mt] = sm120_mma::extract_sf_byte(
+                                        sm120::load_sf(smem_sfa[stage],
+                                            (m_tile_base + mt) * MMA_M + group_id + (thread_id & 1) * 8), sf_byte_a);
+                            }
+                        }
+                    };
+
+                    auto compute_kstep = [&](int buf) {
+                        #pragma unroll
+                        for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                            const sf_t sfa = (kGranKA >= BLOCK_K) ? sfa_hoisted[mt] : sfa_bytes[buf][mt];
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                                float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
+                                const sf_t sfb = (kGranKB >= BLOCK_K) ? sfb_hoisted[nt] : sfb_bytes[buf][nt];
+                                if constexpr (kAIsFP4)
+                                    sm120_mma::fp4_fp8_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                                else if constexpr (kBIsFP4)
+                                    sm120_mma::fp8_fp4_mixed_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                                else if constexpr (kIsFP4)
+                                    sm120_mma::fp4_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                                else
+                                    sm120_mma::fp8_mma_block_scaled(d, a_frag[buf][mt], b_tile[buf][nt], sfa, sfb);
+                            }
+                        }
+                    };
+
+                    load_kstep(0, 0);
+                    #pragma unroll
+                    for (uint32_t ks = 0; ks < kKSteps; ++ks) {
+                        int cur = ks & 1;
+                        int nxt = (ks + 1) & 1;
+                        if (ks < kKSteps - 1)
+                            load_kstep(nxt, ks + 1);
+                        compute_kstep(cur);
+                    }
                 }
 
                 if (lane_idx == 0)
@@ -1174,11 +1351,14 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 }
             } else {
             // Normal epilogue (non-split-K)
+            epilogue.apply_values(*reinterpret_cast<uint32_t(*)[kAccumPerWarp]>(accum));
             constexpr bool kEpilogueGroupOffset = not is_m_grouped_contiguous(kGemmType);
-            const uint32_t m_base = scheduler.template get_global_idx<kEpilogueGroupOffset>(shape_m, BLOCK_M, m_block_idx);
+            const uint32_t m_base = scheduler.template get_global_idx<kEpilogueGroupOffset>(
+                kGemmType == GemmType::MGroupedMasked ? shape_cd_m : shape_m, BLOCK_M, m_block_idx);
             const uint32_t n_base = n_block_idx * BLOCK_N;
-            const uint32_t total_shape_m = (kGemmType == GemmType::KGroupedContiguous or kGemmType == GemmType::MGroupedMasked)
-                ? shape_m * kNumGroups : shape_m;
+            const uint32_t total_shape_m = kGemmType == GemmType::MGroupedMasked
+                ? scheduler.current_group_idx * shape_cd_m + shape_m
+                : is_k_grouped_contiguous(kGemmType) ? shape_m * (scheduler.current_group_idx + 1) : shape_m;
 
             auto read_cd = [&](const cd_dtype_t& x) -> float {
                 if constexpr (cute::is_same_v<cd_dtype_t, float>) return x;
@@ -1189,6 +1369,13 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             const int64_t cd_m_stride = static_cast<int64_t>(stride_cd_m);
             const int64_t cd_batch_offset = kIsBatchedEpilogue
                 ? static_cast<int64_t>(scheduler.current_group_idx) * stride_cd_batch : 0;
+            auto c_index = [&](int64_t idx) {
+                if constexpr (kGemmType == GemmType::Normal) {
+                    if (stride_cd_n == 0)
+                        return (idx / cd_m_stride) * (stride_c_m != 0 ? stride_c_m : cd_m_stride) + idx % cd_m_stride;
+                }
+                return idx;
+            };
 
             if constexpr (kUseTMAStoreEpilogue) {
                 #pragma unroll
@@ -1226,11 +1413,17 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                         n_base + (n_tile_base + nt) * MMA_N) + thread_id * 2;
                                     if (gr0 < total_shape_m and gc + 1 < shape_n) {
                                         const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
-                                        v0 += read_cd(gmem_c[ci]); v1 += read_cd(gmem_c[ci + 1]);
+                                        v0 += read_cd(gmem_c[c_index(ci)]); v1 += read_cd(gmem_c[c_index(ci) + 1]);
+                                    } else if (gr0 < total_shape_m and gc < shape_n) {
+                                        const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
+                                        v0 += read_cd(gmem_c[c_index(ci)]);
                                     }
                                     if (gr1 < total_shape_m and gc + 1 < shape_n) {
                                         const auto ci = cd_batch_offset + static_cast<int64_t>(gr1) * cd_m_stride + gc;
-                                        v2 += read_cd(gmem_c[ci]); v3 += read_cd(gmem_c[ci + 1]);
+                                        v2 += read_cd(gmem_c[c_index(ci)]); v3 += read_cd(gmem_c[c_index(ci) + 1]);
+                                    } else if (gr1 < total_shape_m and gc < shape_n) {
+                                        const auto ci = cd_batch_offset + static_cast<int64_t>(gr1) * cd_m_stride + gc;
+                                        v2 += read_cd(gmem_c[c_index(ci)]);
                                     }
                                 }
 
@@ -1290,6 +1483,17 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
                 };
 
+                auto row_is_valid = [&](const uint32_t& row) -> bool {
+                    if constexpr (kGemmType == GemmType::MGroupedContiguous) {
+                        return __ldg(grouped_layout + row) >= 0;
+                    } else if constexpr (kGemmType == GemmType::MGroupedMasked) {
+                        return row - scheduler.current_group_idx * shape_m <
+                               static_cast<uint32_t>(__ldg(grouped_layout + scheduler.current_group_idx));
+                    } else {
+                        return true;
+                    }
+                };
+
                 const bool can_pair = (stride_cd_n == 0);
                 const int64_t cd_n_stride = can_pair ? 1 : static_cast<int64_t>(stride_cd_n);
 
@@ -1304,33 +1508,41 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t row1 = row0 + 8;
 
                         if (can_pair) {
-                            if (row0 < total_shape_m and col + 1 < shape_n) {
+                            // Pair store, with a single-element tail for odd shape_n
+                            if (row0 < total_shape_m and col < shape_n and row_is_valid(row0)) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
                                 float v0 = accum[ai + 0], v1 = accum[ai + 1];
-                                if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
-                                store_pair(&gmem_d[idx], v0, v1);
+                                if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[c_index(idx)]); if (col + 1 < shape_n) v1 += read_cd(gmem_c[c_index(idx) + 1]); }
+                                if (col + 1 < shape_n) store_pair(&gmem_d[idx], v0, v1);
+                                else                   gmem_d[idx] = cd_dtype_t(v0);
                             }
-                            if (row1 < total_shape_m and col + 1 < shape_n) {
+                            if (row1 < total_shape_m and col < shape_n and row_is_valid(row1)) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
                                 float v2 = accum[ai + 2], v3 = accum[ai + 3];
-                                if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); v3 += read_cd(gmem_c[idx + 1]); }
-                                store_pair(&gmem_d[idx], v2, v3);
+                                if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[c_index(idx)]); if (col + 1 < shape_n) v3 += read_cd(gmem_c[c_index(idx) + 1]); }
+                                if (col + 1 < shape_n) store_pair(&gmem_d[idx], v2, v3);
+                                else                   gmem_d[idx] = cd_dtype_t(v2);
                             }
                         } else {
                             // Strided store: per-element N bounds check (handles shape_n=1)
-                            if (row0 < total_shape_m) {
+                            auto store_value = [&](int64_t idx, float value) {
+                                if constexpr (kWithAccumulation)
+                                    value += read_cd(gmem_c[c_index(idx)]);
+                                gmem_d[idx] = cd_dtype_t(value);
+                            };
+                            if (row0 < total_shape_m and row_is_valid(row0)) {
                                 auto base = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride;
                                 if (col < shape_n)
-                                    gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 0]);
+                                    store_value(base + static_cast<int64_t>(col) * cd_n_stride, accum[ai + 0]);
                                 if (col + 1 < shape_n)
-                                    gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 1]);
+                                    store_value(base + static_cast<int64_t>(col + 1) * cd_n_stride, accum[ai + 1]);
                             }
-                            if (row1 < total_shape_m) {
+                            if (row1 < total_shape_m and row_is_valid(row1)) {
                                 auto base = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride;
                                 if (col < shape_n)
-                                    gmem_d[base + static_cast<int64_t>(col) * cd_n_stride] = cd_dtype_t(accum[ai + 2]);
+                                    store_value(base + static_cast<int64_t>(col) * cd_n_stride, accum[ai + 2]);
                                 if (col + 1 < shape_n)
-                                    gmem_d[base + static_cast<int64_t>(col + 1) * cd_n_stride] = cd_dtype_t(accum[ai + 3]);
+                                    store_value(base + static_cast<int64_t>(col + 1) * cd_n_stride, accum[ai + 3]);
                             }
                         }
                     }

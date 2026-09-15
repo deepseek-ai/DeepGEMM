@@ -69,6 +69,7 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
         prefix_sum[k * 32 + lane_idx] = x;
         sum = __shfl_sync(0xffffffff, x, 31);
     }
+    __syncwarp();
 
     // SM work distribution
     if constexpr (kIsVarlen) {
@@ -76,7 +77,7 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
         const uint32_t total = sum;
         const uint32_t q = total / kNumSMs, r = total % kNumSMs;
         // NOTES: reversed allocation — first (kNumSMs - r) SMs get `q` segments, last `r` get `q + 1`.
-        // Empty SMs (when total < kNumSMs) land on atom_idx == 0, keeping `refresh_num_kv_and_advance` in-bounds.
+        // Empty SM ranges share a boundary and do not refresh context lengths.
         const uint32_t pivot = kNumSMs - r;
         for (uint32_t sm_idx = lane_idx; sm_idx <= kNumSMs; sm_idx += 32) {
             uint32_t seg_starts = sm_idx * q + (sm_idx > pivot ? sm_idx - pivot : 0);
@@ -96,7 +97,7 @@ void sm90_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t ne
             schedule_metadata[sm_idx * 2 + 1] = kv_split_idx;
         }
     } else {
-        // num_next_n_atoms is host-passed (NV PR #314): SM90 multicast wants 1 while
+        // num_next_n_atoms is host-passed (NV PR #314): SM90 clusters want 1 while
         // SM120 next_n=4 wants 2; computing it inline (next_n / 2) over-schedules by
         // 2x on SM90 and triggers IMA when the scheduler steps past context_lens.
         const uint32_t total = sum * num_next_n_atoms;
@@ -227,7 +228,7 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
         current_advance = 1;
         current_num_kv = 0;
         last_advance = 1;
-        if (exist_q_atom_idx(current_q_atom_idx))
+        if (has_next_task())
             refresh_num_kv_and_advance(current_q_atom_idx);
     }
 
@@ -243,24 +244,20 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
     }
 
     CUTLASS_DEVICE bool fetch_next_task(uint32_t &q_atom_idx, uint32_t &kv_idx, uint32_t &num_kv) {
-        // A zero-context request has no KV task. Metadata naturally assigns it
-        // zero work, but traversal can still cross it between two non-empty
-        // requests; skip all of its atoms before exposing a task to the kernel.
-        while (current_num_kv == 0 and
-               not (current_q_atom_idx == end_q_atom_idx and current_kv_idx == end_kv_idx)) {
+        while (has_next_task() and current_kv_idx >= current_num_kv) {
             current_kv_idx = 0;
             current_q_atom_idx += current_advance;
             if (should_refresh_num_kv(current_q_atom_idx) and exist_q_atom_idx(current_q_atom_idx))
                 refresh_num_kv_and_advance(current_q_atom_idx);
         }
 
+        if (not has_next_task())
+            return false;
+
         q_atom_idx = current_q_atom_idx;
         kv_idx = current_kv_idx;
         num_kv = current_num_kv;
         last_advance = current_advance;
-
-        if (current_q_atom_idx == end_q_atom_idx and current_kv_idx == end_kv_idx)
-            return false;
 
         current_kv_idx += kNumBlocksPerSplit;
         if (current_kv_idx >= current_num_kv) {
@@ -274,7 +271,13 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
     }
 
     CUTLASS_DEVICE bool exist_q_atom_idx(const uint32_t& q_atom_idx) const {
-        return q_atom_idx < end_q_atom_idx or (q_atom_idx == end_q_atom_idx and 0 < end_kv_idx);
+        const bool in_batch = kIsVarlen ? q_atom_idx < batch_size : q_atom_idx / kNumNextNAtoms < batch_size;
+        return in_batch and (q_atom_idx < end_q_atom_idx or (q_atom_idx == end_q_atom_idx and 0 < end_kv_idx));
+    }
+
+    CUTLASS_DEVICE bool has_next_task() const {
+        return exist_q_atom_idx(current_q_atom_idx) and
+               (current_q_atom_idx < end_q_atom_idx or current_kv_idx < end_kv_idx);
     }
 };
 

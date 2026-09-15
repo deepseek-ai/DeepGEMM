@@ -22,7 +22,7 @@
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
-#include <deep_gemm/scheduler/gemm.cuh>
+#include <deep_gemm/scheduler/sm120_gemm.cuh>
 
 namespace deep_gemm {
 
@@ -38,13 +38,17 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           typename cd_dtype_t,
           typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
           bool kBKMajor = true,
-          uint32_t kNWarps_ = 1>
+          uint32_t kNWarps_ = 1,
+          bool kKGroupedConstantStride = false,
+          uint32_t kKAlignment = 128>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                      cutlass::bfloat16_t* gmem_a_ptr, cutlass::bfloat16_t* gmem_b_ptr,
                      int* grouped_layout,
                      cute::TmaDescriptor* tensor_map_buffer,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                     const epilogue_type_t epilogue,
+                     uint32_t stride_d_m, uint32_t stride_c_m,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
@@ -78,7 +82,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kNTiles % kNWarps == 0, "N tiles must divide evenly among N warps");
     DG_STATIC_ASSERT(kMTilesPerWarp >= 1, "Need at least 1 M-tile per warp");
     DG_STATIC_ASSERT(kBKMajor or kNTilesPerWarp > 0, "Need at least one N tile per warp");
-    DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp % 2 == 0, "kNTilesPerWarp must be even for ldmatrix.x2 B loading");
+    DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp == 1 or kNTilesPerWarp % 2 == 0,
+                     "K-major B requires one N-tile or an even number of N-tiles per warp");
 
     static constexpr uint32_t kTMARegisters = 40;
     static constexpr uint32_t kMMARegisters = 232;
@@ -98,7 +103,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kNumTMAStores = kUseTMAStoreEpilogue
         ? BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode : 0;
 
-    static constexpr uint32_t SMEM_TM = (kGemmType == GemmType::KGroupedContiguous ? sizeof(cute::TmaDescriptor) * 2 : 0);
+    static constexpr uint32_t SMEM_TM = (is_k_grouped_contiguous(kGemmType) ? sizeof(cute::TmaDescriptor) * 2 : 0);
     static constexpr uint32_t kSMEMKBytes = BLOCK_K * 2;
     static constexpr uint32_t kSMEMNBytes = BLOCK_N * 2;
     static constexpr uint32_t SMEM_A  = BLOCK_M * kSMEMKBytes;
@@ -146,7 +151,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     __syncwarp();
 
     if (warp_idx == 1 and cute::elect_one_sync()) {
-        if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+        if constexpr (is_k_grouped_contiguous(kGemmType)) {
             *smem_tm_a = tensor_map_a_base;
             *smem_tm_b = tensor_map_b_base;
         }
@@ -162,7 +167,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     cudaGridDependencySynchronize();
 
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs>(
+    auto scheduler = sched_sm120::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs, true, kKAlignment>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
@@ -178,23 +183,28 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         if (is_tma_leader) {
             uint32_t last_group_idx = kNumGroups;
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-                if constexpr (kGemmType == GemmType::KGroupedContiguous) {
+                if constexpr (is_k_grouped_contiguous(kGemmType)) {
                     if (last_group_idx != scheduler.current_group_idx) {
                         last_group_idx = scheduler.current_group_idx;
 
                         const auto a_base = reinterpret_cast<const char*>(gmem_a_ptr);
                         const auto b_base = reinterpret_cast<const char*>(gmem_b_ptr);
-                        const uint64_t a_offset = static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m * 2;
-                        const uint64_t b_offset = static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n * 2;
+                        const uint64_t a_offset = static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) * (kKGroupedConstantStride ? 1 : shape_m) * 2;
+                        const uint64_t b_offset = static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) * (kKGroupedConstantStride ? 1 : shape_n) * 2;
 
                         ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
                         ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
 
-                        const uint64_t new_stride = static_cast<uint64_t>(scheduler.current_shape_k * 2);
-                        ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
-                            smem_tm_a, scheduler.current_shape_k, new_stride);
-                        ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
-                            smem_tm_b, scheduler.current_shape_k, new_stride);
+                        if constexpr (kKGroupedConstantStride) {
+                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
+                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
+                        } else {
+                            const uint64_t new_stride = static_cast<uint64_t>(scheduler.current_shape_k * 2);
+                            ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
+                                smem_tm_a, scheduler.current_shape_k, new_stride);
+                            ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
+                                smem_tm_b, scheduler.current_shape_k, new_stride);
+                        }
 
                         *gmem_tm_a = *smem_tm_a;
                         *gmem_tm_b = *smem_tm_b;
@@ -204,17 +214,17 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     }
                 }
 
-                const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
+                const uint32_t current_shape_k = (is_k_grouped_contiguous(kGemmType) ? scheduler.current_shape_k : shape_k);
                 const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
                 constexpr bool kAGroupOffset = (kGemmType == GemmType::MGroupedMasked);
                 const uint32_t m_idx = scheduler.template get_global_idx<kAGroupOffset>(shape_m, BLOCK_M, m_block_idx);
-                constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous);
+                constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or is_k_grouped_contiguous(kGemmType));
                 // For K-major B: group offset on outer=N. For MN-major B: group offset on outer=K.
                 const uint32_t n_idx = scheduler.template get_global_idx<kBGroupOffset and kBKMajor>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
                 const uint32_t k_group_offset = (kBGroupOffset and not kBKMajor) ?
                     scheduler.template get_global_idx<true>(shape_k, 0, 0, m_block_idx) : 0;
-                const auto tma_a_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_a : &tensor_map_a_base);
-                const auto tma_b_desc = (kGemmType == GemmType::KGroupedContiguous ? gmem_tm_b : &tensor_map_b_base);
+                const auto tma_a_desc = (is_k_grouped_contiguous(kGemmType) ? gmem_tm_a : &tensor_map_a_base);
+                const auto tma_b_desc = (is_k_grouped_contiguous(kGemmType) ? gmem_tm_b : &tensor_map_b_base);
 
                 constexpr bool kIsBatchedMM = (kGemmType == GemmType::Batched);
                 const uint32_t batch_idx = kIsBatchedMM ? scheduler.current_group_idx : 0;
@@ -253,7 +263,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         uint32_t iter_idx = 0;
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
-            const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
+            const uint32_t current_shape_k = (is_k_grouped_contiguous(kGemmType) ? scheduler.current_shape_k : shape_k);
             const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
 
             #pragma unroll
@@ -343,11 +353,12 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             }
 
             // Epilogue
+            epilogue.apply_values(*reinterpret_cast<uint32_t(*)[kAccumPerWarp]>(accum));
             constexpr bool kEpilogueGroupOffset = not is_m_grouped_contiguous(kGemmType);
             const uint32_t m_base = scheduler.template get_global_idx<kEpilogueGroupOffset>(shape_m, BLOCK_M, m_block_idx);
             const uint32_t n_base = n_block_idx * BLOCK_N;
-            const uint32_t total_shape_m = (kGemmType == GemmType::KGroupedContiguous or kGemmType == GemmType::MGroupedMasked)
-                ? shape_m * kNumGroups : shape_m;
+            const uint32_t total_shape_m = (is_k_grouped_contiguous(kGemmType) or kGemmType == GemmType::MGroupedMasked)
+                ? shape_m * (scheduler.current_group_idx + 1) : shape_m;
 
             auto read_cd = [&](const cd_dtype_t& x) -> float {
                 if constexpr (cute::is_same_v<cd_dtype_t, float>) return x;
@@ -357,9 +368,14 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             constexpr bool kIsBatchedEpilogue = (kGemmType == GemmType::Batched);
             // Batched D is [M, batch, N] physical layout: stride_m = kNumGroups * shape_n
             const int64_t cd_m_stride = kIsBatchedEpilogue
-                ? static_cast<int64_t>(kNumGroups) * shape_n : static_cast<int64_t>(shape_n);
+                ? static_cast<int64_t>(kNumGroups) * shape_n : static_cast<int64_t>(stride_d_m != 0 ? stride_d_m : shape_n);
             const int64_t cd_batch_offset = kIsBatchedEpilogue
                 ? static_cast<int64_t>(scheduler.current_group_idx) * shape_n : 0;
+            auto c_index = [&](int64_t idx) {
+                if constexpr (kGemmType == GemmType::Normal)
+                    return (idx / cd_m_stride) * (stride_c_m != 0 ? stride_c_m : cd_m_stride) + idx % cd_m_stride;
+                return idx;
+            };
 
             if constexpr (kUseTMAStoreEpilogue) {
                 if (math_warp_idx == 0 and lane_idx == 0)
@@ -383,11 +399,11 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 n_base + (n_tile_base + nt) * MMA_N) + thread_id * 2;
                             if (gr0 < total_shape_m and gc + 1 < shape_n) {
                                 const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
-                                v0 += read_cd(gmem_c[ci]); v1 += read_cd(gmem_c[ci + 1]);
+                                v0 += read_cd(gmem_c[c_index(ci)]); v1 += read_cd(gmem_c[c_index(ci) + 1]);
                             }
                             if (gr1 < total_shape_m and gc + 1 < shape_n) {
                                 const auto ci = cd_batch_offset + static_cast<int64_t>(gr1) * cd_m_stride + gc;
-                                v2 += read_cd(gmem_c[ci]); v3 += read_cd(gmem_c[ci + 1]);
+                                v2 += read_cd(gmem_c[c_index(ci)]); v3 += read_cd(gmem_c[c_index(ci) + 1]);
                             }
                         }
 
@@ -457,14 +473,24 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         if (row0 < total_shape_m and col + 1 < shape_n) {
                             auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
                             float v0 = accum[ai + 0], v1 = accum[ai + 1];
-                            if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[idx]); v1 += read_cd(gmem_c[idx + 1]); }
+                            if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[c_index(idx)]); v1 += read_cd(gmem_c[c_index(idx) + 1]); }
                             store_pair(&gmem_d[idx], v0, v1);
+                        } else if (row0 < total_shape_m and col < shape_n) {
+                            auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
+                            float v0 = accum[ai + 0];
+                            if constexpr (kWithAccumulation) v0 += read_cd(gmem_c[c_index(idx)]);
+                            gmem_d[idx] = cd_dtype_t(v0);
                         }
                         if (row1 < total_shape_m and col + 1 < shape_n) {
                             auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
                             float v2 = accum[ai + 2], v3 = accum[ai + 3];
-                            if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[idx]); v3 += read_cd(gmem_c[idx + 1]); }
+                            if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[c_index(idx)]); v3 += read_cd(gmem_c[c_index(idx) + 1]); }
                             store_pair(&gmem_d[idx], v2, v3);
+                        } else if (row1 < total_shape_m and col < shape_n) {
+                            auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
+                            float v2 = accum[ai + 2];
+                            if constexpr (kWithAccumulation) v2 += read_cd(gmem_c[c_index(idx)]);
+                            gmem_d[idx] = cd_dtype_t(v2);
                         }
                     }
                 }

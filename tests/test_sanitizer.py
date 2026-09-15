@@ -51,7 +51,7 @@ if __name__ == '__main__':
 
     env = os.environ.copy()
     env['CUDA_LAUNCH_BLOCKING'] = '1'
-    env['DG_JIT_PTXAS_CHECK'] = '1'
+    env['DG_JIT_CHECK_NO_SPILLS'] = '1'
     env['DG_USE_NVIDIA_TOOLS'] = '1'
     env['DG_USE_TEMP_CUBLASLT_WORKSPACE'] = '1'  # Avoid holding CUDA tensor that crashes during shutdown
     env['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '1'

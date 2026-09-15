@@ -9,16 +9,21 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/nvfp4_mega_moe.cuh>
 #include <deep_gemm/mma/sm100.cuh>
-#include <deep_gemm/scheduler/mega_moe.cuh>
+#include <deep_gemm/scheduler/nvfp4_mega_moe.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
-namespace deep_gemm {
+namespace deep_gemm::nvfp4 {
 
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+
+template <typename T>
+struct ReduceMax {
+    CUTLASS_DEVICE T operator()(T a, T b) const { return a > b ? a : b; }
+};
 
 // Pack 2 FP32 values into one byte of 2 E2M1 values ({`hi`, `lo`} nibbles)
 CUTLASS_DEVICE uint32_t cvt_into_e2m1x2(const float& hi, const float& lo) {
@@ -96,7 +101,7 @@ template <
     uint32_t kNumTokensPerWarp = 32 / kNumTopk,
     uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
     uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M,
-    typename task_info_t = sched::TaskInfo<kHasShared>
+    typename task_info_t = sched::nvfp4::TaskInfo<kHasShared>
 >
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp4_fp4_mega_moe_impl(void* y,
@@ -171,17 +176,13 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     // Workspaces and Buffer
     // NOTES: tokens are packed E2M1 (2 elements per byte, 4 bits each), SFs are E4M3
     // (1 byte per 16 elements, `sf_gran_k = 16`)
-    const auto buffer = layout::MegaMoEBuffer(
+    const auto buffer = layout::nvfp4::MegaMoEBuffer(
         sym_buffer.get_base_ptr(),
         kHidden, kIntermediateHidden,
         kNumRanks, kNumExperts,
         kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, kNumSFRingTokens,
-        /*with_sf=*/ true,
-        kNumSharedExperts,
-        /*num_mma_elem_bits=*/ 4,
-        /*sf_gran_k=*/ 16,
-        /*shared_num_mma_elem_bits=*/ 16  // BF16 shared experts, SF-free
+        kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
 
@@ -348,7 +349,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     comm::cluster_sync_with_relaxed_arrive();
 
     // Task scheduler
-    auto scheduler = sched::MegaMoEScheduler<
+    auto scheduler = sched::nvfp4::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
@@ -748,11 +749,11 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
         // GEMM TMA load warp for tokens with SFA
         task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
-            const auto tensor_map_a_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_acts :
-                                          task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_acts :
-                                          task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_acts :
-                                        /*task_info.block_phase == sched::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_acts;
-            const auto tensor_map_sfa_ptr = task_info.block_phase == sched::BlockPhase::Linear2
+            const auto tensor_map_a_ptr = task_info.block_phase == sched::nvfp4::BlockPhase::Linear1 ? &tensor_map_l1_acts :
+                                          task_info.block_phase == sched::nvfp4::BlockPhase::Linear2 ? &tensor_map_l2_acts :
+                                          task_info.block_phase == sched::nvfp4::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_acts :
+                                        /*task_info.block_phase == sched::nvfp4::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_acts;
+            const auto tensor_map_sfa_ptr = task_info.block_phase == sched::nvfp4::BlockPhase::Linear2
                 ? &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
             const auto num_k_blocks = math::ceil_div(task_info.shape_k, task_info.is_shared() ? SHARED_BLOCK_K : BLOCK_K);
 
@@ -763,15 +764,15 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
             // Wait the entire token arrival
             // NOTES: `SharedLinear1` reads the resident local BF16 tokens, no wait needed
-            if (task_info.block_phase == sched::BlockPhase::Linear1) {
+            if (task_info.block_phase == sched::nvfp4::BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_full_count_ptr(block_idx);
                 const auto num_expected_tokens = BLOCK_M * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_tokens);
-            } else if (task_info.block_phase == sched::BlockPhase::Linear2) {
+            } else if (task_info.block_phase == sched::nvfp4::BlockPhase::Linear2) {
                 const auto ptr = workspace.get_l2_full_count_ptr(block_idx);
                 const auto num_expected_blocks = (L2_SHAPE_K / BLOCK_N) * 2 * (pool_block_idx / kNumRingBlocks + 1);
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
-            } else if (task_info.block_phase == sched::BlockPhase::SharedLinear2) {
+            } else if (task_info.block_phase == sched::nvfp4::BlockPhase::SharedLinear2) {
                 const auto ptr = workspace.get_shared_l2_full_count_ptr(block_idx);
                 const auto num_expected_blocks = (SHARED_L2_SHAPE_K / BLOCK_N) * 2;
                 while (ptx::ld_acq(ptr) != num_expected_blocks);
@@ -827,12 +828,12 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
         // GEMM TMA load warp for weights with SF
         task_info_t task_info;
         while (scheduler.get_next_task(task_info)) {
-            const auto tensor_map_b_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ? &tensor_map_l1_weights :
-                                          task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights :
-                                          task_info.block_phase == sched::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_weights :
-                                        /*task_info.block_phase == sched::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_weights;
+            const auto tensor_map_b_ptr = task_info.block_phase == sched::nvfp4::BlockPhase::Linear1 ? &tensor_map_l1_weights :
+                                          task_info.block_phase == sched::nvfp4::BlockPhase::Linear2 ? &tensor_map_l2_weights :
+                                          task_info.block_phase == sched::nvfp4::BlockPhase::SharedLinear1 ? &tensor_map_shared_l1_weights :
+                                        /*task_info.block_phase == sched::nvfp4::BlockPhase::SharedLinear2*/ &tensor_map_shared_l2_weights;
             const auto tensor_map_sfb_ptr =
-                task_info.block_phase == sched::BlockPhase::Linear2 ? &tensor_map_l2_weights_sf : &tensor_map_l1_weights_sf;
+                task_info.block_phase == sched::nvfp4::BlockPhase::Linear2 ? &tensor_map_l2_weights_sf : &tensor_map_l1_weights_sf;
 
             const auto shape_k = task_info.shape_k;
             const auto shape_n = task_info.shape_n;
@@ -1109,7 +1110,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
             const uint32_t n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
-            if (task_info.block_phase == sched::BlockPhase::SharedLinear1) {
+            if (task_info.block_phase == sched::nvfp4::BlockPhase::SharedLinear1) {
                 // BF16 shared-expert L1 epilogue: SwiGLU (no topk weight, no alphas, no requant),
                 // BF16 output staged in smem and TMA-stored into the shared L2 activations
                 constexpr uint32_t SHARED_L1_OUT_BLOCK_N = BLOCK_N / 2;
@@ -1218,7 +1219,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
                 }
                 __syncwarp();
-            } else if (task_info.block_phase == sched::BlockPhase::Linear1) {
+            } else if (task_info.block_phase == sched::nvfp4::BlockPhase::Linear1) {
                 // Wait L2 block empty
                 const auto l2_empty_ptr = workspace.get_l2_empty_count_ptr(ring_block_idx);
                 const auto num_expected_blocks = (L2_SHAPE_N / BLOCK_N) * (pool_block_idx / kNumRingBlocks);
@@ -1322,8 +1323,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         // Amax reduction (warp-level): after this, each lane holds the amax of
                         // its own 2 tokens over the warp's 16 output channels (one SF group)
                         float2 amax = {
-                            math::warp_reduce<4, true>(thread_local_amax.x, math::ReduceMax<float>()),
-                            math::warp_reduce<4, true>(thread_local_amax.y, math::ReduceMax<float>())
+                            math::warp_reduce<4, true>(thread_local_amax.x, ReduceMax<float>()),
+                            math::warp_reduce<4, true>(thread_local_amax.y, ReduceMax<float>())
                         };
 
                         // Calculate the NVFP4 E4M3 SF (block SF normalized by `1 / a2_scale`)
@@ -1652,6 +1653,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
                         // Load
+                        __syncwarp();
                         if (cute::elect_one_sync()) {
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 buffer.combine_token_buffer.get_rank_buffer(slot_idx)
@@ -1775,4 +1777,4 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 #endif
 }
 
-} // namespace deep_gemm
+} // namespace deep_gemm::nvfp4

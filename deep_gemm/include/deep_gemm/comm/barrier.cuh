@@ -12,6 +12,18 @@ namespace deep_gemm::comm {
 // 60s timeout, at 2 GHz
 constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
 
+// Spin until `pred()` holds; on timeout, `print_timeout()` runs before the assertion
+template <typename pred_t, typename print_timeout_t>
+CUTLASS_DEVICE void wait_until(const pred_t& pred, const print_timeout_t& print_timeout) {
+    const auto start_clock = clock64();
+    while (not pred()) {
+        if (clock64() - start_clock >= kNumTimeoutCycles) {
+            print_timeout();
+            DG_DEVICE_ASSERT(false and "Timeout");
+        }
+    }
+}
+
 CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
     // Perform cluster_sync with `barrier.cluster.arrive.relaxed`
     // This is slightly faster than `cute::cluster_sync` but has weaker memory ordering guarantee
@@ -21,27 +33,34 @@ CUTLASS_DEVICE void cluster_sync_with_relaxed_arrive() {
 
 template <uint32_t kNumSMs, uint32_t kGridSyncIndex = 0,
           BarrierTimeoutPolicy kTimeoutPolicy = BarrierTimeoutPolicy::Diagnostic,
-          typename sync_scope_t>
-CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
+          typename sync_scope_t, typename WorkspaceT>
+CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
                               const uint32_t& sm_idx, const uint32_t& thread_idx,
                               const sync_scope_t& sync_scope) {
     // NOTES: the implementation idea is from `cooperative_groups::this_grid().sync()`
     static constexpr uint32_t kFinishSumTag = 0x80000000u;
     sync_scope();
     if (thread_idx == 0) {
-        const auto count_ptr = workspace.get_grid_sync_count_ptr<kGridSyncIndex>();
+        const auto count_ptr = workspace.template get_grid_sync_count_ptr<kGridSyncIndex>();
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
-        const auto start_clock = clock64();
-        do {
-            new_value = ptx::ld_acq(count_ptr);
-            if (clock64() - start_clock >= kNumTimeoutCycles) {
-                handle_grid_sync_timeout<kTimeoutPolicy>(
-                    sm_idx, thread_idx, kGridSyncIndex, old_value, new_value,
-                    old_value ^ kFinishSumTag);
-            }
-        } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+        if constexpr (kTimeoutPolicy == BarrierTimeoutPolicy::Diagnostic) {
+            wait_until([&]() { return ((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag; }, [&]() {
+                printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
+                       sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+            });
+        } else {
+            const auto start_clock = clock64();
+            do {
+                new_value = ptx::ld_acq(count_ptr);
+                if (clock64() - start_clock >= kNumTimeoutCycles) {
+                    handle_grid_sync_timeout<kTimeoutPolicy>(
+                        sm_idx, thread_idx, kGridSyncIndex, old_value, new_value,
+                        old_value ^ kFinishSumTag);
+                }
+            } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+        }
     }
     sync_scope();
 }
@@ -49,8 +68,8 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
 template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads,
           uint32_t kGridSyncIndex, uint32_t kTag,
           BarrierTimeoutPolicy kTimeoutPolicy = BarrierTimeoutPolicy::Diagnostic,
-          typename sync_scope_t>
-CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
+          typename sync_scope_t, typename WorkspaceT>
+CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
                                    const layout::SymBuffer<kNumRanks>& sym_buffer,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
@@ -60,8 +79,7 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
 
     // Grid sync before NVLink signaling
     if (sync_prologue)
-        grid_sync<kNumSMs, kGridSyncIndex, kTimeoutPolicy>(
-            workspace, sm_idx, thread_idx, sync_scope);
+        grid_sync<kNumSMs, kGridSyncIndex, kTimeoutPolicy>(workspace, sm_idx, thread_idx, sync_scope);
 
     // NVLink cross-rank barrier, only SM 0 participates
     if (sm_idx == 0) {
@@ -79,13 +97,19 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
         if (thread_idx == 0) {
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
-            const auto start_clock = clock64();
-            while (ptx::ld_acq_sys(signal_ptr) != target) {
-                if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    handle_nvlink_barrier_timeout<kTimeoutPolicy>(
-                        sym_buffer.rank_idx, *counter_ptr,
-                        ptx::ld_acq_sys(signal_ptr), target,
-                        signal_phase, signal_sign, kTag);
+            if constexpr (kTimeoutPolicy == BarrierTimeoutPolicy::Diagnostic) {
+                wait_until([&]() { return ptx::ld_acq_sys(signal_ptr) == target; }, [&]() {
+                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                });
+            } else {
+                const auto start_clock = clock64();
+                while (ptx::ld_acq_sys(signal_ptr) != target) {
+                    if (clock64() - start_clock >= kNumTimeoutCycles) {
+                        handle_nvlink_barrier_timeout<kTimeoutPolicy>(
+                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target,
+                            signal_phase, signal_sign, kTag);
+                    }
                 }
             }
         }
@@ -93,8 +117,7 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
 
     // Grid sync after NVLink completion
     if (sync_epilogue)
-        grid_sync<kNumSMs, kGridSyncIndex, kTimeoutPolicy>(
-            workspace, sm_idx, thread_idx, sync_scope);
+        grid_sync<kNumSMs, kGridSyncIndex, kTimeoutPolicy>(workspace, sm_idx, thread_idx, sync_scope);
 }
 
 } // namespace deep_gemm::comm
