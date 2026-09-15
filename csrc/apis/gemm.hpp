@@ -234,6 +234,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
         for (const auto& t: {a.second, b.first, b.second, d, grouped_layout})
             DG_HOST_ASSERT(t.is_cuda() and t.device() == a.first.device());
+        DG_HOST_ASSERT(not disable_ue8m0_cast or (a.second.scalar_type() == torch::kInt and b.second.scalar_type() == torch::kInt));
     }
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);
@@ -332,6 +333,7 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
         DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
         for (const auto& t: {a.second, b.first, b.second, d, masked_m})
             DG_HOST_ASSERT(t.is_cuda() and t.device() == a.first.device());
+        DG_HOST_ASSERT(not disable_ue8m0_cast or (a.second.scalar_type() == torch::kInt and b.second.scalar_type() == torch::kInt));
     }
     // Shape must be `[G, M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a.first);

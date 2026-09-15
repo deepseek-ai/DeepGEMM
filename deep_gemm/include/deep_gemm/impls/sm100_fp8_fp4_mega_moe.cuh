@@ -1438,6 +1438,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     mask ^= 1 << slot_idx;
 
                     // Load
+                    __syncwarp();
                     if (cute::elect_one_sync()) {
                         const auto src_ptr = math::advance_ptr<uint8_t>(
                             buffer.combine_token_buffer.get_rank_buffer(slot_idx)

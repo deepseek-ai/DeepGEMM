@@ -173,9 +173,9 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
     DG_HOST_ASSERT(split_kv % mma_m == 0 and logits_stride % split_kv == 0);
     DG_HOST_ASSERT(not is_varlen);
     DG_HOST_ASSERT(next_n == 1 or next_n == 2 or next_n == 4);
-    const int num_kv_multicast = next_n == 4 ? 2 : 1;
-    const int next_n_per_cta = next_n / num_kv_multicast;
-    DG_HOST_ASSERT(num_sms % num_kv_multicast == 0);
+    const int num_ctas_per_cluster = next_n == 4 ? 2 : 1;
+    const int next_n_per_cta = next_n / num_ctas_per_cluster;
+    DG_HOST_ASSERT(num_sms % num_ctas_per_cluster == 0);
 
     const auto tensor_map_q = make_tma_2d_desc(q, head_dim, batch_size * next_n * num_heads,
                                                head_dim, next_n_per_cta * num_heads,
@@ -231,7 +231,7 @@ static void __instantiate_kernel() {{
     num_q_stages, num_kv_stages,
     split_kv,
     num_specialized_threads, num_math_threads,
-    num_kv_multicast, to_string(logits_dtype)));
+    num_ctas_per_cluster, to_string(logits_dtype)));
 
     // Launch
     jit->launch(
@@ -239,7 +239,7 @@ static void __instantiate_kernel() {{
             .num_smem_bytes = smem_size,
             .grid_dim = dim3(num_sms, 1, 1),
             .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
-            .cluster_dim = dim3(num_kv_multicast, 1, 1),
+            .cluster_dim = dim3(num_ctas_per_cluster, 1, 1),
         },
         batch_size,
         logits_stride, block_table_stride,

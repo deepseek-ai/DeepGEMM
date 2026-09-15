@@ -20,6 +20,11 @@ namespace deep_gemm::nvfp4 {
 
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
 
+template <typename T>
+struct ReduceMax {
+    CUTLASS_DEVICE T operator()(T a, T b) const { return a > b ? a : b; }
+};
+
 // Pack 2 FP32 values into one byte of 2 E2M1 values ({`hi`, `lo`} nibbles)
 CUTLASS_DEVICE uint32_t cvt_into_e2m1x2(const float& hi, const float& lo) {
     uint32_t packed;
@@ -1318,8 +1323,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         // Amax reduction (warp-level): after this, each lane holds the amax of
                         // its own 2 tokens over the warp's 16 output channels (one SF group)
                         float2 amax = {
-                            math::warp_reduce<4, true>(thread_local_amax.x, math::ReduceMax<float>()),
-                            math::warp_reduce<4, true>(thread_local_amax.y, math::ReduceMax<float>())
+                            math::warp_reduce<4, true>(thread_local_amax.x, ReduceMax<float>()),
+                            math::warp_reduce<4, true>(thread_local_amax.y, ReduceMax<float>())
                         };
 
                         // Calculate the NVFP4 E4M3 SF (block SF normalized by `1 / a2_scale`)

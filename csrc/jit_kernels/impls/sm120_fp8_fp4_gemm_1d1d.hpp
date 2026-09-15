@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <torch/python.h>
 
 #include "sm120_runtime.hpp"
@@ -9,15 +10,23 @@
 
 #include "epilogue.hpp"
 #include "runtime_utils.hpp"
+#include "sm120_padding.hpp"
 
 namespace deep_gemm {
 
-// Skip D stores of M-padding rows in m-grouped layouts, leaving them untouched (their contents
-// are unspecified). Requires the direct-store epilogue (swizzle_cd == 0) and no split-K.
-static bool should_skip_padding_store(const SM120GemmDesc& desc, const SM120GemmConfig& config) {
-    return (desc.gemm_type == GemmType::MGroupedContiguous or desc.gemm_type == GemmType::MGroupedMasked)
-        and config.storage_config.swizzle_cd_mode == 0
-        and config.split_k_factor == 1;
+static torch::Tensor sm120_grouped_tma_output(const torch::Tensor& d, int block_m, bool masked) {
+    const int m = static_cast<int>(d.size(-2));
+    const int n = static_cast<int>(d.size(-1));
+    const bool direct = d.scalar_type() == torch::kBFloat16 and d.stride(-1) == 1
+        and reinterpret_cast<std::uintptr_t>(d.data_ptr()) % 16 == 0
+        and d.stride(-2) >= n and (d.stride(-2) * d.element_size()) % 16 == 0
+        and d.stride(-2) <= std::numeric_limits<int>::max() / 2 and n % 8 == 0
+        and (not masked or (m % block_m == 0 and d.stride(0) == m * d.stride(1)));
+    if (direct)
+        return d;
+    if (masked)
+        return torch::empty({d.size(0), align(m, block_m), align(n, 64)}, d.options());
+    return torch::empty({align(m, block_m), align(n, 64)}, d.options());
 }
 
 class SM120FP8FP4Gemm1D1DRuntime final: public SM120LaunchRuntime<SM120FP8FP4Gemm1D1DRuntime> {
@@ -39,7 +48,7 @@ public:
         int stride_cd_m;
         int stride_cd_n;
         int stride_cd_batch;
-        bool a_cpasync;  // A is contiguous and K % BLOCK_K == 0: padding-skip cp.async A path allowed
+        int shape_cd_m = 0;
 
         void* gmem_d;
         void* gmem_c;
@@ -82,8 +91,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
-        {}, {}
+        {}
     >);
 }};
 )",
@@ -108,8 +116,7 @@ static void __instantiate_kernel() {{
         args.k_grouped_constant_stride ? "true" : "false",
         args.gemm_config.storage_config.store_block_m,
         args.gemm_config.split_k_factor,
-        should_skip_padding_store(args.gemm_desc, args.gemm_config) ? "true" : "false",
-        args.a_cpasync ? "true" : "false", args.k_alignment);
+        args.k_alignment);
     }
 
     template <typename Kernel>
@@ -122,6 +129,7 @@ static void __instantiate_kernel() {{
             args.gmem_workspace,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.stride_cd_m, args.stride_cd_n, args.stride_cd_batch,
+            args.shape_cd_m != 0 ? args.shape_cd_m : args.gemm_desc.m,
             args.epilogue_args, args.stride_c_m,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
@@ -503,9 +511,11 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                                  config.layout.block_n, gran_k_b, num_groups, 0);
     const int cd_store_m = config.storage_config.store_block_m > 0
         ? config.storage_config.store_block_m : config.layout.block_m;
-    const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
+    const auto output = SM120ArchSpec::uses_grouped_tma_output(desc)
+        ? sm120_grouped_tma_output(d, config.layout.block_m, false) : d;
+    const auto tensor_map_cd = make_tma_cd_desc(output, static_cast<int>(output.size(-2)), static_cast<int>(output.size(-1)),
                                                 cd_store_m, config.layout.block_n,
-                                                static_cast<int>(d.stride(-2)), 1,
+                                                static_cast<int>(output.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
     const SM120FP8FP4Gemm1D1DRuntime::Args args = {
@@ -521,11 +531,11 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .b_is_fp4 = b_is_fp4,
         .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = false,
-        .stride_cd_m = static_cast<int>(d.stride(-2)),
+        .stride_cd_m = static_cast<int>(output.stride(-2)),
         .stride_cd_n = 0,
         .stride_cd_batch = 0,
-        .a_cpasync = a.is_contiguous() and (k % config.layout.block_k == 0),
-        .gmem_d = d.data_ptr(),
+        .shape_cd_m = static_cast<int>(output.size(-2)),
+        .gmem_d = output.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = a.data_ptr(),
         .gmem_b_ptr = nullptr,
@@ -541,6 +551,9 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
     const auto code = SM120FP8FP4Gemm1D1DRuntime::generate(args);
     const auto runtime = jit->compile("sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d", code);
     SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    if (output.data_ptr() != d.data_ptr())
+        sm120_copy_grouped_output(output, d, grouped_layout, m, n, num_groups, false, use_psum_layout,
+                                  heuristics_runtime->get_mk_alignment_for_contiguous_layout());
 }
 
 static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -575,7 +588,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
     };
     auto config = get_best_sm120_config<SM120ArchSpec>(desc);
-    if (m % config.layout.block_m != 0)
+    if (not SM120ArchSpec::uses_grouped_tma_output(desc) and m % config.layout.block_m != 0)
         config.storage_config.swizzle_cd_mode = 0;
 
     const bool fp4_unpacked = !is_fp4;
@@ -596,9 +609,11 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
                                                  config.layout.block_n, gran_k_b, num_groups, 0);
     const int cd_store_m = config.storage_config.store_block_m > 0
         ? config.storage_config.store_block_m : config.layout.block_m;
-    const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
+    const auto output = SM120ArchSpec::uses_grouped_tma_output(desc)
+        ? sm120_grouped_tma_output(d, config.layout.block_m, true) : d;
+    const auto tensor_map_cd = make_tma_cd_desc(output, static_cast<int>(output.size(-2)), static_cast<int>(output.size(-1)),
                                                 cd_store_m, config.layout.block_n,
-                                                static_cast<int>(d.stride(-2)), num_groups,
+                                                static_cast<int>(output.stride(-2)), num_groups,
                                                 config.storage_config.swizzle_cd_mode);
 
     const SM120FP8FP4Gemm1D1DRuntime::Args args = {
@@ -614,11 +629,11 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .b_is_fp4 = b_is_fp4,
         .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = false,
-        .stride_cd_m = static_cast<int>(d.stride(-2)),
+        .stride_cd_m = static_cast<int>(output.stride(-2)),
         .stride_cd_n = 0,
         .stride_cd_batch = 0,
-        .a_cpasync = a.is_contiguous() and (k % config.layout.block_k == 0),
-        .gmem_d = d.data_ptr(),
+        .shape_cd_m = static_cast<int>(output.size(-2)),
+        .gmem_d = output.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = a.data_ptr(),
         .gmem_b_ptr = nullptr,
@@ -634,6 +649,8 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
     const auto code = SM120FP8FP4Gemm1D1DRuntime::generate(args);
     const auto runtime = jit->compile("sm120_m_grouped_fp8_fp4_gemm_masked_1d1d", code);
     SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    if (output.data_ptr() != d.data_ptr())
+        sm120_copy_grouped_output(output, d, masked_m, m, n, num_groups, true, false, 1);
 }
 
 static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,

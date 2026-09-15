@@ -27,11 +27,9 @@ inline void init_jit(const std::string& library_root_path) {
             emplace_back("--diag-suppress=39,161,174,177,186,940");
         runtime->default_compiler_options.nvcc_flags->
             emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
-        if (runtime->device.get_arch_major() == 12) {
+        // Preserve the existing 12.x family target when DeepJIT derives a different minor target.
+        if (runtime->device.get_arch_major() == 12 and runtime->device.get_arch_minor() != 0)
             runtime->default_compiler_options.arch = "120f";
-            runtime->default_compiler_options.extra_nvcc_flags.emplace_back(
-                "-gencode=arch=compute_120f,code=sm_120f");
-        }
         return runtime;
     });
 }

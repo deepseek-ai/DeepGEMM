@@ -206,7 +206,7 @@ def _validate_shared_weights(buffer, l1, l2, scaled=False):
             l1.shape != (2 * width, buffer.hidden) or l2.size(0) != buffer.hidden):
             raise ValueError('Shared-expert weights do not match the symmetric buffer layout')
         count = width // buffer.intermediate_hidden
-    if buffer.num_shared_experts != count:
+    if buffer.mma_type == 'fp4xfp4' and buffer.num_shared_experts != count:
         raise ValueError(
             f'Shared-expert layout mismatch: buffer={buffer.num_shared_experts}, call={count}')
 

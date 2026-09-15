@@ -105,6 +105,7 @@ def _reference_expert_ffn(x_dq: torch.Tensor,
 # noinspection PyShadowingNames
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    deep_gemm.set_pdl(bool(args.pdl))
     torch.manual_seed(args.seed + rank_idx)
     random.seed(args.seed + rank_idx)
 
@@ -527,6 +528,8 @@ if __name__ == '__main__':
                         help='Scale routed BF16 output before adding shared output')
 
     # Test settings
+    parser.add_argument('--pdl', type=int, choices=(0, 1), default=0,
+                        help='Set the global PDL default; NVFP4 MegaMoE must retain stream ordering')
     parser.add_argument('--num-correctness-tests', type=int, default=2, help='Number of correctness test rounds')
     parser.add_argument('--stateful-checks', action='store_true',
                         help='Add 3 eager state changes, 2 graph warmups and 3 captured graph replays on one buffer')

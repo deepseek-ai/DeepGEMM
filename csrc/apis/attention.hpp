@@ -629,9 +629,9 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
 
     // Check schedule metadata
     auto [_schedule_meta_size, _meta_info_size] = get_shape<2>(schedule_meta);
-    const int num_kv_multicast = (arch_major == 9 and next_n == 4) ? 2 : 1;
-    DG_HOST_ASSERT(num_sms % num_kv_multicast == 0);
-    DG_HOST_ASSERT(_schedule_meta_size == num_sms / num_kv_multicast + 1 and _meta_info_size == 2);
+    const int num_ctas_per_cluster = (arch_major == 9 and next_n == 4) ? 2 : 1;
+    DG_HOST_ASSERT(num_sms % num_ctas_per_cluster == 0);
+    DG_HOST_ASSERT(_schedule_meta_size == num_sms / num_ctas_per_cluster + 1 and _meta_info_size == 2);
     DG_HOST_ASSERT(schedule_meta.is_contiguous());
     DG_HOST_ASSERT(schedule_meta.scalar_type() == torch::kInt);
 

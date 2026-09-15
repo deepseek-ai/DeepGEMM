@@ -123,6 +123,34 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
     return logits, cost
 
 
+def check_mqa_logits_chunked(actual, q, kv, weights, ks, ke, compressed):
+    stats = torch.zeros(2, device=actual.device, dtype=torch.float64)
+    q_chunk = 256
+    kv_chunk = max(1, (128 * 1024 * 1024) // (q_chunk * q.size(1) * 4))
+    for m0 in range(0, q.size(0), q_chunk):
+        m1 = min(m0 + q_chunk, q.size(0))
+        q_slice = q[m0:m1].float()
+        w = weights[m0:m1].float().T.contiguous()
+        for n0 in range(0, kv.size(0), kv_chunk):
+            n1 = min(n0 + kv_chunk, kv.size(0))
+            columns = torch.arange(n0, n1, device=actual.device)[None, :]
+            mask = (columns >= ks[m0:m1, None]) & (columns < ke[m0:m1, None])
+            scores = torch.einsum('mhd,nd->hmn', q_slice, kv[n0:n1].float()).relu_()
+            reference = torch.einsum('hmn,hm->mn', scores, w)
+            del scores
+            if compressed:
+                offsets = (columns - ks[m0:m1, None]).clamp(0, actual.size(1) - 1).long()
+                values = actual[m0:m1].gather(1, offsets)
+            else:
+                values = actual[m0:m1, n0:n1]
+                assert torch.equal(values == float('-inf'), ~mask)
+            x, y = values.double().masked_fill(~mask, 0), reference.double().masked_fill(~mask, 0)
+            stats[0] += (x * x + y * y).sum()
+            stats[1] += 2 * (x * y).sum()
+    denominator, numerator = stats.tolist()
+    return 1 - numerator / denominator if denominator else 0.0
+
+
 def test_mqa_logits():
 
     # Helper functions

@@ -218,6 +218,8 @@ struct MegaMoEScheduler {
     }
 
     CUTLASS_DEVICE void release_task_info() const {
+        // Complete metadata reads before the scheduler can overwrite this slot.
+        ptx::fence_acq_rel_cta();
         task_info_empty_barriers[sched_stage_idx ^ 1].arrive(0u);
     }
 

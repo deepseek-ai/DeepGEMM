@@ -197,6 +197,7 @@ static void __instantiate_kernel() {{
             .grid_dim = dim3(num_sms, 1, 1),
             .block_dim = dim3(config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads, 1, 1),
             .cluster_dim = dim3(2, 1, 1),
+            .enable_pdl = false,
         },
         y.data_ptr(),
         cumulative_local_expert_recv_stats_ptr,

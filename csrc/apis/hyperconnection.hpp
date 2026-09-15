@@ -27,6 +27,8 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
     // A and B must be K-major, D must be N-major
     DG_HOST_ASSERT(get_major_type_ab(a) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(b) == cute::UMMA::Major::K);
+    // Empty split outputs have a nonzero batch stride in PyTorch; SM120 accepts them as a no-op.
+    // Keep the existing SM90/SM100 layout validation unchanged.
     if (cached.major != 12 or a.size(0) != 0)
         check_major_type_cd(d);
 

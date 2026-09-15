@@ -281,6 +281,7 @@ static void sm90_fp8_mega_moe(
                               split_args.config.num_non_epilogue_threads +
                               split_args.config.num_epilogue_threads, 1, 1),
             .cluster_dim = dim3(1, 1, 1),
+            .enable_pdl = false,
         };
         SM90FP8MegaMoERuntime::compile_and_launch(kernel_name, split_args);
     };

@@ -15,6 +15,14 @@ struct SM120ArchSpec {
 
     static constexpr int kMinBlockM = 64;   // kNWarps=2 floor; BLOCK_M=32 uses kNWarps=4 (m-grouped decode)
 
+    static bool uses_grouped_tma_output(const SM120GemmDesc& desc) {
+        return desc.kernel_type == KernelType::Kernel1D1D
+            and (is_m_grouped_contiguous(desc.gemm_type) or desc.gemm_type == GemmType::MGroupedMasked)
+            and desc.a_dtype == torch::kFloat8_e4m3fn
+            and (desc.b_dtype == torch::kFloat8_e4m3fn or desc.b_dtype == kPackedFP4)
+            and desc.cd_dtype == torch::kBFloat16;
+    }
+
     static std::vector<Layout> get_layout_candidates(const SM120GemmDesc& desc) {
         const int elem_size = desc.get_heuristic_element_size();
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
@@ -22,7 +30,7 @@ struct SM120ArchSpec {
 
         // BLOCK_M candidates: {64, 128} valid for both FP8 and BF16 (kNWarps=2, kMWarps=4).
         const int n_for_tile = desc.get_expected_n() > 0 ? desc.get_expected_n() : desc.n;
-        const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32);
+        const bool is_small_n = (n_for_tile > 0 and n_for_tile <= 32) and not uses_grouped_tma_output(desc);
 
         std::vector<int> block_m_candidates;
         const bool is_m_grouped = is_m_grouped_contiguous(desc.gemm_type)
@@ -56,7 +64,6 @@ struct SM120ArchSpec {
         // but only beneficial for large M (>= 2048) and non-mixed dtypes.
         const bool is_mixed = (desc.a_dtype != desc.b_dtype);
         std::vector<int> block_k_candidates;
-        // BLOCK_M=32 decode keeps BK=128: enables the padding-skip cp.async A path (SW128)
         if (!is_mixed and expected_m >= 2048 and not (is_m_grouped and runtime_align == 32))
             block_k_candidates.push_back(64 / elem_size);
         block_k_candidates.push_back(128 / elem_size);
@@ -159,12 +166,12 @@ struct SM120ArchSpec {
         const auto swizzle_mode_b = get_swizzle_mode(smem_row_bytes_b, 1);
 
         const int cd_size = c10::elementSize(desc.cd_dtype);
-        // cd_n_contiguous gates the TMA-store epilogue (off for AB-swap transposed output).
-        // M-grouped 1D1D uses the direct-store epilogue so the kernel can skip M-padding row
-        // stores (padding rows of D are unspecified); faster at decode AND prefill (fewer bytes).
-        const bool grouped_skip_padding_store = desc.kernel_type == KernelType::Kernel1D1D
-            and (desc.gemm_type == GemmType::MGroupedContiguous or desc.gemm_type == GemmType::MGroupedMasked);
-        const auto swizzle_mode_cd = (not grouped_skip_padding_store and desc.cd_n_contiguous and (desc.n * cd_size) % 16 == 0 and layout.block_n * cd_size >= 128) ? 128 : 0;
+        const bool grouped_direct_store = desc.kernel_type == KernelType::Kernel1D1D
+            and (desc.gemm_type == GemmType::MGroupedContiguous or desc.gemm_type == GemmType::MGroupedMasked)
+            and not uses_grouped_tma_output(desc);
+        const auto swizzle_mode_cd = uses_grouped_tma_output(desc) ? 128 :
+            (not grouped_direct_store and desc.cd_n_contiguous and (desc.n * cd_size) % 16 == 0
+             and layout.block_n * cd_size >= 128) ? 128 : 0;
 
         // Sub-tile epilogue: reduce SMEM_D by storing smaller M sub-tiles.
         // Try store_block_m = 64 (sub-tile) and see if it gains pipeline stages.

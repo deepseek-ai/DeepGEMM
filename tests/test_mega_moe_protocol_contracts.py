@@ -245,15 +245,13 @@ def test_nv_shared_validation(mega, bad):
 
 
 @pytest.mark.parametrize('name', ['bf16_mega_moe', 'fp8_fp4_mega_moe'])
-@pytest.mark.parametrize('bad', ['missing', 'tuple', 'rank', 'count', 'shape'])
+@pytest.mark.parametrize('bad', ['missing', 'tuple', 'rank', 'shape'])
 def test_main_shared_validation(mega, name, bad):
     obj = buffer(mega, 'fp8xfp4', shared=1)
     l1 = torch.empty((1024, 512), dtype=torch.bfloat16)
     l2 = torch.empty((512, 512), dtype=torch.bfloat16)
     if bad == 'rank':
         l1 = l1[0]
-    elif bad == 'count':
-        l1, l2 = torch.empty((2048, 512)), torch.empty((512, 1024))
     elif bad == 'shape':
         l1 = l1[:-1]
     if name == 'fp8_fp4_mega_moe':
@@ -267,16 +265,20 @@ def test_main_shared_validation(mega, name, bad):
 
 
 @pytest.mark.parametrize('name', ['bf16_mega_moe', 'fp8_fp4_mega_moe'])
-def test_main_shared_forwarding_identity(mega, name):
-    obj = buffer(mega, 'fp8xfp4', shared=1)
-    l1 = torch.empty((1024, 512), dtype=torch.bfloat16)
-    l2 = torch.empty((512, 512), dtype=torch.bfloat16)
-    if name == 'fp8_fp4_mega_moe':
-        l1, l2 = [l1, torch.empty(1)], (l2, torch.empty(1))
+@pytest.mark.parametrize('allocated,called', [(1, 1), (2, 0), (2, 1), (0, 1)])
+def test_main_shared_forwarding_identity(mega, name, allocated, called):
+    obj = buffer(mega, 'fp8xfp4', shared=allocated)
+    l1 = l2 = None
+    if called:
+        l1 = torch.empty((1024 * called, 512), dtype=torch.bfloat16)
+        l2 = torch.empty((512, 512 * called), dtype=torch.bfloat16)
+        if name == 'fp8_fp4_mega_moe':
+            l1, l2 = [l1, torch.empty(1)], (l2, torch.empty(1))
     mock = getattr(mega._C, name)
     mock.side_effect = None
     getattr(mega, name)(None, None, None, obj, shared_l1_weights=l1, shared_l2_weights=l2)
     assert mock.call_args.args[3] is l1 and mock.call_args.args[4] is l2
+    assert mock.call_args.args[6] is obj.buffer
 
 
 @pytest.mark.parametrize('shared', [0, 1])
@@ -307,6 +309,43 @@ def test_other_forwarding_and_subclasses(mega, name, arity):
     getattr(mega, name)(y, l1, l2, obj, activation='swiglu')
     assert len(mock.call_args.args) == arity
     assert all(a is b for a, b in zip(mock.call_args.args[:3], (y, l1, l2)))
+
+
+@pytest.mark.parametrize('scheduler', ['mega_moe', 'nvfp4_mega_moe'])
+def test_task_info_release_orders_metadata_reads(scheduler):
+    include = Path(__file__).resolve().parents[1] / 'deep_gemm/include/deep_gemm'
+    source = (include / f'scheduler/{scheduler}.cuh').read_text()
+    release = source.split('void release_task_info() const {', 1)[1].split('}', 1)[0]
+    assert release.index('ptx::fence_acq_rel_cta();') < release.index(
+        'task_info_empty_barriers[sched_stage_idx ^ 1].arrive(0u);')
+    helper = (include / 'ptx/ld_st.cuh').read_text()
+    assert 'asm volatile("fence.acq_rel.cta;" ::: "memory");' in helper
+
+
+@pytest.mark.parametrize('kernel', ['sm90_fp8_mega_moe', 'sm100_fp4_fp4_mega_moe'])
+def test_nv_moe_launch_preserves_stream_dependency(kernel):
+    source = (Path(__file__).resolve().parents[1] /
+              f'csrc/jit_kernels/impls/{kernel}.hpp').read_text()
+    assert '.enable_pdl = false,' in source
+
+
+@pytest.mark.parametrize('kernel', ['sm90_fp8_mega_moe', 'sm100_fp4_fp4_mega_moe',
+                                  'sm100_bf16_mega_moe', 'sm100_fp8_fp4_mega_moe'])
+def test_moe_combine_waits_for_readers_before_refill(kernel):
+    source = (Path(__file__).resolve().parents[1] /
+              f'deep_gemm/include/deep_gemm/impls/{kernel}.cuh').read_text()
+    refill = source.split('const auto move_mask_and_load =', 1)[1].split('return true;', 1)[0]
+    assert refill.index('__syncwarp();') < refill.index('cute::elect_one_sync()')
+    assert refill.index('cute::elect_one_sync()') < refill.index('ptx::tma_load_1d(')
+
+
+def test_nvfp4_amax_preserves_nv_dev_functor():
+    source = (Path(__file__).resolve().parents[1] /
+              'deep_gemm/include/deep_gemm/impls/sm100_fp4_fp4_mega_moe.cuh').read_text()
+    assert 'CUTLASS_DEVICE T operator()(T a, T b) const { return a > b ? a : b; }' in source
+    assert 'math::ReduceMax<float>()' not in source
+    for component in ('x', 'y'):
+        assert f'math::warp_reduce<4, true>(thread_local_amax.{component}, ReduceMax<float>())' in source
 
 
 @pytest.mark.skipif(os.getenv('DEEPGEMM_TEST_NVFP4_REUSE') != '1',

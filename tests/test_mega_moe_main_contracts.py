@@ -109,12 +109,15 @@ class _Fixture:
         (deep_gemm.bf16_mega_moe if self.bf16 else deep_gemm.fp8_fp4_mega_moe)(**kwargs)
 
 
-def _routes(n=NUM_TOKENS):
+def _routes(n=NUM_TOKENS, num_topk=2):
     rows = torch.arange(n, device='cuda')
     routes = torch.stack((rows % NUM_EXPERTS, (rows + 1) % NUM_EXPERTS), dim=-1)
     weights = torch.stack((torch.linspace(-1.25, 1.75, n, device='cuda'),
                            torch.full((n,), 0.375, device='cuda')), dim=-1)
     routes[::7, 1] = -1
+    if num_topk == 3:
+        routes = torch.cat((routes, ((rows + 2) % NUM_EXPERTS)[:, None]), dim=1)
+        weights = torch.cat((weights, torch.full((n, 1), 0.375, device='cuda')), dim=1)
     return routes, weights
 
 
@@ -132,7 +135,7 @@ def _eager(fixture, buffer, routes, weights, case, clamp=None):
 
 
 def _graph_lifecycle(fixture, buffer, case, clamp=None):
-    routes, weights = _routes()
+    routes, weights = _routes(num_topk=buffer.num_topk)
     masked = torch.full_like(routes, -1)
     references = [fixture.reference(r, weights, case, clamp) for r in (routes, masked, routes)]
     fixture.copy(buffer, routes, weights)
@@ -234,6 +237,17 @@ def _worker(local_rank, port):
             finally:
                 buffer.destroy()
         _base_reuse(group)
+        for mma_type in ('bf16xbf16', 'fp8xfp8', 'fp8xfp4'):
+            buffer = SymmBuffer(group, NUM_EXPERTS, NUM_TOKENS, 3, HIDDEN, INTERMEDIATE,
+                                num_shared_experts=2, mma_type=mma_type)
+            try:
+                routes, weights = _routes(num_topk=3)
+                for shared_count in (2, 0, 1, 2):
+                    fixture = _Fixture(mma_type, shared_count)
+                    _eager(fixture, buffer, routes, weights, CASES['swiglu'])
+                    _graph_lifecycle(fixture, buffer, CASES['swiglu'])
+            finally:
+                buffer.destroy()
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

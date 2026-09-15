@@ -654,6 +654,7 @@ def _run_stateful_scenario(
 
 def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    deep_gemm.set_pdl(bool(args.pdl))
 
     # Skip on non-SM90
     if get_arch_major() != 9:
@@ -723,6 +724,8 @@ if __name__ == '__main__':
                         help='Substring filter on scenario names')
     parser.add_argument('--diff-tol', type=float, default=0.01,
                         help='calc_diff tolerance (default: 0.01)')
+    parser.add_argument('--pdl', type=int, choices=(0, 1), default=0,
+                        help='Set the global PDL default; SM90 MegaMoE must retain stream ordering')
     parser.add_argument('--fail-fast', action='store_true',
                         help='Stop on first failing scenario')
     args = parser.parse_args()

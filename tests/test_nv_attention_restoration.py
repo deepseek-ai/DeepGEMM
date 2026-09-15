@@ -1,3 +1,7 @@
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -82,6 +86,48 @@ def test_sm100_fp16_dense_tail_graph(seq_len, num_heads, head_dim, logits_dtype,
     ke.zero_()
     graph.replay()
     validate(captured)
+
+
+@pytest.mark.parametrize('seq_len,seq_len_kv', [(2048, 8192), (2048, 65536), (8192, 8192), (8192, 65536)])
+@pytest.mark.parametrize('num_heads', [32, 64])
+@pytest.mark.parametrize('head_dim', [32, 64, 128])
+@pytest.mark.parametrize('logits_dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('compressed', [False, True])
+def test_sm100_fp16_dense_large(seq_len, seq_len_kv, num_heads, head_dim, logits_dtype, compressed):
+    from test_attention import check_mqa_logits_chunked
+
+    require_arch(10)
+    torch.manual_seed(123)
+    q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
+    weights = (torch.randn(seq_len, num_heads, device='cuda') * 0.1).half()
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv_fp8, kv_sf = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    rows = torch.arange(seq_len, device='cuda', dtype=torch.int32)
+    ks = (rows % 3) * 257
+    ke = seq_len_kv - seq_len + rows + 1
+    ke = torch.maximum(ks, ke)
+    ks[::32], ke[::32] = 0, 0
+    window = int((ke - ks).max())
+    kwargs = dict(q=(q_fp8, None), kv=(kv_fp8, kv_sf), weights=weights,
+                  cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
+                  clean_logits=not compressed, max_seqlen_k=window if compressed else 0,
+                  logits_dtype=logits_dtype)
+    actual = deep_gemm.fp8_fp4_mqa_logits(**kwargs)
+    assert actual.shape == (seq_len, window if compressed else seq_len_kv)
+    assert actual.dtype == logits_dtype
+    assert check_mqa_logits_chunked(actual, q, kv, weights, ks, ke, compressed) < 1e-3
+    simulated_kv = (kv_fp8.float() * kv_sf[:, None]).bfloat16()
+    assert check_mqa_logits_chunked(
+        actual, q_fp8.bfloat16(), simulated_kv, weights, ks, ke, compressed) < ref_diff_tol(True)
+    repeated = deep_gemm.fp8_fp4_mqa_logits(**kwargs)
+    for m0 in range(0, seq_len, 256):
+        m1 = min(m0 + 256, seq_len)
+        if compressed:
+            mask = torch.arange(window, device='cuda')[None, :] < (ke[m0:m1] - ks[m0:m1])[:, None]
+            assert_bitwise_equal(actual[m0:m1][mask], repeated[m0:m1][mask], 'large FP16 dense repeat')
+        else:
+            assert_bitwise_equal(actual[m0:m1], repeated[m0:m1], 'large FP16 dense repeat')
 
 
 @pytest.mark.parametrize('seq_len,num_heads,with_metadata', [(510, 32, False), (512, 12, False), (512, 32, True)])
@@ -219,3 +265,65 @@ def run_sm90_paged_graph_case(page_kv, next_n, head_dim, num_heads, logits_dtype
         assert calc_diff(restored, expected) < ref_diff_tol(logits_dtype == torch.bfloat16)
     finally:
         deep_gemm.set_num_sms(old_num_sms)
+
+
+@pytest.mark.parametrize('case', [
+    'start_past_end', 'end_out_of_batch', 'start_out_of_batch', 'sentinel_nonzero',
+    'kv_past_end', 'stale_zero', 'stale_shrink', 'exact_end',
+])
+@pytest.mark.parametrize('next_n', [1, 4])
+@pytest.mark.parametrize('page_kv', [32, 64])
+def test_sm90_paged_scheduler_bounds(case, next_n, page_kv):
+    require_arch(9)
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), case, str(next_n), str(page_kv)],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def run_sm90_paged_scheduler_bounds(case, next_n, page_kv):
+    deep_gemm.set_num_sms(4 if next_n == 4 else 2)
+    batch_size, head_dim, num_heads, max_context_len = 3, 32, 32, 513
+    max_pages = (max_context_len + page_kv - 1) // page_kv
+    context_lens = torch.zeros(batch_size, next_n, device='cuda', dtype=torch.int32)
+    block_table = torch.full((batch_size, max_pages), -1, device='cuda', dtype=torch.int32)
+    q = torch.ones(batch_size, next_n, num_heads, head_dim, device='cuda').to(torch.float8_e4m3fn)
+    weights = torch.ones(batch_size * next_n, num_heads, device='cuda')
+    kv = torch.ones(max_pages, page_kv, head_dim, device='cuda').to(torch.float8_e4m3fn)
+    scales = torch.ones(max_pages, page_kv, device='cuda')
+    fused = torch.empty(max_pages, page_kv * (head_dim + 4), device='cuda', dtype=torch.uint8)
+    fused[:, :page_kv * head_dim] = kv.view(torch.uint8).reshape(max_pages, -1)
+    fused[:, page_kv * head_dim:] = scales.view(torch.uint8).reshape(max_pages, -1)
+    fused = fused.view(max_pages, page_kv, 1, head_dim + 4)
+    if case in ('stale_zero', 'stale_shrink', 'exact_end'):
+        context_lens[0].fill_(max_context_len)
+        block_table[0] = torch.arange(max_pages, device='cuda', dtype=torch.int32)
+        metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, page_kv, 2)
+        torch.cuda.synchronize()
+        if case == 'stale_zero':
+            context_lens.zero_()
+            block_table.fill_(-1)
+        elif case == 'stale_shrink':
+            context_lens[0].fill_(1)
+            block_table[0, 1:].fill_(-1)
+    else:
+        bounds = {
+            'start_past_end': ((2, 0), (1, 0)),
+            'end_out_of_batch': ((0, 0), (0x7fffffff, 0)),
+            'start_out_of_batch': ((batch_size + 1, 0), (0x7fffffff, 0)),
+            'sentinel_nonzero': ((batch_size, 1), (batch_size, 2)),
+            'kv_past_end': ((0, 2), (0, 1)),
+        }
+        begin, end = bounds[case]
+        metadata = torch.tensor([begin, end, end], device='cuda', dtype=torch.int32)
+    logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+        (q, None), fused, weights, context_lens, block_table, metadata, max_context_len)
+    torch.cuda.synchronize()
+    if case in ('stale_shrink', 'exact_end'):
+        valid = 1 if case == 'stale_shrink' else max_context_len
+        assert torch.equal(logits[:next_n, :valid], torch.full_like(logits[:next_n, :valid], num_heads * head_dim))
+
+
+if __name__ == '__main__':
+    run_sm90_paged_scheduler_bounds(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]))
