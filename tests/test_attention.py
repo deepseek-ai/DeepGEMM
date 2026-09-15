@@ -1,5 +1,6 @@
 import dataclasses
 import os
+import pytest
 import random
 import torch
 from typing import Tuple, List
@@ -962,7 +963,10 @@ def sm120_sparse_reference(q, kv, weights, candidates, sizes, starts, ends, bloc
     return expected.cuda(), math_expected.cuda(), mask.cuda()
 
 
-@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_metadata():
     for fmt in ('mxfp4', 'mxfp8'):
         dtype = torch.int8 if fmt == 'mxfp4' else torch.float8_e4m3fn
@@ -1015,7 +1019,10 @@ def test_sm120_sparse_metadata():
                                     'mxfp4' if dtype == torch.int8 else 'mxfp8')
 
 
-@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_metadata_wave_histogram_reuse():
     original_num_sms = deep_gemm.get_num_sms()
     try:
@@ -1089,6 +1096,10 @@ def check_sm120_sparse_entry_partition_mapping(split_headers, q_token_base):
     return counts
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_entry_partition_mapping():
     for tail in range(81):
         for wave in range(17):
@@ -1265,7 +1276,10 @@ def exercise_sm120_sparse_contract(fmt, block, count, page=0, unaligned=False, b
           f'{physical_tail=}, num_sms={deep_gemm.get_num_sms()}; exact fixture + math tolerance + 30 repeats')
 
 
-@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_contiguous():
     for fmt in ('mxfp4', 'mxfp8'):
         for block in (8, 16):
@@ -1283,7 +1297,10 @@ def test_sm120_sparse_contiguous():
         deep_gemm.set_num_sms(original_num_sms)
 
 
-@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_paged():
     for fmt in ('mxfp4', 'mxfp8'):
         for block in (8, 16):
@@ -1302,7 +1319,10 @@ def test_sm120_sparse_paged():
         deep_gemm.set_num_sms(original_num_sms)
 
 
-@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_contiguous_pipeline_tails():
     original_num_sms = deep_gemm.get_num_sms()
     try:
@@ -1317,7 +1337,10 @@ def test_sm120_sparse_contiguous_pipeline_tails():
         deep_gemm.set_num_sms(original_num_sms)
 
 
-@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_eligible_pipeline_tails():
     original_num_sms = deep_gemm.get_num_sms()
     try:
@@ -1335,7 +1358,10 @@ def test_sm120_sparse_eligible_pipeline_tails():
         deep_gemm.set_num_sms(original_num_sms)
 
 
-@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_entry_balance_row_boundary():
     original_num_sms = deep_gemm.get_num_sms()
     try:
@@ -1347,7 +1373,10 @@ def test_sm120_sparse_entry_balance_row_boundary():
         deep_gemm.set_num_sms(original_num_sms)
 
 
-@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_sparse_concurrent_graphs():
     original_num_sms = deep_gemm.get_num_sms()
     streams, fixtures = [torch.cuda.Stream(), torch.cuda.Stream()], []

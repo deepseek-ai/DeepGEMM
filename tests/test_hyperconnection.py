@@ -3,7 +3,7 @@ import random
 
 import deep_gemm
 from deep_gemm.testing import (
-    test_filter,
+    test_filter as filter_test,
     bench_kineto,
     calc_diff, count_bytes
 )
@@ -11,7 +11,7 @@ from deep_gemm.utils import align
 from generators import get_arch_major
 
 
-@test_filter(lambda: get_arch_major() >= 9)
+@filter_test(lambda: get_arch_major() >= 9)
 def test_hc_prenorm_gemm() -> None:
     # Needs TF32 precision for PyTorch GEMMs
     torch.backends.cuda.matmul.allow_tf32 = True

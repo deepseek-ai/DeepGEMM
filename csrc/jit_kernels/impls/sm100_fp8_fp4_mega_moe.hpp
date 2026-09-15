@@ -31,7 +31,10 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_situ,
+    const float& situ_beta,
+    const float& situ_linear_beta
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -70,7 +73,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                            num_experts_per_rank, 0, 0, false,
                                                            sf_smem_outer_dim);
     // NOTES: L1 output and L2 activations are essentially the same tensor.
-    // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
+    // Post-activation output has half the N width (`BLOCK_N / 2` per input tile),
     // so the swizzle mode is also halved (128 -> 64).
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, config.num_ring_tokens,
@@ -183,6 +186,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {}, {}, {},
         {}
     >);
 }};
@@ -201,6 +205,8 @@ static void __instantiate_kernel() {{
         num_sms, num_ranks,
         to_string(activation_clamp),
         fast_math ? "true" : "false",
+        use_situ ? "true" : "false",
+        to_string(situ_beta), to_string(situ_linear_beta),
         to_string(l1_weights.scalar_type())));
 
     // Launch

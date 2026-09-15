@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import random
 import torch
 
@@ -420,6 +421,10 @@ def exercise_sm120_bf16_native(layout, shape, out_dtype, alpha, c_mode,
           f'{c_mode=}, {padded=}, {offset=}, {graph=}, {pdl=}')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_bf16_native_layouts_alpha():
     assert get_arch_major() == 12
     for layout in ('nt', 'nn', 'tn', 'tt'):
@@ -429,6 +434,10 @@ def test_sm120_bf16_native_layouts_alpha():
                     exercise_sm120_bf16_native(layout, (128, 128, 256), out_dtype, alpha, c_mode)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_bf16_native_strided_tails():
     assert get_arch_major() == 12
     for layout in ('nt', 'nn', 'tn', 'tt'):
@@ -440,6 +449,10 @@ def test_sm120_bf16_native_strided_tails():
             exercise_sm120_bf16_native(layout, (67, 30, 63 if layout == 'nt' else 64), out_dtype, 0.5, 'same', padded=True)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_bf16_native_alpha_zero():
     assert get_arch_major() == 12
     for layout in ('nt', 'nn', 'tn', 'tt'):
@@ -448,6 +461,10 @@ def test_sm120_bf16_native_alpha_zero():
                 exercise_sm120_bf16_native(layout, (65, 18, 67 if layout == 'nt' else 72), out_dtype, 0.0, c_mode, padded=True, offset=1)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_bf16_native_graph_pdl():
     assert get_arch_major() == 12
     for layout in ('nt', 'nn', 'tn', 'tt'):
@@ -576,6 +593,10 @@ def exercise_sm120_grouped_bf16(mode, alignment, groups, n=64, k=72,
           f'{zero_padding=}, {all_empty=}, {graph=}, {pdl=}, {nn=}')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_grouped_bf16_alignment():
     assert get_arch_major() == 12
     old = deep_gemm.get_mk_alignment_for_contiguous_layout()
@@ -590,6 +611,10 @@ def test_sm120_grouped_bf16_alignment():
         deep_gemm.set_mk_alignment_for_contiguous_layout(old)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_grouped_bf16_contiguous():
     for alignment in (32, 64, 128):
         for mode in ('labels', 'psum'):
@@ -600,6 +625,10 @@ def test_sm120_grouped_bf16_contiguous():
                                                     zero_padding=zero_padding, nn=nn)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_grouped_bf16_masked():
     for alignment in (32, 64, 128):
         for groups in (3, 5):
@@ -607,6 +636,10 @@ def test_sm120_grouped_bf16_masked():
                 exercise_sm120_grouped_bf16('masked', alignment, groups, all_empty=all_empty)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_grouped_bf16_graph_padding():
     for alignment in (32, 64, 128):
         for mode in ('labels', 'psum', 'masked'):
@@ -615,6 +648,10 @@ def test_sm120_grouped_bf16_graph_padding():
                                             graph=True, pdl=pdl, nn=mode == 'psum')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_grouped_bf16_empty():
     for alignment in (32, 64, 128):
         for mode in ('labels', 'psum'):
@@ -793,6 +830,10 @@ def exercise_sm120_k_grouped(api, groups, alignment, psum, out_dtype, c_mode,
           f'{c_mode=}, {shape=}, {gran=}, {packed=}, {graph=}, {empty=}, {ks_mode=}, {word_prefix=}')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_k_grouped_bf16_contracts():
     for groups in (1, 3, 8):
         for psum in (False, True):
@@ -803,6 +844,10 @@ def test_sm120_k_grouped_bf16_contracts():
                                             ks_mode=('list', 'none', 'empty')[ci] if psum else 'list')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_k_grouped_bf16_graph():
     for dtype in (torch.bfloat16, torch.float32):
         for ci, c_mode in enumerate(('none', 'same', 'different')):
@@ -810,6 +855,10 @@ def test_sm120_k_grouped_bf16_graph():
                                     shape=(40, 72), graph=True, pdl=ci % 2 == 1, ks_mode='none')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_k_grouped_bf16_empty():
     for c_mode in ('none', 'same', 'different'):
         exercise_sm120_k_grouped('bf16_tn', 3, 128, True, torch.float32, c_mode, empty=True, ks_mode='empty')

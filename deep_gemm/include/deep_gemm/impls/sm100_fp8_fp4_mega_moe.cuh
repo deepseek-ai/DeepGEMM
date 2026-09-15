@@ -35,6 +35,9 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kUseSiTU,
+    float kSiTUBeta,
+    float kSiTULinearBeta,
     typename weight_dtype_t,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
@@ -148,6 +151,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     using shared_b_dtype_t = cutlass::float_e4m3_t;
     constexpr bool kIsWeightFP8 = cute::is_same_v<weight_dtype_t, cutlass::float_e4m3_t>;
     DG_STATIC_ASSERT(kIsWeightFP8 or cute::is_same_v<weight_dtype_t, cutlass::detail::float_e2m1_unpacksmem_t>, "Invalid routed weight type");
+    DG_STATIC_ASSERT(not kUseSiTU or not kIsWeightFP8, "SiTU requires FP8xFP4");
+    DG_STATIC_ASSERT(not kUseSiTU or
+                     (kSiTUBeta > 0 and kSiTUBeta < cute::numeric_limits<float>::infinity() and
+                      kSiTULinearBeta > 0 and kSiTULinearBeta < cute::numeric_limits<float>::infinity()), "Invalid SiTU beta");
+    DG_STATIC_ASSERT(not kUseSiTU or kActivationClamp == cute::numeric_limits<float>::infinity(), "SiTU cannot clamp");
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
@@ -180,7 +188,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumScheduleConsumerThreads = 2 * kNumEpilogueThreads;
 
     // Shared memory sizes
-    // NOTES: FP8 CD output for L1 (2 TMA stages, BLOCK_N/2 post-SwiGLU), BF16 output for L2 (no TMA, a single stage)
+    // NOTES: FP8 CD output for L1 (2 TMA stages, BLOCK_N/2 post-activation), BF16 output for L2 (no TMA, a single stage)
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;
     constexpr uint32_t AMAX_REDUCTION_WARP_BUFFER_SIZE = STORE_BLOCK_M / 2; // float2
 
@@ -999,7 +1007,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     while (ptx::ld_acq(l2_empty_ptr) != num_expected_blocks);
                 }
 
-                // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
+                // Unified L1 epilogue: SwiGLU or SiTU using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 float stored_cached_weight = 1.0f;
 
@@ -1049,7 +1057,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             shared_storage.tmem_empty_barriers[accum_stage_idx].arrive(0u);
                         }
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Apply SwiGLU or SiTU gated activation
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
@@ -1061,6 +1069,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 bf16_gate = __hmin2(bf16_gate, {kActivationClamp, kActivationClamp});
                                 bf16_up = __hmax2(bf16_up, {-kActivationClamp, -kActivationClamp});
                                 bf16_up = __hmin2(bf16_up, {kActivationClamp, kActivationClamp});
+                            }
+
+                            if constexpr (kUseSiTU) {
+                                const auto raw_gate = __bfloat1622float2(bf16_gate);
+                                const auto raw_up = __bfloat1622float2(bf16_up);
+                                auto neg_gate_exp = make_float2(
+                                    kFastMath ? __expf(-raw_gate.x) : expf(-raw_gate.x),
+                                    kFastMath ? __expf(-raw_gate.y) : expf(-raw_gate.y));
+                                const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+                                float2 sigmoid;
+                                if constexpr (kFastMath) {
+                                    sigmoid = {math::fast_rcp(denom.x), math::fast_rcp(denom.y)};
+                                } else {
+                                    sigmoid = {1.0f / denom.x, 1.0f / denom.y};
+                                }
+                                const auto gate = __fmul2_rn(sigmoid, {
+                                    kSiTUBeta * tanhf(raw_gate.x / kSiTUBeta),
+                                    kSiTUBeta * tanhf(raw_gate.y / kSiTUBeta)});
+                                const auto up = make_float2(
+                                    kSiTULinearBeta * tanhf(raw_up.x / kSiTULinearBeta),
+                                    kSiTULinearBeta * tanhf(raw_up.y / kSiTULinearBeta));
+                                activation_values[i][k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
+                                continue;
                             }
 
                             // SwiGLU
@@ -1130,7 +1161,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto smem_ptr = reinterpret_cast<uint8_t*>(shared_storage.smem_d.l1[epilogue_wg_idx][tma_stage_idx])
                             + i * ATOM_M * L1_OUT_BLOCK_N
                             + row * L1_OUT_BLOCK_N
-                            // Use 64B swizzle for SwiGLU, so divided by 2
+                            // Use 64B swizzle for the gated activation, so divided by 2
                             + (col ^ (row / 2)) * kNumBankGroupBytes;
                         ptx::SM100_U8x4_STSM_T<__nv_fp8x4_e4m3>::copy(fp8x4_values, smem_ptr);
 

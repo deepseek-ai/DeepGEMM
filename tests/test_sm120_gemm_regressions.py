@@ -3,32 +3,38 @@ import torch
 
 import deep_gemm
 from deep_gemm.testing import get_arch_major
-from sm120_old_heuristic import predict_dense_fp8
+from sm120_reference_heuristic import predict_dense_fp8
 from test_bf16 import exercise_sm120_bf16_native, exercise_sm120_k_grouped
 from test_fp8_fp4 import exercise_sm120_dense_fp8_fp4, sm120_dense_quantized
 
 
+pytestmark = pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
+
+
 @pytest.mark.parametrize('layout', ('nt', 'nn', 'tn', 'tt'))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
-def test_sm120_restored_bf16(layout, dtype):
+def test_sm120_bf16(layout, dtype):
     exercise_sm120_bf16_native(layout, (128, 128, 256), dtype, -0.5, 'different', graph=True)
 
 
 @pytest.mark.parametrize('fmt', ((False, False), (False, True), (True, False), (True, True)))
 @pytest.mark.parametrize('grans', ((32, 32), (32, 128), (128, 32), (128, 128)))
-def test_sm120_restored_sf_branches(fmt, grans):
+def test_sm120_sf_branches(fmt, grans):
     exercise_sm120_dense_fp8_fp4(fmt, 'nt', (128, 128, 512), torch.float32,
                                 -0.5, 'different', 'packed', grans)
 
 
 @pytest.mark.parametrize('m', (8, 16, 17))
 @pytest.mark.parametrize('fmt', ((False, False), (True, True)))
-def test_sm120_restored_swap_boundary(m, fmt):
+def test_sm120_swap_boundary(m, fmt):
     exercise_sm120_dense_fp8_fp4(fmt, 'nt', (m, 128, 512), torch.bfloat16,
                                 0.5, 'none', 'packed', (32, 128))
 
 
-def test_sm120_restored_subtile():
+def test_sm120_subtile():
     old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
     try:
         deep_gemm.set_mk_alignment_for_contiguous_layout(128)
@@ -43,7 +49,7 @@ def test_sm120_restored_subtile():
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize('alpha', (None, 0.0, -0.5, 2.0))
 @pytest.mark.parametrize('c_mode', ('none', 'same', 'different'))
-def test_sm120_restored_split_k(dtype, alpha, c_mode):
+def test_sm120_split_k(dtype, alpha, c_mode):
     old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
     try:
         deep_gemm.set_mk_alignment_for_contiguous_layout(128)
@@ -58,14 +64,14 @@ def test_sm120_restored_split_k(dtype, alpha, c_mode):
 
 @pytest.mark.parametrize('api', ('bf16_tn', 'fp8_tn', 'fp8_nt'))
 @pytest.mark.parametrize('c_mode', ('none', 'same', 'different'))
-def test_sm120_restored_k_grouped(api, c_mode):
+def test_sm120_k_grouped(api, c_mode):
     exercise_sm120_k_grouped(api, 8, 128, False, torch.float32, c_mode,
                             shape=(64, 128), gran=128)
 
 
 @pytest.mark.parametrize('api', ('bf16_tn', 'fp8_tn'))
 @pytest.mark.parametrize('alignment', (128, 256))
-def test_sm120_restored_k_psum_adapter(api, alignment):
+def test_sm120_k_psum_adapter(api, alignment):
     exercise_sm120_k_grouped(api, 8, alignment, True, torch.float32, 'same',
                             shape=(64, 128), gran=128, graph=True, ks_mode='none')
 
@@ -77,7 +83,7 @@ def test_sm120_restored_k_psum_adapter(api, alignment):
     ('fp8_nt', 128, (0, 128, 256, 0)),
 ))
 @pytest.mark.parametrize('packed', (False, True))
-def test_sm120_restored_legacy_k_alignment(api, alignment, ks, packed):
+def test_sm120_legacy_k_alignment(api, alignment, ks, packed):
     assert get_arch_major() == 12
     m, n, gran = 64, 128, 128
     quant = api != 'bf16_tn'
@@ -118,7 +124,7 @@ def test_sm120_restored_legacy_k_alignment(api, alignment, ks, packed):
 @pytest.mark.parametrize('quant', (False, True))
 @pytest.mark.parametrize('mode', ('labels', 'psum', 'masked'))
 @pytest.mark.parametrize('alignment', (32, 64, 128))
-def test_sm120_restored_m_grouped(quant, mode, alignment):
+def test_sm120_m_grouped(quant, mode, alignment):
     assert get_arch_major() == 12
     groups, capacity, n, k = 3, 2 * alignment, 128, 256
     lengths = (0, alignment + 1, alignment - 3)

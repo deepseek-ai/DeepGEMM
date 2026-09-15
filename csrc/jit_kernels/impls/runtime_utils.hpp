@@ -91,6 +91,8 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         case torch::kInt:           return CU_TENSOR_MAP_DATA_TYPE_INT32;
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+        case torch::kFloat16:       return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+        case torch::kUInt8:         return CU_TENSOR_MAP_DATA_TYPE_UINT8;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
         case kPackedFP4:            return fp4_unpacked_smem ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
                                                              : CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;

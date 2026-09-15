@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <functional>
 #include <string>
 #include <pybind11/functional.h>
@@ -10,10 +11,13 @@
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "nvfp4_mega_moe.hpp"
 
 namespace deep_gemm::mega {
 
-static int get_token_alignment_for_mega_moe() {
+static int get_token_alignment_for_mega_moe(const std::string& mma_type = "fp8xfp4") {
+    if (mma_type == "fp4xfp4")
+        return nvfp4::get_token_alignment_for_mega_moe();
     return layout::kLCMCandidateBlockM;
 }
 
@@ -21,6 +25,9 @@ static int get_block_m_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_tokens, const int& num_topk,
     const std::string& mma_type) {
+    if (mma_type == "fp4xfp4")
+        return nvfp4::get_block_m_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, mma_type);
     DG_HOST_ASSERT(num_tokens >= 0);
     const auto mma_kind = parse_mma_kind(mma_type);
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
@@ -37,8 +44,12 @@ get_symm_buffer_size_for_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
     const int& num_shared_experts = 0) {
+    if (mma_type == "fp4xfp4")
+        return nvfp4::get_symm_buffer_size_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden, mma_type, activation, num_shared_experts);
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or (mma_type == "fp8xfp4" and activation == "situ"));
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
@@ -165,7 +176,9 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const std::optional<float>& situ_beta_opt,
+    const std::optional<float>& situ_linear_beta_opt
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -174,13 +187,24 @@ static void fp8_fp4_mega_moe(
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
     // Activation checks
+    const auto use_situ = activation == "situ";
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    const auto situ_beta = situ_beta_opt.value_or(0.0f);
+    const auto situ_linear_beta = situ_linear_beta_opt.value_or(0.0f);
+    DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value());
+    DG_HOST_ASSERT(not use_situ or
+                   (std::isfinite(situ_beta) and situ_beta > 0 and
+                    std::isfinite(situ_linear_beta) and situ_linear_beta > 0));
+    DG_HOST_ASSERT(use_situ or
+                   (not situ_beta_opt.has_value() and not situ_linear_beta_opt.has_value()));
+    DG_HOST_ASSERT(not use_situ or
+                   (l1_weights.scalar_type() == kPackedFP4 and l2_weights.scalar_type() == kPackedFP4));
 
     // Tensor checks
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
@@ -273,7 +297,8 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math,
+                               use_situ, situ_beta, situ_linear_beta);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -393,9 +418,11 @@ static void bf16_mega_moe(
 }
 
 static void register_apis(pybind11::module_& m) {
-    m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
+    m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe,
+          pybind11::arg("mma_type") = "fp8xfp4");
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
+    m.def("fp4_fp4_mega_moe", &nvfp4::fp4_fp4_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 }

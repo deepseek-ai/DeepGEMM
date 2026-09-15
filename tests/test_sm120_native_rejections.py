@@ -5,6 +5,12 @@ import deep_gemm
 from deep_gemm.testing import get_arch_major
 
 
+pytestmark = pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
+
+
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize('invalid', ('a_offset', 'a_stride', 'd_offset', 'd_stride'))
 def test_sm120_native_tma_rejections(dtype, invalid):

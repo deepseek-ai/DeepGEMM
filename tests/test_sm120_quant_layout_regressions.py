@@ -6,9 +6,15 @@ from deep_gemm.testing import get_arch_major
 from test_fp8_fp4 import sm120_dense_quantized
 
 
+pytestmark = pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
+
+
 @pytest.mark.parametrize('mn_a,mn_b', ((False, True), (True, False), (True, True)))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
-def test_sm120_restored_symmetric_fp4_mn(mn_a, mn_b, dtype):
+def test_sm120_symmetric_fp4_mn(mn_a, mn_b, dtype):
     assert get_arch_major() == 12
     av, sa, ar = sm120_dense_quantized(32, 128, True, 32, 0, mn_major=mn_a)
     bv, sb, br = sm120_dense_quantized(32, 128, True, 32, 1, mn_major=mn_b)
@@ -28,7 +34,7 @@ def test_sm120_restored_symmetric_fp4_mn(mn_a, mn_b, dtype):
 @pytest.mark.parametrize('api', ('tn', 'nt'))
 @pytest.mark.parametrize('orientation', ('sf_k_mn', 'mn_sf_k'))
 @pytest.mark.parametrize('contiguous', (False, True))
-def test_sm120_restored_legacy_sf_orientation(api, orientation, contiguous):
+def test_sm120_legacy_sf_orientation(api, orientation, contiguous):
     assert get_arch_major() == 12
     m, n, gran, ks = 64, 128, 128, (0, 128, 256, 0)
     a_parts, b_parts, sa_parts, sb_parts, expected = [], [], [], [], []

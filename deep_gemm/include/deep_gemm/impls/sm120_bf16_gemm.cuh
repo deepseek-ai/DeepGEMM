@@ -475,12 +475,22 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             float v0 = accum[ai + 0], v1 = accum[ai + 1];
                             if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[c_index(idx)]); v1 += read_cd(gmem_c[c_index(idx) + 1]); }
                             store_pair(&gmem_d[idx], v0, v1);
+                        } else if (row0 < total_shape_m and col < shape_n) {
+                            auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
+                            float v0 = accum[ai + 0];
+                            if constexpr (kWithAccumulation) v0 += read_cd(gmem_c[c_index(idx)]);
+                            gmem_d[idx] = cd_dtype_t(v0);
                         }
                         if (row1 < total_shape_m and col + 1 < shape_n) {
                             auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
                             float v2 = accum[ai + 2], v3 = accum[ai + 3];
                             if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[c_index(idx)]); v3 += read_cd(gmem_c[c_index(idx) + 1]); }
                             store_pair(&gmem_d[idx], v2, v3);
+                        } else if (row1 < total_shape_m and col < shape_n) {
+                            auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
+                            float v2 = accum[ai + 2];
+                            if constexpr (kWithAccumulation) v2 += read_cd(gmem_c[c_index(idx)]);
+                            gmem_d[idx] = cd_dtype_t(v2);
                         }
                     }
                 }

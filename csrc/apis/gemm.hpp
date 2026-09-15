@@ -114,8 +114,7 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         DG_HOST_ASSERT(recipe_a.has_value() == recipe_b.has_value() and recipe.has_value() != recipe_a.has_value());
         const auto ra = recipe.has_value() ? std::make_tuple(std::get<0>(*recipe), std::get<2>(*recipe)) : *recipe_a;
         const auto rb = recipe.has_value() ? std::make_tuple(std::get<1>(*recipe), std::get<2>(*recipe)) : *recipe_b;
-        DG_HOST_ASSERT((std::get<0>(ra) == 1 or std::get<0>(ra) == 128) and
-                       (std::get<0>(rb) == 1 or std::get<0>(rb) == 128));
+        DG_HOST_ASSERT(std::get<0>(ra) > 0 and std::get<0>(rb) > 0);
         DG_HOST_ASSERT(a.second.scalar_type() != torch::kInt or std::get<0>(ra) == 1);
         DG_HOST_ASSERT(b.second.scalar_type() != torch::kInt or std::get<0>(rb) == 1);
         DG_HOST_ASSERT((std::get<1>(ra) == 32 or std::get<1>(ra) == 128) and

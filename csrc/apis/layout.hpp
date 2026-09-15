@@ -37,9 +37,15 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
             DG_HOST_ASSERT(psum_layout->is_cuda() and psum_layout->device() == sf.device());
             DG_HOST_ASSERT(psum_layout->dim() == 1 and psum_layout->is_contiguous() and psum_layout->scalar_type() == torch::kInt);
         }
-        DG_HOST_ASSERT((gran_mn == 1 or gran_mn == 128) and (gran_k == 32 or gran_k == 128));
+        DG_HOST_ASSERT(gran_mn > 0 and (gran_k == 32 or gran_k == 128));
         check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
         if (sf.scalar_type() == torch::kFloat) {
+            if (disable_ue8m0_cast and gran_k == 128) {
+                if (gran_mn == 1)
+                    return get_mn_major_tma_aligned_tensor(sf);
+                if (gran_mn == 128)
+                    return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
+            }
             DG_HOST_ASSERT(not disable_ue8m0_cast and "SM120 MMA requires UE8M0 scales");
             const auto broadcasted = gran_mn == 1 ? sf :
                 sf.index_select(-2, torch::arange(mn, at::TensorOptions().device(sf.device())).floor_divide_(gran_mn));

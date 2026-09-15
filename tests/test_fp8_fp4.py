@@ -1,3 +1,4 @@
+import pytest
 import random
 import torch
 
@@ -521,6 +522,10 @@ def exercise_sm120_dense_fp8_fp4(fmt, layout, shape, out_dtype, alpha, c_mode, s
           f'{alpha=}, {c_mode=}, {sf_kind=}, {grans=}, {padded=}, {graph=}, {pdl=}')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_dense_fp8_fp4_formats_alpha():
     for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
         for li, layout in enumerate(('nt', 'nn', 'tn', 'tt')):
@@ -534,6 +539,10 @@ def test_sm120_dense_fp8_fp4_formats_alpha():
                                                 common_recipe=grans[0] == grans[1])
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_dense_fp8_fp4_swap_boundary():
     for fmt in ((False, False), (False, True), (True, False), (True, True)):
         for m in (15, 16, 17):
@@ -542,6 +551,10 @@ def test_sm120_dense_fp8_fp4_swap_boundary():
                                             c_mode, 'packed', (32, 128), padded=True)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_dense_fp8_fp4_tails_large():
     for fmt in ((False, False), (False, True), (True, False), (True, True)):
         for dtype in (torch.bfloat16, torch.float32):
@@ -552,6 +565,10 @@ def test_sm120_dense_fp8_fp4_tails_large():
                                         'none', 'packed', (32, 128))
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_dense_fp8_fp4_graph_pdl():
     for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
         for li, layout in enumerate(('nt', 'nn', 'tn', 'tt')):
@@ -562,6 +579,10 @@ def test_sm120_dense_fp8_fp4_graph_pdl():
                                             'packed' if pdl else 'float', (128, 32), padded=True, graph=True, pdl=pdl)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_dense_fp8_fp4_explicit_rejections():
     assert get_arch_major() == 12
     raw, sf, _ = sm120_dense_quantized(32, 128, False, 32, 0)
@@ -570,7 +591,7 @@ def test_sm120_dense_fp8_fp4_explicit_rejections():
     cases = [
         (a, a, dict(recipe_a=(1, 32))),
         (a, a, dict(recipe=(1, 1, 32), recipe_a=(1, 32), recipe_b=(1, 32))),
-        (a, a, dict(recipe=(2, 1, 32))),
+        (a, a, dict(recipe=(0, 1, 32))),
         (a, a, dict(recipe=(1, 1, 64))),
         (a, a, dict(recipe=(1, 1, 32), disable_ue8m0_cast=True)),
     ]
@@ -588,6 +609,10 @@ def test_sm120_dense_fp8_fp4_explicit_rejections():
             raise AssertionError(f'Invalid dense input contract was not rejected: {kwargs}')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_dense_scaling_defaults():
     for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
         for si, sf_kind in enumerate(('float', 'packed')):
@@ -601,6 +626,10 @@ def test_sm120_dense_scaling_defaults():
                                             compare_default=True, legacy_alias=fmt == (False, False))
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_dense_scaling_blockwise_tails():
     for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
         for gi, mn_grans in enumerate(((128, 1), (1, 128), (128, 128))):
@@ -614,6 +643,10 @@ def test_sm120_dense_scaling_blockwise_tails():
                                             common_recipe=grans[0] == grans[1])
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_dense_scaling_graph():
     for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
         for pdl in (False, True):
@@ -801,6 +834,10 @@ def exercise_sm120_quant_grouped(mode, fmt, alignment, sf_kind, grans=(32, 128),
           f'{grans=}, {mn_grans=}, {nn=}, {zero_padding=}, {all_empty=}, {graph=}, {pdl=}, {defaults=}, {k=}')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_quant_grouped_formats():
     for mi, mode in enumerate(('labels', 'psum', 'masked')):
         for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
@@ -814,6 +851,10 @@ def test_sm120_quant_grouped_formats():
                                                 k=128 if index % 2 else 256)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_quant_grouped_block_scales():
     for mi, mode in enumerate(('labels', 'psum', 'masked')):
         for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
@@ -824,6 +865,10 @@ def test_sm120_quant_grouped_block_scales():
                                             zero_padding=mode != 'masked' and (mi + fi + gi) % 2 == 0)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_quant_grouped_defaults():
     for mi, mode in enumerate(('labels', 'psum', 'masked')):
         for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
@@ -834,6 +879,10 @@ def test_sm120_quant_grouped_defaults():
                                             zero_padding=mode != 'masked' and fi % 2 == 1)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_quant_grouped_graph_mutation():
     for mi, mode in enumerate(('labels', 'psum', 'masked')):
         for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
@@ -847,6 +896,10 @@ def test_sm120_quant_grouped_graph_mutation():
                                             zero_padding=mode != 'masked' and (fi + ai) % 2 == 0)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_quant_grouped_all_empty():
     for mi, mode in enumerate(('labels', 'psum', 'masked')):
         for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
@@ -856,6 +909,10 @@ def test_sm120_quant_grouped_all_empty():
                                         zero_padding=mode != 'masked' and fi % 2 == 0)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_quant_grouped_zero_m():
     for fmt in ((False, False), (False, True), (True, False), (True, True)):
         a = torch.empty((0, 64 if fmt[0] else 128), dtype=torch.int8 if fmt[0] else torch.float8_e4m3fn, device='cuda')
@@ -871,6 +928,10 @@ def test_sm120_quant_grouped_zero_m():
             assert d.numel() == 0
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_k_grouped_fp8_contracts():
     from test_bf16 import exercise_sm120_k_grouped
     for api in ('fp8_tn', 'fp8_nt'):
@@ -885,6 +946,10 @@ def test_sm120_k_grouped_fp8_contracts():
                                             default_recipe=gran == 128)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_k_grouped_fp8_graph():
     from test_bf16 import exercise_sm120_k_grouped
     for api in ('fp8_tn', 'fp8_nt'):
@@ -897,6 +962,10 @@ def test_sm120_k_grouped_fp8_graph():
                                         default_recipe=ci == 0)
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
 def test_sm120_k_grouped_fp8_empty():
     from test_bf16 import exercise_sm120_k_grouped
     for api in ('fp8_tn', 'fp8_nt'):
@@ -904,7 +973,11 @@ def test_sm120_k_grouped_fp8_empty():
             exercise_sm120_k_grouped(api, 3, 128, False, torch.float32, c_mode, empty=True)
 
 
-def test_sm120_k_grouped_fp4_pending_rejection():
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
+def test_sm120_k_grouped_fp4_unsupported_rejection():
     assert get_arch_major() == 12
     a = torch.zeros((20, 128), dtype=torch.int8, device='cuda')
     b = torch.zeros((36, 128), dtype=torch.int8, device='cuda')
@@ -916,7 +989,7 @@ def test_sm120_k_grouped_fp4_pending_rejection():
     except RuntimeError as error:
         assert 'SM120 K-grouped FP4 NT is not implemented' in str(error), str(error)
     else:
-        raise AssertionError('Deferred SM120 K-grouped FP4 unexpectedly accepted input')
+        raise AssertionError('Unsupported SM120 K-grouped FP4 unexpectedly accepted input')
     assert (d == 7).all()
 
 
