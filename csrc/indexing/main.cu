@@ -9,6 +9,7 @@
 #include <deep_gemm/impls/sm90_fp8_mqa_logits.cuh>
 #include <deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh>
 #include <deep_gemm/impls/sm100_mqa_logits.cuh>
+#include <deep_gemm/impls/sm100_fp8_mqa_logits_f16_weights.cuh>
 
 // Einsum kernels
 #include <deep_gemm/impls/sm90_bmk_bnk_mn.cuh>
