@@ -379,8 +379,13 @@ def generate_m_grouped_contiguous(num_groups: int, expected_m_per_group: int, n:
                                   major_a: MajorTypeAB, major_b: MajorTypeAB,
                                   use_ue8m0: bool = False, use_bf16: bool = False,
                                   use_psum_layout: bool = False,
-                                  quant_config: Optional[QuantConfig] = None):
-    actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
+                                  quant_config: Optional[QuantConfig] = None,
+                                  actual_ms_override: Optional[List[int]] = None):
+    if actual_ms_override is not None:
+        assert num_groups == len(actual_ms_override), f'{num_groups=} != {len(actual_ms_override)=}'
+        actual_ms = list(actual_ms_override)
+    else:
+        actual_ms = [int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)]
     aligned_ms = [align(actual_m, get_mk_alignment_for_contiguous_layout()) for actual_m in actual_ms]
     m = sum(aligned_ms)
 

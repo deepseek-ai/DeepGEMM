@@ -1,3 +1,4 @@
+import os
 import random
 import torch
 
@@ -15,7 +16,8 @@ from utils import (
 )
 
 from generators import (
-    KernelType, QuantConfig, get_ue8m0_usage,
+    KernelType, MajorTypeAB, QuantConfig, get_ue8m0_usage,
+    get_kernel_types, get_major_ab, reset_seed,
     enumerate_normal, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     enumerate_k_grouped_contiguous_test_variants,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
@@ -147,6 +149,122 @@ def test_m_grouped_gemm_contiguous() -> None:
               f'{t * 1e6:4.0f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
+    print()
+
+
+def test_m_grouped_gemm_contiguous_middle_empty_groups() -> None:
+    print('Testing m-grouped contiguous GEMM with empty groups:')
+
+    # Select best alignment
+    alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
+    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+
+    for kernel_type in get_kernel_types(torch.float8_e4m3fn):
+        for quant_config in QuantConfig.get_list_from_dtype(torch.float8_e4m3fn):
+            use_ue8m0 = get_ue8m0_usage(kernel_type)
+            disable_ue8m0_cast = not use_ue8m0
+            recipe, recipe_a, recipe_b = quant_config.get_recipes()
+
+            reset_seed()
+            for actual_ms in ([100, 0, 130, 65], [128, 130, 65], [0, 100, 130], [100, 130, 0]):
+                num_groups, n, k = len(actual_ms), 128, 256
+                for major_a, major_b in get_major_ab(False, get_arch_major() != 9):
+                    if quant_config.is_fp4_fp4() and major_b.is_mn_major():
+                        continue
+                    m, a, b, grouped_layout, d, ref_d, valid_mask = generate_m_grouped_contiguous(
+                        num_groups, 0, n, k, major_a, major_b,
+                        use_ue8m0=use_ue8m0, quant_config=quant_config,
+                        actual_ms_override=actual_ms)
+                    deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                        a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast,
+                        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+                    diff = calc_diff(d[valid_mask], ref_d[valid_mask])
+                    assert diff < quant_config.max_diff(), (f'{m=}, {n=}, {k=}, {actual_ms=}, '
+                                                            f'{major_a=}, {major_b=}, {diff:.5f}')
+    print()
+
+
+def test_m_grouped_gemm_contiguous_labels_contract_rejection() -> None:
+    print('Testing m-grouped contiguous labels contract rejection:')
+
+    saved_env = os.environ.get('DG_CHECK_CONTIGUOUS_LABELS')
+    saved_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    os.environ['DG_CHECK_CONTIGUOUS_LABELS'] = '1'
+    try:
+        quant_config = QuantConfig()
+        use_ue8m0 = get_ue8m0_usage(get_kernel_types(torch.float8_e4m3fn)[0])
+        disable_ue8m0_cast = not use_ue8m0
+        recipe, recipe_a, recipe_b = quant_config.get_recipes()
+        n, k = 128, 256
+
+        # Group 1 starts at row 128: a multiple of 128, but not of 256
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        reset_seed()
+        m, a, b, grouped_layout, d, ref_d, valid_mask = generate_m_grouped_contiguous(
+            2, 0, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor,
+            use_ue8m0=use_ue8m0, quant_config=quant_config,
+            actual_ms_override=[100, 130])
+        assert m == 384 and grouped_layout[127].item() == -1 and grouped_layout[128].item() == 1
+
+        # A runtime alignment above the label granularity must be rejected loudly
+        deep_gemm.set_mk_alignment_for_contiguous_layout(256)
+        raised = None
+        try:
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast,
+                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+        except RuntimeError as e:
+            raised = str(e)
+        assert raised is not None and 'not a multiple of the runtime mk alignment' in raised, raised
+
+        # The same layout is valid when the runtime alignment matches the label granularity
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        raised = None
+        try:
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast,
+                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+        except RuntimeError as e:
+            raised = str(e)
+        if raised is None:
+            diff = calc_diff(d[valid_mask], ref_d[valid_mask])
+            assert diff < quant_config.max_diff(), f'{m=}, {n=}, {k=}, {diff:.5f}'
+        else:
+            # Unsupported architectures fail after the contract check, at kernel dispatch;
+            # a supported architecture must run to completion and is checked above
+            assert get_arch_major() == 12, raised
+            assert 'not a multiple of the runtime mk alignment' not in raised, raised
+
+        # A label run resuming after padding at an unaligned row must also be rejected:
+        # such a tile has a padding first-row label and would be silently skipped
+        for labels in ([0] * 128 + [-1] * 3 + [0] * 125 + [-1] * 128,
+                       [0] * 128 + [1] * 128 + [-1] + [1] * 127):
+            grouped_layout = torch.tensor(labels, device='cuda', dtype=torch.int32)
+            raised = None
+            try:
+                deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                    a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast,
+                    recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+            except RuntimeError as e:
+                raised = str(e)
+            assert raised is not None and 'not a multiple of the runtime mk alignment' in raised, raised
+
+        # Out-of-range labels must be rejected as well (any negative label is padding)
+        grouped_layout = torch.tensor([0] * 128 + [1] * 255 + [2], device='cuda', dtype=torch.int32)
+        raised = None
+        try:
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                a, b, d, grouped_layout, disable_ue8m0_cast=disable_ue8m0_cast,
+                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+        except RuntimeError as e:
+            raised = str(e)
+        assert raised is not None and 'out of range' in raised, raised
+    finally:
+        if saved_env is None:
+            os.environ.pop('DG_CHECK_CONTIGUOUS_LABELS', None)
+        else:
+            os.environ['DG_CHECK_CONTIGUOUS_LABELS'] = saved_env
+        deep_gemm.set_mk_alignment_for_contiguous_layout(saved_alignment)
     print()
 
 
@@ -362,5 +480,7 @@ if __name__ == '__main__':
 
     test_gemm()
     test_m_grouped_gemm_contiguous()
+    test_m_grouped_gemm_contiguous_middle_empty_groups()
+    test_m_grouped_gemm_contiguous_labels_contract_rejection()
     test_m_grouped_gemm_masked()
     test_k_grouped_gemm_contiguous()
