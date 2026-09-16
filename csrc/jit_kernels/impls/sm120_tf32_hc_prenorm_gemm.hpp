@@ -14,6 +14,7 @@ class SM120TF32HCPrenormGemmRuntime final: public SM120LaunchRuntime<SM120TF32HC
 public:
     struct Args {
         int m, n, k;
+        int64_t stride_d_m, stride_d_split;
         int block_m, block_n, block_k;
         int num_splits;
         int num_stages;
@@ -53,7 +54,8 @@ static void __instantiate_kernel() {{
     template <typename Kernel>
     static void launch_impl(const Kernel& kernel, const Args& args) {
         sm120_launch_kernel(kernel, args.launch_args,
-            args.m, args.tensor_map_a, args.tensor_map_b, args.gmem_d, args.sqr_sum);
+            args.m, args.tensor_map_a, args.tensor_map_b, args.gmem_d, args.sqr_sum,
+            args.stride_d_m, args.stride_d_split);
     }
 };
 
@@ -106,6 +108,8 @@ static void sm120_tf32_hc_prenorm_gemm(const torch::Tensor& a,
 
     const SM120TF32HCPrenormGemmRuntime::Args args = {
         .m = m, .n = n, .k = k,
+        .stride_d_m = d.stride(-2),
+        .stride_d_split = d.dim() == 3 ? d.stride(0) : 0,
         .block_m = block_m, .block_n = block_n, .block_k = block_k,
         .num_splits = num_splits,
         .num_stages = num_stages,

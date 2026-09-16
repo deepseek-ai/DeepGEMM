@@ -48,7 +48,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                      cute::TmaDescriptor* tensor_map_buffer,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                      const epilogue_type_t epilogue,
-                     uint32_t stride_d_m, uint32_t stride_c_m,
+                     uint32_t stride_d_m, uint32_t stride_c_m, uint32_t stride_d_batch,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
@@ -205,6 +205,10 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             ptx::tensor_map_replace_global_inner_dim_stride_in_smem(
                                 smem_tm_b, scheduler.current_shape_k, new_stride);
                         }
+
+                        cute::tma_desc_commit_group();
+                        cute::tma_desc_wait_group();
+                        __syncwarp(1u << lane_idx);
 
                         *gmem_tm_a = *smem_tm_a;
                         *gmem_tm_b = *smem_tm_b;
@@ -366,11 +370,9 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             };
 
             constexpr bool kIsBatchedEpilogue = (kGemmType == GemmType::Batched);
-            // Batched D is [M, batch, N] physical layout: stride_m = kNumGroups * shape_n
-            const int64_t cd_m_stride = kIsBatchedEpilogue
-                ? static_cast<int64_t>(kNumGroups) * shape_n : static_cast<int64_t>(stride_d_m != 0 ? stride_d_m : shape_n);
+            const int64_t cd_m_stride = stride_d_m != 0 ? stride_d_m : shape_n;
             const int64_t cd_batch_offset = kIsBatchedEpilogue
-                ? static_cast<int64_t>(scheduler.current_group_idx) * shape_n : 0;
+                ? static_cast<int64_t>(scheduler.current_group_idx) * stride_d_batch : 0;
             auto c_index = [&](int64_t idx) {
                 if constexpr (kGemmType == GemmType::Normal)
                     return (idx / cd_m_stride) * (stride_c_m != 0 ? stride_c_m : cd_m_stride) + idx % cd_m_stride;

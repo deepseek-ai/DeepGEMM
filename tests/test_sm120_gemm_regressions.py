@@ -49,16 +49,40 @@ def test_sm120_subtile():
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize('alpha', (None, 0.0, -0.5, 2.0))
 @pytest.mark.parametrize('c_mode', ('none', 'same', 'different'))
-def test_sm120_split_k(dtype, alpha, c_mode):
+@pytest.mark.parametrize('padded', (False, True))
+def test_sm120_split_k(dtype, alpha, c_mode, padded):
     old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    old_sms = deep_gemm.get_num_sms()
     try:
+        deep_gemm.set_num_sms(32)
         deep_gemm.set_mk_alignment_for_contiguous_layout(128)
         prediction = predict_dense_fp8(32, 256, 16384, deep_gemm.get_num_sms(),
                                        output_bytes=torch.empty((), dtype=dtype).element_size())
         assert prediction['split_k'] > 1, prediction
         exercise_sm120_dense_fp8_fp4((False, False), 'nt', (32, 256, 16384), dtype,
-                                    alpha, c_mode, 'packed', (128, 128), graph=True)
+                                    alpha, c_mode, 'packed', (128, 128), padded=padded,
+                                    graph=True, pdl=True)
     finally:
+        deep_gemm.set_num_sms(old_sms)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
+
+
+@pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
+@pytest.mark.parametrize('alpha', (None, 0.0, -0.5, 2.0))
+def test_sm120_split_k_swapped_strides(dtype, alpha):
+    old_sms = deep_gemm.get_num_sms()
+    old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    try:
+        deep_gemm.set_num_sms(32)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        prediction = predict_dense_fp8(128, 8, 16384, 32, swapped=True,
+                                       output_bytes=torch.empty((), dtype=dtype).element_size())
+        assert prediction['split_k'] > 1 and prediction['swizzle_cd'] == 0, prediction
+        exercise_sm120_dense_fp8_fp4((False, False), 'nt', (8, 128, 16384), dtype,
+                                    alpha, 'none', 'packed', (128, 128), padded=True,
+                                    graph=True, pdl=True)
+    finally:
+        deep_gemm.set_num_sms(old_sms)
         deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
 
 

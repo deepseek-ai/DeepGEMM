@@ -83,7 +83,18 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         };
         const auto native_a = aligned_input(a);
         const auto native_b = aligned_input(b);
-        const bool direct_d = d.is_contiguous() and reinterpret_cast<uintptr_t>(d.data_ptr()) % 8 == 0;
+        const auto direct_d = [&]() {
+            const auto row_stride = d.stride(-2);
+            if (reinterpret_cast<uintptr_t>(d.data_ptr()) % 8 != 0 or row_stride < n
+                or row_stride > std::numeric_limits<int>::max() / 4 or row_stride % 2 != 0)
+                return false;
+            const auto row_span = (m - 1LL) * row_stride + n;
+            const auto split_stride = d.dim() == 3 ? d.stride(0) : 0;
+            if (splits > 1 and (split_stride < row_span or split_stride % 2 != 0))
+                return false;
+            const auto span_bytes = ((splits - 1LL) * split_stride + row_span) * 4;
+            return reinterpret_cast<uintptr_t>(d.data_ptr()) <= std::numeric_limits<uintptr_t>::max() - span_bytes;
+        }();
         const auto native_d = direct_d ? d : torch::empty(d.sizes(), d.options());
         sm120_tf32_hc_prenorm_gemm(native_a, native_b, native_d, sqr_sum, m, n, k, splits);
         if (not direct_d)

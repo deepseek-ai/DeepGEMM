@@ -81,29 +81,7 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k,
                                 128, 128, major_a, major_b, compiled_dims, epilogue_type);
     } else if (arch_major == 12 and sfa.scalar_type() == torch::kInt) {
-        const auto desc = SM120GemmDesc {
-            .gemm_type = GemmType::Normal,
-            .kernel_type = KernelType::Kernel1D1D,
-            .m = m, .n = n, .k = k, .num_groups = 1,
-            .a_dtype = a.first.scalar_type(), .b_dtype = b.first.scalar_type(),
-            .cd_dtype = d.scalar_type(), .major_a = major_a, .major_b = major_b,
-            .with_accumulation = false,
-            .num_sms = runtime->get_num_sms(), .tc_util = runtime->get_tc_util(),
-            .compiled_dims = compiled_dims, .max_gran_k = 128, .cd_n_contiguous = true
-        };
-        const auto config = get_best_sm120_config<SM120ArchSpec>(desc);
-        const int split_k = SM120ArchSpec::get_split_k_factor(desc, config.layout);
-        const int64_t last_mapped_n = n - 1 +
-            (static_cast<int64_t>(n) - 1 + right) / (static_cast<int64_t>(left) + right) * mid;
-        const bool identity_on_valid_columns = last_mapped_n == n - 1;
-        DG_HOST_ASSERT((split_k == 1 or identity_on_valid_columns) and
-                       "SM120 split-K reduction does not support nonidentity head-split index transforms");
-        const int swizzle_cd = config.storage_config.swizzle_cd_mode;
-        const int block_n_bytes = config.layout.block_n * static_cast<int>(d.element_size());
-        const bool use_tma_store = swizzle_cd > 0 and block_n_bytes >= swizzle_cd and
-                                   block_n_bytes % swizzle_cd == 0;
-        DG_HOST_ASSERT((split_k > 1 or use_tma_store or last_mapped_n < n) and
-                       "SM120 direct stores bound transformed head-split columns by the unexpanded N");
+        DG_HOST_ASSERT(sfb.scalar_type() == torch::kInt);
         sm120_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, std::nullopt, d, m, n, k,
                                 128, 128, major_a, major_b, compiled_dims, epilogue_type);
     } else {

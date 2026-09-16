@@ -23,6 +23,7 @@ public:
         int k_alignment = 128;
         int stride_d_m = 0;
         int stride_c_m = 0;
+        int stride_d_batch = 0;
 
         void* gmem_d;
         void* gmem_c;
@@ -88,7 +89,7 @@ static void __instantiate_kernel() {{
             args.grouped_layout,
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
-            args.epilogue_args, args.stride_d_m, args.stride_c_m,
+            args.epilogue_args, args.stride_d_m, args.stride_c_m, args.stride_d_batch,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd);
     }
@@ -443,6 +444,8 @@ static void sm120_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
                                   config.pipeline_config.smem_size,
                                   1),
         .epilogue_type = std::nullopt,
+        .stride_d_m = static_cast<int>(tensor_d.stride(0)),
+        .stride_d_batch = static_cast<int>(tensor_d.stride(1)),
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,
@@ -501,6 +504,8 @@ static void sm120_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
                                   config.pipeline_config.smem_size,
                                   1),
         .epilogue_type = std::nullopt,
+        .stride_d_m = static_cast<int>(tensor_d.stride(0)),
+        .stride_d_batch = static_cast<int>(tensor_d.stride(1)),
         .gmem_d = tensor_d.data_ptr(),
         .gmem_c = nullptr,
         .gmem_a_ptr = nullptr,

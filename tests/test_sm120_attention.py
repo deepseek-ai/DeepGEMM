@@ -189,6 +189,35 @@ def test_sm120_skip_head_mid(dtype):
     assert (storage[~valid] == 19).all()
 
 
+@pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
+@pytest.mark.parametrize('packed_a,packed_b', ((False, False), (False, True), (True, False)))
+def test_sm120_skip_head_mid_reject_fp32_scale_without_cast(dtype, packed_a, packed_b):
+    a = torch.ones((1, 512), dtype=torch.float8_e4m3fn, device='cuda')
+    b = torch.ones((256, 512), dtype=torch.float8_e4m3fn, device='cuda')
+    sa, sb = torch.ones((1, 4), device='cuda'), torch.ones((256, 4), device='cuda')
+    packed_sa = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sa)
+    packed_sb = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sb)
+    sfa, sfb = packed_sa if packed_a else sa, packed_sb if packed_b else sb
+    d, storage = native_matrix(torch.full((1, 320), 19, dtype=dtype), True, 1)
+    before = storage.clone()
+    match = 'sfb.scalar_type' if packed_a else 'Unsupported architecture or scaling factor types'
+    with pytest.raises(RuntimeError, match=match):
+        deep_gemm.fp8_gemm_nt_skip_head_mid((a, sfa), (b, sfb), d, (128, 64, 128),
+                                          recipe=(1, 1, 128), disable_ue8m0_cast=True)
+    assert torch.equal(storage, before)
+    for scale_a, scale_b, disable_cast in ((sfa, sfb, False), (packed_sa, packed_sb, True)):
+        d.fill_(19)
+        deep_gemm.fp8_gemm_nt_skip_head_mid((a, scale_a), (b, scale_b), d, (128, 64, 128),
+                                          recipe=(1, 1, 128), disable_ue8m0_cast=disable_cast)
+        actual = d.cpu()
+        torch.testing.assert_close(actual[:, :128], torch.full((1, 128), 512, dtype=dtype), rtol=0, atol=0)
+        torch.testing.assert_close(actual[:, 192:], torch.full((1, 128), 512, dtype=dtype), rtol=0, atol=0)
+        assert (actual[:, 128:192] == 19).all()
+        valid = torch.zeros_like(storage, dtype=torch.bool)
+        valid.as_strided(d.shape, d.stride(), d.storage_offset()).fill_(True)
+        assert (storage[~valid] == 19).all()
+
+
 @pytest.mark.parametrize('dim,heads,page', ((32, 32, 64), (64, 64, 128)))
 def test_sm120_paged_mqa_metadata_graph(dim, heads, page):
     batch, pages = 7, 6
@@ -273,33 +302,77 @@ def test_sm120_mqa_host_rejections():
         deep_gemm.get_mqa_logits_metadata(starts, ends, 128, 16)
 
 
-@pytest.mark.parametrize('identity', (False, True))
-def test_sm120_skip_head_split_k_guard(identity):
-    m, n, k = 32, 256, 16384
+@pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
+@pytest.mark.parametrize('padded', (False, True))
+@pytest.mark.parametrize('pdl', (False, True))
+@pytest.mark.parametrize('shape,splits,sms,branch', (
+    ((128, 16, 128), (8, 8, 8), 2, 'scalar'),
+    ((65, 16, 128), (8, 8, 8), 2, 'scalar'),
+    ((129, 16, 128), (0, 8, 8), 2, 'scalar'),
+    ((1, 16, 128), (8, 8, 0), 2, 'scalar'),
+    ((65, 16, 128), (8, 0, 8), 2, 'scalar'),
+    ((32, 256, 16384), (128, 64, 128), 32, 'split'),
+    ((32, 512, 16384), (128, 64, 128), 32, 'split'),
+    ((32, 128, 16384), (0, 64, 128), 32, 'split'),
+    ((32, 128, 16384), (128, 64, 0), 32, 'split'),
+    ((32, 256, 16384), (128, 0, 128), 32, 'split'),
+    ((128, 256, 2048), (128, 64, 128), 2, 'tma'),
+    ((1024, 512, 128), (128, 64, 128), 32, 'tma'),
+))
+def test_sm120_skip_head_stores(dtype, padded, pdl, shape, splits, sms, branch):
+    from sm120_reference_heuristic import predict_dense_fp8
+
+    m, n, k = shape
+    left, mid, right = splits
+    width = n + n // (left + right) * mid
     aa, sa, ar = fp8_operand(1, m, k, 1, 128, 1)
     bb, sb, br = fp8_operand(1, n, k, 1, 128, 2)
     a, b = (aa[0].cuda(), sa[0].cuda()), (bb[0].cuda(), sb[0].cuda())
-    splits = (128, 0, 128) if identity else (128, 64, 128)
-    d, storage = native_matrix(torch.full((m, n if identity else 320), 19, dtype=torch.bfloat16), True, 1)
-    before = storage.clone()
-    if identity:
-        deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, splits, recipe=(1, 1, 128))
-        check_logits(d.cpu(), ar[0] @ br[0].T, torch.bfloat16)
-        valid = torch.zeros_like(storage, dtype=torch.bool)
-        valid.as_strided(d.shape, d.stride(), d.storage_offset()).fill_(True)
-        assert (storage[~valid] == 19).all()
-    else:
-        with pytest.raises(RuntimeError, match='split-K reduction'):
+    d, storage = native_matrix(torch.full((m, width), 19, dtype=dtype), padded, int(padded))
+    logical = torch.arange(n)
+    physical = logical + (logical + right) // (left + right) * mid
+    expected = ar[0] @ br[0].T
+    untouched = torch.ones(width, dtype=torch.bool)
+    untouched[physical] = False
+    valid = torch.zeros_like(storage, dtype=torch.bool)
+    valid.as_strided(d.shape, d.stride(), d.storage_offset()).fill_(True)
+    old_sms = deep_gemm.get_num_sms()
+    old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    old_pdl = deep_gemm.get_pdl()
+    try:
+        deep_gemm.set_pdl(pdl)
+        deep_gemm.set_num_sms(sms)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        prediction = predict_dense_fp8(m, n, k, sms, output_bytes=d.element_size())
+        assert (prediction['split_k'] > 1) == (branch == 'split'), prediction
+        if branch != 'split':
+            assert (prediction['swizzle_cd'] > 0) == (branch == 'tma'), prediction
+
+        def call():
             deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, splits, recipe=(1, 1, 128))
-        assert torch.equal(storage, before)
 
+        def check():
+            actual = d.cpu()
+            check_logits(actual[:, physical], expected, dtype)
+            assert (actual[:, untouched] == 19).all()
+            assert (storage[~valid] == 19).all()
 
-def test_sm120_skip_head_direct_guard():
-    aa, sa, _ = fp8_operand(1, 128, 128, 1, 128, 1)
-    bb, sb, _ = fp8_operand(1, 16, 128, 1, 128, 2)
-    d, storage = native_matrix(torch.full((128, 24), 19, dtype=torch.bfloat16), True, 1)
-    before = storage.clone()
-    with pytest.raises(RuntimeError, match='direct stores bound transformed'):
-        deep_gemm.fp8_gemm_nt_skip_head_mid((aa[0].cuda(), sa[0].cuda()), (bb[0].cuda(), sb[0].cuda()),
-                                          d, (8, 8, 8), recipe=(1, 1, 128))
-    assert torch.equal(storage, before)
+        call()
+        check()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            call()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            call()
+        for _ in range(2):
+            storage.fill_(19)
+            graph.replay()
+            torch.cuda.synchronize()
+            check()
+    finally:
+        deep_gemm.set_pdl(old_pdl)
+        deep_gemm.set_num_sms(old_sms)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)

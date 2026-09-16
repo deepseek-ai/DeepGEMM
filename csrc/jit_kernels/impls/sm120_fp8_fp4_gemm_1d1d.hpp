@@ -151,6 +151,7 @@ public:
         int stride_c_m, stride_c_n;
         bool with_alpha;
         float alpha;
+        std::optional<std::string> epilogue_type;
     };
 
     static std::string generate_impl(const Args& args) {
@@ -160,11 +161,12 @@ public:
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm120_split_k_reduce_impl<{}, {}>);
+    auto ptr = reinterpret_cast<void*>(&sm120_split_k_reduce_impl<{}, {}, {}>);
 }};
 )",
         to_string(args.gemm_desc.cd_dtype),
-        args.gemm_config.split_k_factor);
+        args.gemm_config.split_k_factor,
+        get_default_epilogue_type(args.epilogue_type));
     }
 
     template <typename Kernel>
@@ -180,7 +182,8 @@ static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Te
                                   const int& m, const int& n, const int& split_k,
                                   const int stride_cd_m, const int stride_cd_n,
                                   const std::optional<torch::Tensor>& c,
-                                  const std::optional<float>& alpha) {
+                                  const std::optional<float>& alpha,
+                                  const std::optional<std::string>& epilogue_type = std::nullopt) {
     const int total = m * n;
     const int threads = 256;
     const int blocks = ceil_div(total, threads);
@@ -213,6 +216,7 @@ static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Te
         .stride_c_n = c.has_value() ? static_cast<int>(c->stride(-1)) : 0,
         .with_alpha = alpha.has_value(),
         .alpha = alpha.value_or(1.0f),
+        .epilogue_type = epilogue_type,
     };
     const auto code = SM120SplitKReduceRuntime::generate(args);
     const auto runtime = jit->compile("sm120_split_k_reduce", code);
@@ -328,7 +332,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     if (split_k > 1) {
         const int reduce_stride_m = swap_ab ? static_cast<int>(d.stride(-1)) : d_stride;
         const int reduce_stride_n = swap_ab ? static_cast<int>(d.stride(-2)) : 1;
-        sm120_split_k_reduce(workspace, d, m, n, split_k, reduce_stride_m, reduce_stride_n, c, alpha);
+        sm120_split_k_reduce(workspace, d, m, n, split_k, reduce_stride_m, reduce_stride_n, c, alpha, epilogue_type);
     }
 }
 

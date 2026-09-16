@@ -1503,24 +1503,25 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                         const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
                         const uint32_t nt_global = n_tile_base + nt;
+                        const uint32_t logical_col = n_base + nt_global * MMA_N + thread_id * 2;
                         const uint32_t col = epilogue_type_t::template apply_index_n<MMA_N>(n_base + nt_global * MMA_N) + thread_id * 2;
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 
                         if (can_pair) {
                             // Pair store, with a single-element tail for odd shape_n
-                            if (row0 < total_shape_m and col < shape_n and row_is_valid(row0)) {
+                            if (row0 < total_shape_m and logical_col < shape_n and row_is_valid(row0)) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride + col;
                                 float v0 = accum[ai + 0], v1 = accum[ai + 1];
-                                if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[c_index(idx)]); if (col + 1 < shape_n) v1 += read_cd(gmem_c[c_index(idx) + 1]); }
-                                if (col + 1 < shape_n) store_pair(&gmem_d[idx], v0, v1);
+                                if constexpr (kWithAccumulation) { v0 += read_cd(gmem_c[c_index(idx)]); if (logical_col + 1 < shape_n) v1 += read_cd(gmem_c[c_index(idx) + 1]); }
+                                if (logical_col + 1 < shape_n) store_pair(&gmem_d[idx], v0, v1);
                                 else                   gmem_d[idx] = cd_dtype_t(v0);
                             }
-                            if (row1 < total_shape_m and col < shape_n and row_is_valid(row1)) {
+                            if (row1 < total_shape_m and logical_col < shape_n and row_is_valid(row1)) {
                                 auto idx = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride + col;
                                 float v2 = accum[ai + 2], v3 = accum[ai + 3];
-                                if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[c_index(idx)]); if (col + 1 < shape_n) v3 += read_cd(gmem_c[c_index(idx) + 1]); }
-                                if (col + 1 < shape_n) store_pair(&gmem_d[idx], v2, v3);
+                                if constexpr (kWithAccumulation) { v2 += read_cd(gmem_c[c_index(idx)]); if (logical_col + 1 < shape_n) v3 += read_cd(gmem_c[c_index(idx) + 1]); }
+                                if (logical_col + 1 < shape_n) store_pair(&gmem_d[idx], v2, v3);
                                 else                   gmem_d[idx] = cd_dtype_t(v2);
                             }
                         } else {
@@ -1532,16 +1533,16 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                             };
                             if (row0 < total_shape_m and row_is_valid(row0)) {
                                 auto base = cd_batch_offset + static_cast<int64_t>(row0) * cd_m_stride;
-                                if (col < shape_n)
+                                if (logical_col < shape_n)
                                     store_value(base + static_cast<int64_t>(col) * cd_n_stride, accum[ai + 0]);
-                                if (col + 1 < shape_n)
+                                if (logical_col + 1 < shape_n)
                                     store_value(base + static_cast<int64_t>(col + 1) * cd_n_stride, accum[ai + 1]);
                             }
                             if (row1 < total_shape_m and row_is_valid(row1)) {
                                 auto base = cd_batch_offset + static_cast<int64_t>(row1) * cd_m_stride;
-                                if (col < shape_n)
+                                if (logical_col < shape_n)
                                     store_value(base + static_cast<int64_t>(col) * cd_n_stride, accum[ai + 2]);
-                                if (col + 1 < shape_n)
+                                if (logical_col + 1 < shape_n)
                                     store_value(base + static_cast<int64_t>(col + 1) * cd_n_stride, accum[ai + 3]);
                             }
                         }

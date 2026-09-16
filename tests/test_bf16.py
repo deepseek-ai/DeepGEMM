@@ -864,6 +864,49 @@ def test_sm120_k_grouped_bf16_empty():
         exercise_sm120_k_grouped('bf16_tn', 3, 128, True, torch.float32, c_mode, empty=True, ks_mode='empty')
 
 
+@pytest.mark.skipif(
+    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
+    reason='requires SM120',
+)
+@pytest.mark.parametrize('logical_ks', ((154, 147, 121, 109, 128, 120, 149, 112), (121, 121, 121)))
+@pytest.mark.parametrize('alias', (False, True))
+def test_sm120_k_grouped_bf16_descriptor_reuse(logical_ks, alias):
+    m, n = 768, 2048
+    host_ks = [(k + 127) // 128 * 128 for k in logical_ks]
+    generator = torch.Generator().manual_seed(0)
+    av = torch.zeros((sum(host_ks), m), dtype=torch.bfloat16)
+    bv = torch.zeros((sum(host_ks), n), dtype=torch.bfloat16)
+    cv = torch.randn((len(host_ks), m, n), generator=generator) * 32
+    expected, start = [], 0
+    for g, (logical_k, host_k) in enumerate(zip(logical_ks, host_ks)):
+        av[start:start + logical_k] = torch.randn((logical_k, m), generator=generator, dtype=torch.bfloat16)
+        bv[start:start + logical_k] = torch.randn((logical_k, n), generator=generator, dtype=torch.bfloat16)
+        expected.append((av[start:start + host_k].double().T @ bv[start:start + host_k].double()
+                         + cv[g].double()).float())
+        start += host_k
+    expected = torch.stack(expected)
+    a, b, initial = av.cuda(), bv.cuda(), cv.cuda()
+    metadata = torch.tensor(host_ks, dtype=torch.int32, device='cuda')
+    old_sms = deep_gemm.get_num_sms()
+    old_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    try:
+        deep_gemm.set_num_sms(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        first = None
+        for _ in range(8):
+            d = initial.clone()
+            deep_gemm.k_grouped_bf16_gemm_tn_contiguous(a, b, d, host_ks, metadata, d if alias else initial)
+            actual = d.cpu()
+            torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-4)
+            if first is not None:
+                torch.testing.assert_close(actual, first, rtol=0, atol=0)
+            first = actual
+        torch.testing.assert_close(initial.cpu(), cv, rtol=0, atol=0)
+    finally:
+        deep_gemm.set_num_sms(old_sms)
+        deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)

@@ -127,8 +127,18 @@ static void sm120_bf16_einsum(const torch::Tensor& A, const torch::Tensor& B,
                                     b_k_major ? k : native_n, native_n != n);
         native_b.narrow(b_k_major ? 1 : 2, 0, n).copy_(B);
     }
-    const bool direct_output = native_n == n and tma_aligned(D)
-        and D.stride(0) == static_cast<int64_t>(h) * n and D.stride(1) == n;
+    const auto direct_output = [&]() {
+        if (native_n != n or not tma_aligned(D))
+            return false;
+        const auto row_stride = D.stride(0), group_stride = D.stride(1);
+        const bool separate_rows = (h == 1 or group_stride >= n)
+            and (m == 1 or row_stride >= (h - 1LL) * group_stride + n);
+        const bool separate_groups = (m == 1 or row_stride >= n)
+            and (h == 1 or group_stride >= (m - 1LL) * row_stride + n);
+        const auto span_bytes = ((m - 1LL) * row_stride + (h - 1LL) * group_stride + n) * 2;
+        return (separate_rows or separate_groups)
+            and reinterpret_cast<std::uintptr_t>(D.data_ptr()) <= std::numeric_limits<std::uintptr_t>::max() - span_bytes;
+    }();
     auto native_d = D;
     if (not direct_output) {
         DG_HOST_ASSERT(static_cast<int64_t>(h) * native_n <= max_stride);
