@@ -196,8 +196,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
 
                         if constexpr (kKGroupedConstantStride) {
-                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
-                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
+                            sm120::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
+                            sm120::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
                         } else {
                             const uint64_t new_stride = static_cast<uint64_t>(scheduler.current_shape_k * 2);
                             ptx::tensor_map_replace_global_inner_dim_stride_in_smem(

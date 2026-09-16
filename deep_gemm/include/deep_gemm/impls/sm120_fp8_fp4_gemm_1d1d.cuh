@@ -256,8 +256,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 : (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)));
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_k_byte_offset);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_k_byte_offset);
-                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
-                            ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
+                            sm120::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
+                            sm120::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
                         } else {
                             const uint64_t a_offset = kIsFP4
                                 ? (static_cast<uint64_t>((kGemmType == GemmType::KGroupedContiguousWithPsumLayout ? scheduler.current_k_start : scheduler.current_k_cumsum)) * shape_m / 2)

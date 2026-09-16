@@ -1,9 +1,10 @@
 #pragma once
 
 #include <cutlass/arch/barrier.h>
+#include <cutlass/float_subbyte.h>
+#include <cute/util/type_traits.hpp>
 
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/common/packing.cuh>
 #include <deep_gemm/common/types.cuh>
 
 namespace deep_gemm::layout::sparse_mqa_logits {
@@ -95,7 +96,9 @@ template <uint32_t BLOCK_Q, uint32_t SPARSE_BLOCK_KV, uint32_t SPLIT_KV, uint32_
 struct SharedStorage {
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
-    static constexpr uint32_t kPackFactor = get_smem_pack_factor<qk_dtype_t>();
+    // Packed FP4 stores two logical elements per byte in shared memory.
+    // Inlined: pristine nv_dev has no `common/packing.cuh`; keep the vendored tree self-contained.
+    static constexpr uint32_t kPackFactor = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t> ? 2 : 1;
     static constexpr uint32_t kNumKVBlocksPerSplit = SPLIT_KV / SPARSE_BLOCK_KV;
     static constexpr uint32_t kNumSFQ = math::constexpr_align(BLOCK_Q * kNumHeads, kNumUTCCPAlignedElems);
     static constexpr uint32_t kSwizzleAlignment = 8 * kHeadDim / kPackFactor;
