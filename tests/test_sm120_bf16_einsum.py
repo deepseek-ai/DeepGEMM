@@ -1,14 +1,9 @@
 import pytest
+import random
 import torch
 
 import deep_gemm
-from deep_gemm.testing import get_arch_major
-
-
-pytestmark = pytest.mark.skipif(
-    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
-    reason='requires SM120',
-)
+from deep_gemm.testing import get_arch_major, test_filter
 
 
 EXPRESSIONS = ('bhr,hdr->bhd', 'bhd,hdr->bhr')
@@ -93,6 +88,7 @@ def exercise_sm120_bf16_einsum(expr, shape, layouts, graph=False, pdl=False, det
     print(f' > Native SM120 BF16 einsum fixture: {expr=}, {shape=}, {layouts=}, {graph=}, {pdl=}, {deterministic=}')
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('expr', EXPRESSIONS)
 def test_sm120_bf16_einsum_native_layouts(expr):
     cases = ((1, 2, 1, 13), (2, 3, 7, 67), (65, 2, 17, 129),
@@ -103,6 +99,7 @@ def test_sm120_bf16_einsum_native_layouts(expr):
             exercise_sm120_bf16_einsum(expr, shape, layouts)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('expr', EXPRESSIONS)
 def test_sm120_bf16_einsum_wide_controls(expr):
     for shape in ((128, 2, 128, 128), (257, 4, 256, 256)):
@@ -110,6 +107,7 @@ def test_sm120_bf16_einsum_wide_controls(expr):
             exercise_sm120_bf16_einsum(expr, shape, ('canonical', 'canonical', d_layout))
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('expr', EXPRESSIONS)
 def test_sm120_bf16_einsum_graph(expr):
     for i, n in enumerate((1, 7, 17, 33, 8, 32)):
@@ -119,6 +117,7 @@ def test_sm120_bf16_einsum_graph(expr):
                                      graph=True, pdl=pdl)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('expr', EXPRESSIONS)
 def test_sm120_bf16_einsum_empty(expr):
     for shape in ((0, 2, 7, 13), (2, 0, 7, 13), (2, 3, 0, 13), (2, 3, 7, 0)):
@@ -126,9 +125,9 @@ def test_sm120_bf16_einsum_empty(expr):
             exercise_sm120_bf16_einsum(expr, shape, ('unaligned',) * 3, graph=graph)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('expr', EXPRESSIONS)
 def test_sm120_bf16_einsum_c_rejection(expr):
-    assert get_arch_major() == 12
     a = torch.ones((2, 2, 128), dtype=torch.bfloat16, device='cuda')
     b = torch.ones((2, 8, 128) if expr == EXPRESSIONS[0] else (2, 128, 8), dtype=torch.bfloat16, device='cuda')
     d = torch.full((2, 2, 8), 19, dtype=torch.bfloat16, device='cuda')
@@ -139,6 +138,28 @@ def test_sm120_bf16_einsum_c_rejection(expr):
         assert (d == 19).all()
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('expr', EXPRESSIONS)
 def test_sm120_bf16_einsum_default_policy(expr):
     exercise_sm120_bf16_einsum(expr, (16, 2, 32, 128), ('canonical',) * 3, deterministic=False)
+
+
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    random.seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
+    for expr in EXPRESSIONS:
+        test_sm120_bf16_einsum_native_layouts(expr=expr)
+    for expr in EXPRESSIONS:
+        test_sm120_bf16_einsum_wide_controls(expr=expr)
+    for expr in EXPRESSIONS:
+        test_sm120_bf16_einsum_graph(expr=expr)
+    for expr in EXPRESSIONS:
+        test_sm120_bf16_einsum_empty(expr=expr)
+    for expr in EXPRESSIONS:
+        test_sm120_bf16_einsum_c_rejection(expr=expr)
+    for expr in EXPRESSIONS:
+        test_sm120_bf16_einsum_default_policy(expr=expr)

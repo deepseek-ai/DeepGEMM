@@ -1,20 +1,15 @@
 import pytest
+import random
 import torch
 
 import deep_gemm
-from deep_gemm.testing import get_arch_major
+from deep_gemm.testing import get_arch_major, test_filter
 
 
-pytestmark = pytest.mark.skipif(
-    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
-    reason='requires SM120',
-)
-
-
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize('invalid', ('a_offset', 'a_stride', 'd_offset', 'd_stride'))
 def test_sm120_native_tma_rejections(dtype, invalid):
-    assert get_arch_major() == 12
     a = torch.zeros((64, 128), dtype=torch.bfloat16, device='cuda')
     b = torch.zeros_like(a)
     d = torch.full((64, 64), 7, dtype=dtype, device='cuda')
@@ -31,8 +26,8 @@ def test_sm120_native_tma_rejections(dtype, invalid):
     assert (d == 7).all()
 
 
+@test_filter(lambda: get_arch_major() == 12)
 def test_sm120_native_alignment32_small_n_rejection():
-    assert get_arch_major() == 12
     a = torch.zeros((32, 128), dtype=torch.bfloat16, device='cuda')
     b = torch.zeros((1, 17, 128), dtype=torch.bfloat16, device='cuda')
     d = torch.full((32, 24), 7, dtype=torch.bfloat16, device='cuda')[:, :17]
@@ -47,9 +42,9 @@ def test_sm120_native_alignment32_small_n_rejection():
     assert (d == 7).all()
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('layout', ('nn', 'tn', 'tt'))
 def test_sm120_native_repacked_odd_k_rejection(layout):
-    assert get_arch_major() == 12
     a = torch.zeros((64, 67), dtype=torch.bfloat16, device='cuda')
     b = torch.zeros((64, 67), dtype=torch.bfloat16, device='cuda')
     aa = a if layout[0] == 'n' else a.T.contiguous()
@@ -60,9 +55,9 @@ def test_sm120_native_repacked_odd_k_rejection(layout):
     assert (d == 7).all()
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('quant', (False, True))
 def test_sm120_native_k_grouped_small_stride_rejection(quant):
-    assert get_arch_major() == 12
     m, n = (20, 36) if quant else (3, 5)
     dtype = torch.float8_e4m3fn if quant else torch.bfloat16
     a = torch.zeros((128, m), dtype=dtype, device='cuda')
@@ -80,3 +75,20 @@ def test_sm120_native_k_grouped_small_stride_rejection(quant):
     finally:
         deep_gemm.set_mk_alignment_for_contiguous_layout(previous)
     assert (d == 7).all()
+
+
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    random.seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
+    for dtype in (torch.bfloat16, torch.float32):
+        for invalid in ('a_offset', 'a_stride', 'd_offset', 'd_stride'):
+            test_sm120_native_tma_rejections(dtype=dtype, invalid=invalid)
+    test_sm120_native_alignment32_small_n_rejection()
+    for layout in ('nn', 'tn', 'tt'):
+        test_sm120_native_repacked_odd_k_rejection(layout=layout)
+    for quant in (False, True):
+        test_sm120_native_k_grouped_small_stride_rejection(quant=quant)

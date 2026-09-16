@@ -1,18 +1,13 @@
 import math
 
 import pytest
+import random
 import torch
 
 import deep_gemm
-from deep_gemm.testing import calc_diff, get_arch_major
+from deep_gemm.testing import calc_diff, get_arch_major, test_filter
 from sm120_test_storage import native_matrix
 from test_sm120_gemm import fp8_operand
-
-
-pytestmark = pytest.mark.skipif(
-    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
-    reason='requires SM120',
-)
 
 
 MN_GRANS = (2, 3, 16, 32, 64, 256)
@@ -25,9 +20,9 @@ def packed_reference(sf):
     return padded.contiguous().view(torch.int32)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('gran_mn', MN_GRANS)
 def test_sm120_sf_arbitrary_mn_transform(gran_mn):
-    assert get_arch_major() == 12
     for mn in (gran_mn + 1, 2 * gran_mn + 1):
         for gran_k in (32, 128):
             k = 257
@@ -45,6 +40,7 @@ def test_sm120_sf_arbitrary_mn_transform(gran_mn):
                 torch.testing.assert_close(device_sf.cpu(), sf, rtol=0, atol=0)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('gran_mn', MN_GRANS)
 def test_sm120_sf_arbitrary_mn_dense(gran_mn):
     for m in (16, 32, 33):
@@ -69,6 +65,7 @@ def test_sm120_sf_arbitrary_mn_dense(gran_mn):
             assert (storage[~valid] == 19).all()
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('gran_mn', (1, 128))
 def test_sm120_sf_standalone_float_disable_cast(gran_mn):
     mn, k = 259, 257
@@ -87,6 +84,7 @@ def test_sm120_sf_standalone_float_disable_cast(gran_mn):
                 assert out.data_ptr() == x.data_ptr() and out.stride() == x.stride()
 
 
+@test_filter(lambda: get_arch_major() == 12)
 def test_sm120_sf_invalid_contracts():
     sf = torch.ones((3, 2), device='cuda')
     for gran_mn in (0, -1):
@@ -109,6 +107,7 @@ def test_sm120_sf_invalid_contracts():
             deep_gemm.fp8_fp4_gemm_nt((a, x), (a, x), d, recipe=(gran_mn, gran_mn, 128), disable_ue8m0_cast=True)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('gran_mn', MN_GRANS)
 def test_sm120_sf_psum_metadata(gran_mn):
     mn, k = 384, 256
@@ -131,3 +130,21 @@ def test_sm120_sf_psum_metadata(gran_mn):
             deep_gemm.transform_sf_into_required_layout(sf.cuda().unsqueeze(0), mn, k, (gran_mn, 128), num_groups=1, psum_layout=layout)
     finally:
         deep_gemm.set_mk_alignment_for_contiguous_layout(old)
+
+
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    random.seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
+    for gran_mn in MN_GRANS:
+        test_sm120_sf_arbitrary_mn_transform(gran_mn=gran_mn)
+    for gran_mn in MN_GRANS:
+        test_sm120_sf_arbitrary_mn_dense(gran_mn=gran_mn)
+    for gran_mn in (1, 128):
+        test_sm120_sf_standalone_float_disable_cast(gran_mn=gran_mn)
+    test_sm120_sf_invalid_contracts()
+    for gran_mn in MN_GRANS:
+        test_sm120_sf_psum_metadata(gran_mn=gran_mn)

@@ -1,21 +1,16 @@
 import pytest
+import random
 import torch
 
 import deep_gemm
-from deep_gemm.testing import get_arch_major
-from test_fp8_fp4 import sm120_dense_quantized
+from deep_gemm.testing import get_arch_major, test_filter
+from sm120_exercise import sm120_dense_quantized
 
 
-pytestmark = pytest.mark.skipif(
-    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
-    reason='requires SM120',
-)
-
-
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('mn_a,mn_b', ((False, True), (True, False), (True, True)))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 def test_sm120_symmetric_fp4_mn(mn_a, mn_b, dtype):
-    assert get_arch_major() == 12
     av, sa, ar = sm120_dense_quantized(32, 128, True, 32, 0, mn_major=mn_a)
     bv, sb, br = sm120_dense_quantized(32, 128, True, 32, 1, mn_major=mn_b)
     a, b = (av.cuda(), sa.cuda()), (bv.cuda(), sb.cuda())
@@ -31,11 +26,11 @@ def test_sm120_symmetric_fp4_mn(mn_a, mn_b, dtype):
                                    atol=0.02 if dtype == torch.bfloat16 else 1e-4)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('api', ('tn', 'nt'))
 @pytest.mark.parametrize('orientation', ('sf_k_mn', 'mn_sf_k'))
 @pytest.mark.parametrize('contiguous', (False, True))
 def test_sm120_legacy_sf_orientation(api, orientation, contiguous):
-    assert get_arch_major() == 12
     m, n, gran, ks = 64, 128, 128, (0, 128, 256, 0)
     a_parts, b_parts, sa_parts, sb_parts, expected = [], [], [], [], []
     for g, k in enumerate(ks):
@@ -77,3 +72,19 @@ def test_sm120_legacy_sf_orientation(api, orientation, contiguous):
             torch.testing.assert_close(d.cpu(), torch.stack(expected), rtol=2e-4, atol=1e-4)
     finally:
         deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
+
+
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    random.seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
+    for mn_a, mn_b in ((False, True), (True, False), (True, True)):
+        for dtype in (torch.bfloat16, torch.float32):
+            test_sm120_symmetric_fp4_mn(mn_a=mn_a, mn_b=mn_b, dtype=dtype)
+    for api in ('tn', 'nt'):
+        for orientation in ('sf_k_mn', 'mn_sf_k'):
+            for contiguous in (False, True):
+                test_sm120_legacy_sf_orientation(api=api, orientation=orientation, contiguous=contiguous)

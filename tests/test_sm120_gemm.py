@@ -1,16 +1,17 @@
 import math
 
 import pytest
+import random
 import torch
 
 import deep_gemm
-from deep_gemm.testing import calc_diff, get_arch_major
+from deep_gemm.testing import calc_diff, get_arch_major, test_filter
 from sm120_test_storage import native_matrix
-
-
-pytestmark = pytest.mark.skipif(
-    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
-    reason='requires SM120',
+from sm120_exercise import (
+    exercise_sm120_dense_fp8_fp4,
+    exercise_sm120_k_grouped,
+    exercise_sm120_quant_grouped,
+    sm120_dense_quantized,
 )
 
 
@@ -33,10 +34,10 @@ def split_k_ranges(k, splits):
             for i in range(splits)]
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('m', (0, 1, 127, 128, 129))
 @pytest.mark.parametrize('n', (8, 24, 128))
 def test_sm120_hc_prenorm_contract(m, n):
-    assert get_arch_major() == 12
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -77,6 +78,7 @@ def test_sm120_hc_prenorm_contract(m, n):
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('offset', (0, 1))
 def test_sm120_hc_strided_output(offset):
     m, n, k = 129, 24, 192
@@ -97,6 +99,7 @@ def test_sm120_hc_strided_output(offset):
     torch.testing.assert_close(b.cpu(), bv, rtol=0, atol=0)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('splits', (None, 3, 16))
 @pytest.mark.parametrize('pdl', (False, True))
 def test_sm120_hc_prenorm_graph(splits, pdl):
@@ -150,10 +153,10 @@ def fp8_operand(groups, rows, k, gran_mn, gran_k, phase):
     return raw, sf, decoded
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('expr', ('bhr,hdr->bhd', 'bhd,hdr->bhr', 'bhd,bhr->hdr'))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 def test_sm120_fp8_einsum_contract(expr, dtype):
-    assert get_arch_major() == 12
     old_pdl = deep_gemm.get_pdl()
     try:
         for m, n, k in ((16, 64, 256), (32, 64, 256), (33, 64, 256), (1024, 512, 128)):
@@ -224,9 +227,9 @@ def test_sm120_fp8_einsum_contract(expr, dtype):
         deep_gemm.set_pdl(old_pdl)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 def test_sm120_bf16_batch_reduction(dtype):
-    assert get_arch_major() == 12
     for groups, m, n, k in ((1, 64, 64, 64), (3, 128, 64, 128), (5, 64, 128, 192)):
         av = ((torch.arange(groups * m * k).reshape(groups, m, k) % 15 - 7).float() / 8).to(torch.bfloat16)
         bv = ((torch.arange(groups * n * k).reshape(groups, n, k) % 13 - 6).float() / 8).to(torch.bfloat16)
@@ -248,6 +251,7 @@ def test_sm120_bf16_batch_reduction(dtype):
         print(f' > SM120 BF16 batch reduction fixture: {groups=}, {m=}, {n=}, {k=}, {dtype=}')
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 def test_sm120_bf16_batch_reduction_empty_graph(dtype):
     for groups, m, n, k in ((0, 64, 64, 64), (2, 0, 64, 64), (2, 64, 0, 64), (2, 64, 64, 0), (3, 64, 64, 128)):
@@ -276,3 +280,311 @@ def test_sm120_bf16_batch_reduction_empty_graph(dtype):
             expected = torch.full((m, n), groups * k * scale + (0.25 if c is not None else 0), dtype=dtype)
             torch.testing.assert_close(d.cpu(), expected, rtol=0, atol=0)
             check_compact_guards(storage, offset)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_dense_fp8_fp4_formats_alpha():
+    for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+        for li, layout in enumerate(('nt', 'nn', 'tn', 'tt')):
+            for di, dtype in enumerate((torch.bfloat16, torch.float32)):
+                for ai, alpha in enumerate((None, 0.0, 0.5, -1.0, 2.0)):
+                    index = fi + li + di + ai
+                    grans = ((32, 32), (32, 128), (128, 32), (128, 128))[index % 4]
+                    exercise_sm120_dense_fp8_fp4(fmt, layout, (32, 64, 256), dtype, alpha,
+                                                ('none', 'same', 'different')[index % 3],
+                                                ('float', 'packed')[index % 2], grans,
+                                                common_recipe=grans[0] == grans[1])
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_dense_fp8_fp4_swap_boundary():
+    for fmt in ((False, False), (False, True), (True, False), (True, True)):
+        for m in (15, 16, 17):
+            for c_mode in ('none', 'same'):
+                exercise_sm120_dense_fp8_fp4(fmt, 'nt', (m, 33, 256), torch.bfloat16, 0.5,
+                                            c_mode, 'packed', (32, 128), padded=True)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_dense_fp8_fp4_tails_large():
+    for fmt in ((False, False), (False, True), (True, False), (True, True)):
+        for dtype in (torch.bfloat16, torch.float32):
+            k = 130 if fmt == (True, True) else (131 if fmt == (False, False) else 256)
+            exercise_sm120_dense_fp8_fp4(fmt, 'nt', (65, 67, k), dtype, -1.0,
+                                        'different', 'float', (128, 32), padded=True)
+            exercise_sm120_dense_fp8_fp4(fmt, 'nt', (2049, 256, 256), dtype, 2.0,
+                                        'none', 'packed', (32, 128))
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_dense_fp8_fp4_graph_pdl():
+    for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+        for li, layout in enumerate(('nt', 'nn', 'tn', 'tt')):
+            for pdl in (False, True):
+                exercise_sm120_dense_fp8_fp4(fmt, layout, (32, 64, 256),
+                                            torch.bfloat16 if pdl else torch.float32,
+                                            -1.0 if pdl else 0.5, ('none', 'same', 'different')[(fi + li) % 3],
+                                            'packed' if pdl else 'float', (128, 32), padded=True, graph=True, pdl=pdl)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_dense_fp8_fp4_explicit_rejections():
+    assert get_arch_major() == 12
+    raw, sf, _ = sm120_dense_quantized(32, 128, False, 32, 0)
+    a = raw.cuda(), sf.cuda()
+    d = torch.empty((32, 32), device='cuda', dtype=torch.bfloat16)
+    cases = [
+        (a, a, dict(recipe_a=(1, 32))),
+        (a, a, dict(recipe=(1, 1, 32), recipe_a=(1, 32), recipe_b=(1, 32))),
+        (a, a, dict(recipe=(0, 1, 32))),
+        (a, a, dict(recipe=(1, 1, 64))),
+        (a, a, dict(recipe=(1, 1, 32), disable_ue8m0_cast=True)),
+    ]
+    short8, short_sf, _ = sm120_dense_quantized(32, 130, False, 32, 0)
+    short4, short_sf4, _ = sm120_dense_quantized(32, 130, True, 32, 0)
+    cases.append(((short8.cuda(), short_sf.cuda()), (short4.cuda(), short_sf4.cuda()), dict(recipe=(1, 1, 32))))
+    block_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf[:1].cuda())
+    cases.append(((a[0], block_sf), a, dict(recipe_a=(128, 32), recipe_b=(1, 32))))
+    for aa, bb, kwargs in cases:
+        try:
+            deep_gemm.fp8_fp4_gemm_nt(aa, bb, d, **kwargs)
+        except RuntimeError as error:
+            assert 'Assertion' in str(error) or 'assert' in str(error), str(error)
+        else:
+            raise AssertionError(f'Invalid dense input contract was not rejected: {kwargs}')
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_dense_scaling_defaults():
+    for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+        for si, sf_kind in enumerate(('float', 'packed')):
+            for i, (m, n) in enumerate(((15, 127), (16, 128), (17, 129), (129, 255), (257, 257))):
+                exercise_sm120_dense_fp8_fp4(fmt, 'nt', (m, n, 256),
+                                            torch.bfloat16 if i % 2 else torch.float32,
+                                            (None, 0.0, 0.5, -1.0, 2.0)[i],
+                                            ('none', 'same', 'different')[(fi + si + i) % 3], sf_kind,
+                                            (128, 128), padded=True,
+                                            mn_grans=(1, 128) if sf_kind == 'float' else (1, 1),
+                                            compare_default=True, legacy_alias=fmt == (False, False))
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_dense_scaling_blockwise_tails():
+    for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+        for gi, mn_grans in enumerate(((128, 1), (1, 128), (128, 128))):
+            for i, (m, n) in enumerate(((127, 129), (128, 255), (129, 257), (255, 127), (257, 128))):
+                grans = ((32, 128), (128, 32), (32, 32), (128, 128))[(fi + gi + i) % 4]
+                exercise_sm120_dense_fp8_fp4(fmt, 'nt', (m, n, 256),
+                                            torch.bfloat16 if (gi + i) % 2 else torch.float32,
+                                            (None, 0.0, 0.5, -1.0, 2.0)[i],
+                                            ('none', 'same', 'different')[(fi + i) % 3], 'float', grans,
+                                            padded=True, mn_grans=mn_grans,
+                                            common_recipe=grans[0] == grans[1])
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_dense_scaling_graph():
+    for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+        for pdl in (False, True):
+            exercise_sm120_dense_fp8_fp4(fmt, 'nt', (129, 257, 256),
+                                        torch.bfloat16 if pdl else torch.float32, -1.0,
+                                        ('none', 'same', 'different')[fi % 3], 'float', (128, 128),
+                                        padded=True, graph=True, pdl=pdl, mn_grans=(1, 128), compare_default=True)
+            exercise_sm120_dense_fp8_fp4(fmt, 'tt', (128, 256, 256),
+                                        torch.bfloat16 if pdl else torch.float32, 0.5, 'same', 'float', (32, 128),
+                                        padded=True, graph=True, pdl=pdl, mn_grans=(128, 128))
+
+
+@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.parametrize('fp4_b', (False, True), ids=('fp8b', 'fp4b'))
+@pytest.mark.parametrize('mode, alignment, n, zero_padding, graph, padded_a', (
+    pytest.param('labels', 32, 1, False, False, False, id='labels-a32-n1'),
+    pytest.param('labels', 64, 33, True, True, True, id='labels-a64-n33-graph-padded'),
+    pytest.param('labels', 128, 65, False, False, False, id='labels-a128-n65'),
+    pytest.param('labels', 32, 72, True, False, False, id='labels-a32-n72'),
+    pytest.param('psum', 32, 33, True, True, False, id='psum-a32-n33-graph'),
+    pytest.param('psum', 64, 1, False, False, True, id='psum-a64-n1-padded'),
+    pytest.param('psum', 128, 65, True, False, False, id='psum-a128-n65'),
+    pytest.param('psum', 64, 72, False, False, False, id='psum-a64-n72'),
+    pytest.param('masked', 32, 8, False, False, False, id='masked-a32-n8'),
+    pytest.param('masked', 64, 24, False, True, False, id='masked-a64-n24-graph'),
+    pytest.param('masked', 128, 72, False, False, False, id='masked-a128-n72'),
+))
+def test_sm120_grouped_tma_layout_contract(mode, alignment, n, zero_padding, graph, padded_a, fp4_b):
+    exercise_sm120_quant_grouped(mode, (False, fp4_b), alignment, 'packed' if fp4_b else 'float',
+                                grans=(32, 128), zero_padding=zero_padding, graph=graph, pdl=fp4_b,
+                                k=384, n=n, padded_a=padded_a)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_quant_grouped_formats():
+    for mi, mode in enumerate(('labels', 'psum', 'masked')):
+        for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+            for ai, alignment in enumerate((32, 64, 128)):
+                for si, sf_kind in enumerate(('float', 'packed')):
+                    index = mi + fi + ai + si
+                    exercise_sm120_quant_grouped(mode, fmt, alignment, sf_kind,
+                                                grans=((32, 32), (32, 128), (128, 32), (128, 128))[index % 4],
+                                                nn=mode != 'masked' and index % 2 == 0,
+                                                zero_padding=mode != 'masked' and (fi + si) % 2 == 0,
+                                                k=128 if index % 2 else 256)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_quant_grouped_block_scales():
+    for mi, mode in enumerate(('labels', 'psum', 'masked')):
+        for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+            for gi, mn_grans in enumerate(((128, 1), (1, 128), (128, 128))):
+                exercise_sm120_quant_grouped(mode, fmt, (32, 64, 128)[gi], 'float',
+                                            grans=((32, 128), (128, 32), (32, 32))[(fi + gi) % 3],
+                                            mn_grans=mn_grans, nn=mode != 'masked' and fi % 2 == 1,
+                                            zero_padding=mode != 'masked' and (mi + fi + gi) % 2 == 0)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_quant_grouped_defaults():
+    for mi, mode in enumerate(('labels', 'psum', 'masked')):
+        for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+            for si, sf_kind in enumerate(('float', 'packed')):
+                exercise_sm120_quant_grouped(mode, fmt, (32, 64, 128)[(mi + fi + si) % 3], sf_kind,
+                                            grans=(128, 128), mn_grans=(1, 128) if sf_kind == 'float' else (1, 1),
+                                            defaults=True, nn=mode != 'masked' and si == 1,
+                                            zero_padding=mode != 'masked' and fi % 2 == 1)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_quant_grouped_graph_mutation():
+    for mi, mode in enumerate(('labels', 'psum', 'masked')):
+        for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+            for ai, alignment in enumerate((32, 64, 128)):
+                packed = (fi + ai) % 2 == 1
+                exercise_sm120_quant_grouped(mode, fmt, alignment, 'packed' if packed else 'float',
+                                            grans=(32, 128) if ai % 2 else (128, 32),
+                                            mn_grans=(1, 1) if packed else ((128, 128) if ai == 2 else (1, 128)),
+                                            graph=True, pdl=(mi + fi + ai) % 2 == 1,
+                                            nn=mode != 'masked' and fi % 2 == 1,
+                                            zero_padding=mode != 'masked' and (fi + ai) % 2 == 0)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_quant_grouped_all_empty():
+    for mi, mode in enumerate(('labels', 'psum', 'masked')):
+        for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
+            exercise_sm120_quant_grouped(mode, fmt, (32, 64, 128)[(mi + fi) % 3],
+                                        'packed' if fi % 2 else 'float', all_empty=True,
+                                        nn=mode != 'masked' and fi % 2 == 1,
+                                        zero_padding=mode != 'masked' and fi % 2 == 0)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_quant_grouped_zero_m():
+    for fmt in ((False, False), (False, True), (True, False), (True, True)):
+        a = torch.empty((0, 64 if fmt[0] else 128), dtype=torch.int8 if fmt[0] else torch.float8_e4m3fn, device='cuda')
+        b = torch.empty((3, 65, 64 if fmt[1] else 128), dtype=torch.int8 if fmt[1] else torch.float8_e4m3fn, device='cuda')
+        sa = torch.empty((0, 1), device='cuda')
+        sb = torch.ones((3, 65, 1), device='cuda')
+        d = torch.empty((0, 65), dtype=torch.bfloat16, device='cuda')
+        for psum in (False, True):
+            metadata = torch.zeros(3 if psum else 0, dtype=torch.int32, device='cuda')
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous((a, sa), (b, sb), d, metadata,
+                                                         recipe=(1, 1, 128), use_psum_layout=psum,
+                                                         ensure_zero_padding=True)
+            assert d.numel() == 0
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_k_grouped_fp8_contracts():
+    from sm120_exercise import exercise_sm120_k_grouped
+    for api in ('fp8_tn', 'fp8_nt'):
+        for gi, groups in enumerate((1, 3, 8)):
+            for di, dtype in enumerate((torch.bfloat16, torch.float32)):
+                for si, (gran, packed) in enumerate(((128, False), (32, False), (32, True))):
+                    psum = api == 'fp8_tn' and (gi + di + si) % 2 == 0
+                    exercise_sm120_k_grouped(api, groups, 256 if psum else 128, psum, dtype,
+                                            ('none', 'same', 'different')[(gi + di + si) % 3],
+                                            shape=(16, 48) if gi % 2 else (48, 80), gran=gran, packed=packed,
+                                            ks_mode=('list', 'none', 'empty')[si] if psum else 'list',
+                                            default_recipe=gran == 128)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_k_grouped_fp8_graph():
+    from sm120_exercise import exercise_sm120_k_grouped
+    for api in ('fp8_tn', 'fp8_nt'):
+        for di, dtype in enumerate((torch.bfloat16, torch.float32)):
+            for ci, c_mode in enumerate(('none', 'same', 'different')):
+                psum = api == 'fp8_tn'
+                exercise_sm120_k_grouped(api, 8, 256 if psum and ci == 2 else 128, psum, dtype, c_mode,
+                                        gran=128 if ci == 0 else 32, packed=ci == 2,
+                                        graph=True, pdl=(di + ci) % 2 == 1, ks_mode='none' if psum else 'list',
+                                        default_recipe=ci == 0)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_k_grouped_fp8_empty():
+    from sm120_exercise import exercise_sm120_k_grouped
+    for api in ('fp8_tn', 'fp8_nt'):
+        for c_mode in ('none', 'same', 'different'):
+            exercise_sm120_k_grouped(api, 3, 128, False, torch.float32, c_mode, empty=True)
+
+
+@test_filter(lambda: get_arch_major() == 12)
+def test_sm120_k_grouped_fp4_unsupported_rejection():
+    assert get_arch_major() == 12
+    a = torch.zeros((20, 128), dtype=torch.int8, device='cuda')
+    b = torch.zeros((36, 128), dtype=torch.int8, device='cuda')
+    sa, sb = torch.ones((8, 20), device='cuda'), torch.ones((8, 36), device='cuda')
+    d = torch.full((1, 20, 36), 7, dtype=torch.bfloat16, device='cuda')
+    metadata = torch.tensor([256], dtype=torch.int32, device='cuda')
+    try:
+        deep_gemm.k_grouped_fp4_gemm_nt_contiguous((a, sa), (b, sb), d, [256], metadata)
+    except RuntimeError as error:
+        assert 'SM120 K-grouped FP4 NT is not implemented' in str(error), str(error)
+    else:
+        raise AssertionError('Unsupported SM120 K-grouped FP4 unexpectedly accepted input')
+    assert (d == 7).all()
+
+
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    random.seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
+    for m in (0, 1, 127, 128, 129):
+        for n in (8, 24, 128):
+            test_sm120_hc_prenorm_contract(m=m, n=n)
+    for offset in (0, 1):
+        test_sm120_hc_strided_output(offset=offset)
+    for splits in (None, 3, 16):
+        for pdl in (False, True):
+            test_sm120_hc_prenorm_graph(splits=splits, pdl=pdl)
+    for expr in ('bhr,hdr->bhd', 'bhd,hdr->bhr', 'bhd,bhr->hdr'):
+        for dtype in (torch.bfloat16, torch.float32):
+            test_sm120_fp8_einsum_contract(expr=expr, dtype=dtype)
+    for dtype in (torch.bfloat16, torch.float32):
+        test_sm120_bf16_batch_reduction(dtype=dtype)
+    for dtype in (torch.bfloat16, torch.float32):
+        test_sm120_bf16_batch_reduction_empty_graph(dtype=dtype)
+    test_sm120_dense_fp8_fp4_formats_alpha()
+    test_sm120_dense_fp8_fp4_swap_boundary()
+    test_sm120_dense_fp8_fp4_tails_large()
+    test_sm120_dense_fp8_fp4_graph_pdl()
+    test_sm120_dense_fp8_fp4_explicit_rejections()
+    test_sm120_dense_scaling_defaults()
+    test_sm120_dense_scaling_blockwise_tails()
+    test_sm120_dense_scaling_graph()
+    for fp4_b in (False, True):
+        for mode, alignment, n, zero_padding, graph, padded_a in (('labels', 32, 1, False, False, False), ('labels', 64, 33, True, True, True), ('labels', 128, 65, False, False, False), ('labels', 32, 72, True, False, False), ('psum', 32, 33, True, True, False), ('psum', 64, 1, False, False, True), ('psum', 128, 65, True, False, False), ('psum', 64, 72, False, False, False), ('masked', 32, 8, False, False, False), ('masked', 64, 24, False, True, False), ('masked', 128, 72, False, False, False)):
+            test_sm120_grouped_tma_layout_contract(fp4_b=fp4_b, mode=mode, alignment=alignment, n=n, zero_padding=zero_padding, graph=graph, padded_a=padded_a)
+    test_sm120_quant_grouped_formats()
+    test_sm120_quant_grouped_block_scales()
+    test_sm120_quant_grouped_defaults()
+    test_sm120_quant_grouped_graph_mutation()
+    test_sm120_quant_grouped_all_empty()
+    test_sm120_quant_grouped_zero_m()
+    test_sm120_k_grouped_fp8_contracts()
+    test_sm120_k_grouped_fp8_graph()
+    test_sm120_k_grouped_fp8_empty()
+    test_sm120_k_grouped_fp4_unsupported_rejection()

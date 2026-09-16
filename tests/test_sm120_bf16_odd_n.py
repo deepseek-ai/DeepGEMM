@@ -1,18 +1,14 @@
 import pytest
+import random
 import torch
 
 import deep_gemm
-from deep_gemm.testing import get_arch_major
+from deep_gemm.testing import get_arch_major, test_filter
 from sm120_test_storage import native_matrix
-from test_bf16 import exercise_sm120_bf16_native, sm120_grouped_intervals
+from sm120_exercise import exercise_sm120_bf16_native, sm120_grouped_intervals
 
 
-pytestmark = pytest.mark.skipif(
-    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
-    reason='requires SM120',
-)
-
-
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('n', (1, 7, 17, 33))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 def test_sm120_bf16_odd_n_dense(n, dtype):
@@ -23,6 +19,7 @@ def test_sm120_bf16_odd_n_dense(n, dtype):
                 ('none', 'same', 'different')[(mi + li) % 3], padded=True, offset=1)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize('c_mode', ('none', 'same', 'different'))
 def test_sm120_bf16_odd_n_graph_alpha_zero(dtype, c_mode):
@@ -118,8 +115,27 @@ def exercise_sm120_bf16_odd_n_grouped(mode, n, nn, zero_padding, graph):
     print(f' > Native SM120 BF16 odd-N grouped: {mode=}, {n=}, {nn=}, {zero_padding=}, {graph=}')
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('n', (1, 7, 17, 33))
 @pytest.mark.parametrize('mode', ('labels', 'psum'))
 def test_sm120_bf16_odd_n_grouped(n, mode):
     for zero_padding in (False, True):
         exercise_sm120_bf16_odd_n_grouped(mode, n, False, zero_padding, graph=True)
+
+
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    random.seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
+    for n in (1, 7, 17, 33):
+        for dtype in (torch.bfloat16, torch.float32):
+            test_sm120_bf16_odd_n_dense(n=n, dtype=dtype)
+    for dtype in (torch.bfloat16, torch.float32):
+        for c_mode in ('none', 'same', 'different'):
+            test_sm120_bf16_odd_n_graph_alpha_zero(dtype=dtype, c_mode=c_mode)
+    for n in (1, 7, 17, 33):
+        for mode in ('labels', 'psum'):
+            test_sm120_bf16_odd_n_grouped(n=n, mode=mode)

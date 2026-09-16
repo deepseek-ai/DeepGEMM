@@ -1,15 +1,13 @@
 import pytest
+import random
 import torch
 
-from test_fp8_fp4 import exercise_sm120_dense_fp8_fp4, sm120_dense_quantized
+import deep_gemm
+from deep_gemm.testing import get_arch_major, test_filter
+from sm120_exercise import exercise_sm120_dense_fp8_fp4, sm120_dense_quantized
 
 
-pytestmark = pytest.mark.skipif(
-    'not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12',
-    reason='requires SM120',
-)
-
-
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('fmt', ((False, True), (True, False)))
 @pytest.mark.parametrize('k', (128, 256, 384, 512, 640, 768, 896))
 @pytest.mark.parametrize('grans,alpha,c_mode', (
@@ -26,7 +24,23 @@ def test_sm120_mixed_tail(fmt, k, grans, alpha, c_mode):
                                 alpha, c_mode, 'float', grans)
 
 
+@test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('fmt', ((False, False), (True, True)))
 def test_sm120_truepath_control(fmt):
     exercise_sm120_dense_fp8_fp4(fmt, 'nt', (32, 64, 256), torch.float32,
                                 None, 'none', 'float', (128, 128))
+
+
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    random.seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
+    for fmt in ((False, True), (True, False)):
+        for k in (128, 256, 384, 512, 640, 768, 896):
+            for grans, alpha, c_mode in (((128, 128), None, 'none'), ((128, 128), 0.5, 'different'), ((32, 128), None, 'different'), ((128, 32), 0.5, 'none')):
+                test_sm120_mixed_tail(fmt=fmt, k=k, grans=grans, alpha=alpha, c_mode=c_mode)
+    for fmt in ((False, False), (True, True)):
+        test_sm120_truepath_control(fmt=fmt)

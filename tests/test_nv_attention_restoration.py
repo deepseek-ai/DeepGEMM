@@ -94,7 +94,7 @@ def test_sm100_fp16_dense_tail_graph(seq_len, num_heads, head_dim, logits_dtype,
 @pytest.mark.parametrize('logits_dtype', [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize('compressed', [False, True])
 def test_sm100_fp16_dense_large(seq_len, seq_len_kv, num_heads, head_dim, logits_dtype, compressed):
-    from test_attention import check_mqa_logits_chunked
+    from test_sm120_attention import check_mqa_logits_chunked
 
     require_arch(10)
     torch.manual_seed(123)
