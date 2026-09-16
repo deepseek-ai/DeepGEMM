@@ -2,6 +2,8 @@
 
 #include "../utils/compatibility.hpp"
 
+#include <format>
+
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
@@ -173,6 +175,39 @@ static void fp8_fp4_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
                     d, c, recipe, recipe_a, recipe_b, compiled_dims, disable_ue8m0_cast, alpha);
 }
 
+// M-grouped contiguous (labels-mode) layout contract: every run of a non-padding label
+// must start at a multiple of `get_mk_alignment_for_contiguous_layout()`. The kernels
+// select B (and SFB) per BLOCK_M tile from the label of the tile's first row, and the
+// tile heuristics guarantee BLOCK_M divides the runtime alignment, so contract-respecting
+// labels never put a group boundary inside a tile. Labels built at a finer granularity
+// than the runtime alignment violate this and silently compute the straddled rows with
+// the wrong group's B. Set DG_CHECK_CONTIGUOUS_LABELS=1 to turn violations into a loud
+// error (does one GPU->CPU copy of the labels; meant for debugging/integration).
+static void check_contiguous_labels_contract(const torch::Tensor& grouped_layout,
+                                             const int& num_groups) {
+    if (not deep_jit::get_env<int>("DG_CHECK_CONTIGUOUS_LABELS"))
+        return;
+    const int alignment = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+    DG_HOST_ASSERT(alignment > 0 and "mk alignment for the contiguous layout must be positive");
+    const auto labels = grouped_layout.cpu();
+    const auto* data = labels.data_ptr<int>();
+    const auto m = static_cast<int64_t>(labels.size(0));
+    // Any negative label is padding, matching the device scheduler. Track the previous
+    // ROW's label (not the previous non-padding one), so a label run resuming after
+    // padding at an unaligned row is still caught.
+    int64_t prev_label = -1;
+    for (int64_t i = 0; i < m; ++ i) {
+        const int label = data[i];
+        DG_HOST_ASSERT(label < num_groups and "m-grouped contiguous label out of range");
+        if (label >= 0 and label != prev_label and i % alignment != 0)
+            DG_HOST_UNREACHABLE(std::format(
+                "m-grouped contiguous group {} starts at row {}, not a multiple of the "
+                "runtime mk alignment {}; rebuild the labels with matching alignment or "
+                "call set_mk_alignment_for_contiguous_layout()", label, i, alignment));
+        prev_label = label;
+    }
+}
+
 static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
                                                  const std::pair<torch::Tensor, torch::Tensor>& b,
                                                  const torch::Tensor& d,
@@ -211,6 +246,7 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         const auto [m__] = get_shape<1>(grouped_layout);
         DG_HOST_ASSERT(m == m__);
         DG_HOST_ASSERT(not expected_m_for_psum_layout.has_value());
+        check_contiguous_labels_contract(grouped_layout, num_groups);
     }
 
     // D must be N-major
@@ -569,6 +605,7 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
         const auto [m__] = get_shape<1>(grouped_layout);
         DG_HOST_ASSERT(m == m__);
         DG_HOST_ASSERT(not expected_m_for_psum_layout.has_value());
+        check_contiguous_labels_contract(grouped_layout, num_groups);
     }
 
     // D must be N-major

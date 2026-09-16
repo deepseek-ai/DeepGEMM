@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import random
 import torch
 
@@ -12,7 +13,9 @@ from utils import (
     assert_psum_zero_padding,
 )
 from generators import (
+    MajorTypeAB,
     get_arch_major,
+    get_major_ab, reset_seed,
     enumerate_normal, enumerate_batched_syrk_symm, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     enumerate_k_grouped_contiguous_test_variants,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
@@ -98,6 +101,58 @@ def test_m_grouped_gemm_contiguous() -> None:
               f'{t * 1e6:4.0f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
+    print()
+
+
+def test_m_grouped_gemm_contiguous_middle_empty_groups() -> None:
+    print('Testing m-grouped contiguous GEMM with empty groups:')
+
+    # Select best alignment
+    alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
+    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+
+    for actual_ms in ([100, 0, 130, 65], [128, 130, 65], [0, 100, 130], [100, 130, 0]):
+        num_groups, n, k = len(actual_ms), 128, 256
+        for major_a, major_b in get_major_ab(False, True):
+            reset_seed()
+            m, a, b, grouped_layout, d, ref_d, valid_mask = generate_m_grouped_contiguous(
+                num_groups, 0, n, k, major_a, major_b,
+                use_bf16=True, actual_ms_override=actual_ms)
+            deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout)
+            diff = calc_diff(d[valid_mask], ref_d[valid_mask])
+            assert diff < 1e-5, f'{m=}, {n=}, {k=}, {actual_ms=}, {major_a=}, {major_b=}, {diff:.5f}'
+    print()
+
+
+def test_m_grouped_gemm_contiguous_labels_contract_rejection() -> None:
+    print('Testing m-grouped contiguous labels contract rejection:')
+
+    saved_env = os.environ.get('DG_CHECK_CONTIGUOUS_LABELS')
+    saved_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    os.environ['DG_CHECK_CONTIGUOUS_LABELS'] = '1'
+    try:
+        # Group 1 starts at row 128: a multiple of 128, but not of 256
+        deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+        reset_seed()
+        m, a, b, grouped_layout, d, ref_d, valid_mask = generate_m_grouped_contiguous(
+            2, 0, 128, 256, MajorTypeAB.KMajor, MajorTypeAB.KMajor,
+            use_bf16=True, actual_ms_override=[100, 130])
+        assert m == 384 and grouped_layout[127].item() == -1 and grouped_layout[128].item() == 1
+
+        # A runtime alignment above the label granularity must be rejected loudly
+        deep_gemm.set_mk_alignment_for_contiguous_layout(256)
+        raised = None
+        try:
+            deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, grouped_layout)
+        except RuntimeError as e:
+            raised = str(e)
+        assert raised is not None and 'not a multiple of the runtime mk alignment' in raised, raised
+    finally:
+        if saved_env is None:
+            os.environ.pop('DG_CHECK_CONTIGUOUS_LABELS', None)
+        else:
+            os.environ['DG_CHECK_CONTIGUOUS_LABELS'] = saved_env
+        deep_gemm.set_mk_alignment_for_contiguous_layout(saved_alignment)
     print()
 
 
@@ -323,6 +378,8 @@ if __name__ == '__main__':
     if get_arch_major() >= 9:
         test_gemm()
         test_m_grouped_gemm_contiguous()
+        test_m_grouped_gemm_contiguous_middle_empty_groups()
+        test_m_grouped_gemm_contiguous_labels_contract_rejection()
         test_m_grouped_gemm_masked()
         test_k_grouped_gemm_contiguous()
 

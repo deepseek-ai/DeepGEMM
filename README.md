@@ -178,6 +178,7 @@ Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` varia
     - `DG_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
     - `DG_COMM_KERNEL_DEBUG`: `0` or `1`, zero symmetric buffer before each Mega MoE call for debugging, `0` by default
     - `DG_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
+    - `DG_CHECK_CONTIGUOUS_LABELS`: `0` or `1`, validate on the host that m-grouped contiguous labels respect the mk-alignment layout contract, turning silent miscomputation into a loud error (one GPU-to-CPU copy per call, meant for debugging/integration), `0` by default
 - Build options
     - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
