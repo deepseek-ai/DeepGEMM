@@ -49,8 +49,10 @@ void sm120_fp8_paged_mqa_logits(const uint32_t batch_size,
     static constexpr uint32_t kKSteps = kHeadDim / MMA_K;
     static constexpr uint32_t kNTilesPerQ = kNumHeads / MMA_N;
 
-    static constexpr uint32_t BLOCK_KV = 64;
-    DG_STATIC_ASSERT(PAGE_KV == 64 or PAGE_KV == 128 or PAGE_KV == 256, "Unsupported FP8 page size");
+    // A 32-row page needs a 32-row compute tile: BLOCK_KV=64 would straddle two
+    // non-contiguous physical pages. Mirrors the FP4 sibling kernel.
+    static constexpr uint32_t BLOCK_KV = PAGE_KV < 64 ? PAGE_KV : 64;
+    DG_STATIC_ASSERT(PAGE_KV == 32 or PAGE_KV == 64 or PAGE_KV == 128 or PAGE_KV == 256, "Unsupported FP8 page size");
 
     // SM120a: 8 math warps grouped into kNumGroups (each group processes BLOCK_KV KV rows)
     static constexpr uint32_t kNumMathWarps = kNumMathThreads / 32;

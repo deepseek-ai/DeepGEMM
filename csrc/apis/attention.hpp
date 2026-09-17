@@ -558,8 +558,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     const auto [num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
     DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
                    (arch_major == 9 and (block_kv == 32 or block_kv == 64)) or
-                   (arch_major == 12 and ((is_fp4 and block_kv == 32) or
-                                          block_kv == 64 or block_kv == 128 or block_kv == 256)));
+                   (arch_major == 12 and (block_kv == 32 or block_kv == 64 or block_kv == 128 or block_kv == 256)));
     const int kv_head_dim = is_fp4 ? head_dim / 2 : head_dim;
     const int sf_bytes = static_cast<int>(is_mx_sf ? sizeof(int) : sizeof(float));
     DG_HOST_ASSERT(num_heads_kv == 1 and head_dim_with_sf == kv_head_dim + sf_bytes);

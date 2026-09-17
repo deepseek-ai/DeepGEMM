@@ -454,13 +454,17 @@ static void sm120_fp8_paged_mqa_logits(
     const int& num_sms, const int& split_kv) {
     constexpr int num_tma_threads = 128;
     constexpr int num_math_threads = 256;
-    constexpr int num_q_stages = 2, num_kv_stages = 3;
-    constexpr int tile_kv = 64;
+    constexpr int num_q_stages = 2;
+    const int tile_kv = std::min(block_kv, 64);
     const int num_groups = split_kv / tile_kv;
     const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
     DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
-    DG_HOST_ASSERT(block_kv == 64 or block_kv == 128 or block_kv == 256);
+    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128 or block_kv == 256);
     DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
+    // Four 32-row KV groups exceed the 99 KiB SMEM budget with three stages at
+    // 64 heads and paired queries (by 4 bytes). Keep the 64-row path unchanged.
+    const int num_kv_stages =
+        (block_kv == 32 and num_heads == 64 and (is_varlen or next_n >= 2)) ? 2 : 3;
 
     const auto tensor_map_q = make_tma_2d_desc(
         q, head_dim, batch_size * next_n * num_heads,

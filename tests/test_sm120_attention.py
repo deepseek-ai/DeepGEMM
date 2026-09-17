@@ -107,7 +107,7 @@ def test_sm120_dense_mqa_contract(fp4, dim, heads):
 
 
 @test_filter(lambda: get_arch_major() == 12)
-@pytest.mark.parametrize('fp4,page', ((False, 64), (False, 128), (False, 256), (True, 32), (True, 64), (True, 128), (True, 256)))
+@pytest.mark.parametrize('fp4,page', ((False, 32), (False, 64), (False, 128), (False, 256), (True, 32), (True, 64), (True, 128), (True, 256)))
 @pytest.mark.parametrize('dtype', (torch.float32, torch.bfloat16))
 def test_sm120_paged_mqa_contract(fp4, page, dtype):
     dim, heads, pages, batch = 128, 16, 8, 3
@@ -165,6 +165,51 @@ def test_sm120_paged_mqa_contract(fp4, page, dtype):
         with pytest.raises(RuntimeError, match='clean_logits'):
             deep_gemm.fp8_fp4_paged_mqa_logits((q, qsf), cache, weights, contexts, table, meta, 2 * page, clean_logits=True)
         print(f' > SM120 paged MQA: {fp4=}, {page=}, {next_n=}')
+
+
+@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.parametrize('varlen', (False, True))
+def test_sm120_paged_mqa_page32_smem_edge(varlen):
+    # page32 + 64 heads + paired atoms exceeds the 99 KiB SMEM budget with three
+    # KV stages (by 4 bytes); the launcher must fall back to two stages.
+    page, dim, heads, pages, batch = 32, 128, 64, 16, 3
+    next_n = 1 if varlen else 2
+    kv, sf, decoded = mqa_operand((pages * page, dim), False, 2)
+    sf = torch.pow(2.0, (torch.arange(pages * page) % 3 - 4).float()).cuda()
+    decoded *= sf.cpu()[:, None]
+    page_bytes = page * (dim + 4)
+    stride = (page_bytes + 511) // 512 * 512
+    backing = torch.full((pages * stride + 32,), 19, dtype=torch.uint8, device='cuda')
+    cache = backing.as_strided((pages, page, 1, dim + 4), (stride, dim + 4, dim + 4, 1))
+    for p in range(pages):
+        backing[p * stride:p * stride + page * dim].copy_(kv[p * page:(p + 1) * page].contiguous().view(torch.uint8).reshape(-1))
+        backing[p * stride + page * dim:p * stride + page_bytes].copy_(sf[p * page:(p + 1) * page].contiguous().view(torch.uint8).reshape(-1))
+    pages_per_req = 4
+    table_cpu = torch.arange(batch * pages_per_req, dtype=torch.int32).reshape(batch, pages_per_req)
+    if varlen:
+        # Atoms group adjacent tokens with equal indices: atom a reads block-table
+        # row a, and a paired atom's context length comes from its second token.
+        table_cpu[1] = table_cpu[0]
+    table = table_cpu.cuda()
+    indices = torch.tensor([0, 0, 1], dtype=torch.int32, device='cuda') if varlen else None
+    q, qsf, qr = mqa_operand((batch, next_n, heads, dim), False, 1)
+    weights_cpu = torch.full((batch * next_n, heads), 0.125)
+    weights = weights_cpu.cuda()
+    if varlen:
+        contexts_cpu = torch.tensor([[page - 1], [2 * page], [0]], dtype=torch.int32)
+    else:
+        contexts_cpu = torch.stack([torch.linspace(0, pages_per_req * page - i, next_n).int() for i in range(batch)])
+    contexts = contexts_cpu.cuda()
+    meta = deep_gemm.get_paged_mqa_logits_metadata(contexts, page, deep_gemm.get_num_sms(), indices=indices)
+    out = deep_gemm.fp8_fp4_paged_mqa_logits((q, qsf), cache, weights, contexts, table, meta, pages_per_req * page,
+                                             indices=indices, logits_dtype=torch.bfloat16)
+    for row in range(batch):
+        keys = torch.cat([decoded[p * page:(p + 1) * page] for p in table_cpu[row].tolist()])
+        ref = mqa_reference(qr[row], keys, weights_cpu[row * next_n:(row + 1) * next_n])
+        for token in range(next_n):
+            end = contexts_cpu[row, token].item()
+            check_logits(out[row * next_n + token, :end].cpu(), ref[token, :end], torch.bfloat16)
+    print(f' > SM120 paged MQA page32 smem edge: {varlen=}')
 
 
 @test_filter(lambda: get_arch_major() == 12)
