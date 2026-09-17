@@ -388,10 +388,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Write expert count
         if (sm_idx == 0) {
-            // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
+            // CUDA graph replay can reuse grid IDs. Clear local readiness before the pull barrier,
+            // which separates these resets from every peer's current L2 completion notification.
             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
-            if (thread_idx < kNumRanks)
+            if (thread_idx < kNumRanks) {
+                ptx::st_rel_sys(workspace.get_combine_ready_grid_idx_ptr(thread_idx), uint64_t(0));
                 *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+            }
             __syncwarp();
 
             #pragma unroll

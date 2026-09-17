@@ -69,7 +69,8 @@ struct alignas(128) MegaMoESignals {
     uint32_t shared_l2_task_count;
 
     // Combine readiness: `combine_ready_grid_idx[peer] == own grid index` means the peer's L2 writes into this
-    // rank are done; grid indices are unique per launch, so no reset is needed. Peers push theirs during dispatch.
+    // rank are done. Dispatch resets readiness before the pull barrier because graph replay can reuse grid indices.
+    // Peers push their current grid indices during dispatch.
     alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
     alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
 
