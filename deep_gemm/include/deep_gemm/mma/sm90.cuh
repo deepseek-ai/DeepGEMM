@@ -208,6 +208,14 @@ make_smem_desc(PointerType smem_ptr, const int& layout_type,
     return desc;
 }
 
+CUTLASS_DEVICE cute::GmmaDescriptor
+advance_smem_desc(const cute::GmmaDescriptor& desc, const uint32_t& byte_offset) {
+    cute::GmmaDescriptor advanced;
+    advanced.desc_ = desc.desc_;
+    advanced.reg32_[0] += byte_offset >> 4;
+    return advanced;
+}
+
 template <uint32_t BLOCK_INNER, uint32_t kSwizzleMode, typename dtype_t>
 constexpr uint32_t get_inner_block_atom_size() {
     return kSwizzleMode == 0 ? BLOCK_INNER : kSwizzleMode / sizeof(dtype_t);

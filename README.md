@@ -169,6 +169,37 @@ The input activation SF is FP32 with shape `[num_tokens, hidden / 128]`, using o
 
 For distributed correctness and performance drivers, refer to `tests/test_mega_moe_sm90.py` and `tests/bench_mega_moe_sm90.py`.
 
+##### SM90 FP8xFP8, fused single kernel
+
+The fused SM90 implementation runs linear 1 and linear 2 in one kernel: one task stream, with linear 2 trailing linear 1 by a fixed schedule lag, and the linear-1 activation pool sized as a ring around that lag rather than around the token bound. It keeps the split path's tensor contract, weight transform and entry point; `fused=True` selects it when the buffer is allocated, and the buffer type then selects the kernel at launch:
+
+```python
+# NOTES: requires PyTorch >= 2.9
+buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
+    group, num_experts, num_max_tokens_per_rank, num_topk,
+    hidden, intermediate_hidden,
+    fused=True,
+)
+
+transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
+    (l1_weight_fp8, l1_weight_sf),
+    (l2_weight_fp8, l2_weight_sf),
+)
+
+buffer.x[:num_tokens].copy_(x_fp8)
+buffer.x_sf[:num_tokens].copy_(x_sf)
+buffer.topk_idx[:num_tokens].copy_(topk_idx)
+buffer.topk_weights[:num_tokens].copy_(topk_weights)
+
+y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+# `num_tokens_bound` must be the same value on every rank, e.g. the max over ranks of `num_tokens`
+deep_gemm.fp8_mega_moe(y, transformed_l1, transformed_l2, buffer, num_tokens_bound=num_tokens)
+```
+
+The activation and weight SF contract, the shape constraints on `hidden` and `intermediate_hidden`, and the 128-token alignment are the ones above; the fused combine stages whole rows where they fit and chunks of a row where they do not, so a large `hidden` can need a larger multiple than 256, which the host reports before compiling. Two buffer arguments are specific to this path, both optional: `num_experts_per_wave` chooses the activation-pool layout (`None` follows the schedule, `-1` sizes a ring for an automatically chosen expert wave, `N > 0` for a wave of `min(N, experts_per_rank)` experts, never larger than a full pool), and `l2_act_sf_gran_k` (64 or 128) is the K granularity of the FP8 scale on the intermediate activation, defaulting to 128 where the shape allows it (pinning 128 elsewhere is rejected at launch on decode-sized calls). `num_tokens_bound` lets a call smaller than the buffer be scheduled for its own token count; it must be identical on every rank and cover every rank's own count, and it is rejected above the buffer capacity. Each rank checks only its own count: a bound below a peer's count sizes this rank's single-wave pool for fewer rows than arrive, which reuses a ring slot inside one wave and hangs. `intermediate_hidden` must be at most 4096 on this path.
+
+`tests/test_mega_moe_sm90.py --fused` and `tests/test_mega_moe_sm90_fused_ring.py` drive it, and `tests/bench_mega_moe_sm90.py --arms split fused` benchmarks it against the two-kernel path.
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:

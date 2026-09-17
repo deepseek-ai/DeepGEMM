@@ -33,7 +33,7 @@ import random
 import sys
 import torch
 import torch.distributed as dist
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Optional
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -115,6 +115,7 @@ def _reference_fused(
     num_experts: int, num_topk: int,
     hidden: int, intermediate_hidden: int,
     activation_clamp: float,
+    l2_act_sf_gran_k: int,
 ) -> torch.Tensor:
     """Reference: returns (num_tokens, hidden) bf16 result for *this* rank.
 
@@ -192,11 +193,11 @@ def _reference_fused(
             # SwiGLU + clamp + multiply by topk weight
             l1_y = _swiglu_fp32(l1_y, activation_clamp) * weights.unsqueeze(-1)   # (S, IH)
 
-            # Per-row, per-64-col FP8 quantize -> dequantize
+            # Per-row, per-`l2_act_sf_gran_k`-col FP8 quantize -> dequantize
             s_, ih = l1_y.shape
-            assert ih == intermediate_hidden and ih % 64 == 0
-            l1_view = l1_y.view(s_, ih // 64, 64)
-            amax = l1_view.abs().amax(dim=-1).clamp(1e-4)          # (S, IH/64)
+            assert ih == intermediate_hidden and ih % l2_act_sf_gran_k == 0
+            l1_view = l1_y.view(s_, ih // l2_act_sf_gran_k, l2_act_sf_gran_k)
+            amax = l1_view.abs().amax(dim=-1).clamp(1e-4)          # (S, IH/gran_k)
             sf2 = amax / 448.0
             l1_q = (l1_view / sf2.unsqueeze(-1)).to(torch.float8_e4m3fn).float()
             l2_in = (l1_q * sf2.unsqueeze(-1)).view(s_, ih)        # (S, IH) fp32
@@ -226,6 +227,8 @@ def _run_scenario(
     cfg: Dict[str, Any],
     rank_idx: int, num_ranks: int, group: dist.ProcessGroup,
     diff_tol: float,
+    fused: bool = False,
+    l2_act_sf_gran_k: Optional[int] = None,
 ):
     num_max = cfg['num_max_tokens_per_rank']
     num_tokens = cfg.get('num_tokens', num_max)
@@ -282,10 +285,15 @@ def _run_scenario(
 
     # ---- Allocate symm buffer -----------------------------------------------
     _trace('alloc_symm_buffer')
+    # None keeps the package default; the reference reads the granularity back from the buffer
+    buffer_kwargs = dict(fused=True) if fused else {}
+    if fused and l2_act_sf_gran_k is not None:
+        buffer_kwargs['l2_act_sf_gran_k'] = l2_act_sf_gran_k
     buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
         group, num_experts,
         num_max, num_topk,
         hidden, intermediate_hidden,
+        **buffer_kwargs,
     )
     cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
 
@@ -322,6 +330,8 @@ def _run_scenario(
         num_experts, num_topk,
         hidden, intermediate_hidden,
         activation_clamp,
+        # split kernel: per-64-K L2 activation scales; fused kernel: the granularity the buffer was sized with
+        buffer.l2_act_sf_gran_k if fused else 64,
     )
 
     diff = calc_diff(y_fused, y_ref)
@@ -498,14 +508,25 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
 
+    if args.fused:
+        # The fused kernel tiles the intermediate dimension in at most 64 N blocks.
+        limit = 64 * 64
+        skipped = [n for n, c in layers if c['intermediate_hidden'] > limit]
+        layers = [(n, c) for n, c in layers if c['intermediate_hidden'] <= limit]
+        if skipped:
+            dist_print(f'  [SKIP] beyond the fused intermediate_hidden limit: '
+                       f'{", ".join(skipped)}', once_in_node=True)
+
+    impl = f'fused (l2_act_sf_gran_k={args.l2_act_sf_gran_k or "package default"})' if args.fused else 'split'
     dist_print(f'SM90 MegaMoE test plan: {len(layers)} scenarios across '
-               f'layers {sorted(args.layers)} on {num_ranks} ranks',
+               f'layers {sorted(args.layers)} on {num_ranks} ranks, {impl} kernels',
                once_in_node=True)
 
     failures: List[str] = []
     for name, cfg in layers:
         try:
-            _run_scenario(name, cfg, rank_idx, num_ranks, group, diff_tol)
+            _run_scenario(name, cfg, rank_idx, num_ranks, group, diff_tol,
+                          args.fused, args.l2_act_sf_gran_k)
         except AssertionError as ex:
             dist_print(f'  [{name}] FAIL: {ex}', once_in_node=True)
             failures.append(name)
@@ -540,6 +561,10 @@ if __name__ == '__main__':
                         help='calc_diff tolerance (default: 0.01)')
     parser.add_argument('--fail-fast', action='store_true',
                         help='Stop on first failing scenario')
+    parser.add_argument('--fused', action='store_true',
+                        help='Run the single-kernel SM90 fused implementation')
+    parser.add_argument('--l2-act-sf-gran-k', type=int, choices=[64, 128], default=None,
+                        help='L2 activation scale-factor K granularity of the fused kernel (default: the package default)')
     args = parser.parse_args()
 
     np = args.num_processes

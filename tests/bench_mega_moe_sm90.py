@@ -1,4 +1,4 @@
-"""Benchmark the SM90 FP8 MegaMoE kernel on Flash and Pro model shapes."""
+"""Benchmark the SM90 FP8 MegaMoE kernels (split L1/L2, fused) on Flash and Pro model shapes."""
 
 import argparse
 import json
@@ -40,6 +40,11 @@ PHASE_KERNEL_NAMES = (
     'sm90_fp8_mega_moe_l1_impl',
     'sm90_fp8_mega_moe_l2_impl',
 )
+FUSED_KERNEL_NAMES = ('sm90_fp8_fused_mega_moe_impl',)
+ARM_KERNEL_NAMES = {
+    'split': PHASE_KERNEL_NAMES,
+    'fused': FUSED_KERNEL_NAMES,
+}
 
 
 def _stable_seed(name: str) -> int:
@@ -96,14 +101,6 @@ def _benchmark_case(
         + _stable_seed(f'{model_name}:{num_tokens}')
     )
     torch.manual_seed(case_seed)
-    buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
-        group,
-        num_experts,
-        args.num_max_tokens_per_rank,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-    )
 
     x_bf16 = torch.randn(
         (num_tokens, hidden), dtype=torch.bfloat16, device='cuda',
@@ -145,95 +142,139 @@ def _benchmark_case(
         (num_tokens, hidden), dtype=torch.bfloat16, device='cuda',
     )
 
-    def run_sm90() -> torch.Tensor:
-        buffer.x[:num_tokens].copy_(x_fp8)
-        buffer.x_sf[:num_tokens].copy_(x_sf)
-        buffer.topk_idx[:num_tokens].copy_(topk_idx)
-        buffer.topk_weights[:num_tokens].copy_(topk_weights)
-        deep_gemm.fp8_mega_moe(
-            y,
-            transformed_l1,
-            transformed_l2,
-            buffer,
-            cumulative_local_expert_recv_stats=cumulative_recv_stats,
-            recipe=(128, 128, 128),
-            activation='swiglu',
-            activation_clamp=args.activation_clamp,
-            fast_math=bool(args.fast_math),
+    # The arms share inputs and weights; each gets its own symmetric buffer.
+    medians: Dict[str, float] = {}
+    symm_bytes: Dict[str, int] = {}
+    for arm in args.arms:
+        # None keeps the package default granularity
+        buffer_kwargs = dict(fused=True) if arm == 'fused' else {}
+        if arm == 'fused' and args.l2_act_sf_gran_k is not None:
+            buffer_kwargs['l2_act_sf_gran_k'] = args.l2_act_sf_gran_k
+        buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
+            group,
+            num_experts,
+            args.num_max_tokens_per_rank,
+            num_topk,
+            hidden,
+            intermediate_hidden,
+            **buffer_kwargs,
         )
-        return y
+        symm_bytes[arm] = buffer.buffer.numel()
 
-    if args.ncu_profile_only:
-        dist_print(
-            f'[NCU] model={model_name} M={num_tokens}', once_in_node=True,
-        )
+        # Every rank here runs the same count, so that count is also the bound a caller would
+        # pass as the maximum over its step.
+        launch_kwargs = dict(num_tokens_bound=num_tokens) if arm == 'fused' else {}
+
+        def run_sm90() -> torch.Tensor:
+            buffer.x[:num_tokens].copy_(x_fp8)
+            buffer.x_sf[:num_tokens].copy_(x_sf)
+            buffer.topk_idx[:num_tokens].copy_(topk_idx)
+            buffer.topk_weights[:num_tokens].copy_(topk_weights)
+            deep_gemm.fp8_mega_moe(
+                y,
+                transformed_l1,
+                transformed_l2,
+                buffer,
+                cumulative_local_expert_recv_stats=cumulative_recv_stats,
+                recipe=(128, 128, 128),
+                activation='swiglu',
+                activation_clamp=args.activation_clamp,
+                fast_math=bool(args.fast_math),
+                **launch_kwargs,
+            )
+            return y
+
+        if args.ncu_profile_only:
+            dist_print(
+                f'[NCU] model={model_name} M={num_tokens} arm={arm}', once_in_node=True,
+            )
+            run_sm90()
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            buffer.destroy()
+            continue
+
+        repeats = args.repeats
+        if repeats is None:
+            repeats = args.small_repeats if num_tokens <= 128 else args.large_repeats
+
         run_sm90()
         torch.cuda.synchronize()
         dist.barrier(group=group)
-        buffer.destroy()
-        return
 
-    repeats = args.repeats
-    if repeats is None:
-        repeats = args.small_repeats if num_tokens <= 128 else args.large_repeats
+        rank0_observations = []
+        max_rank_observations = []
+        for repeat in range(repeats):
+            phase_times = bench_kineto(
+                run_sm90,
+                ARM_KERNEL_NAMES[arm],
+                barrier=lambda: dist.barrier(group=group),
+                num_tests=args.num_tests,
+                suppress_kineto_output=True,
+            )
+            local_time = sum(phase_times)
+            max_rank_time = torch.tensor(local_time, dtype=torch.float64, device='cuda')
+            dist.all_reduce(max_rank_time, op=dist.ReduceOp.MAX, group=group)
 
-    run_sm90()
-    torch.cuda.synchronize()
-    dist.barrier(group=group)
+            rank0_observations.append(local_time)
+            max_rank_observations.append(max_rank_time.item())
+            if rank_idx == 0:
+                observation = {
+                    'model': model_name,
+                    'm': num_tokens,
+                    'arm': arm,
+                    'repeat': repeat,
+                    'rank0_us': local_time * 1e6,
+                    'max_rank_us': max_rank_time.item() * 1e6,
+                    'num_tests': args.num_tests,
+                    'num_max_tokens_per_rank': args.num_max_tokens_per_rank,
+                    'seed': args.seed,
+                }
+                if arm == 'split':
+                    observation['l1_rank0_us'] = phase_times[0] * 1e6
+                    observation['l2_rank0_us'] = phase_times[1] * 1e6
+                else:
+                    observation['fused_rank0_us'] = phase_times[0] * 1e6
+                print('BENCH_OBS_JSON ' + json.dumps(observation, sort_keys=True), flush=True)
 
-    rank0_observations = []
-    max_rank_observations = []
-    for repeat in range(repeats):
-        phase_times = bench_kineto(
-            run_sm90,
-            PHASE_KERNEL_NAMES,
-            barrier=lambda: dist.barrier(group=group),
-            num_tests=args.num_tests,
-            suppress_kineto_output=True,
-        )
-        local_time = sum(phase_times)
-        max_rank_time = torch.tensor(local_time, dtype=torch.float64, device='cuda')
-        dist.all_reduce(max_rank_time, op=dist.ReduceOp.MAX, group=group)
-
-        rank0_observations.append(local_time)
-        max_rank_observations.append(max_rank_time.item())
         if rank_idx == 0:
-            print('BENCH_OBS_JSON ' + json.dumps({
+            median_time = statistics.median(max_rank_observations)
+            medians[arm] = median_time
+            arm_label = f' {arm}' if len(args.arms) > 1 else ''
+            print(
+                f'[{model_name:5s}] M={num_tokens:4d}{arm_label} obs={repeats:2d} '
+                f'max-rank median={median_time * 1e6:8.1f} us '
+                f'range={min(max_rank_observations) * 1e6:.1f}-'
+                f'{max(max_rank_observations) * 1e6:.1f} us',
+                flush=True,
+            )
+            print('BENCH_SUMMARY_JSON ' + json.dumps({
                 'model': model_name,
                 'm': num_tokens,
-                'repeat': repeat,
-                'rank0_us': local_time * 1e6,
-                'max_rank_us': max_rank_time.item() * 1e6,
-                'l1_rank0_us': phase_times[0] * 1e6,
-                'l2_rank0_us': phase_times[1] * 1e6,
+                'arm': arm,
+                'observations': repeats,
+                'rank0_median_us': statistics.median(rank0_observations) * 1e6,
+                'max_rank_median_us': median_time * 1e6,
+                'max_rank_min_us': min(max_rank_observations) * 1e6,
+                'max_rank_max_us': max(max_rank_observations) * 1e6,
                 'num_tests': args.num_tests,
                 'num_max_tokens_per_rank': args.num_max_tokens_per_rank,
-                'seed': args.seed,
+                'num_tokens_bound': launch_kwargs.get('num_tokens_bound', 0),
+                'symm_buffer_bytes': symm_bytes[arm],
             }, sort_keys=True), flush=True)
 
-    if rank_idx == 0:
-        median_time = statistics.median(max_rank_observations)
+        dist.barrier(group=group)
+        buffer.destroy()
+
+    if rank_idx == 0 and len(medians) > 1:
+        split_us = medians['split'] * 1e6
+        fused_us = medians['fused'] * 1e6
         print(
-            f'[{model_name:5s}] M={num_tokens:4d} obs={repeats:2d} '
-            f'max-rank median={median_time * 1e6:8.1f} us '
-            f'range={min(max_rank_observations) * 1e6:.1f}-'
-            f'{max(max_rank_observations) * 1e6:.1f} us',
+            f'[{model_name:5s}] M={num_tokens:4d} split={split_us:8.1f} us fused={fused_us:8.1f} us '
+            f'fused/split={fused_us / split_us:.3f} '
+            f'symm MiB split={symm_bytes["split"] / 2 ** 20:.1f} fused={symm_bytes["fused"] / 2 ** 20:.1f}',
             flush=True,
         )
-        print('BENCH_SUMMARY_JSON ' + json.dumps({
-            'model': model_name,
-            'm': num_tokens,
-            'observations': repeats,
-            'rank0_median_us': statistics.median(rank0_observations) * 1e6,
-            'max_rank_median_us': median_time * 1e6,
-            'max_rank_min_us': min(max_rank_observations) * 1e6,
-            'max_rank_max_us': max(max_rank_observations) * 1e6,
-            'num_tests': args.num_tests,
-            'num_max_tokens_per_rank': args.num_max_tokens_per_rank,
-        }, sort_keys=True), flush=True)
-
-    dist.barrier(group=group)
-    buffer.destroy()
 
 
 def _benchmark_worker(
@@ -292,6 +333,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument('--activation-clamp', type=float, default=10.0)
     parser.add_argument('--fast-math', type=int, choices=[0, 1], default=1)
     parser.add_argument('--ncu-profile-only', action='store_true')
+    parser.add_argument(
+        '--arms', nargs='+', choices=sorted(ARM_KERNEL_NAMES), default=['split'],
+        help='Implementations to time per case; both print side by side.',
+    )
+    parser.add_argument(
+        '--l2-act-sf-gran-k', type=int, choices=[64, 128], default=None,
+        help='L2 activation scale-factor K granularity of the fused arm (default: the package default).',
+    )
     args = parser.parse_args()
 
     assert args.num_processes > 0
@@ -301,6 +350,7 @@ def _parse_args() -> argparse.Namespace:
     assert args.repeats is None or args.repeats > 0
     assert args.num_tests > 0
     assert 0 <= args.masked_ratio <= 1
+    assert len(set(args.arms)) == len(args.arms)
     return args
 
 
