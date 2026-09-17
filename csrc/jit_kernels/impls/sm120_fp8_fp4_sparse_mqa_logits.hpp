@@ -2,6 +2,7 @@
 
 #include <format>
 #include <limits>
+#include <regex>
 #include <torch/python.h>
 
 #include <deep_gemm/layout/sparse_mqa_logits.cuh>
@@ -13,6 +14,23 @@ namespace deep_gemm {
 
 namespace sm120_sparse_mqa_runtime {
 DJ_DECL_LAZY_DL_FUNCTION(deep_jit::cuda::driver::get_cuda_handle, cuFuncGetAttribute);
+}
+
+// CUDA 13.3 ptxas crashes (SIGSEGV) when compiling the non-warp-specialized MXFP4 variants
+// of this kernel at -O3 with any --register-usage-level (lucifer1004/DeepGEMM-sm120#2).
+// CUDA 13.2 (the validated toolchain) is unaffected, and ptxas -O2 both avoids the crash
+// and reproduces the 13.2 register allocation for the reference instantiation. Relax this
+// gate once a fixed ptxas is known.
+static bool sparse_mqa_needs_ptxas_o2() {
+    static const bool affected = [] {
+        std::smatch match;
+        if (not std::regex_search(jit->backend.compiler_info.version, match,
+                                  std::regex(R"(release (\d+)\.(\d+))")))
+            return false;
+        const int major = std::stoi(match[1].str()), minor = std::stoi(match[2].str());
+        return major > 13 or (major == 13 and minor >= 3);
+    }();
+    return affected;
 }
 
 static void launch_sm120_fp8_fp4_sparse_mqa_logits(
@@ -87,6 +105,9 @@ static void launch_sm120_fp8_fp4_sparse_mqa_logits(
         align<int>(tile_bytes + 6 * sizeof(cutlass::arch::ClusterBarrier), 1024) : tile_bytes;
     DG_HOST_ASSERT(smem_bytes <= jit->device.get_num_smem_bytes());
 
+    deep_jit::cuda::CompilerOptions compiler_options;
+    if (not warp_specialized and sparse_mqa_needs_ptxas_o2())
+        compiler_options.extra_nvcc_flags = {"--ptxas-options=-O2"};
     const auto kernel = jit->compile("sm120_fp8_fp4_sparse_mqa_logits", std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_fp4_sparse_mqa_logits.cuh>
 
@@ -100,7 +121,7 @@ static void __instantiate_kernel() {{
 )", warp_specialized ? "WarpSpecializedSharedStorage" : "SharedStorage",
         is_fp4, sparse_block_kv, pipeline, smem_bytes,
         is_fp4, is_paged, sparse_block_kv, is_paged ? kv.size(1) : 0, num_sms, use_unaligned_ks,
-        work_partitions, pipeline, warp_specialized, cache_q, entry_balance));
+        work_partitions, pipeline, warp_specialized, cache_q, entry_balance), compiler_options);
 
     if (warp_specialized) {
         int registers = 0;
