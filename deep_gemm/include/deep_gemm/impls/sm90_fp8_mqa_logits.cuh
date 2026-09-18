@@ -283,7 +283,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
                     auto shifted_accum = accum + i * kNumAccumPerReduce;
                     const auto transform = [&](const uint32_t& j) {
-                        return fmaxf(shifted_accum[j], 0) * weights[i][(j / 4) * 2 + (j & 1)];
+                        return (shifted_accum[j] + fabsf(shifted_accum[j])) * weights[i][(j / 4) * 2 + (j & 1)];
                     };
 
                     // Intra-thread reduction
@@ -294,8 +294,8 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                         for (uint32_t k = 0; k < 4; k ++)
                             sum[k] += transform(j * 4 + k);
                     }
-                    float v_0 = (sum[0] + sum[1]) * scale_kv_0;
-                    float v_1 = (sum[2] + sum[3]) * scale_kv_1;
+                    float v_0 = (sum[0] + sum[1]) * (scale_kv_0 * 0.5f);
+                    float v_1 = (sum[2] + sum[3]) * (scale_kv_1 * 0.5f);
 
                     // Inter-thread reduction
                     #pragma unroll
