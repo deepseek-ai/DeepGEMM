@@ -240,6 +240,9 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
         bool owner_group_found = false;
         // gran_k/k_alignment are powers of two at every call site today (host-asserted);
         // turns the per-group align/ceil_div divisions into shifts. Generic path kept.
+        // Exactness: on SM90/100 psum ends are k_alignment-multiples and gran_k divides
+        // k_alignment, so aligned_group_k % gran_k == 0 and the rounding is exact division
+        // there; the ceil matters only on SM120 (k_alignment % 32, K not gran_k-aligned).
         const bool pow2_layout = (gran_k & (gran_k - 1)) == 0 and (k_alignment & (k_alignment - 1)) == 0;
         const uint32_t align_shift = pow2_layout ? 31 - __clz(k_alignment) : 0;
         const uint32_t gran_shift = pow2_layout ? 31 - __clz(gran_k) : 0;
