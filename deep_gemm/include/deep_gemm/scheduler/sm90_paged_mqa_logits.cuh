@@ -161,6 +161,7 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
 
     uint32_t current_q_atom_idx, current_kv_idx;
     uint32_t end_q_atom_idx, end_kv_idx;
+    uint64_t end_key;
     uint32_t current_num_kv;
     uint32_t current_advance;
     uint32_t last_advance;
@@ -222,14 +223,29 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
         current_q_atom_idx = current_pack.x, current_kv_idx = current_pack.y * kNumBlocksPerSplit;
         end_q_atom_idx = end_pack.x, end_kv_idx = end_pack.y * kNumBlocksPerSplit;
 
-        // Empty metadata ranges may carry the one-past-the-end sentinel (notably
-        // all-zero varlen context lengths). Do not dereference context_lens or
-        // indices until this SM actually owns a task.
+        // Clamp once here so the per-task loop below only needs ordered comparisons:
+        // stale or corrupted metadata (end past the batch, start past end, non-zero
+        // sentinel KV) collapses to an empty or in-batch range, and `context_lens` /
+        // `indices` are never dereferenced past the one-past-the-end sentinel.
+        const uint32_t sentinel_q_atom_idx = kIsVarlen ? batch_size : batch_size * kNumNextNAtoms;
+        if (end_q_atom_idx >= sentinel_q_atom_idx)
+            end_q_atom_idx = sentinel_q_atom_idx, end_kv_idx = 0;
+        if (current_q_atom_idx > end_q_atom_idx or (current_q_atom_idx == end_q_atom_idx and current_kv_idx > end_kv_idx))
+            current_q_atom_idx = end_q_atom_idx, current_kv_idx = end_kv_idx;
+        end_key = (static_cast<uint64_t>(end_q_atom_idx) << 32) | end_kv_idx;
+
         current_advance = 1;
         current_num_kv = 0;
         last_advance = 1;
-        if (has_next_task())
+        if (not at_end())
             refresh_num_kv_and_advance(current_q_atom_idx);
+    }
+
+    // Ordered (not equality) end test: a stale request that shrank or emptied can move
+    // `current_kv_idx` past `end_kv_idx` inside the last request of this SM's range.
+    // (q, kv) packed into one 64-bit key so the test is a single compare.
+    CUTLASS_DEVICE bool at_end() const {
+        return ((static_cast<uint64_t>(current_q_atom_idx) << 32) | current_kv_idx) >= end_key;
     }
 
     // Whether num_kv should be refreshed after advancing to q_atom_idx.
@@ -244,14 +260,16 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
     }
 
     CUTLASS_DEVICE bool fetch_next_task(uint32_t &q_atom_idx, uint32_t &kv_idx, uint32_t &num_kv) {
-        while (has_next_task() and current_kv_idx >= current_num_kv) {
+        // Skip requests that have no (remaining) KV work; `at_end()` keeps every
+        // `context_lens` read inside the batch because `end_q_atom_idx <= sentinel`.
+        while (current_kv_idx >= current_num_kv and not at_end()) {
             current_kv_idx = 0;
             current_q_atom_idx += current_advance;
-            if (should_refresh_num_kv(current_q_atom_idx) and exist_q_atom_idx(current_q_atom_idx))
+            if (not at_end() and should_refresh_num_kv(current_q_atom_idx))
                 refresh_num_kv_and_advance(current_q_atom_idx);
         }
 
-        if (not has_next_task())
+        if (at_end())
             return false;
 
         q_atom_idx = current_q_atom_idx;
@@ -263,21 +281,10 @@ struct SM90PagedMQALogitsScheduler : SM90IndicesStorage<kIsVarlen> {
         if (current_kv_idx >= current_num_kv) {
             current_kv_idx = 0;
             current_q_atom_idx += current_advance;
-            if (should_refresh_num_kv(current_q_atom_idx) and exist_q_atom_idx(current_q_atom_idx)) {
+            if (not at_end() and should_refresh_num_kv(current_q_atom_idx))
                 refresh_num_kv_and_advance(current_q_atom_idx);
-            }
         }
         return true;
-    }
-
-    CUTLASS_DEVICE bool exist_q_atom_idx(const uint32_t& q_atom_idx) const {
-        const bool in_batch = kIsVarlen ? q_atom_idx < batch_size : q_atom_idx / kNumNextNAtoms < batch_size;
-        return in_batch and (q_atom_idx < end_q_atom_idx or (q_atom_idx == end_q_atom_idx and 0 < end_kv_idx));
-    }
-
-    CUTLASS_DEVICE bool has_next_task() const {
-        return exist_q_atom_idx(current_q_atom_idx) and
-               (current_q_atom_idx < end_q_atom_idx or current_kv_idx < end_kv_idx);
     }
 };
 
