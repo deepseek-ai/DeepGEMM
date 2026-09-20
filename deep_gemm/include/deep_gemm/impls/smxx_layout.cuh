@@ -238,17 +238,28 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
         uint32_t num_prefix_packed_rows = 0;
         uint32_t prev_group_end = 0;
         bool owner_group_found = false;
+        // gran_k/k_alignment are powers of two at every call site today (host-asserted);
+        // turns the per-group align/ceil_div divisions into shifts. Generic path kept.
+        const bool pow2_layout = (gran_k & (gran_k - 1)) == 0 and (k_alignment & (k_alignment - 1)) == 0;
+        const uint32_t align_shift = pow2_layout ? 31 - __clz(k_alignment) : 0;
+        const uint32_t gran_shift = pow2_layout ? 31 - __clz(gran_k) : 0;
         #pragma unroll
         for (uint32_t group_idx = 0; group_idx < kNumGroups; ++ group_idx) {
             const auto layout_value = __shfl_sync(0xffffffff, layout_cache[group_idx % 4], group_idx / 4);
             uint32_t group_k;
             if constexpr (kUsePsumLayout) {
-                group_k = layout_value - math::align(prev_group_end, k_alignment);
+                const auto aligned_prev = pow2_layout ? ((prev_group_end + k_alignment - 1) >> align_shift) << align_shift
+                                                      : math::align(prev_group_end, k_alignment);
+                group_k = layout_value - aligned_prev;
             } else {
                 group_k = layout_value;
             }
-            const auto aligned_group_k = kUsePsumLayout ? math::align(group_k, k_alignment) : group_k;
-            const auto num_group_sf_rows = math::ceil_div(aligned_group_k, gran_k);
+            const auto aligned_group_k =
+                kUsePsumLayout ? (pow2_layout ? ((group_k + k_alignment - 1) >> align_shift) << align_shift
+                                              : math::align(group_k, k_alignment))
+                               : group_k;
+            const auto num_group_sf_rows = pow2_layout ? (aligned_group_k + gran_k - 1) >> gran_shift
+                                                       : math::ceil_div(aligned_group_k, gran_k);
             group_sf_row_start = num_prefix_sf_rows;
             group_sf_row_end = group_sf_row_start + num_group_sf_rows;
             num_prefix_sf_rows += num_group_sf_rows;
