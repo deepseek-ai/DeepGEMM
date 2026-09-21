@@ -20,6 +20,25 @@ from generators import (
 )
 
 
+def test_bf16_repeatability() -> None:
+    if get_arch_major() != 12:
+        return
+    generator = torch.Generator(device='cuda').manual_seed(233)
+    a = torch.randn(4096, 1024, device='cuda', dtype=torch.bfloat16,
+                    generator=generator)
+    b = torch.randn(896, 1024, device='cuda', dtype=torch.bfloat16,
+                    generator=generator).t()
+    reference = torch.empty(4096, 896, device='cuda', dtype=torch.bfloat16)
+    output = torch.empty_like(reference)
+    deep_gemm.bf16_gemm_nn(a, b, reference)
+    torch.cuda.synchronize()
+    for iteration in range(6000):
+        deep_gemm.bf16_gemm_nn(a, b, output)
+        torch.cuda.synchronize()
+        assert torch.equal(reference, output), f'Output changed at iteration {iteration}'
+
+
+
 def test_gemm() -> None:
     print('Testing GEMM:')
     scores = []
@@ -249,6 +268,7 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     if get_arch_major() >= 9:
+        test_bf16_repeatability()
         test_gemm()
         test_m_grouped_gemm_contiguous()
         test_m_grouped_gemm_masked()
