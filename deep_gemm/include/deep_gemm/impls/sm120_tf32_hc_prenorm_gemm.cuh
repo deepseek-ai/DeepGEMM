@@ -228,6 +228,8 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 }
             }
 
+            // Order shared-memory reads before the producer reuses this stage.
+            cutlass::arch::fence_view_async_shared();
             if (lane_idx == 0)
                 empty_barriers[stage_idx]->arrive();
         }

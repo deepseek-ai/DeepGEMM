@@ -262,8 +262,11 @@ void sm120_fp4_paged_mqa_logits(const uint32_t batch_size,
 
         while (scheduler.fetch_next_task(next_q_idx, next_kv_idx, next_num_kv)) {
             if (q_idx != next_q_idx) {
-                if (q_iter_idx > 0)
+                if (q_iter_idx > 0) {
+                    // Order shared-memory reads before the producer reuses this stage.
+                    cutlass::arch::fence_view_async_shared();
                     empty_q_barriers[(q_iter_idx - 1) % kNumQStages]->arrive();
+                }
 
                 CUTE_TIE(get_q_pipeline(q_iter_idx ++), q_stage_idx, q_phase);
                 full_q_barriers[q_stage_idx]->wait(q_phase);
@@ -361,6 +364,8 @@ void sm120_fp4_paged_mqa_logits(const uint32_t batch_size,
                 compute_and_store(cute::Int<kNextNAtom>{});
             }
 
+            // Order shared-memory reads before the producer reuses this stage.
+            cutlass::arch::fence_view_async_shared();
             empty_kv_barriers[kv_stage_idx]->arrive();
         }
     }

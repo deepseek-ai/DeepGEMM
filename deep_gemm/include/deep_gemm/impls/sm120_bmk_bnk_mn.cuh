@@ -198,6 +198,8 @@ sm120_bmn_bnk_mn_gemm_impl(const uint32_t shape_s,
                 compute_kstep(cur);
             }
 
+            // Order shared-memory reads before the producer reuses this stage.
+            cutlass::arch::fence_view_async_shared();
             if (lane_idx == 0)
                 empty_barriers[stage_idx]->arrive();
         }
