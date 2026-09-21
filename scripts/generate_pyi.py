@@ -1,10 +1,11 @@
 import re
 from pathlib import Path
 
+CPP_SOURCE_EXTENSIONS = {'.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.cuh', '.inl'}
+
 
 def build_cpp_function_index(root_path):
     func_index = {}
-    extensions = {'.cpp', '.cc', '.cxx', '.c', '.hpp', '.h'}
 
     pattern = re.compile(
         r'([\w:\s*<&>,\[\]\(\)]+?)'
@@ -14,7 +15,7 @@ def build_cpp_function_index(root_path):
     )
 
     for file_path in Path(root_path).rglob('*'):
-        if file_path.suffix.lower() not in extensions:
+        if file_path.suffix.lower() not in CPP_SOURCE_EXTENSIONS:
             continue
         if not file_path.is_file():
             continue
@@ -80,7 +81,7 @@ def build_cpp_function_index(root_path):
                 continue
 
             # Check for definition or header declaration
-            is_header = file_path.suffix.lower() in {'.h', '.hpp', '.cuh'}
+            is_header = file_path.suffix.lower() in {'.h', '.hpp', '.cuh', '.inl'}
             after_paren = content[pos+1:pos+500]
             has_brace = '{' in after_paren
             has_semicolon = ';' in after_paren.split('{')[0]
@@ -153,13 +154,12 @@ def extract_m_def_statements(root_path):
     Scan all c files under root_path and extract all m.def(...) statements.
     """
     results = []
-    extensions = {'.hpp', '.cpp', '.h', '.cc'}
 
     # Regex: match m.def( ... ), supports multi-line
     pattern = re.compile(r'm\.def\s*\(')
 
     for file_path in Path(root_path).rglob('*'):
-        if file_path.suffix.lower() not in extensions:
+        if file_path.suffix.lower() not in CPP_SOURCE_EXTENSIONS:
             continue
         if not file_path.is_file():
             continue
@@ -401,7 +401,7 @@ def parse_mdef_and_attach_cpp_signatures(item, func_index):
             cpp_sig = func_index[cpp_func_name]
         else:
             if not parsed['is_lambda']:
-                print(f'Warning: C++ function "{cpp_func_name}" not found in any .cpp file')
+                print(f'Warning: C++ function "{cpp_func_name}" not found in indexed C++ sources')
 
         parsed['cpp_signature'] = cpp_sig
         statements_with_parsed_signatures.append({

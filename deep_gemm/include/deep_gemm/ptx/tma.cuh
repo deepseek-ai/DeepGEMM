@@ -49,8 +49,8 @@ CUTLASS_DEVICE void mbarrier_arrive_and_set_tx(
                  "r"(num_bytes), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
 }
 
-CUTLASS_DEVICE void mbarrier_wait_and_flip_phase(
-    cutlass::arch::ClusterTransactionBarrier* ptr, uint32_t& phase) {
+CUTLASS_DEVICE void mbarrier_wait(
+    cutlass::arch::ClusterTransactionBarrier* ptr, const uint32_t& phase) {
     asm volatile(
         "{\n\t"
         ".reg .pred       P1; \n\t"
@@ -62,6 +62,11 @@ CUTLASS_DEVICE void mbarrier_wait_and_flip_phase(
         "}" ::
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
         "r"(phase), "r"(0x989680));
+}
+
+CUTLASS_DEVICE void mbarrier_wait_and_flip_phase(
+    cutlass::arch::ClusterTransactionBarrier* ptr, uint32_t& phase) {
+    mbarrier_wait(ptr, phase);
     phase ^= 1;
 }
 

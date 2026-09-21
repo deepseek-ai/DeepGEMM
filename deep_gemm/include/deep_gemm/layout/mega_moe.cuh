@@ -12,6 +12,7 @@ static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96
 static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 384;
+static constexpr int kSM90InterleavedSchedulerSMEMBytes = 96;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -176,6 +177,11 @@ struct Workspace {
     }
 
     CUTLASS_DEVICE
+    uint32_t* get_debug_progress_word_ptr(const uint32_t& word_idx = 0) const {
+        return math::advance_ptr<uint32_t>(base, 44u) + word_idx;
+    }
+
+    CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
         return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
     }
@@ -237,6 +243,7 @@ struct Workspace {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;
     }
+
 };
 
 struct Data {
@@ -365,7 +372,14 @@ struct MegaMoEBuffer {
                   const uint32_t& num_shared_experts = 0,
                   const uint32_t& num_mma_elem_bits_opt = 0,
                   const uint32_t& sf_gran_k = 32,
-                  const uint32_t& shared_num_mma_elem_bits_opt = 0) {
+                  const uint32_t& shared_num_mma_elem_bits_opt = 0,
+                  // `l2_sf_gran_k_opt == 0` keeps L2's SF granularity equal to `sf_gran_k`;
+                  // the SM90 fused NVFP4 kernel uses a coarser dispatch-SF granularity for
+                  // L2 (per-64 elements) than L1/input (per-128 elements)
+                  const uint32_t& l2_sf_gran_k_opt = 0,
+                  // SM90's fused NVFP4 dispatch SF record need not be 16-byte aligned
+                  // (unlike SM100's packed-UE8M0 record)
+                  const bool& require_sf_tma_alignment = true) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -374,6 +388,7 @@ struct MegaMoEBuffer {
         // NOTES: element sizes are in bits to support sub-byte packed NVFP4 (4 bits);
         // `num_mma_elem_bits_opt == 0` keeps the legacy behavior (FP8 with SF, BF16 without)
         const uint32_t num_mma_elem_bits = num_mma_elem_bits_opt != 0 ? num_mma_elem_bits_opt : (with_sf ? 8 : 16);
+        const uint32_t l2_sf_gran_k = l2_sf_gran_k_opt != 0 ? l2_sf_gran_k_opt : sf_gran_k;
 
         // Shared
         // NOTES: shared experts may use a different (wider) dtype than routed experts,
@@ -387,10 +402,10 @@ struct MegaMoEBuffer {
         const auto bf16_token_layout = layout::Data(hidden * 2);
         const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bits / 8);
         const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * shared_num_mma_elem_bits / 8);
-        const auto input_sf_layout = layout::Data(with_sf ? hidden / sf_gran_k : 0);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / sf_gran_k : 0);
+        const auto input_sf_layout = layout::Data(with_sf ? hidden / sf_gran_k : 0, require_sf_tma_alignment);
+        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / l2_sf_gran_k : 0, require_sf_tma_alignment);
         const auto shared_intermediate_sf_layout = layout::Data(
-            shared_with_sf ? shared_intermediate_hidden / sf_gran_k : 0);
+            shared_with_sf ? shared_intermediate_hidden / sf_gran_k : 0, require_sf_tma_alignment);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
         // NVFP4 keeps routing weights in the full-pool tail sidecar because the L1 ring

@@ -75,9 +75,29 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             const auto start_clock = clock64();
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
+#if defined(DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT)
+                    DG_TRAP_ONLY_DEVICE_ASSERT(false and "NVLink barrier timeout");
+#else
                     printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+#if defined(DG_SM90_NVFP4_MOE_COUNTER_DEBUG)
+                    for (uint32_t rank = 0; rank < kNumRanks; ++rank) {
+                        printf("DeepGEMM math progress: observer_rank=%d, "
+                               "target_rank=%u\n",
+                               sym_buffer.rank_idx, rank);
+                        for (uint32_t sm = 0; sm < kNumSMs; ++sm) {
+                            const auto word_ptr = sym_buffer.map(
+                                workspace.get_debug_progress_word_ptr(sm / 8),
+                                rank);
+                            const auto word = ptx::ld_acq_sys(word_ptr);
+                            const auto progress = (word >> ((sm % 8) * 4)) & 0xfu;
+                            if (progress != 15u)
+                                printf("  sm=%u checkpoint=%u\n", sm, progress);
+                        }
+                    }
+#endif
                     DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+#endif
                 }
             }
         }
