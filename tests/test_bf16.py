@@ -21,6 +21,7 @@ from generators import (
 
 
 def test_bf16_repeatability() -> None:
+    """Best-effort soak test. A passing run does not rule out this intermittent race."""
     if get_arch_major() != 12:
         return
     generator = torch.Generator(device='cuda').manual_seed(233)
