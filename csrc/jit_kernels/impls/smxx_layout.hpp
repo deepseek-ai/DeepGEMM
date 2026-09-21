@@ -30,17 +30,17 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&pack_fp32_into_ue8m0<
-        {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}
     >);
 }};
 )", args.num_groups, args.options.block_dim->x, args.block_mn, args.block_packed_sf_k,
+    args.gran_k, args.k_alignment,
     "true", args.use_psum_layout ? "true" : "false"));
 
         // Launch
         jit->launch(
             kernel, args.options,
-            args.sf, args.out, args.grouped_layout, args.mn, args.sf_k, args.packed_sf_k,
-            args.gran_k, args.k_alignment
+            args.sf, args.out, args.grouped_layout, args.mn, args.sf_k, args.packed_sf_k
         );
     }
 };
