@@ -23,6 +23,8 @@ static void sm90_bmn_bnk_mn_gemm(const torch::Tensor &a,
     constexpr int num_math_threads = 256;
     DG_HOST_ASSERT(k % block_k == 0);
     DG_HOST_ASSERT(m % 64 == 0 and n % 64 == 0);
+    // NOTES: the BF16 API path accumulates into an FP32 workspace first, so D is always FP32 here
+    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(static_cast<int64_t>(s) * static_cast<int64_t>(std::max(m, n)) <= std::numeric_limits<int>::max());
 
     const int swizzle_ab_mode = get_swizzle_mode(block_k, static_cast<int>(a.element_size()));
