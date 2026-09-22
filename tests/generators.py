@@ -154,18 +154,21 @@ def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) ->
 
             # Backward
             if quant_config is None or not quant_config.is_fp4_fp4():
+                override_major = MajorTypeAB.MNMajor
+                override_kernel_type = kernel_type
+                if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
+                    override_major = MajorTypeAB.KMajor
+                    override_kernel_type = KernelType.Kernel1D1D
                 for m in m_bwd_list:
                     for n, k in nk_list:
-                        override_major = MajorTypeAB.MNMajor
-                        override_kernel_type = kernel_type
-                        if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
-                            override_major = MajorTypeAB.KMajor
-                            override_kernel_type = KernelType.Kernel1D1D
                         yield emit(kernel_type,          quant_config, m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16)  # Dgrad
                         yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, True,  torch.float)         # Wgrad
                         yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, False, torch.bfloat16)      # Wgrad
                         if dtype == torch.bfloat16 or get_arch_major() == 10:
                             yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, False, torch.float)     # Wgrad
+                # Wgrad with small M (e.g., narrow weights), where the heuristic may pick small block M
+                for small_m in (16, 32):
+                    yield emit(override_kernel_type, quant_config, small_m, 4096, 7168, override_major, override_major, True, torch.float)  # Wgrad
 
             if collect_cublas_scores and scores:
                 quant_type = f'FP{4 if quant_config.is_fp4_a else 8}xFP{4 if quant_config.is_fp4_b else 8}'
