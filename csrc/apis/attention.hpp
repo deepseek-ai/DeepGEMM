@@ -263,7 +263,16 @@ static const torch::Tensor& get_sparse_mqa_logits_workspace(const torch::TensorO
     auto& workspace = workspaces[stream];
     if (not workspace.defined()) {
         // Warm up each stream before capture so one-time zeroing is not replayed with the graph.
-        DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None);
+        if (c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None) {
+            // Frameworks capture on a dedicated side stream but replay on the stream that
+            // launched the eager warm-up, so reuse that stream's workspace instead of
+            // recording a fresh allocation and its zeroing into the graph.
+            for (const auto& [other_stream, other_workspace] : workspaces) {
+                if (other_workspace.defined() and other_workspace.device() == options.device())
+                    return other_workspace;
+            }
+            DG_HOST_UNREACHABLE("Warm up the sparse MQA logits workspace on this device before capturing");
+        }
         workspace = torch::zeros({kNumWorkspaceBytes}, options.dtype(torch::kByte));
     }
     return workspace;
