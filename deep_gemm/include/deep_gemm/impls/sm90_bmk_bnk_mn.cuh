@@ -19,7 +19,7 @@ namespace deep_gemm {
 
 template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
-          uint32_t kSplitFactor,
+          uint32_t kSplitFactor, bool kUseSplitWorkspace,
           uint32_t kNumStages,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
@@ -93,6 +93,11 @@ sm90_bmn_bnk_mn_gemm_impl(const uint32_t shape_s,
     const uint32_t n_block_idx = mn_block_idx % num_n_blocks;
     const uint32_t m_block_idx = mn_block_idx / num_n_blocks;
     const uint32_t num_total_stages = cute::min(kSplitFactor, shape_s * (SHAPE_K / BLOCK_K) - sk_block_idx * kSplitFactor);
+
+    // With a split workspace, each split accumulates into its own `[SHAPE_M, SHAPE_N]` slice, so every element
+    // has a single writer and the result does not depend on the order of the atomic additions
+    if constexpr (kUseSplitWorkspace)
+        d += static_cast<uint64_t>(sk_block_idx) * SHAPE_M * SHAPE_N;
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
