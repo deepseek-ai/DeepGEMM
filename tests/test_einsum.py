@@ -36,6 +36,22 @@ def test_bmk_bnk_mn() -> None:
     print()
 
 
+def test_bmk_bnk_mn_fp32_requires_c() -> None:
+    print('Testing "bmk, bnk -> mn" FP32 output without C:')
+    # FP32 D is only supported as the accumulated expression (`c` must be `d` itself),
+    # so a missing `c` must be rejected with an error instead of crashing the process
+    a = torch.randn((4, 128, 128), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((4, 256, 128), device='cuda', dtype=torch.bfloat16)
+    d = torch.empty((128, 256), device='cuda', dtype=torch.float)
+    try:
+        deep_gemm.einsum('bmk,bnk->mn', a, b, d)
+    except RuntimeError:
+        print(' > Rejected as expected')
+    else:
+        raise AssertionError('FP32 D without C was not rejected')
+    print()
+
+
 def test_bhr_hdr_bhd():
     print('Testing "bhr, hdr -> bhd":')
     for h, r, d in [(128, 512, 128), (8, 4096, 1024)]:
@@ -229,6 +245,7 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_bmk_bnk_mn()
+    test_bmk_bnk_mn_fp32_requires_c()
     test_bhr_hdr_bhd()
     test_bhd_hdr_bhr()
     test_bhd_bhr_hdr()
