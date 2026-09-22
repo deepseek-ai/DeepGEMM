@@ -33,6 +33,12 @@ static void sm90_bmn_bnk_mn_gemm(const torch::Tensor &a,
     const int num_mn_blocks = ceil_div(m, block_m) * ceil_div(n, block_n);
     const int num_sk_blocks = s * (k / block_k);
     const int split_factor = ceil_div(num_sk_blocks, std::max(num_sms / num_mn_blocks, 1));
+    const int num_splits = ceil_div(num_sk_blocks, split_factor);
+
+    // Splits are reduced into D with atomic additions, whose order changes between runs. For deterministic
+    // algorithms, each split writes its own slice of a workspace instead, and the slices are summed in a fixed order.
+    const bool use_split_workspace = heuristics_runtime->get_deterministic_algorithms() and num_splits > 1;
+    const auto split_workspace = use_split_workspace ? torch::zeros({num_splits, m, n}, d.options()) : torch::Tensor();
 
     // Select best number of stages
     int num_stages = 4, smem_size = 0;
@@ -74,7 +80,7 @@ static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm90_bmn_bnk_mn_gemm_impl<
         {}, {}, {},
         {}, {}, {},
-        {},
+        {}, {},
         {},
         {}, {}
     >);
@@ -82,7 +88,7 @@ static void __instantiate_kernel() {{
 )",
         m, n, k,
         block_m, block_n, block_k,
-        split_factor,
+        split_factor, use_split_workspace,
         num_stages,
         num_tma_threads, num_math_threads));
 
@@ -90,11 +96,13 @@ static void __instantiate_kernel() {{
     jit->launch(
         kernel, {
             .num_smem_bytes = smem_size,
-            .grid_dim = dim3(num_mn_blocks * ceil_div(num_sk_blocks, split_factor), 1, 1),
+            .grid_dim = dim3(num_mn_blocks * num_splits, 1, 1),
             .block_dim = dim3(num_tma_threads + num_math_threads, 1, 1),
         },
-        s, tensor_map_a, tensor_map_b, d.data_ptr<float>()
+        s, tensor_map_a, tensor_map_b, (use_split_workspace ? split_workspace : d).data_ptr<float>()
     );
+    if (use_split_workspace)
+        d.add_(split_workspace.sum(0));
 }
 
 } // namespace deep_gemm

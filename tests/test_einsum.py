@@ -36,6 +36,35 @@ def test_bmk_bnk_mn() -> None:
     print()
 
 
+@test_filter(lambda: get_arch_major() == 9)
+def test_bmk_bnk_mn_deterministic() -> None:
+    print('Testing deterministic "bmk, bnk -> mn":')
+    # Split-K partial sums are reduced with atomic additions by default,
+    # so the deterministic mode must give bitwise identical results across calls
+    deep_gemm.use_deterministic_algorithms(True)
+    try:
+        for s in (129, 4096):
+            for m, n, k in [(128, 384, 128), (256, 256, 256)]:
+                for dtype in (torch.float, torch.bfloat16):
+                    a = torch.randn((s, m, k), dtype=torch.bfloat16, device='cuda')
+                    b = torch.randn((s, n, k), dtype=torch.bfloat16, device='cuda')
+                    d_init = torch.randn((m, n), dtype=dtype, device='cuda')
+                    ref_d = (d_init.float() if dtype == torch.float else 0) + torch.bmm(a.float(), b.float().mT).sum(0)
+
+                    outputs = []
+                    for _ in range(10):
+                        d = d_init.clone()
+                        deep_gemm.einsum('bmk,bnk->mn', a, b, d, c=d if dtype == torch.float else None)
+                        outputs.append(d)
+                    assert calc_diff(outputs[0], ref_d) < 1e-5, f'{s=}, {m=}, {n=}, {k=}, {dtype=}'
+                    for d in outputs[1:]:
+                        assert torch.equal(d, outputs[0]), f'{s=}, {m=}, {n=}, {k=}, {dtype=}'
+                    print(f' > OK (b={s:4.0f}, {m=}, {n=}, {k=}, {"FP32" if dtype == torch.float else "BF16"})')
+    finally:
+        deep_gemm.use_deterministic_algorithms(False)
+    print()
+
+
 def test_bhr_hdr_bhd():
     print('Testing "bhr, hdr -> bhd":')
     for h, r, d in [(128, 512, 128), (8, 4096, 1024)]:
@@ -229,6 +258,7 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_bmk_bnk_mn()
+    test_bmk_bnk_mn_deterministic()
     test_bhr_hdr_bhd()
     test_bhd_hdr_bhr()
     test_bhd_bhr_hdr()
