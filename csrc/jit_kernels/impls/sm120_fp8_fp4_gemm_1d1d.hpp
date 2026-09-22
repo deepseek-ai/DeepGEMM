@@ -1,12 +1,14 @@
 #pragma once
 
+#include <algorithm>
+#include <format>
+#include <optional>
+#include <string>
+#include <vector>
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
 
@@ -15,13 +17,13 @@
 
 namespace deep_gemm {
 
-class SM120FP8FP4Gemm1D1DRuntime final: public LaunchRuntime<SM120FP8FP4Gemm1D1DRuntime> {
+class SM120FP8FP4Gemm1D1DRuntime final {
 public:
     struct Args {
         GemmDesc gemm_desc;
         GemmConfig gemm_config;
-        LaunchArgs launch_args;
-        const std::optional<std::string> epilogue_type;
+        deep_jit::cuda::LaunchOptions options;
+        std::optional<std::string> epilogue_type;
 
         int gran_k_a, gran_k_b;
         bool is_fp4;
@@ -46,8 +48,8 @@ public:
         CUtensorMap tensor_map_cd;
     };
 
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+    static void compile_and_launch(const std::string& tag, const Args& args) {
+        const auto kernel = jit->compile(tag, std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh>
 
 using namespace deep_gemm;
@@ -96,11 +98,11 @@ static void __instantiate_kernel() {{
         (args.gemm_desc.major_b == cute::UMMA::Major::K) ? "true" : "false",
         args.k_grouped_constant_stride ? "true" : "false",
         args.gemm_config.storage_config.store_block_m,
-        args.gemm_config.split_k_factor);
-    }
+        args.gemm_config.split_k_factor));
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
+        // Launch
+        jit->launch(
+            kernel, args.options,
             args.gmem_d, args.gmem_c,
             args.gmem_a_ptr, args.gmem_b_ptr,
             args.grouped_layout,
@@ -110,40 +112,8 @@ static void __instantiate_kernel() {{
             args.stride_cd_m, args.stride_cd_n, args.stride_cd_batch,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
-            args.tensor_map_cd));
-    }
-};
-
-class SM120SplitKReduceRuntime final: public LaunchRuntime<SM120SplitKReduceRuntime> {
-public:
-    struct Args {
-        GemmDesc gemm_desc;
-        GemmConfig gemm_config;
-        LaunchArgs launch_args;
-        int stride_cd_m;
-        int stride_cd_n;
-        void* gmem_d;
-        void* workspace;
-    };
-
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
-#include <deep_gemm/impls/sm120_split_k_reduce.cuh>
-
-using namespace deep_gemm;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm120_split_k_reduce_impl<{}, {}>);
-}};
-)",
-        to_string(args.gemm_desc.cd_dtype),
-        args.gemm_config.split_k_factor);
-    }
-
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.gmem_d, args.workspace,
-            args.gemm_desc.m, args.gemm_desc.n, args.stride_cd_m, args.stride_cd_n));
+            args.tensor_map_cd
+        );
     }
 };
 
@@ -154,33 +124,29 @@ static void sm120_split_k_reduce(const torch::Tensor& workspace, const torch::Te
     const int threads = 256;
     const int blocks = ceil_div(total, threads);
 
-    const auto desc = GemmDesc {
-        .gemm_type = GemmType::Normal,
-        .kernel_type = KernelType::KernelNoSF,
-        .m = m, .n = n, .k = 0, .num_groups = 1,
-        .a_dtype = torch::kFloat, .b_dtype = torch::kFloat,
-        .cd_dtype = d.scalar_type(),
-        .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
-        .with_accumulation = false,
-        .num_sms = blocks,
-        .tc_util = 100, .compiled_dims = ""
-    };
-    const auto config = GemmConfig {
-        .split_k_factor = split_k
-    };
+    // Compile
+    const auto kernel = jit->compile("sm120_split_k_reduce", std::format(R"(
+#include <deep_gemm/impls/sm120_split_k_reduce.cuh>
 
-    const SM120SplitKReduceRuntime::Args args = {
-        .gemm_desc = desc,
-        .gemm_config = config,
-        .launch_args = LaunchArgs(blocks, threads, 0, 0),
-        .stride_cd_m = stride_cd_m,
-        .stride_cd_n = stride_cd_n,
-        .gmem_d = d.data_ptr(),
-        .workspace = workspace.data_ptr(),
-    };
-    const auto code = SM120SplitKReduceRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_split_k_reduce", code);
-    SM120SplitKReduceRuntime::launch(runtime, args);
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm120_split_k_reduce_impl<{}, {}>);
+}};
+)",
+        to_string(d.scalar_type()),
+        split_k));
+
+    // Launch
+    jit->launch(
+        kernel, {
+            .num_smem_bytes = 0,
+            .grid_dim = dim3(blocks, 1, 1),
+            .block_dim = dim3(threads, 1, 1),
+        },
+        d.data_ptr(), workspace.data_ptr(),
+        m, n, stride_cd_m, stride_cd_n
+    );
 }
 
 static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -209,8 +175,8 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .max_gran_k = std::max(gran_k_a, gran_k_b),
         .cd_n_contiguous = !swap_ab  // strided-store epilogue (AB-swap output is transposed)
@@ -251,12 +217,15 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
     if (split_k > 1)
         workspace = torch::empty({split_k, m, n}, d.options().dtype(torch::kFloat));
 
-    const SM120FP8FP4Gemm1D1DRuntime::Args args = {
+    // Compile and launch
+    SM120FP8FP4Gemm1D1DRuntime::compile_and_launch("sm120_fp8_fp4_gemm_1d1d", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+        },
         .epilogue_type = epilogue_type,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
@@ -279,11 +248,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
         .tensor_map_cd = tensor_map_cd,
-    };
-
-    const auto code = SM120FP8FP4Gemm1D1DRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp8_fp4_gemm_1d1d", code);
-    SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    });
 
     if (split_k > 1) {
         const int reduce_stride_m = swap_ab ? static_cast<int>(d.stride(-1)) : d_stride;
@@ -333,8 +298,8 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .max_gran_k = std::max(gran_k_a, gran_k_b),
         .expected_m = m, .expected_n = n, .expected_k = max_k, .expected_num_groups = num_groups
@@ -366,12 +331,15 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
                                                 n, num_groups,
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120FP8FP4Gemm1D1DRuntime::Args args = {
+    // Compile and launch
+    SM120FP8FP4Gemm1D1DRuntime::compile_and_launch("sm120_k_grouped_fp8_fp4_gemm_1d1d", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+        },
         .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
@@ -394,10 +362,7 @@ static void sm120_k_grouped_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torc
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120FP8FP4Gemm1D1DRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_k_grouped_fp8_fp4_gemm_1d1d", code);
-    SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    });
 }
 
 static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -432,8 +397,8 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .max_gran_k = std::max(gran_k_a, gran_k_b),
         .expected_m = expected_m_for_psum_layout.value_or(m),
@@ -465,12 +430,15 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120FP8FP4Gemm1D1DRuntime::Args args = {
+    // Compile and launch
+    SM120FP8FP4Gemm1D1DRuntime::compile_and_launch("sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+        },
         .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
@@ -493,10 +461,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120FP8FP4Gemm1D1DRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_m_grouped_fp8_fp4_gemm_contiguous_1d1d", code);
-    SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    });
 }
 
 static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -524,8 +489,8 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = false,
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .max_gran_k = std::max(gran_k_a, gran_k_b),
         .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
@@ -555,12 +520,15 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
                                                 static_cast<int>(d.stride(-2)), num_groups,
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120FP8FP4Gemm1D1DRuntime::Args args = {
+    // Compile and launch
+    SM120FP8FP4Gemm1D1DRuntime::compile_and_launch("sm120_m_grouped_fp8_fp4_gemm_masked_1d1d", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+        },
         .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
@@ -583,10 +551,7 @@ static void sm120_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, con
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120FP8FP4Gemm1D1DRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_m_grouped_fp8_fp4_gemm_masked_1d1d", code);
-    SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    });
 }
 
 static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
@@ -615,8 +580,8 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .cd_dtype = d.scalar_type(),
         .major_a = major_a, .major_b = major_b,
         .with_accumulation = c.has_value(),
-        .num_sms = device_runtime->get_num_sms(),
-        .tc_util = device_runtime->get_tc_util(),
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
         .max_gran_k = std::max(gran_k_a, gran_k_b),
         .cd_n_contiguous = !swap_ab  // strided-store epilogue (AB-swap output is transposed)
@@ -645,12 +610,15 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                                                 d.stride(1), d.stride(0),
                                                 config.storage_config.swizzle_cd_mode);
 
-    const SM120FP8FP4Gemm1D1DRuntime::Args args = {
+    // Compile and launch
+    SM120FP8FP4Gemm1D1DRuntime::compile_and_launch("sm120_fp8_fp4_bmm", {
         .gemm_desc = desc,
         .gemm_config = config,
-        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
-                                  config.pipeline_config.smem_size,
-                                  1),
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+        },
         .epilogue_type = std::nullopt,
         .gran_k_a = gran_k_a,
         .gran_k_b = gran_k_b,
@@ -673,10 +641,7 @@ static void sm120_fp8_fp4_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
         .tensor_map_cd = tensor_map_cd,
-    };
-    const auto code = SM120FP8FP4Gemm1D1DRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp8_fp4_bmm", code);
-    SM120FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+    });
 }
 
 } // namespace deep_gemm

@@ -1,5 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <vector>
+
 #include <cute/arch/mma_sm100_desc.hpp>
 #include <deep_gemm/common/types.cuh>
 
@@ -13,10 +18,16 @@ namespace deep_gemm {
 struct SM120ArchSpec {
     static constexpr int smem_capacity = 101376;  // 99KB
 
+    // SM120 heuristics address operands in whole bytes: packed FP4 (the `MXF4` MMA kind, 4 bits)
+    // is tiled like a 1-byte element, with `BLOCK_K` counted in logical elements
+    static int get_byte_addressable_element_size(const GemmDesc& desc) {
+        return std::max(get_num_element_bits(desc.get_mma_kind()) / 8, 1);
+    }
+
     static constexpr int kMinBlockM = 64;   // kMWarps(4) * MMA_M(16), both FP8 and BF16 with kNWarps=2
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
-        const int elem_size = get_byte_addressable_element_size(desc.get_mma_kind());
+        const int elem_size = get_byte_addressable_element_size(desc);
         const int runtime_align = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
         const int expected_m = desc.get_expected_m();
 
@@ -242,7 +253,7 @@ struct SM120ArchSpec {
         const int64_t expected_k = desc.get_expected_k();
         const int k_blocks = ceil_div(static_cast<int>(expected_k), layout.block_k);
 
-        const int elem_size = get_byte_addressable_element_size(desc.get_mma_kind());
+        const int elem_size = get_byte_addressable_element_size(desc);
         const int sf_bytes_a = (desc.kernel_type == KernelType::Kernel1D1D)
             ? align(layout.block_m * 4, 128) : 0;
         const int sf_bytes_b = (desc.kernel_type == KernelType::Kernel1D1D)

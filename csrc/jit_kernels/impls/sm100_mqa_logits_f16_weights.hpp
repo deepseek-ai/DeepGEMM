@@ -1,80 +1,12 @@
 #pragma once
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include <format>
+
+#include "../../runtime/runtime.hpp"
 #include "../heuristics/sm100.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
-
-class SM100MQALogitsF16WeightsRuntime final
-    : public LaunchRuntime<SM100MQALogitsF16WeightsRuntime> {
-public:
-    struct Args {
-        int seq_len;
-        int seq_len_kv;
-        int max_seqlen_k;
-        int stride_logits;
-        int num_heads, head_dim;
-        bool is_compressed_logits;
-
-        int num_q_stages;
-        int num_kv_stages;
-        int block_q;
-        int block_kv;
-
-        uint32_t* cu_seq_len_k_start_and_end;
-        void* logits;
-
-        CUtensorMap tensor_map_q;
-        CUtensorMap tensor_map_kv;
-        CUtensorMap tensor_map_kv_scales;
-        CUtensorMap tensor_map_weights;
-        at::ScalarType logits_dtype;
-
-        int num_specialized_threads;
-        int num_math_threads;
-
-        LaunchArgs launch_args;
-    };
-
-    static std::string generate_impl(const Args& args) {
-        DG_HOST_ASSERT(128 % args.num_heads == 0);
-
-        return fmt::format(R"(
-#include <deep_gemm/impls/sm100_fp8_mqa_logits_f16_weights.cuh>
-
-using namespace deep_gemm;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_fp8_mqa_logits_f16_weights<
-        {}, {},
-        {},
-        {}, {},
-        {}, {},
-        {}, {},
-        {}
-    >);
-}};
-)", args.num_heads, args.head_dim,
-    args.is_compressed_logits,
-    args.block_q, args.block_kv,
-    args.num_q_stages, args.num_kv_stages,
-    args.num_specialized_threads, args.num_math_threads,
-    to_string(args.logits_dtype));
-    }
-
-    static void launch_impl(const KernelHandle& kernel,
-                            const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.seq_len, args.seq_len_kv, args.max_seqlen_k,
-            static_cast<uint64_t>(args.stride_logits),
-            args.cu_seq_len_k_start_and_end, args.logits, args.tensor_map_q,
-            args.tensor_map_kv, args.tensor_map_kv_scales,
-            args.tensor_map_weights));
-    }
-};
 
 static void sm100_mqa_logits_f16_weights(
     const torch::Tensor& q, const torch::Tensor& kv,
@@ -85,7 +17,8 @@ static void sm100_mqa_logits_f16_weights(
     const int& seq_len_kv, const int& max_seqlen_k, const int& stride_logits,
     const int& num_heads, const int& head_dim, const int& block_q,
     const int& block_kv) {
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    DG_HOST_ASSERT(128 % num_heads == 0);
 
     constexpr int num_specialized_threads = 128;
     constexpr int num_q_stages = 5, num_kv_stages = 8;
@@ -144,36 +77,43 @@ static void sm100_mqa_logits_f16_weights(
     valid_offsets.select(1, 1).copy_(cu_seq_len_k_end);
     cu_seq_len_k_start_and_end = cu_seq_len_k_start_and_end.reshape({-1}).contiguous();
 
-    const SM100MQALogitsF16WeightsRuntime::Args args = {
-        .seq_len = seq_len,
-        .seq_len_kv = seq_len_kv,
-        .max_seqlen_k = max_seqlen_k,
-        .stride_logits = stride_logits,
-        .num_heads = num_heads,
-        .head_dim = head_dim,
-        .is_compressed_logits = is_compressed_logits,
-        .num_q_stages = num_q_stages,
-        .num_kv_stages = num_kv_stages,
-        .block_q = block_q,
-        .block_kv = block_kv,
-        .cu_seq_len_k_start_and_end = reinterpret_cast<uint32_t*>(
-            cu_seq_len_k_start_and_end.data_ptr<int>()),
-        .logits = logits.data_ptr(),
-        .tensor_map_q = tensor_map_q,
-        .tensor_map_kv = tensor_map_kv,
-        .tensor_map_kv_scales = tensor_map_kv_scales,
-        .tensor_map_weights = tensor_map_weights,
-        .logits_dtype = logits_dtype,
-        .num_specialized_threads = num_specialized_threads,
-        .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
-                                  num_specialized_threads + num_math_threads,
-                                  smem_size, 2)
-    };
-    const auto code = SM100MQALogitsF16WeightsRuntime::generate(args);
-    const auto runtime =
-        compiler->build("sm100_mqa_logits_f16_weights", code);
-    SM100MQALogitsF16WeightsRuntime::launch(runtime, args);
+    // Compile
+    const auto kernel = jit->compile("sm100_mqa_logits_f16_weights", std::format(R"(
+#include <deep_gemm/impls/sm100_fp8_mqa_logits_f16_weights.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm100_fp8_mqa_logits_f16_weights<
+        {}, {},
+        {},
+        {}, {},
+        {}, {},
+        {}, {},
+        {}
+    >);
+}};
+)", num_heads, head_dim,
+    is_compressed_logits,
+    block_q, block_kv,
+    num_q_stages, num_kv_stages,
+    num_specialized_threads, num_math_threads,
+    to_string(logits_dtype)));
+
+    // Launch (two-CTA cluster)
+    jit->launch(
+        kernel, {
+            .num_smem_bytes = smem_size,
+            .grid_dim = dim3(runtime->get_num_sms(), 1, 1),
+            .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
+            .cluster_dim = dim3(2, 1, 1),
+        },
+        seq_len, seq_len_kv, max_seqlen_k,
+        static_cast<uint64_t>(stride_logits),
+        reinterpret_cast<uint32_t*>(cu_seq_len_k_start_and_end.data_ptr<int>()),
+        logits.data_ptr(),
+        tensor_map_q, tensor_map_kv, tensor_map_kv_scales, tensor_map_weights
+    );
 }
 
 } // namespace deep_gemm

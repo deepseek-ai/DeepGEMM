@@ -324,6 +324,7 @@ sm100_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                     cast_stage_idx * BLOCK_K + i * 8);
             }
             cutlass::arch::fence_view_async_tmem_store();
+            cutlass::arch::fence_view_async_shared();
 
             // Arrive for issuing MMAs
             ptx::tcgen05_before_thread_sync();

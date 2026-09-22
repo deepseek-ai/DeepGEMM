@@ -22,13 +22,10 @@ from scripts.generate_pyi import generate_pyi_file
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
-DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
 
 # Compiler flags
-cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
+cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
-if DG_JIT_USE_RUNTIME_API:
-    cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -37,10 +34,10 @@ build_include_dirs = [
     f'{CUDA_HOME}/include',
     f'{CUDA_HOME}/include/cccl',
     'deep_gemm/include',
+    'third-party/deep_jit/include',
     'third-party/cutlass/include',
-    'third-party/fmt/include',
 ]
-build_libraries = ['cudart', 'nvrtc']
+build_libraries = ['cudart']
 build_library_dirs = [f'{CUDA_HOME}/lib64']
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
@@ -122,8 +119,19 @@ class CustomBuildPy(build_py):
         # Third, generate and copy .pyi file to build root directory
         self.generate_pyi_file()
 
+        # Fourth, copy csrc and docs into the wheel for agent-side error lookup
+        self.prepare_agent_files()
+
         # Finally, run the regular build
         build_py.run(self)
+
+    def prepare_agent_files(self):
+        # Copy csrc and docs into the wheel for agent-side error lookup
+        package_dir = os.path.join(self.build_lib, 'deep_gemm')
+        for name in ('csrc', 'docs'):
+            dst = os.path.join(package_dir, name)
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(os.path.join(current_dir, name), dst)
 
     def generate_pyi_file(self):
         generate_pyi_file(name='_C', root='./csrc', output_dir='./stubs')

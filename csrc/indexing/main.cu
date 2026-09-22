@@ -26,6 +26,7 @@
 // Mega kernels
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 #include <deep_gemm/impls/sm100_bf16_mega_moe.cuh>
+#include <deep_gemm/impls/sm100_bf16_mega_gate.cuh>
 
 using namespace deep_gemm;
 

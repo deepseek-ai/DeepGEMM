@@ -50,15 +50,28 @@ enum class MegaMoEPhaseKind {
     Linear2
 };
 
+// Power-of-two helpers for the UE8M0 activation SF (previously in `common/math.cuh`)
+__forceinline__ __device__ float sm90_fp8_mega_moe_fast_pow2(const int& x) {
+    uint32_t bits_x = (x + 127) << 23;
+    return *reinterpret_cast<float*>(&bits_x);
+}
+
+__forceinline__ __device__ int sm90_fp8_mega_moe_fast_log2_ceil(float x) {
+    const auto bits = *reinterpret_cast<uint32_t*>(&x);
+    const auto exp = bits >> 23;
+    const auto man = bits & ((1 << 23) - 1);
+    return exp - 127 + (man != 0);
+}
+
 __forceinline__ __device__ void sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
     const float2& amax, float2& sf, float2& sf_inv) {
     constexpr float kScale = 1.0f / 448.0f;
     const auto scaled = make_float2(
         __fmul_rn(amax.x, kScale), __fmul_rn(amax.y, kScale));
-    const auto exp_x = math::fast_log2_ceil(scaled.x);
-    const auto exp_y = math::fast_log2_ceil(scaled.y);
-    sf.x = math::fast_pow2(exp_x), sf_inv.x = math::fast_pow2(-exp_x);
-    sf.y = math::fast_pow2(exp_y), sf_inv.y = math::fast_pow2(-exp_y);
+    const auto exp_x = sm90_fp8_mega_moe_fast_log2_ceil(scaled.x);
+    const auto exp_y = sm90_fp8_mega_moe_fast_log2_ceil(scaled.y);
+    sf.x = sm90_fp8_mega_moe_fast_pow2(exp_x), sf_inv.x = sm90_fp8_mega_moe_fast_pow2(-exp_x);
+    sf.y = sm90_fp8_mega_moe_fast_pow2(exp_y), sf_inv.y = sm90_fp8_mega_moe_fast_pow2(-exp_y);
 }
 
 template <MegaMoEPhaseKind kKind,

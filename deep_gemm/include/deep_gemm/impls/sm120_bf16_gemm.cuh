@@ -184,8 +184,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                         const auto a_base = reinterpret_cast<const char*>(gmem_a_ptr);
                         const auto b_base = reinterpret_cast<const char*>(gmem_b_ptr);
-                        const uint64_t a_offset = static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m * 2;
-                        const uint64_t b_offset = static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n * 2;
+                        const uint64_t a_offset = static_cast<uint64_t>(scheduler.current_k_start) * shape_m * 2;
+                        const uint64_t b_offset = static_cast<uint64_t>(scheduler.current_k_start) * shape_n * 2;
 
                         ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
                         ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);

@@ -1,133 +1,24 @@
 #pragma once
 
+#include <format>
 #include <torch/python.h>
-#include "../../jit/compiler.hpp"
-#include "../../jit/kernel_runtime.hpp"
-#include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
-#include "runtime_utils.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
+#include "../../runtime/runtime.hpp"
+#include "../../utils/exception.hpp"
 #include "../heuristics/sm90_mega_moe.hpp"
+#include "runtime_utils.hpp"
 
 namespace deep_gemm {
 
 // SM90 uses FP8 operands, float scale factors, register-resident WGMMA
 // accumulators, and one CTA per scheduled work item.
 
-class SM90FP8MegaMoERuntime final : public LaunchRuntime<SM90FP8MegaMoERuntime> {
-public:
-    enum class KernelPhase {
-        Linear1,
-        Linear2
-    };
-
-    struct Args {
-        // Templated arguments
-        int num_max_tokens_per_rank;
-        int hidden, intermediate_hidden;
-        int num_experts, num_topk;
-        int num_ranks;
-        float activation_clamp;
-        bool fast_math;
-        bool bf16_scaled_accum;
-        KernelPhase kernel_phase;
-        MegaMoESM90Config config;
-
-        // Runtime arguments
-        void* y;
-        int* cumulative_local_expert_recv_stats;
-        int num_tokens;
-        layout::SymBuffer<> sym_buffer_ptrs;
-
-        // Tensormaps for activations and weights. Weight scale factors use
-        // block (128, 128) quantization and are loaded by the math warpgroup
-        // directly from global memory (no TMA descriptor required).
-        CUtensorMap tensor_map_l1_acts;
-        CUtensorMap tensor_map_l1_acts_sf;
-        CUtensorMap tensor_map_l1_weights;
-        const float* l1_weights_sf;
-        CUtensorMap tensor_map_l1_output;
-        CUtensorMap tensor_map_l2_acts;
-        CUtensorMap tensor_map_l2_acts_sf;
-        CUtensorMap tensor_map_l2_weights;
-        const float* l2_weights_sf;
-
-        // Launch configs
-        LaunchArgs launch_args;
-    };
-
-    static std::string generate_impl(const Args& args) {
-        const char* kernel_symbol = args.kernel_phase == KernelPhase::Linear1 ? "sm90_fp8_mega_moe_l1_impl" :
-            "sm90_fp8_mega_moe_l2_impl";
-        const auto phase_template_args = args.kernel_phase == KernelPhase::Linear1 ?
-            fmt::format(",\n        {}", args.config.nmajor_schedule ? "true" : "false") :
-            fmt::format(",\n        {}, {}, {}",
-                        args.config.direct_l2_scatter ? "true" : "false",
-                        args.config.nmajor_schedule ? "true" : "false",
-                        args.config.one_warp_cleanup ? "true" : "false");
-        return fmt::format(R"(
-#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
-
-using namespace deep_gemm;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&{}<
-        {},
-        {}, {},
-        {}, {},
-        {},
-        {}, {}, {},
-        {},
-        {}, {},
-        {},
-        {}, {}, {},
-        {}, {},
-        {},
-        {},
-        {},
-        {}{}
-    >);
-}};
-)",
-    kernel_symbol,
-    args.num_max_tokens_per_rank,
-    args.hidden, args.intermediate_hidden,
-    args.num_experts, args.num_topk,
-    args.config.num_experts_per_wave,
-    args.config.block_m, args.config.block_n, args.config.block_k,
-    args.config.num_max_pool_tokens,
-    args.config.num_padded_sf_pool_tokens,
-    args.config.sf_pool_stride_tokens,
-    args.config.num_stages,
-    args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
-    args.config.num_sms, args.num_ranks,
-    to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false",
-    args.config.swap_ab ? "true" : "false",
-    args.bf16_scaled_accum ? "true" : "false",
-    phase_template_args);
-    }
-
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.y,
-            args.cumulative_local_expert_recv_stats,
-            args.num_tokens,
-            args.sym_buffer_ptrs,
-            args.tensor_map_l1_acts,
-            args.tensor_map_l1_acts_sf,
-            args.tensor_map_l1_weights,
-            args.l1_weights_sf,
-            args.tensor_map_l1_output,
-            args.tensor_map_l2_acts,
-            args.tensor_map_l2_acts_sf,
-            args.tensor_map_l2_weights,
-            args.l2_weights_sf
-        ));
-    }
+enum class SM90MegaMoEKernelPhase {
+    Linear1,
+    Linear2
 };
 
 static void sm90_fp8_mega_moe(
@@ -151,7 +42,7 @@ static void sm90_fp8_mega_moe(
 
     // Resolve hardware, generic fallback, phase schedules, and numerical modes
     // once. The runtime only consumes the resulting complete launch config.
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = runtime->get_num_sms();
     const Sm90MoeHeuristicInput heuristic_input {
         num_sms,
         num_ranks, num_experts, num_experts_per_rank,
@@ -249,55 +140,90 @@ static void sm90_fp8_mega_moe(
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
-    // Launch
+    // Compile and launch the two phases (Linear1 and Linear2) as separate kernels
+    // Weight scale factors use block (128, 128) quantization and are loaded by the math
+    // warpgroup directly from global memory (no TMA descriptor required).
     const bool bf16_scaled_accum = launch_config.numerical.bf16_scaled_accum;
-    const SM90FP8MegaMoERuntime::Args args = {
-        .num_max_tokens_per_rank = num_max_tokens_per_rank,
-        .hidden = hidden, .intermediate_hidden = intermediate_hidden,
-        .num_experts = num_experts, .num_topk = num_topk,
-        .num_ranks = num_ranks,
-        .activation_clamp = activation_clamp,
-        .fast_math = fast_math,
-        .bf16_scaled_accum = bf16_scaled_accum,
-        .kernel_phase = SM90FP8MegaMoERuntime::KernelPhase::Linear1,
-        .config = l1_config,
-        .y = y.data_ptr(),
-        .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
-        .num_tokens = num_tokens,
-        .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
-        .tensor_map_l1_acts = tensor_map_l1_acts,
-        .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
-        .tensor_map_l1_weights = tensor_map_l1_weights,
-        .l1_weights_sf = l1_weights_sf.data_ptr<float>(),
-        .tensor_map_l1_output = tensor_map_l1_output,
-        .tensor_map_l2_acts = tensor_map_l2_acts,
-        .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
-        .tensor_map_l2_weights = tensor_map_l2_weights,
-        .l2_weights_sf = l2_weights_sf.data_ptr<float>(),
-        .launch_args = LaunchArgs(l1_config.num_sms,
-                                  l1_config.num_dispatch_threads + l1_config.num_non_epilogue_threads +
-                                      l1_config.num_epilogue_threads,
-                                  l1_config.smem_size, 1)
-    };
-    const auto launch_with_phase = [&](const SM90FP8MegaMoERuntime::KernelPhase kernel_phase,
+    const auto sym_buffer = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx);
+    const auto launch_with_phase = [&](const SM90MegaMoEKernelPhase& kernel_phase,
                                        const char* kernel_name) {
-        auto split_args = args;
-        split_args.kernel_phase = kernel_phase;
-        const bool is_linear2 =
-            kernel_phase == SM90FP8MegaMoERuntime::KernelPhase::Linear2;
-        split_args.config = is_linear2 ? l2_config : l1_config;
-        split_args.launch_args = LaunchArgs(
-            split_args.config.num_sms,
-            split_args.config.num_dispatch_threads + split_args.config.num_non_epilogue_threads +
-                split_args.config.num_epilogue_threads,
-            split_args.config.smem_size, 1);
-        const auto code = SM90FP8MegaMoERuntime::generate(split_args);
-        const auto runtime = compiler->build(kernel_name, code);
-        SM90FP8MegaMoERuntime::launch(runtime, split_args);
+        const bool is_linear2 = kernel_phase == SM90MegaMoEKernelPhase::Linear2;
+        const auto& config = is_linear2 ? l2_config : l1_config;
+        const auto phase_template_args = is_linear2 ?
+            std::format(",\n        {}, {}, {}",
+                        config.direct_l2_scatter ? "true" : "false",
+                        config.nmajor_schedule ? "true" : "false",
+                        config.one_warp_cleanup ? "true" : "false") :
+            std::format(",\n        {}", config.nmajor_schedule ? "true" : "false");
+
+        // Compile
+        const auto kernel = jit->compile(kernel_name, std::format(R"(
+#include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&{}<
+        {},
+        {}, {},
+        {}, {},
+        {},
+        {}, {}, {},
+        {},
+        {}, {},
+        {},
+        {}, {}, {},
+        {}, {},
+        {},
+        {},
+        {},
+        {}{}
+    >);
+}};
+)",
+            kernel_name,
+            num_max_tokens_per_rank,
+            hidden, intermediate_hidden,
+            num_experts, num_topk,
+            config.num_experts_per_wave,
+            config.block_m, config.block_n, config.block_k,
+            config.num_max_pool_tokens,
+            config.num_padded_sf_pool_tokens,
+            config.sf_pool_stride_tokens,
+            config.num_stages,
+            config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
+            config.num_sms, num_ranks,
+            to_string(activation_clamp),
+            fast_math ? "true" : "false",
+            config.swap_ab ? "true" : "false",
+            bf16_scaled_accum ? "true" : "false",
+            phase_template_args));
+
+        // Launch
+        jit->launch(
+            kernel, {
+                .num_smem_bytes = config.smem_size,
+                .grid_dim = dim3(config.num_sms, 1, 1),
+                .block_dim = dim3(config.num_dispatch_threads + config.num_non_epilogue_threads +
+                                  config.num_epilogue_threads, 1, 1),
+            },
+            y.data_ptr(),
+            cumulative_local_expert_recv_stats_ptr,
+            num_tokens,
+            sym_buffer,
+            tensor_map_l1_acts,
+            tensor_map_l1_acts_sf,
+            tensor_map_l1_weights,
+            l1_weights_sf.data_ptr<float>(),
+            tensor_map_l1_output,
+            tensor_map_l2_acts,
+            tensor_map_l2_acts_sf,
+            tensor_map_l2_weights,
+            l2_weights_sf.data_ptr<float>());
     };
 
-    launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Linear1, "sm90_fp8_mega_moe_l1_impl");
-    launch_with_phase(SM90FP8MegaMoERuntime::KernelPhase::Linear2, "sm90_fp8_mega_moe_l2_impl");
+    launch_with_phase(SM90MegaMoEKernelPhase::Linear1, "sm90_fp8_mega_moe_l1_impl");
+    launch_with_phase(SM90MegaMoEKernelPhase::Linear2, "sm90_fp8_mega_moe_l2_impl");
 }
 
 } // namespace deep_gemm

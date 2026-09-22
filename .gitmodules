@@ -1,6 +1,6 @@
 [submodule "third-party/cutlass"]
 	path = third-party/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
-[submodule "third-party/fmt"]
-	path = third-party/fmt
-	url = https://github.com/fmtlib/fmt.git
+[submodule "third-party/deep_jit"]
+	path = third-party/deep_jit
+	url = https://github.com/deepseek-ai/DeepJIT.git

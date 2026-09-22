@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <format>
+#include <iostream>
 #include <string>
 #include <unordered_set>
 
@@ -11,9 +13,9 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sm90_mega_moe.cuh>
+#include <deep_jit/utils/env.hpp>
 
 #include "../../utils/math.hpp"
-#include "../../utils/system.hpp"
 #include "sm90.hpp"
 
 namespace deep_gemm {
@@ -889,8 +891,8 @@ static Sm90MoeLaunchConfig select_mega_moe_sm90(
         is_sm90_moe_launch_config_legal(input, candidate, tuning.selected)) {
         result = candidate;
     }
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        const auto key = fmt::format(
+    if (deep_jit::get_env<int>("DG_JIT_DEBUG") or deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
+        const auto key = std::format(
             "Sm90MoeLaunchConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
             input.num_ranks, input.num_experts, input.hidden,
             input.intermediate_hidden, input.num_max_tokens_per_rank,

@@ -1,67 +1,16 @@
 #pragma once
 
+#include <cstdio>
+#include <format>
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "../../runtime/jit.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../heuristics/sm90.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
-
-class SM90BF16HCPrenormGemmRuntime final: public LaunchRuntime<SM90BF16HCPrenormGemmRuntime> {
-public:
-    struct Args {
-        int m, n, k;
-        int block_m, block_n, block_k;
-        int num_splits;
-        int swizzle_cd_mode;
-        int num_stages;
-        int num_math_threads, num_tma_threads;
-
-        LaunchArgs launch_args;
-
-        CUtensorMap tensor_map_a;
-        CUtensorMap tensor_map_b;
-        CUtensorMap tensor_map_d;
-        float* sqr_sum;
-    };
-
-    static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
-#include <deep_gemm/impls/sm90_tf32_hc_prenorm_gemm.cuh>
-
-using namespace deep_gemm;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm90_tf32_hc_prenorm_gemm_impl<
-        {}, {},
-        {}, {}, {},
-        {},
-        {},
-        {},
-        {}, {}
-    >);
-}};
-)",
-        args.n, args.k,
-        args.block_m, args.block_n, args.block_k,
-        args.num_splits,
-        args.swizzle_cd_mode,
-        args.num_stages,
-        args.num_math_threads, args.num_tma_threads);
-    }
-
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        // TODO: optimize `args` copy
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.m, args.tensor_map_a, args.tensor_map_b, args.tensor_map_d, args.sqr_sum));
-    }
-};
 
 static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
                                       const torch::Tensor& b,
@@ -119,7 +68,7 @@ static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
     DG_HOST_ASSERT(num_stages > 0);
 
     // Print configs
-    if (get_env("DG_JIT_DEBUG", 0)) {
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         printf("M: %d, N: %d, K: %d -> "
                "block M: %d, block N: %d, block K: %d, split K: %d"
                "stages: %d, shared memory: %d, swizzle CD: %d\n",
@@ -129,24 +78,39 @@ static void sm90_tf32_hc_prenorm_gemm(const torch::Tensor& a,
 
     smem_size = SM90ArchSpec::smem_capacity;
 
+    // Compile
+    const auto kernel = jit->compile("sm90_tf32_hc_prenorm_gemm", std::format(R"(
+#include <deep_gemm/impls/sm90_tf32_hc_prenorm_gemm.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&sm90_tf32_hc_prenorm_gemm_impl<
+        {}, {},
+        {}, {}, {},
+        {},
+        {},
+        {},
+        {}, {}
+    >);
+}};
+)",
+        n, k,
+        block_m, block_n, block_k,
+        num_splits,
+        swizzle_cd_mode,
+        num_stages,
+        num_math_threads, num_tma_threads));
+
     // Launch
-    const SM90BF16HCPrenormGemmRuntime::Args& args = {
-        .m = m, .n = n, .k = k,
-        .block_m = block_m, .block_n = block_n, .block_k = block_k,
-        .num_splits = num_splits,
-        .swizzle_cd_mode = swizzle_cd_mode,
-        .num_stages = num_stages,
-        .num_math_threads = num_math_threads,
-        .num_tma_threads = num_tma_threads,
-        .launch_args = LaunchArgs(num_splits * ceil_div(m, block_m), num_threads, smem_size),
-        .tensor_map_a = tensor_map_a,
-        .tensor_map_b = tensor_map_b,
-        .tensor_map_d = tensor_map_d,
-        .sqr_sum = sqr_sum.data_ptr<float>()
-    };
-    const auto code = SM90BF16HCPrenormGemmRuntime::generate(args);
-    const auto runtime = compiler->build("sm90_tf32_hc_prenorm_gemm", code);
-    SM90BF16HCPrenormGemmRuntime::launch(runtime, args);
+    jit->launch(
+        kernel, {
+            .num_smem_bytes = smem_size,
+            .grid_dim = dim3(num_splits * ceil_div(m, block_m), 1, 1),
+            .block_dim = dim3(num_threads, 1, 1),
+        },
+        m, tensor_map_a, tensor_map_b, tensor_map_d, sqr_sum.data_ptr<float>()
+    );
 }
 
 } // namespace deep_gemm

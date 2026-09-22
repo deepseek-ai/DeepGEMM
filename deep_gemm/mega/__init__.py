@@ -22,7 +22,12 @@ class SymmBuffer:
                  hidden: int, intermediate_hidden: int,
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 base: Optional['SymmBuffer'] = None):
+        # Align token count
+        num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+
+        # Init
         assert activation == 'swiglu' or (mma_type == 'fp8xfp4' and activation == 'situ'), \
             f'Only FP8xFP4 MegaMoE supports `situ`, got mma_type={mma_type!r}, activation={activation!r}'
         self.group = group
@@ -35,7 +40,7 @@ class SymmBuffer:
         self.mma_type = mma_type
         self.activation = activation
 
-        # Allocate a symmetric buffer
+        # Allocate or reuse a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
             group.size(), num_experts,
             num_max_tokens_per_rank, num_topk,
@@ -43,16 +48,25 @@ class SymmBuffer:
             mma_type, activation,
             num_shared_experts
         )
-        allocator = torch if group.size() == 1 else symm_mem
-        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
-        self.handle = (
-            types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-            if group.size() == 1
-            else symm_mem.rendezvous(self.buffer, group=group)
-        )
-        self.buffer.zero_()
-        self.group.barrier()
-        torch.cuda.synchronize()
+        if base is None:
+            allocator = torch if group.size() == 1 else symm_mem
+            self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+            self.handle = (
+                types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+                if group.size() == 1
+                else symm_mem.rendezvous(self.buffer, group=group)
+            )
+            self.buffer.zero_()
+            self.group.barrier()
+            torch.cuda.synchronize()
+        else:
+            assert base.buffer is not None and base.handle is not None and base.group is group, \
+                'Cannot reuse an invalid symmetric buffer'
+            assert num_bytes <= base.buffer.nbytes, \
+                (f'The reused Mega MoE config requires {num_bytes} bytes, '
+                 f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
+            self.buffer = base.buffer
+            self.handle = base.handle
 
         # Create input buffer views
         (self.x, self.x_sf,
@@ -117,6 +131,7 @@ class SM90SymmBuffer:
         self.group = None
 
 
+# TODO: remove this function
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
@@ -125,9 +140,6 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
                                  activation: str = 'swiglu') -> SymmBuffer:
-    # Align token count
-    num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
-
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -205,7 +217,7 @@ def transform_weights_for_mega_moe(
     assert activation != 'situ' or (isinstance(l1_weights, tuple) and isinstance(l2_weights, tuple)), \
         '`situ` requires FP8xFP4 `(weight, sf)` tuples for both L1 and L2 weights'
     if isinstance(l1_weights, tuple):
-        # Scaled FP8xFP4/NVFP4: both formats use the same MN-major SF layout.
+        # Scaled FP8xFP4/FP8xFP8/NVFP4: all formats use the same MN-major SF layout.
         # Interleave gate/up for weight and SF, then transpose L1 SF for UTCCP.
         l1_w = _interleave_weights(l1_weights[0])
         l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))

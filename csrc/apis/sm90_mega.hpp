@@ -8,13 +8,11 @@
 #include <vector>
 #include <pybind11/functional.h>
 
-#if DG_TENSORMAP_COMPATIBLE
-#include "../jit/compiler.hpp"
-#endif
-#include "../jit/device_runtime.hpp"
+#include <deep_jit/utils/env.hpp>
+
+#include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mega_moe.hpp"
 #include "../utils/layout.hpp"
-#include "../utils/system.hpp"
 
 namespace deep_gemm::mega {
 
@@ -168,7 +166,7 @@ static void fp8_mega_moe(
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
     // Architecture check
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = jit->device.get_arch_major();
     if (arch_major != 9)
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE requires a compute capability 9.x GPU");
 
@@ -252,16 +250,14 @@ static void fp8_mega_moe(
                      hidden, intermediate_hidden,
                      activation_clamp, fast_math);
 
-    if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
 
 static void register_sm90_apis(pybind11::module_& m) {
-#if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_sm90_mega_moe", &get_token_alignment_for_sm90_mega_moe);
     m.def("get_symm_buffer_size_for_sm90_mega_moe", &get_symm_buffer_size_for_sm90_mega_moe);
     m.def("fp8_mega_moe", &fp8_mega_moe);
-#endif
 }
 
 } // namespace deep_gemm::mega

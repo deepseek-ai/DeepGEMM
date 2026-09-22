@@ -243,22 +243,22 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                         if constexpr (kKGroupedConstantStride) {
                             const uint64_t a_k_byte_offset = kIsFP4
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                                ? (static_cast<uint64_t>(scheduler.current_k_start) / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_start));
                             const uint64_t b_k_byte_offset = (kIsFP4 || kBIsFP4)
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum));
+                                ? (static_cast<uint64_t>(scheduler.current_k_start) / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_start));
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_k_byte_offset);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_k_byte_offset);
                             ptx::tensor_map_replace_global_dim_in_smem(smem_tm_a, scheduler.current_shape_k);
                             ptx::tensor_map_replace_global_dim_in_smem(smem_tm_b, scheduler.current_shape_k);
                         } else {
                             const uint64_t a_offset = kIsFP4
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_m);
+                                ? (static_cast<uint64_t>(scheduler.current_k_start) * shape_m / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_start) * shape_m);
                             const uint64_t b_offset = (kIsFP4 || kBIsFP4)
-                                ? (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n / 2)
-                                : (static_cast<uint64_t>(scheduler.current_k_cumsum) * shape_n);
+                                ? (static_cast<uint64_t>(scheduler.current_k_start) * shape_n / 2)
+                                : (static_cast<uint64_t>(scheduler.current_k_start) * shape_n);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_a, a_base + a_offset);
                             ptx::tensor_map_replace_global_addr_in_smem(smem_tm_b, b_base + b_offset);
                             const uint64_t a_new_stride = kIsFP4

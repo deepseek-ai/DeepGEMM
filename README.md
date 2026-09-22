@@ -1,6 +1,6 @@
 # DeepGEMM
 
-DeepGEMM is a unified, high-performance tensor core kernel library that brings together the key computation primitives of modern large language models — GEMMs (FP8, FP4, BF16), fused MoE with overlapped communication (Mega MoE), MQA scoring for the lightning indexer, HyperConnection (HC), and more — into a single, cohesive CUDA codebase. All kernels are compiled at runtime via a lightweight Just-In-Time (JIT) module, requiring no CUDA compilation during installation.
+DeepGEMM is a unified, high-performance tensor core kernel library that brings together the key computation primitives of modern large language models — GEMMs (FP8, FP4, BF16), fused MoE with overlapped communication (Mega MoE), MQA scoring for the lightning indexer, HyperConnection (HC), and more — into a single, cohesive CUDA codebase. All kernels are compiled at runtime through DeepJIT, requiring no CUDA compilation during installation.
 
 DeepGEMM leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), but avoids heavy reliance on their templates or algebras. The library is designed for simplicity, with only a limited number of core kernel functions, making it a clean and accessible resource for learning NVIDIA GPU kernel optimization techniques.
 
@@ -8,18 +8,17 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## News
 
+- 2026.09.10: Sparse Indexer, Mega Gate, Mega mHC, DeepJIT, MoE and Indexer optimizations and more.
+    - Please see [#432](https://github.com/deepseek-ai/DeepGEMM/pull/432) for more details.
 - 2026.04.16: Mega MoE, FP8xFP4 GEMM, FP4 Indexer, PDL, faster JIT compilation and more.
     - Please see [#304](https://github.com/deepseek-ai/DeepGEMM/pull/304) for more details.
     - For Mega MoE benchmarks, refer to [#316](https://github.com/deepseek-ai/DeepGEMM/pull/316).
 - 2025.09.28: DeepGEMM now supports scoring kernels (weighted ReLU MQA logits) for the lightning indexer for DeepSeek v3.2.
     - Please see [#200](https://github.com/deepseek-ai/DeepGEMM/pull/200) for more details.
 - 2025.07.20: DeepGEMM now supports both SM90/SM100, and has a full refactor with a low-CPU-overhead JIT CPP module.
-    - NVRTC and post-compilation SASS optimization are all disabled.
-    - NVRTC will be supported later.
     - As NVCC 12.9 will automatically do the FFMA interleaving, all post optimizations will be no longer supported.
     - Please see [#112](https://github.com/deepseek-ai/DeepGEMM/pull/112) for more details.
 - 2025.05.14: DeepGEMM now offers weight gradient kernels for dense and MoE backward! See [#95](https://github.com/deepseek-ai/DeepGEMM/pull/95) for details.
-- 2025.05.07: DeepGEMM now supports NVRTC with up to 10x compilation speedup! See [#94](https://github.com/deepseek-ai/DeepGEMM/pull/94) for details. Please use `DG_JIT_USE_NVRTC=1` to enable it (may have performance loss with some cases).
 - 2025.04.18: DeepGEMM now achieves up to **1550 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81), [#86](https://github.com/deepseek-ai/DeepGEMM/pull/86) and [340d988](https://github.com/deepseek-ai/DeepGEMM/commit/340d9880f4a418d943d34260d20a79f41f4c0526) for details.
 
 ## Quick start
@@ -28,14 +27,10 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 - NVIDIA SM90 or SM100 architecture GPU
 - Python 3.8 or higher
-- Compilers with C++20 support
-- CUDA Toolkit:
-    - CUDA 12.3 or higher for SM90
-        - **We highly recommend 12.9 or higher for the best performance**
-    - CUDA 12.9 or higher for SM100
-- PyTorch 2.1 or higher
+- Compilers and standard libraries with C++20 `<format>` support
+- CUDA Toolkit 12.9 or higher
+- PyTorch 2.3 or higher
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
-- `{fmt}` library (could be cloned by Git submodule)
 
 ### Development
 
@@ -44,7 +39,7 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
 cd DeepGEMM
 
-# Link some essential includes and build the CPP JIT module
+# Link some essential includes and build the C++ extension
 cat develop.sh
 ./develop.sh
 ```
@@ -113,16 +108,17 @@ For more details and the paged version `fp8_paged_mqa_logits`, please refer to `
 
 #### Mega MoE
 
-Mega MoE fuses and overlaps EP dispatch, linear 1 (FP8xFP4), SwiGLU, linear 2 (FP8xFP4), and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xFP8), SwiGLU, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
 
 ```python
 # Allocate symmetric memory buffer
 # NOTES: requires PyTorch >= 2.9
 buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden
+    group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
+    mma_type='fp8xfp4',  # Use 'fp8xfp8' for FP8 routed-expert weights
 )
 
-# Transform weights (FP4 with UE8M0 SF) into the required layout
+# Transform routed weights (FP4 or FP8 with UE8M0 SF) into the required layout
 transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
 
 # Copy inputs into the buffer before each call
@@ -176,6 +172,7 @@ The library provides some utility functions besides the above kernels:
 - `deep_gemm.set_num_sms` / `get_num_sms`: set/get the maximum SM count to use
 - `deep_gemm.set_tc_util` / `get_tc_util`: set/get an approximated tensor core utilization ratio
 - `deep_gemm.set_pdl` / `get_pdl`: enable/disable Programmatic Dependent Launch (PDL)
+- `deep_gemm.use_deterministic_algorithms`: enable/disable deterministic algorithms
 - `deep_gemm.set_mk_alignment_for_contiguous_layout` / `get_mk_alignment_for_contiguous_layout`: set/get the group-level M/K alignment for contiguous layout
 - `deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout`: get the theoretical minimum M/K alignment
 - `deep_gemm.set_ignore_compile_dims`: configure dimensions to ignore during JIT compilation
@@ -188,19 +185,21 @@ The library provides some utility functions besides the above kernels:
 
 The library also provides some environment variables, which may be useful:
 
+Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` variable when unset.
+
 - General
-    - `DG_JIT_DEBUG`: `0` or `1`, print JIT debugging information, `0` by default
+    - `DG_JIT_DEBUG`: `0` or `1`, enable JIT debugging features, including compiler command and PTXAS output, load-time reporting, line info, and PTX/SASS dumps; `0` by default
     - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
 - JIT cache
-    - `DG_JIT_CACHE_DIR`: string, cache directory for compiled kernels, `$HOME/.deep_gemm` by default
+    - `DG_JIT_CACHE_DIR`: string, cache directory (or a `:`-separated list of directories) for compiled kernels; lookup searches all paths front-to-back (first hit wins) and a cache miss compiles into the first path, `$HOME/.dj` by default
 - Compiler selection
-    - `DG_JIT_USE_NVRTC`: `0` or `1`, use NVRTC instead of NVCC (faster compilation, may have lower performance for some cases), `0` by default
-    - `DG_JIT_NVCC_COMPILER`: string, NVCC compiler path; defaults to `torch.utils.cpp_extension.CUDA_HOME`
+    - `DG_JIT_NVCC_COMPILER`: string, NVCC compiler path; otherwise CUDA is found through `CUDA_HOME`, `CUDA_PATH`, `which nvcc`, then `/usr/local/cuda`
     - `DG_JIT_CPP_STANDARD`: integer, C++ standard version, `20` by default
 - Compiler output
     - `DG_JIT_PRINT_COMPILER_COMMAND`: `0` or `1`, print compilation commands, `0` by default
     - `DG_JIT_PTXAS_VERBOSE`: `0` or `1`, show detailed PTXAS output, `0` by default
-    - `DG_JIT_PTXAS_CHECK`: `0` or `1`, assert no local memory usage in compiled kernels, `0` by default
+    - `DG_JIT_CHECK_NO_SPILLS`: `0` or `1`, assert no register spills in compiled kernels, `0` by default
+    - `DG_JIT_CHECK_NO_LOCAL_MEMORY`: `0` or `1`, assert no local memory usage in compiled kernels, `0` by default
     - `DG_JIT_PRINT_LOAD_TIME`: `0` or `1`, print kernel load time, `0` by default
 - Debug and profiling
     - `DG_JIT_WITH_LINEINFO`: `0` or `1`, embed source line info for profiling tools, `0` by default
@@ -212,9 +211,8 @@ The library also provides some environment variables, which may be useful:
 - Build options
     - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
-    - `DG_JIT_USE_RUNTIME_API`: `0` or `1`, use CUDA Runtime API for kernel loading (requires CUDA runtime >= 12.8), `0` by default
 
-For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
+For additional examples and details, please refer to [the test code](tests) or review the corresponding Python documentation.
 
 ## Acknowledgement
 

@@ -7,51 +7,73 @@
 
 namespace deep_gemm {
 
-template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K,
+template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K, uint32_t BLOCK_SF_K,
           uint32_t PADDED_SF_K = SF_K + (1 - (SF_K % 2))>
-CUTLASS_GLOBAL void transpose_fp32(const float* sf, float* out, const uint32_t mn) {
+CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 4)
+void transpose_fp32(const float* sf, float* out, const uint32_t mn) {
     typedef typename utils::Vectorized<sizeof(float) * SF_K>::vec_t in_vec_t;
     constexpr static uint32_t kNumElemsPerVec = sizeof(in_vec_t) / sizeof(float);
-    constexpr static uint32_t SF_VEC_K = SF_K / kNumElemsPerVec;
+    constexpr static uint32_t kSmemSFK = SF_K < BLOCK_SF_K ? PADDED_SF_K : BLOCK_SF_K + 1;
+    DG_STATIC_ASSERT(BLOCK_SF_K % kNumElemsPerVec == 0, "Invalid SF block size");
 
     // Shapes and strides
     extern __shared__ float smem_buffer[];
     constexpr auto kNumTMAAlignedElems = static_cast<uint32_t>(16 / sizeof(float));
-    const auto in_block_mn = min(BLOCK_MN, mn - blockIdx.x * BLOCK_MN);
+    const auto num_mn_blocks = math::ceil_div(mn, BLOCK_MN);
+    const auto block_mn_idx = SF_K < BLOCK_SF_K ? blockIdx.x : blockIdx.x % num_mn_blocks;
+    const auto block_sf_k_idx = SF_K < BLOCK_SF_K ? 0u : blockIdx.x / num_mn_blocks;
+    const auto block_sf_k_start = block_sf_k_idx * BLOCK_SF_K;
+    const auto in_block_mn = min(BLOCK_MN, mn - block_mn_idx * BLOCK_MN);
+    const auto in_block_sf_k = SF_K < BLOCK_SF_K ? SF_K : min(BLOCK_SF_K, SF_K - block_sf_k_start);
     const auto tma_aligned_mn = math::align<uint32_t>(mn, kNumTMAAlignedElems);
 
     // Shift into the block
     sf = sf + static_cast<uint64_t>(blockIdx.y) * mn * SF_K;
     out = out + static_cast<uint64_t>(blockIdx.y) * tma_aligned_mn * SF_K;
-    const auto& local_sf = reinterpret_cast<const in_vec_t*>(sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
+    const auto local_sf = sf + static_cast<uint64_t>(block_mn_idx) * BLOCK_MN * SF_K + block_sf_k_start;
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
 
     // Load
-    for (uint32_t i = threadIdx.x; i < in_block_mn * SF_VEC_K; i += kNumThreads) {
-        auto in_vec = local_sf[i];
-        const auto& in_values = reinterpret_cast<float*>(&in_vec);
-
-        const auto& row = i / SF_VEC_K, col = (i % SF_VEC_K) * kNumElemsPerVec;
-        #pragma unroll
-        for (uint32_t j = 0; j < kNumElemsPerVec; ++ j)
-            smem_buffer[row * PADDED_SF_K + col + j] = in_values[j];
+    if constexpr (SF_K < BLOCK_SF_K) {
+        constexpr auto kNumSFKVecs = SF_K / kNumElemsPerVec;
+        for (uint32_t i = threadIdx.x; i < in_block_mn * kNumSFKVecs; i += kNumThreads) {
+            auto in_vec = reinterpret_cast<const in_vec_t*>(local_sf)[i];
+            const auto& in_values = reinterpret_cast<float*>(&in_vec);
+            const auto row = i / kNumSFKVecs, col = (i % kNumSFKVecs) * kNumElemsPerVec;
+            #pragma unroll
+            for (uint32_t j = 0; j < kNumElemsPerVec; ++ j)
+                smem_buffer[row * kSmemSFK + col + j] = in_values[j];
+        }
+    } else {
+        const auto warp_idx = threadIdx.x / 32;
+        const auto lane_idx = ptx::get_lane_idx();
+        for (uint32_t row = warp_idx; row < in_block_mn; row += kNumThreads / 32) {
+            for (uint32_t col = lane_idx * kNumElemsPerVec; col < in_block_sf_k; col += 32 * kNumElemsPerVec) {
+                auto in_vec = *reinterpret_cast<const in_vec_t*>(local_sf + row * SF_K + col);
+                const auto& in_values = reinterpret_cast<float*>(&in_vec);
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumElemsPerVec; ++ j)
+                    smem_buffer[row * kSmemSFK + col + j] = in_values[j];
+            }
+        }
     }
     __syncthreads();
 
     // Store
     #pragma unroll
-    for (uint32_t i = threadIdx.x; i < in_block_mn * SF_K; i += kNumThreads) {
+    for (uint32_t i = threadIdx.x; i < in_block_mn * in_block_sf_k; i += kNumThreads) {
         const auto& sf_k_idx = i / in_block_mn, mn_idx = i % in_block_mn;
-        const auto& global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx;
-        out[sf_k_idx * tma_aligned_mn + global_mn_idx] = ptx::ld_shared(smem_buffer + mn_idx * PADDED_SF_K + sf_k_idx);
+        const auto& global_mn_idx = block_mn_idx * BLOCK_MN + mn_idx;
+        const auto& global_sf_k_idx = block_sf_k_start + sf_k_idx;
+        out[global_sf_k_idx * tma_aligned_mn + global_mn_idx] = ptx::ld_shared(smem_buffer + mn_idx * kSmemSFK + sf_k_idx);
     }
 }
 
 // NOTES: the two kernels below always pack the K dimension
 
-template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K,
+template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K, uint32_t BLOCK_SF_K,
           uint32_t kNumPsumGroups = 1, bool kUsePsumLayout = false>
 CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out, const uint32_t mn,
                                                        const uint32_t* grouped_layout, const uint32_t m_alignment) {
@@ -60,7 +82,17 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
     // Shapes and strides
     constexpr auto kNumPackedSFK = math::constexpr_ceil_div(SF_K, 4u);
     constexpr auto kNumTMAAlignedElems = static_cast<uint32_t>(16 / sizeof(int));
-    const auto in_block_mn = min(BLOCK_MN, mn - blockIdx.x * BLOCK_MN);
+    typedef typename utils::Vectorized<sizeof(float) * SF_K>::vec_t in_vec_t;
+    constexpr auto kNumElemsPerVec = sizeof(in_vec_t) / sizeof(float);
+    constexpr auto kSmemSFK = SF_K < BLOCK_SF_K ? SF_K : BLOCK_SF_K + 1;
+    DG_STATIC_ASSERT(BLOCK_SF_K % 4 == 0 and BLOCK_SF_K % kNumElemsPerVec == 0, "Invalid SF block size");
+    const auto num_mn_blocks = math::ceil_div(mn, BLOCK_MN);
+    const auto block_mn_idx = SF_K < BLOCK_SF_K ? blockIdx.x : blockIdx.x % num_mn_blocks;
+    const auto block_sf_k_idx = SF_K < BLOCK_SF_K ? 0u : blockIdx.x / num_mn_blocks;
+    const auto block_sf_k_start = block_sf_k_idx * BLOCK_SF_K;
+    const auto in_block_mn = min(BLOCK_MN, mn - block_mn_idx * BLOCK_MN);
+    const auto in_block_sf_k = SF_K < BLOCK_SF_K ? SF_K : min(BLOCK_SF_K, SF_K - block_sf_k_start);
+    const auto in_block_packed_sf_k = math::ceil_div(in_block_sf_k, 4u);
     const auto tma_aligned_mn = math::align<uint64_t>(mn, kNumTMAAlignedElems);
 
     // Wait for primary kernel completion before reading SFs or PSUM layout
@@ -71,7 +103,7 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
     const auto group_mn_end = smem_buffer + kNumPsumGroups;
     const auto sf_smem_buffer = smem_buffer + kNumPsumLayoutElems;
 
-    // Precompute PSUM valid MN ranges into smem before the SF tile.
+    // Precompute PSUM valid MN ranges into smem before the SF block.
     if constexpr (kUsePsumLayout) {
         for (uint32_t g = threadIdx.x; g < kNumPsumGroups; g += kNumThreads) {
             const auto end_g = grouped_layout[g];
@@ -99,25 +131,39 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
 
     // Load FP32 SFs
     DG_STATIC_ASSERT(BLOCK_MN % 4 == 0, "Invalid block size");
-    const auto local_sf = reinterpret_cast<uint32_t*>(sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
-    const auto num_values = in_block_mn * SF_K;
-    const auto num_uint4 = num_values / 4;
-    #pragma unroll
-    for (uint32_t i = threadIdx.x; i < num_uint4; i += kNumThreads) {
-        const auto& [x, y, z, w] = reinterpret_cast<const uint4*>(local_sf)[i];
-        ptx::st_shared(reinterpret_cast<uint4*>(sf_smem_buffer) + i, x, y, z, w);
+    const auto local_sf = sf + static_cast<uint64_t>(block_mn_idx) * BLOCK_MN * SF_K + block_sf_k_start;
+    if constexpr (SF_K < BLOCK_SF_K) {
+        const auto local_sf_u32 = reinterpret_cast<uint32_t*>(local_sf);
+        const auto num_values = in_block_mn * SF_K;
+        const auto num_uint4 = num_values / 4;
+        #pragma unroll
+        for (uint32_t i = threadIdx.x; i < num_uint4; i += kNumThreads) {
+            const auto& [x, y, z, w] = reinterpret_cast<const uint4*>(local_sf_u32)[i];
+            ptx::st_shared(reinterpret_cast<uint4*>(sf_smem_buffer) + i, x, y, z, w);
+        }
+        if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
+            ptx::st_shared(sf_smem_buffer + unaligned_idx, local_sf_u32[unaligned_idx]);
+    } else {
+        const auto warp_idx = threadIdx.x / 32;
+        const auto lane_idx = ptx::get_lane_idx();
+        for (uint32_t row = warp_idx; row < in_block_mn; row += kNumThreads / 32) {
+            for (uint32_t col = lane_idx * kNumElemsPerVec; col < in_block_sf_k; col += 32 * kNumElemsPerVec) {
+                const auto in_vec = *reinterpret_cast<const in_vec_t*>(local_sf + row * SF_K + col);
+                const auto in_values = reinterpret_cast<const uint32_t*>(&in_vec);
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumElemsPerVec; ++ j)
+                    ptx::st_shared(sf_smem_buffer + row * kSmemSFK + col + j, in_values[j]);
+            }
+        }
     }
-
-    // Fill unaligned values as well
-    if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
-        ptx::st_shared(sf_smem_buffer + unaligned_idx, local_sf[unaligned_idx]);
     __syncthreads();
 
     // Pack into UE8M0 and store
     #pragma unroll
-    for (uint32_t i = threadIdx.x; i < (kNumPackedSFK * BLOCK_MN); i += kNumThreads) {
+    for (uint32_t i = threadIdx.x; i < in_block_packed_sf_k * BLOCK_MN; i += kNumThreads) {
         const auto sf_k_pack_idx = i / BLOCK_MN, mn_idx = i % BLOCK_MN;
-        const auto global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx;
+        const auto global_mn_idx = block_mn_idx * BLOCK_MN + mn_idx;
+        const auto global_sf_k_pack_idx = block_sf_k_start / 4 + sf_k_pack_idx;
         const auto in_bounds_mn = global_mn_idx < mn;
         const auto valid_mn = is_valid_mn(global_mn_idx);
 
@@ -126,9 +172,10 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
         #pragma unroll
         for (uint32_t j = 0; j < 4; ++ j) {
             const auto sf_k_idx = sf_k_pack_idx * 4 + j;
-            values[j] = valid_mn and sf_k_idx < SF_K ? ptx::ld_shared(sf_smem_buffer + mn_idx * SF_K + sf_k_idx) : 0;
+            const auto global_sf_k_idx = block_sf_k_start + sf_k_idx;
+            values[j] = valid_mn and global_sf_k_idx < SF_K ? ptx::ld_shared(sf_smem_buffer + mn_idx * kSmemSFK + sf_k_idx) : 0;
             // FP32 SFs must have a zero sign and mantissa (only the exponent is packed)
-            DG_DEVICE_ASSERT((values[j] & 0x807fffffu) == 0);
+            DG_TRAP_ONLY_DEVICE_ASSERT((values[j] & 0x807fffffu) == 0);
         }
 
         // Pack and store
@@ -139,7 +186,7 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
         packed |= (values[3] <<  1u);
         // Write safe finite scale codes for PSUM gap rows; UE8M0 0xff is NaN.
         if (in_bounds_mn)
-            out[sf_k_pack_idx * tma_aligned_mn + global_mn_idx] = packed;
+            out[global_sf_k_pack_idx * tma_aligned_mn + global_mn_idx] = packed;
     }
 }
 
@@ -150,7 +197,7 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
                                          const uint32_t gran_k, const uint32_t k_alignment) {
     // Always packing the K dimension
     // NOTES: should also assert `mn % 4 == 0` at launch
-    // psum layout may have input gaps, but packed output remains per-group compact.
+    // Each group starts at a new packed row; unused tail slots are zero-filled
     DG_STATIC_ASSERT(kTransposed, "Currently only support transposed SFs (MN-major)");
     DG_STATIC_ASSERT(BLOCK_MN % 4 == 0, "Invalid block sizes");
     DG_STATIC_ASSERT(BLOCK_PACKED_SF_K == kNumThreads / 32, "Invalid block sizes");
@@ -178,7 +225,6 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
     uint32_t num_padding_sf_rows = 0;
     uint32_t group_sf_row_start = 0, group_sf_row_end = sf_k;
     if constexpr (kNumGroups > 1 or kUsePsumLayout) {
-        // Layout entries are group K sizes, or psum end offsets in psum mode
         DG_STATIC_ASSERT(kNumGroups <= 128, "Too many groups");
         uint32_t layout_cache[4];
         #pragma unroll
@@ -201,7 +247,8 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
             } else {
                 group_k = layout_value;
             }
-            const auto num_group_sf_rows = math::ceil_div(group_k, gran_k);
+            const auto aligned_group_k = kUsePsumLayout ? math::align(group_k, k_alignment) : group_k;
+            const auto num_group_sf_rows = aligned_group_k / gran_k;
             group_sf_row_start = num_prefix_sf_rows;
             group_sf_row_end = group_sf_row_start + num_group_sf_rows;
             num_prefix_sf_rows += num_group_sf_rows;
@@ -225,14 +272,14 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
         #pragma unroll
         for (uint32_t j = 0; j < 4; ++ j) {
             values[j] = make_uint4(0, 0, 0, 0);
-            const uint32_t sf_row_idx = packed_sf_k_idx * 4 + j - num_padding_sf_rows;
+            const uint32_t sf_row_idx = static_cast<uint32_t>(packed_sf_k_idx) * 4 + j - num_padding_sf_rows;
             if (sf_row_idx >= group_sf_row_start and sf_row_idx < group_sf_row_end)
                 values[j] = reinterpret_cast<const uint4*>(sf + sf_row_idx * mn)[mn_idx];
             // FP32 SFs must have a zero sign and mantissa (only the exponent is packed)
-            DG_DEVICE_ASSERT((values[j].x & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].y & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].z & 0x807fffffu) == 0);
-            DG_DEVICE_ASSERT((values[j].w & 0x807fffffu) == 0);
+            DG_TRAP_ONLY_DEVICE_ASSERT((values[j].x & 0x807fffffu) == 0);
+            DG_TRAP_ONLY_DEVICE_ASSERT((values[j].y & 0x807fffffu) == 0);
+            DG_TRAP_ONLY_DEVICE_ASSERT((values[j].z & 0x807fffffu) == 0);
+            DG_TRAP_ONLY_DEVICE_ASSERT((values[j].w & 0x807fffffu) == 0);
         }
 
         // Pack and store
