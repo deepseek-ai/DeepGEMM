@@ -443,7 +443,7 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
                    head_dim_with_sf == (is_fp4 ? head_dim / 2 : head_dim) + static_cast<int>(sizeof(int)));
     DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kUInt8 and fused_kv_cache.stride(1) == head_dim_with_sf and
                    fused_kv_cache.stride(3) == 1 and fused_kv_cache.stride(0) <= std::numeric_limits<int>::max() and
-                   fused_kv_cache.stride(0) % 512 == 0);
+                   fused_kv_cache.stride(0) % 16 == 0);  // pages are read with 16-byte cp.async chunks
     DG_HOST_ASSERT(fused_kv_cache.is_cuda() and fused_kv_cache.device() == q_fp.device());
 
     const auto [_num_q_tokens_weights, _num_heads_weights] = get_shape<2>(weights);
@@ -451,7 +451,8 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
     DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 and weights.stride(1) == 1);
     DG_HOST_ASSERT(metadata.dim() == 1 and metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous());
     DG_HOST_ASSERT(metadata.numel() >= static_cast<int64_t>(sizeof(MetadataHeader)));
-    for (const auto& tensor: {q_fp, q_sf, weights, metadata}) {
+    // Pages start at `data_ptr() + page_idx * stride(0)`, so the base pointer needs 16-byte alignment too
+    for (const auto& tensor: {q_fp, q_sf, fused_kv_cache, weights, metadata}) {
         DG_HOST_ASSERT(tensor.is_cuda() and tensor.device() == q_fp.device());
         DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0);
     }

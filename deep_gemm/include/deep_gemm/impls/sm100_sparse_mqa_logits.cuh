@@ -616,7 +616,7 @@ void sm100_paged_sparse_mqa_logits(const uint32_t logits_stride, const uint32_t 
     // Keep the CUTLASS dtype out of the kernel template signature to avoid ptxas register spills
     using qk_dtype_t = cute::conditional_t<kIsMXFP4, cutlass::float_e2m1_t, cutlass::float_e4m3_t>;
     DG_STATIC_ASSERT(PAGE_KV % SPARSE_BLOCK_KV == 0, "Sparse KV blocks must not cross pages");
-    DG_DEVICE_ASSERT(kv_page_stride_bytes % 512 == 0);
+    DG_DEVICE_ASSERT(kv_page_stride_bytes % 16 == 0);
     const auto kv_accessor = sparse_mqa_detail::PagedSparseKVAccessor<PAGE_KV, SPARSE_BLOCK_KV, qk_dtype_t>(
         fused_kv_cache, kv_page_stride_bytes);
     sm100_sparse_mqa_logits_core_impl<SPARSE_BLOCK_KV, kNumQStages, kNumKVStages, kNumTmemStages,
