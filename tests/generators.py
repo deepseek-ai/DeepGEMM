@@ -127,6 +127,7 @@ def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) ->
     fp32_output_nk = [(256, 7168), (129280, 7168)]
     bf16_output_nk = [(2112, 7168), (576, 7168), (24576, 1536), (32768, 512), (7168, 16384), (4096, 7168), (7168, 2048)]
     m_fwd_list, m_bwd_list = [1, 128, 4096], [4096, ]
+    m_small_wgrad_list, small_wgrad_nk = [16, 32], (4096, 7168)
     nk_list = list(bf16_output_nk)
 
     # Only BF16 GEMM needs FP32 outputs
@@ -166,9 +167,11 @@ def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) ->
                         yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, False, torch.bfloat16)      # Wgrad
                         if dtype == torch.bfloat16 or get_arch_major() == 10:
                             yield emit(override_kernel_type, quant_config, n, m, k, override_major, override_major, False, torch.float)     # Wgrad
-                # Wgrad with small M (e.g., narrow weights), where the heuristic may pick small block M
-                for small_m in (16, 32):
-                    yield emit(override_kernel_type, quant_config, small_m, 4096, 7168, override_major, override_major, True, torch.float)  # Wgrad
+                # Wgrad with small M: regression for the SM90 1D1D kernel, which only supports block M 64/128
+                # (the heuristic must not pick block M 16/32 for it)
+                n, k = small_wgrad_nk
+                for m in m_small_wgrad_list:
+                    yield emit(override_kernel_type, quant_config, m, n, k, override_major, override_major, True, torch.float)  # Wgrad
 
             if collect_cublas_scores and scores:
                 quant_type = f'FP{4 if quant_config.is_fp4_a else 8}xFP{4 if quant_config.is_fp4_b else 8}'
@@ -251,10 +254,14 @@ def enumerate_k_grouped_contiguous(dtype: torch.dtype):
         cd_options = [(True, torch.float), (False, torch.float), (False, torch.bfloat16)]
 
     # NOTES: the first shape has many small groups, for stressing the SM90 in-place tensor map update
-    for num_groups, m, n, expected_k_per_group in (( 8,  768, 2048,  128),
-                                                   ( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
-                                                   ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
-                                                   (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)):  # EP16
+    shapes = [( 8,  768, 2048,  128),
+              ( 4, 4096, 7168, 8192), ( 4, 7168, 2048, 8192),   # EP64
+              ( 8, 4096, 7168, 4096), ( 8, 7168, 2048, 4096),   # EP32
+              (16, 4096, 7168, 2048), (16, 7168, 2048, 2048)]   # EP16
+    # NOTES: small M, as the SM90 1D1D kernel only supports block M 64/128 (the heuristic must not pick 16/32)
+    if get_arch_major() == 9:
+        shapes.append((8, 16, 2048, 256))
+    for num_groups, m, n, expected_k_per_group in shapes:
         real_ks_cpu = [max(1, int(expected_k_per_group * random.uniform(0.7, 1.3))) for _ in range(num_groups)]
         for use_psum_layout in psum_list:
             for gran_k, k_alignment in sf_layout_list:
