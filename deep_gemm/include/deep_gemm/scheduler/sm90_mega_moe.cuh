@@ -1,7 +1,7 @@
 #pragma once
 
 #include <deep_gemm/common/math.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/nv_moe_workspace.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
@@ -24,7 +24,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumSMs, uint32_t kNumRanks,
           bool kL2NMajorSchedule = false,
           bool kL1NMajorSchedule = false,
-          typename WorkspaceT = layout::Workspace,
+          typename WorkspaceT = layout::nv_moe::Workspace,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,

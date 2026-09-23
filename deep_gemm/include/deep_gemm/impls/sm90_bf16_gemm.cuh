@@ -156,6 +156,9 @@ sm90_bf16_gemm_impl(int* grouped_layout,
 
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                if (is_k_grouped_contiguous(kGemmType) and scheduler.current_shape_k == 0)
+                    continue;
+
                 // Assign TMA multicast number into A and B
                 // NOTES: there may be additional odd rows/columns or cases where multicast is not possible.
                 const bool is_tma_multicast_valid = scheduler.is_tma_multicast_valid(m_block_idx);
@@ -220,6 +223,9 @@ sm90_bf16_gemm_impl(int* grouped_layout,
         const uint32_t b_desc_lo = __shfl_sync(0xffffffff, b_desc.reg32_[0], 0);
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            if (is_k_grouped_contiguous(kGemmType) and scheduler.current_shape_k == 0)
+                continue;
+
             constexpr uint32_t WAVE_BLOCK_M = BLOCK_M <= WGMMA::M ? BLOCK_M : WGMMA::M * 2;
             DG_STATIC_ASSERT(BLOCK_M % WAVE_BLOCK_M == 0, "Invalid block sizes");
             float accum[WGMMA::kNumAccum * (BLOCK_M / WAVE_BLOCK_M)] = {0};

@@ -2,17 +2,11 @@
 
 import argparse
 import json
-import os
 import statistics
-import sys
 from typing import Dict, Tuple
 
 import torch
 import torch.distributed as dist
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
 
 import deep_gemm
 from deep_gemm.testing import bench_kineto, get_arch_major

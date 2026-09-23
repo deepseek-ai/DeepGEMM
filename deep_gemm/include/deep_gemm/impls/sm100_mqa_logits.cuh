@@ -6,8 +6,11 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 
 #include <deep_gemm/common/cute_tie.cuh>
+#include <deep_gemm/common/packing.cuh>
+#include <deep_gemm/common/ring_pipeline.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/epilogue/clean_logits.cuh>
 #include <deep_gemm/layout/mqa_logits.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
@@ -21,22 +24,6 @@
 
 namespace deep_gemm {
 
-// Ring-buffer counter avoiding `% kNumStages`, which ptxas can lower poorly for TMEM paths
-template <uint32_t kNumStages>
-struct RingPipeline {
-    uint32_t stage_idx = 0, phase = 0;
-
-    CUTLASS_DEVICE cute::tuple<uint32_t, uint32_t> advance(const uint32_t& step = 1) {
-        const uint32_t current_stage_idx = stage_idx, current_phase = phase;
-        stage_idx += step;
-        if (stage_idx >= kNumStages) {
-            stage_idx -= kNumStages;
-            phase ^= 1;
-        }
-        return {current_stage_idx, current_phase};
-    }
-};
-
 // Convert runtime valid-token count to `cute::Int` so token loops stay compile-time constant
 template <uint32_t kBlockQ, uint32_t kCandidate = kBlockQ, typename Fn>
 CUTLASS_DEVICE void dispatch_num_block_tokens(const uint32_t& num_block_tokens, Fn&& fn) {
@@ -49,9 +36,24 @@ CUTLASS_DEVICE void dispatch_num_block_tokens(const uint32_t& num_block_tokens, 
     }
 }
 
+// Load heads using power-of-two TMEM chunks.
+template <uint32_t kNumHeads, uint32_t kNumLoaded = 0>
+CUTLASS_DEVICE void load_tmem_heads_decomposed(const uint32_t& tmem_col, float* accum) {
+    constexpr uint32_t kNumRemaining = kNumHeads - kNumLoaded;
+    if constexpr (kNumRemaining > 0) {
+        constexpr uint32_t kChunk = kNumRemaining >= 64 ? 64
+                                  : kNumRemaining >= 32 ? 32
+                                  : kNumRemaining >= 16 ? 16
+                                  : kNumRemaining >= 8  ? 8
+                                  : 4;
+        ptx::tmem_load_32dp32b<kChunk>(tmem_col + kNumLoaded, reinterpret_cast<uint32_t*>(accum + kNumLoaded));
+        load_tmem_heads_decomposed<kNumHeads, kNumLoaded + kChunk>(tmem_col, accum);
+    }
+}
+
 // Shared device core parameterized by dtype and scheduler geometry/addressing
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsMXSF, bool kIsCompressedLogits,
+          bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
@@ -70,9 +72,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
     const auto sm_idx = blockIdx.x;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
-    const auto warpgroup_idx = warp_idx / 4;
     const auto lane_idx = ptx::get_lane_idx();
     constexpr uint32_t kSpecWarpStart = kNumMathWarpGroups * 4;
+
+    const auto kNegInf = -cute::numeric_limits<logits_dtype_t>::infinity();
 
     if (warp_idx == kSpecWarpStart) {
         cute::prefetch_tma_descriptor(&tensor_map_q);
@@ -85,27 +88,32 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     static constexpr uint32_t kNumTmemStages = 3;
     static constexpr uint32_t kNumUTCCPAlignedElems = 128;
     static constexpr uint32_t UMMA_M = 128;
-    static constexpr uint32_t UMMA_N = BLOCK_Q * kNumHeads;
+    static constexpr uint32_t BLOCK_QH = BLOCK_Q * kNumHeads;
+    static constexpr uint32_t UMMA_N = math::constexpr_align(BLOCK_QH, 8u);
     static constexpr uint32_t UMMA_K = kIsFP4 ? 64 : 32;
-    static constexpr uint32_t kNumSFQ  = kIsMXSF ? math::constexpr_align(BLOCK_Q * kNumHeads, kNumUTCCPAlignedElems) : 0;
+    static constexpr uint32_t kNumSFQ  = kIsMXSF ? math::constexpr_align(UMMA_N, kNumUTCCPAlignedElems) : 0;
     static constexpr uint32_t kNumSFKV = kIsMXSF ? math::constexpr_align(SPLIT_KV, kNumUTCCPAlignedElems) : 0;
-    static constexpr uint32_t kRealNumSFQ = BLOCK_Q * kNumHeads;
     static constexpr uint32_t kNumQKBytesPerToken = kIsFP4 ? (kHeadDim / 2) : kHeadDim;
-    static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * kNumQKBytesPerToken;
+    static constexpr uint32_t SMEM_Q_SIZE_PER_STAGE = BLOCK_QH * kNumQKBytesPerToken;
     static constexpr uint32_t SMEM_KV_SIZE_PER_STAGE = SPLIT_KV * kNumQKBytesPerToken;
-    static constexpr uint32_t SMEM_SF_Q_SIZE_PER_STAGE = kIsMXSF ? (kRealNumSFQ * sizeof(int)) : 0;
+    static constexpr uint32_t SMEM_SF_Q_SIZE_PER_STAGE = kIsMXSF ? (BLOCK_QH * sizeof(int)) : 0;
     static constexpr uint32_t SMEM_SF_KV_SIZE_PER_STAGE = kIsMXSF ? (kNumSFKV * sizeof(int)) : (SPLIT_KV * sizeof(float));
-    static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = BLOCK_Q * kNumHeads * sizeof(reduce_dtype_t);
+    static constexpr uint32_t kNumWeightBytesPerRow = math::constexpr_align(
+        kNumHeads * static_cast<uint32_t>(sizeof(reduce_dtype_t)), 16u);
+    static constexpr uint32_t kNumWeightElementsPerRow =
+        kNumWeightBytesPerRow / static_cast<uint32_t>(sizeof(reduce_dtype_t));
+    static constexpr uint32_t SMEM_WEIGHT_SIZE_PER_STAGE = BLOCK_Q * kNumWeightBytesPerRow;
 
     DG_STATIC_ASSERT(kNumSpecializedThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
     DG_STATIC_ASSERT(SPLIT_KV == kNumMathWarpGroups * UMMA_M and SPLIT_KV % kNumUTCCPAlignedElems == 0, "Invalid `SPLIT_KV`");
+    DG_STATIC_ASSERT(not (kIsCompressedLogits and kCleanLogits), "Compressed logits cannot be cleaned in-kernel");
 
     using SharedStorage = layout::MQALogitsSharedStorage<kNumHeads, kHeadDim, kIsMXSF, BLOCK_Q, SPLIT_KV,
                                                          kNumQStages, kNumKVStages, kNumTmemStages, qk_dtype_t, reduce_dtype_t>;
     extern __shared__ __align__(SharedStorage::kSwizzleAlignment) uint8_t smem_buffer[];
     auto& smem = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
-    constexpr uint32_t kNumAccumTmemCols = BLOCK_Q * kNumHeads * kNumTmemStages;
+    constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumTmemStages;
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kNumAccumTmemCols + kNumSFQ / 32 + kNumSFKV / 32>();
     constexpr uint32_t kTmemStartColOfSFQ = kNumAccumTmemCols;
     constexpr uint32_t kTmemStartColOfSFKV = kNumAccumTmemCols + kNumSFQ / 32;
@@ -135,8 +143,6 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         cute::TMEM::Allocator1Sm().allocate(kNumTmemCols, &smem.tmem_ptr_in_smem);
     __syncthreads();
 
-    uint32_t seq_k_start[BLOCK_Q], seq_k_end[BLOCK_Q];
-
     RingPipeline<kNumQStages> q_pipeline;
     RingPipeline<kNumKVStages> kv_pipeline;
     RingPipeline<kNumTmemStages> tmem_pipeline;
@@ -149,7 +155,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     if (warp_idx == kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
         if (cute::elect_one_sync()) {
-            auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end);
+            auto scheduler = make_scheduler(sm_idx);
             // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
             uint32_t q_block_idx, kv_base, num_kv_splits;
             while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
@@ -157,12 +163,12 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 smem.empty_q_barriers[q_stage_idx].wait(q_phase ^ 1);
 
                 const uint32_t q_token_base = scheduler.get_q_tma_token_base(q_block_idx);
-                tma::copy<kNumQKBytesPerToken, BLOCK_Q * kNumHeads, 0>(
+                tma::copy<kHeadDim, BLOCK_Q * kNumHeads, 0>(
                     &tensor_map_q, &smem.full_q_barriers[q_stage_idx],
                     smem.smem_q[q_stage_idx], 0, q_token_base * kNumHeads);
                 if constexpr (kIsMXSF)
                     tma::copy<BLOCK_Q * kNumHeads, 1, 0>(&tensor_map_sf_q, &smem.full_q_barriers[q_stage_idx], smem.smem_sf_q[q_stage_idx], 0, q_token_base);
-                tma::copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_weights, &smem.full_q_barriers[q_stage_idx], smem.smem_weights[q_stage_idx], 0, q_token_base);
+                tma::copy<kNumWeightElementsPerRow, BLOCK_Q, 0>(&tensor_map_weights, &smem.full_q_barriers[q_stage_idx], smem.smem_weights[q_stage_idx], 0, q_token_base);
                 smem.full_q_barriers[q_stage_idx].arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_SF_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
             }
         }
@@ -170,7 +176,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     } else if (warp_idx == kSpecWarpStart + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
 
-        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end);
+        auto scheduler = make_scheduler(sm_idx);
         uint32_t cached_kv_page_base = 0;
         uint32_t cached_kv_page_coord = 0;
         // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
@@ -205,7 +211,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     if (cute::elect_one_sync()) {
                         #pragma unroll
                         for (uint32_t page_idx = 0; page_idx < kNumPagesPerSplit; ++ page_idx) {
-                            tma::copy<kNumQKBytesPerToken, kPageKV, 0, qk_dtype_t, true>(
+                            tma::copy<kHeadDim, kPageKV, 0, qk_dtype_t, true>(
                                 &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
                                 smem.smem_kv[kv_stage_idx] + page_idx * kPageKV * kNumQKBytesPerToken,
                                 0, 0, 1, page_coords[page_idx]);
@@ -221,7 +227,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     smem.empty_kv_barriers[kv_stage_idx].wait(kv_phase ^ 1);
 
                     const uint32_t kv_tma_offset = scheduler.get_kv_tma_offset(kv_base, kv_split_idx);
-                    tma::copy<kNumQKBytesPerToken, SPLIT_KV, 0>(
+                    tma::copy<kHeadDim, SPLIT_KV, 0>(
                         &tensor_map_kv, &smem.full_kv_barriers[kv_stage_idx],
                         smem.smem_kv[kv_stage_idx], 0, kv_tma_offset);
                     tma::copy<SPLIT_KV, 1, 0>(&tensor_map_sf_kv, &smem.full_kv_barriers[kv_stage_idx],
@@ -247,7 +253,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
         auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
-        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end);
+        auto scheduler = make_scheduler(sm_idx);
         // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
         uint32_t q_block_idx, kv_base, num_kv_splits;
         while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
@@ -304,7 +310,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                         if constexpr (kIsMXSF) {
                             DG_STATIC_ASSERT((not kIsFP4 and kHeadDim == 32) or kHeadDim == 64 or kHeadDim == 128, "Invalid head dim");
 
-                            constexpr uint32_t kPackFactor = kIsFP4 ? 2 : 1;
+                            constexpr uint32_t kPackFactor = get_smem_pack_factor<qk_dtype_t>();
                             constexpr uint32_t kQKSwizzleMode = kHeadDim / kPackFactor;
 
                             using mma_op_t = cute::conditional_t<kIsFP4, ptx::SM100_MMA_MXF4_SS, ptx::SM100_MMA_MXF8F6F4_SS>;
@@ -335,8 +341,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             }
                         }
 
-                        asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
-                                     ::"r"(cute::cast_smem_ptr_to_uint(&smem.full_tmem_barriers[tmem_stage_idx])));
+                        ptx::umma_arrive_no_elect(smem.full_tmem_barriers[tmem_stage_idx]);
                     }
                 }
                 __syncwarp();
@@ -347,40 +352,47 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         }
     } else if (warp_idx == kSpecWarpStart + 3) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+
+        if constexpr (kCleanLogits) {
+            const auto cleaner = epilogue::LogitsCleaner<logits_dtype_t>(lane_idx);
+
+            // Cleaning always runs grid-stride
+            auto scheduler = make_scheduler(sm_idx).make_cleaner(sm_idx);
+            uint32_t q_block_idx, kv_base, num_kv_splits;
+            while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
+                const auto coverage_end = cute::min(kv_base + num_kv_splits * SPLIT_KV, logits_stride);
+                #pragma unroll 1
+                for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
+                    const auto row = logits + scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
+                    cleaner.fill_row(row, 0, kv_base);
+                    cleaner.fill_row(row, coverage_end, logits_stride);
+                }
+            }
+        }
     } else if (warp_idx < kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
-        const auto math_warpgroup_idx = warpgroup_idx;
+        constexpr bool kLoadSeqBounds = kIsCompressedLogits or kCleanLogits;
+        uint32_t seq_k_start[kLoadSeqBounds ? BLOCK_Q : 1];
+        uint32_t seq_k_end[kLoadSeqBounds ? BLOCK_Q : 1];
+        const auto math_warpgroup_idx = warp_idx / 4;
         const auto math_thread_idx = warp_idx * 32 + lane_idx;
         DG_STATIC_ASSERT(kNumMathWarpGroups <= kNumTmemStages, "Math warp groups exceed TMEM stages");
         tmem_pipeline.advance(math_warpgroup_idx);
 
         constexpr bool kIsReduceBF16 = not cute::is_same_v<reduce_dtype_t, float>;
-        DG_STATIC_ASSERT(not kIsReduceBF16 or kNumHeads % 2 == 0, "bf16 weights need even kNumHeads");
-        DG_STATIC_ASSERT(kNumHeads == 4 or kNumHeads == 8 or kNumHeads == 16 or kNumHeads == 32 or kNumHeads == 64,
-                         "Unsupported TMEM load size");
+        DG_STATIC_ASSERT(kNumHeads % 4 == 0, "Head count must be a multiple of 4");
+        DG_STATIC_ASSERT(8 <= UMMA_N and UMMA_N <= 256, "Invalid UMMA_N for MMA");
         using weights_reg_dtype_t = cute::conditional_t<kIsReduceBF16, nv_bfloat162, float>;
         constexpr uint32_t kNumWeightsRegPerToken = kIsReduceBF16 ? (kNumHeads / 2) : kNumHeads;
         weights_reg_dtype_t weights[BLOCK_Q][kNumWeightsRegPerToken];
         float accum[kNumHeads];
 
-        auto tmem_load_no_fence = [](auto num_elems_t, const uint32_t& addr, float* load_dst) {
-            constexpr uint32_t N = decltype(num_elems_t)::value;
-            using Loader = cute::conditional_t<N == 2,  cute::SM100_TMEM_LOAD_32dp32b2x,
-                           cute::conditional_t<N == 4,  cute::SM100_TMEM_LOAD_32dp32b4x,
-                           cute::conditional_t<N == 8,  cute::SM100_TMEM_LOAD_32dp32b8x,
-                           cute::conditional_t<N == 16, cute::SM100_TMEM_LOAD_32dp32b16x,
-                           cute::conditional_t<N == 32, cute::SM100_TMEM_LOAD_32dp32b32x,
-                                                        cute::SM100_TMEM_LOAD_32dp32b64x>>>>>;
-            [&]<size_t... Is>(cute::index_sequence<Is...>) {
-                Loader::copy(addr, reinterpret_cast<uint32_t*>(load_dst)[Is]...);
-            }(cute::make_index_sequence<N>{});
-        };
-
-        auto scheduler = make_scheduler(sm_idx, seq_k_start, seq_k_end);
+        auto scheduler = make_scheduler(sm_idx);
         // NOTES: split index for paged scheduler, token offset for contiguous-KV scheduler.
         uint32_t q_block_idx, kv_base, num_kv_splits;
-        while (scheduler.next_q_block(q_block_idx, kv_base, num_kv_splits)) {
+        while (scheduler.template next_q_block<kLoadSeqBounds>(
+                q_block_idx, kv_base, num_kv_splits, seq_k_start, seq_k_end)) {
             CUTE_TIE_DECL(q_pipeline.advance(), q_stage_idx, q_phase);
             smem.full_q_barriers[q_stage_idx].wait(q_phase);
 
@@ -389,7 +401,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
-                    const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumHeads;
+                    const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
                     if constexpr (kIsReduceBF16) {
                         // Load two bf16 weights at a time as one packed shared u32
                         const auto packed_row = reinterpret_cast<const uint32_t*>(smem_weights_row);
@@ -424,23 +436,30 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     ptx::tcgen05_after_thread_sync();
 
                     // Release KV smem only after UMMA commits TMEM; earlier release races TMA overwrite
-                    if constexpr (not kIsMXSF)
+                    if constexpr (not kIsMXSF) {
+                        cutlass::arch::fence_view_async_shared();
                         smem.empty_kv_barriers[kv_stage_idx].arrive();
+                    }
 
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
                         uint32_t tmem_addr = tmem_stage_idx * UMMA_N + i * kNumHeads;
                         if constexpr (kNumHeads == 8) {
-                            tmem_load_no_fence(cute::Int<kNumHeads>{}, tmem_addr, accum);
+                            ptx::tmem_load_32dp32b<kNumHeads>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
                             cutlass::arch::fence_view_async_tmem_load();
                         } else if constexpr (kNumHeads == 16) {
-                            tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
-                            tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
+                            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
+                            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr + kNumHeads / 2,
+                                                                  reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
+                            cutlass::arch::fence_view_async_tmem_load();
+                        } else if constexpr (kNumHeads == 32 or kNumHeads == 64) {
+                            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr, reinterpret_cast<uint32_t*>(accum));
+                            cutlass::arch::fence_view_async_tmem_load();
+                            ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr + kNumHeads / 2,
+                                                                  reinterpret_cast<uint32_t*>(accum + kNumHeads / 2));
                             cutlass::arch::fence_view_async_tmem_load();
                         } else {
-                            tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr, accum);
-                            cutlass::arch::fence_view_async_tmem_load();
-                            tmem_load_no_fence(cute::Int<kNumHeads / 2>{}, tmem_addr + kNumHeads / 2, accum + kNumHeads / 2);
+                            load_tmem_heads_decomposed<kNumHeads>(tmem_addr, accum);
                             cutlass::arch::fence_view_async_tmem_load();
                         }
 
@@ -493,6 +512,10 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             const uint32_t len = seq_k_end[i] - seq_k_start[i];
                             if (rel_kv < len)
                                 logits[q_offset + rel_kv] = result;
+                        } else if constexpr (kCleanLogits) {
+                            const uint32_t rel_kv = kv_offset - seq_k_start[i];
+                            const uint32_t len = seq_k_end[i] - seq_k_start[i];
+                            logits[q_offset + kv_offset] = rel_kv < len ? result : kNegInf;
                         } else {
                             logits[q_offset + kv_offset] = result;
                         }
@@ -505,6 +528,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             else
                 process_q_block(cute::Int<BLOCK_Q>{});
 
+            cutlass::arch::fence_view_async_shared();
             smem.empty_q_barriers[q_stage_idx].arrive();
         }
 
@@ -516,7 +540,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
 // Unified contiguous-KV entry for FP8 / MXFP4 / MXFP8.
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsMXSF, bool kIsCompressedLogits,
+          bool kIsMXSF, bool kIsCompressedLogits, bool kCleanLogits,
+          bool kUseSchedule,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
@@ -528,18 +553,20 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
                       const uint32_t logits_stride,
                       const uint32_t* cu_seq_len_k_start,
                       const uint32_t* cu_seq_len_k_end,
+                      const uint32_t* schedule_meta,
                       logits_dtype_t* logits,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
-    const auto make_scheduler = [&](const uint32_t& sm_idx, uint32_t* seq_k_start, uint32_t* seq_k_end) {
-        return sched::SM100MQALogitsScheduler<BLOCK_Q, SPLIT_KV, kNumSMs>(
-            sm_idx, num_q_tokens, num_kv_tokens, cu_seq_len_k_start, cu_seq_len_k_end, seq_k_start, seq_k_end);
+    const auto make_scheduler = [&](const uint32_t& sm_idx) {
+        return sched::SM100MQALogitsScheduler<BLOCK_Q, SPLIT_KV, kNumSMs, kUseSchedule>(
+            sm_idx, num_q_tokens, num_kv_tokens, cu_seq_len_k_start, cu_seq_len_k_end, schedule_meta);
     };
 
-    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, kIsCompressedLogits, BLOCK_Q, SPLIT_KV,
+    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, kIsCompressedLogits, kCleanLogits,
+                               BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, kNumSMs,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
                                reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
@@ -549,7 +576,7 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
 }
 
 // Unified paged entry for FP8 / MXFP4 / MXFP8.
-// Paged scheduler walks (Q-block, chunk) tasks; BLOCK_Q = 128 / kNumHeads
+// Paged scheduler walks (Q-block, chunk) tasks.
 template <uint32_t kTokensPerRequest, uint32_t kNumHeads,
           uint32_t kHeadDim, uint32_t PAGE_KV,
           bool kIsMXSF, bool kIsContextLens2D, bool kIsVarlen,
@@ -573,7 +600,7 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
     static constexpr uint32_t kNumPagesPerSplit = SPLIT_KV / PAGE_KV;
     DG_STATIC_ASSERT(SPLIT_KV == PAGE_KV * kNumPagesPerSplit, "Invalid split/page size");
 
-    const auto make_scheduler = [&](const uint32_t& sm_idx, uint32_t* /*seq_k_start*/, uint32_t* /*seq_k_end*/) {
+    const auto make_scheduler = [&](const uint32_t& sm_idx) {
         return sched::SM100PagedMQALogitsScheduler<kTokensPerRequest, kIsContextLens2D, kIsVarlen,
                                                    kNumHeads, SPLIT_KV, PAGE_KV, kSplitsPerChunk>(
             sm_idx, context_lens, schedule_meta, indices,
@@ -581,7 +608,8 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
     };
 
     // Paged uses `kNumSMs = 0`; schedule meta drives the grid stride
-    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, BLOCK_Q, SPLIT_KV,
+    sm100_mqa_logits_core_impl<kNumHeads, kHeadDim, kIsMXSF, false, false,
+                               BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, 0,
                                kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t,
                                reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(

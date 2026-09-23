@@ -5,6 +5,7 @@
 
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/packing.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 
 namespace deep_gemm::mma::sm100 {
@@ -82,24 +83,16 @@ constexpr static cute::UMMA::LayoutType to_umma_layout_type() {
 template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t kSwizzleMode, typename dtype_t>
 CUTLASS_DEVICE
 constexpr uint32_t get_umma_desc_stride_k() {
-    return kMajorMode == cute::UMMA::Major::K ? 1 : tma::get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, dtype_t>();
+    return kMajorMode == cute::UMMA::Major::K ? 1 : tma::get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, 1, dtype_t>();
 }
 
 template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t kSwizzleMode, typename dtype_t>
 CUTLASS_DEVICE
 uint32_t advance_umma_desc_lo(const uint32_t& base, const uint32_t& offset, const uint32_t& k_idx) {
-    return base + (((offset + k_idx * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>()) * static_cast<uint32_t>(sizeof(dtype_t))) >> 4u);
-}
-
-template <typename dtype_t>
-CUTLASS_DEVICE
-constexpr uint32_t get_umma_desc_pack_factor() {
-    // Packed FP4 stores two logical elements per byte in SMEM.
-    if constexpr (cute::is_same_v<dtype_t, cutlass::float_e2m1_t>) {
-        return 2;
-    } else {
-        return 1;
-    }
+    constexpr uint32_t kPackFactor = get_smem_pack_factor<dtype_t>();
+    const uint32_t byte_offset = (offset + k_idx * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>())
+                                 * static_cast<uint32_t>(sizeof(dtype_t)) / kPackFactor;
+    return base + (byte_offset >> 4u);
 }
 
 template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode,
@@ -107,7 +100,7 @@ template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uin
 CUTLASS_DEVICE
 cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_idx, uint32_t k_idx) {
     // NOTES: `base_smem_ptr` must use the logical SMEM element type used by UMMA descriptors.
-    constexpr uint32_t kPackFactor = get_umma_desc_pack_factor<dtype_t>();
+    constexpr uint32_t kPackFactor = get_smem_pack_factor<dtype_t>();
     DG_STATIC_ASSERT(kPackFactor == 1 or sizeof(dtype_t) == 1, "Packing expects a 1-byte storage type");
     const uint32_t stride_k = get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>();
     const auto layout_type = to_umma_layout_type<kMajorMode, kSwizzleMode, kUseBase32, dtype_t>();
@@ -127,7 +120,7 @@ cute::UMMA::SmemDescriptor make_umma_desc(dtype_t* base_smem_ptr, uint32_t mn_id
         return make_smem_desc(layout_type, byte_ptr, stride_byte_offset, leading_byte_offset);
     } else {
         DG_STATIC_ASSERT(kPackFactor <= 1, "Packing only supports K-major");
-        constexpr uint32_t BLOCK_MN_ATOM = tma::get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, dtype_t>();
+        constexpr uint32_t BLOCK_MN_ATOM = tma::get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, 1, dtype_t>();
 
         // Must have no in-atom MN-idx
         // NOTES: no worries for the runtime assert, the `mn_idx` are constants at compilation time

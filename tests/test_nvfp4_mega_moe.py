@@ -65,7 +65,7 @@ def _reference_expert_ffn(x_dq: torch.Tensor,
                           l1_alpha: torch.Tensor, l2_alpha: torch.Tensor,
                           use_l2_input_scale: bool = False) -> Tuple[torch.Tensor, float]:
     # Mirror the kernel semantics: FP32 GEMM -> BF16 round -> clamp -> SwiGLU (FP32)
-    # -> top-k weight -> NVFP4 quantization -> FP32 GEMM -> BF16 partials.
+    # -> NVFP4 quantization -> FP32 GEMM -> BF16 -> top-k weight -> BF16 partials.
     # Returns `(partial, a2_scale)` where `a2_scale` is the down-proj input scale used
     # for the intermediate NVFP4 requant (1.0 when disabled).
     h1 = x_dq @ w1_dq.t()
@@ -105,6 +105,7 @@ def _reference_expert_ffn(x_dq: torch.Tensor,
 # noinspection PyShadowingNames
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    deep_gemm.set_pdl(bool(args.pdl))
     torch.manual_seed(args.seed + rank_idx)
     random.seed(args.seed + rank_idx)
 
@@ -214,13 +215,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Run fused mega MoE
     # NOTES: copy inputs into the buffer before each call because debug mode zeros the entire buffer
-    def run_fused():
+    def run_fused(y=None):
         buffer.x[:num_tokens].copy_(x_packed.view(torch.uint8))
         buffer.x_sf[:num_tokens].copy_(x_sf_packed)
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
 
-        y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        if y is None:
+            y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         deep_gemm.fp4_fp4_mega_moe(
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
             sym_buffer=buffer,
@@ -362,6 +364,123 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist_print(' > All correctness tests passed', once_in_node=True)
     dist_print(once_in_node=True)
 
+    if args.stateful_checks:
+        dist_print('Running stateful buffer and CUDA graph checks:', once_in_node=True)
+        live_weights, live_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+        live_weights = live_weights.softmax(dim=-1)
+        if args.routing_hot_rank >= 0:
+            live_idx = (args.routing_hot_rank * num_experts_per_rank + torch.arange(
+                num_topk, dtype=torch.long, device='cuda'
+            )).expand(num_tokens, -1).contiguous()
+        global_tokens = torch.tensor(num_tokens, dtype=torch.long, device='cuda')
+        dist.all_reduce(global_tokens, group=group)
+        assert global_tokens.item() > 0, 'Stateful live checks require at least one global token'
+
+        stable_a2_scales = torch.ones(
+            num_experts_per_rank, dtype=torch.float, device='cuda') if args.per_expert_a2 else None
+        stable_x_ptr = x.data_ptr()
+        ring_tokens = buffer.l1_acts.size(0)
+        assert buffer.l2_acts.size(0) == ring_tokens
+        block_m = deep_gemm.get_block_m_for_mega_moe(
+            num_ranks, num_experts, buffer.num_max_tokens_per_rank,
+            num_tokens, num_topk, 'fp4xfp4')
+        assert ring_tokens > 0 and ring_tokens % block_m == 0
+        max_routed_tokens = 0
+        max_pool_tokens = 0
+
+        def prepare_state(masked, variant):
+            nonlocal x_dq, a2_scales_for_kernel, max_routed_tokens, max_pool_tokens
+            x.copy_(args.input_scale * torch.randn_like(x))
+            packed, packed_sf = _cast_to_nvfp4(x, pack_sf=True)
+            x_packed.copy_(packed)
+            x_sf_packed.copy_(packed_sf)
+            x_dq = cast_back_from_fp4(
+                x_packed, _unpack_sf(x_sf_packed).view(num_tokens, hidden // 16), gran_k=16)
+            if masked:
+                topk_idx.fill_(-1)
+                topk_weights.zero_()
+            else:
+                if args.routing_hot_rank >= 0:
+                    first = args.routing_hot_rank * num_experts_per_rank
+                    topk_idx.copy_(first + (live_idx - first + variant) % num_experts_per_rank)
+                else:
+                    topk_idx.copy_((live_idx + variant) % num_experts)
+                topk_weights.copy_(live_weights.roll(variant, dims=1))
+            reference, recv = run_reference()
+            if stable_a2_scales is not None:
+                stable_a2_scales.copy_(a2_scales_for_kernel)
+            a2_scales_for_kernel = stable_a2_scales
+            assert x.data_ptr() == stable_x_ptr
+            routed_tokens = int(recv.sum().item())
+            pool_tokens = int(((recv.long() + block_m - 1) // block_m).sum().item()) * block_m
+            max_routed_tokens = max(max_routed_tokens, routed_tokens)
+            max_pool_tokens = max(max_pool_tokens, pool_tokens)
+            if masked:
+                assert routed_tokens == 0
+            return reference, recv
+
+        def check_state(label, actual, reference, recv):
+            nonlocal expected_stats
+            assert actual.shape == reference.shape
+            if reference.numel() == 0:
+                diff = relative_l2 = 0.0
+            else:
+                diff = calc_diff(actual, reference)
+                error = actual.float() - reference.float()
+                relative_l2 = (
+                    torch.linalg.vector_norm(error)
+                    / torch.linalg.vector_norm(reference.float()).clamp_min(1e-12)
+                ).item()
+            assert diff < 1e-3, f'Rank {rank_idx} {label}: diff {diff} is too large'
+            assert relative_l2 < 2e-2, f'Rank {rank_idx} {label}: relative L2 {relative_l2} is too large'
+            expected_stats = expected_stats + recv
+            assert torch.equal(cumulative_local_expert_recv_stats_fused, expected_stats), \
+                f'Rank {rank_idx} {label}: cumulative stats mismatch'
+            dist.barrier(group=group)
+            dist_print(f' > {label}: diff {diff:.3e}, relative L2 {relative_l2:.3e}, exact stats')
+
+        for variant, masked in enumerate((False, True, False)):
+            reference, recv = prepare_state(masked, variant)
+            check_state(f'eager-{variant}-{"masked" if masked else "live"}',
+                        run_fused(), reference, recv)
+
+        graph_output = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        capture_stream = torch.cuda.Stream()
+        for warmup in range(2):
+            reference, recv = prepare_state(False, 3 + warmup)
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                run_fused(graph_output)
+            torch.cuda.current_stream().wait_stream(capture_stream)
+            check_state(f'graph-warmup-{warmup}', graph_output, reference, recv)
+
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            run_fused(graph_output)
+        torch.cuda.synchronize()
+        assert torch.equal(cumulative_local_expert_recv_stats_fused, expected_stats), \
+            f'Rank {rank_idx}: capture unexpectedly executed the kernel'
+        for variant, masked in enumerate((False, True, False), start=5):
+            reference, recv = prepare_state(masked, variant)
+            graph.replay()
+            check_state(f'graph-replay-{variant}-{"masked" if masked else "live"}',
+                        graph_output, reference, recv)
+
+        wrapped = max_routed_tokens > ring_tokens
+        print(f'Rank {rank_idx}: ring_tokens={ring_tokens}, block_m={block_m}, '
+              f'actual_max_routed_tokens={max_routed_tokens}, padded_max_pool_tokens={max_pool_tokens}; '
+              f'ring wrap {"exercised by actual load" if wrapped else "NOT TESTED: actual load did not exceed ring"}',
+              flush=True)
+        any_wrap = torch.tensor(int(wrapped), dtype=torch.int, device='cuda')
+        dist.all_reduce(any_wrap, op=dist.ReduceOp.MAX, group=group)
+        if args.require_ring_wrap:
+            assert any_wrap.item() == 1, \
+                '--require-ring-wrap failed: no rank had actual routed load greater than its ring capacity'
+        dist_print(' > Stateful checks passed (3 eager calls, 2 warmups, 3 graph replays)', once_in_node=True)
+
     # Exit
     dist.barrier()
     buffer.destroy()
@@ -409,7 +528,17 @@ if __name__ == '__main__':
                         help='Scale routed BF16 output before adding shared output')
 
     # Test settings
+    parser.add_argument('--pdl', type=int, choices=(0, 1), default=0,
+                        help='Set the global PDL default; NVFP4 MegaMoE must retain stream ordering')
     parser.add_argument('--num-correctness-tests', type=int, default=2, help='Number of correctness test rounds')
+    parser.add_argument('--stateful-checks', action='store_true',
+                        help='Add 3 eager state changes, 2 graph warmups and 3 captured graph replays on one buffer')
+    parser.add_argument('--require-ring-wrap', action='store_true',
+                        help='Require --stateful-checks and actual routed load greater than ring capacity on at least one rank')
     args = parser.parse_args()
+    if args.require_ring_wrap and not args.stateful_checks:
+        parser.error('--require-ring-wrap requires --stateful-checks')
+    if args.stateful_checks and int(os.getenv('DG_COMM_KERNEL_DEBUG', '0')):
+        parser.error('--stateful-checks requires DG_COMM_KERNEL_DEBUG=0: buffer clearing would hide stale state')
 
     torch.multiprocessing.spawn(test, args=(args.num_processes, args), nprocs=args.num_processes)

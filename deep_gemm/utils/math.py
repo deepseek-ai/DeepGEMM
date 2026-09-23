@@ -17,9 +17,12 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 def pack_ue8m0_to_int(x: torch.Tensor):
+    """Pack non-negative, zero-mantissa scales; validate values only outside capture."""
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
     x_int = x.view(torch.int)
-    assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
+    if not (x.is_cuda and torch.cuda.is_current_stream_capturing()):
+        assert ((x_int >> 31) == 0).all(), "pack_ue8m0_to_int: scale values must be non-negative"
+        assert ((x_int & 0x7FFFFF) == 0).all(), "pack_ue8m0_to_int: scale values must have zero mantissa"
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
@@ -86,8 +89,11 @@ def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
     # {0, 0.5, 1, 1.5, 2, 3, 4, 6}
     # midpoints: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
     code = torch.zeros_like(x, dtype=torch.uint8)
-    for boundary in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        code += (ax > boundary).to(torch.uint8)
+    for boundary, round_up in zip(
+        (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0),
+        (False, True, False, True, False, True, False),
+    ):
+        code += (ax >= boundary if round_up else ax > boundary).to(torch.uint8)
     sign = (x < 0) & (code != 0)
     code = code | (sign.to(torch.uint8) << 3)
     return code.view(torch.int8)

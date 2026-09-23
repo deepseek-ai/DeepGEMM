@@ -18,7 +18,8 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/nv_moe_workspace.cuh>
+#include <deep_gemm/impls/sm90_mega_moe_math.cuh>
 #include <deep_gemm/layout/sm90_mega_moe.cuh>
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/scheduler/sm90_mega_moe.cuh>
@@ -55,10 +56,10 @@ __forceinline__ __device__ void sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
     constexpr float kScale = 1.0f / 448.0f;
     const auto scaled = make_float2(
         __fmul_rn(amax.x, kScale), __fmul_rn(amax.y, kScale));
-    const auto exp_x = math::fast_log2_ceil(scaled.x);
-    const auto exp_y = math::fast_log2_ceil(scaled.y);
-    sf.x = math::fast_pow2(exp_x), sf_inv.x = math::fast_pow2(-exp_x);
-    sf.y = math::fast_pow2(exp_y), sf_inv.y = math::fast_pow2(-exp_y);
+    const auto exp_x = sm90_moe_math::fast_log2_ceil(scaled.x);
+    const auto exp_y = sm90_moe_math::fast_log2_ceil(scaled.y);
+    sf.x = sm90_moe_math::fast_pow2(exp_x), sf_inv.x = sm90_moe_math::fast_pow2(-exp_x);
+    sf.y = sm90_moe_math::fast_pow2(exp_y), sf_inv.y = sm90_moe_math::fast_pow2(-exp_y);
 }
 
 template <MegaMoEPhaseKind kKind,
@@ -211,9 +212,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         }
     }
 
-    // Workspaces and symmetric buffer slicing (mirror SM100 layout, except SF
-    // for L2 activations uses per-64 K granularity)
-    const auto workspace = layout::Workspace(
+    // L2 activation SFs use per-64 K granularity in the nv_dev workspace.
+    const auto workspace = layout::nv_moe::Workspace(
         sym_buffer.get_base_ptr(), kNumRanks, kNumExperts, kNumMaxTokensPerRank,
         kNumTopk, kNumMaxPoolTokens);
 
@@ -1892,8 +1892,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
                     #pragma unroll
                     for (uint32_t g = 0; g < kNumSFGroups; ++ g) {
-                        amax_r0[g] = math::warp_reduce<4, false>(amax_r0[g], math::ReduceMax<float>());
-                        amax_r1[g] = math::warp_reduce<4, false>(amax_r1[g], math::ReduceMax<float>());
+                        amax_r0[g] = math::warp_reduce<4, false>(amax_r0[g], sm90_moe_math::ReduceMax<float>());
+                        amax_r1[g] = math::warp_reduce<4, false>(amax_r1[g], sm90_moe_math::ReduceMax<float>());
                     }
 
                     float sf_r0[kNumSFGroups], sf_inv_r0[kNumSFGroups];
@@ -2236,6 +2236,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     if (mask) {
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        __syncwarp();
                         if (cute::elect_one_sync()) {
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 combine_token_buffer.get_rank_buffer(slot_idx)

@@ -1,16 +1,15 @@
 #pragma once
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "sm120_runtime.hpp"
 #include "../heuristics/sm120.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
 
-class SM120FP8MQALogitsRuntime final: public LaunchRuntime<SM120FP8MQALogitsRuntime> {
+class SM120FP8MQALogitsRuntime final: public SM120LaunchRuntime<SM120FP8MQALogitsRuntime> {
 public:
     struct Args {
+        int kv_splits;
         int seq_len;
         int seq_len_kv;
         int max_seqlen_k;
@@ -28,12 +27,12 @@ public:
         CUtensorMap tensor_map_weights;
         at::ScalarType logits_dtype;
         int num_tma_threads, num_math_threads;
-        LaunchArgs launch_args;
+        SM120LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
         DG_HOST_ASSERT(128 % args.num_heads == 0);
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -47,16 +46,22 @@ static void __instantiate_kernel() {{
 }};
 )", args.num_heads, args.head_dim, args.is_compressed_logits,
     args.block_q, args.block_kv, args.num_q_stages, args.num_kv_stages,
-    args.launch_args.grid_dim.first,
+    args.launch_args.blocks,
     args.num_tma_threads, args.num_math_threads, to_string(args.logits_dtype));
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.seq_len, args.seq_len_kv, args.max_seqlen_k, args.stride_logits,
+    template <typename Kernel>
+    static void launch_impl(const Kernel& kernel, const Args& args) {
+        jit->launch(kernel, {
+            .num_smem_bytes = args.launch_args.smem,
+            .grid_dim = dim3(args.launch_args.blocks, args.kv_splits, 1),
+            .block_dim = dim3(args.launch_args.threads, 1, 1),
+        },
+            static_cast<uint32_t>(args.seq_len), static_cast<uint32_t>(args.seq_len_kv),
+            static_cast<uint32_t>(args.max_seqlen_k), static_cast<uint32_t>(args.stride_logits),
             args.cu_seq_len_k_start, args.cu_seq_len_k_end, args.logits,
             args.tensor_map_q, args.tensor_map_kv,
-            args.tensor_map_kv_scales, args.tensor_map_weights));
+            args.tensor_map_kv_scales, args.tensor_map_weights);
     }
 };
 
@@ -75,7 +80,7 @@ static void sm120_fp8_mqa_logits(const torch::Tensor& q,
     constexpr int num_tma_threads = 128;
     constexpr int num_q_stages = 2, num_kv_stages = 3;
     constexpr int num_math_threads = 256;
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = deep_gemm::runtime->get_num_sms();
     const bool is_compressed_logits = max_seqlen_k > 0;
 
     // Split the KV range only when Q blocks underfill SM120. The split blocks
@@ -97,7 +102,7 @@ static void sm120_fp8_mqa_logits(const torch::Tensor& q,
         }
     }
 
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 12);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
     DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
     const auto tensor_map_q = make_tma_2d_desc(
         q, head_dim, seq_len * num_heads,
@@ -130,6 +135,7 @@ static void sm120_fp8_mqa_logits(const torch::Tensor& q,
     DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
 
     const SM120FP8MQALogitsRuntime::Args args = {
+        .kv_splits = kv_splits,
         .seq_len = seq_len, .seq_len_kv = seq_len_kv,
         .max_seqlen_k = max_seqlen_k, .stride_logits = stride_logits,
         .num_heads = num_heads, .head_dim = head_dim,
@@ -145,15 +151,15 @@ static void sm120_fp8_mqa_logits(const torch::Tensor& q,
         .logits_dtype = logits_dtype,
         .num_tma_threads = num_tma_threads,
         .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs({num_sms, kv_splits},
-                                  num_tma_threads + num_math_threads, smem_size)
+        .launch_args = SM120LaunchArgs(num_sms,
+                                  num_tma_threads + num_math_threads, smem_size, 1)
     };
     const auto code = SM120FP8MQALogitsRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp8_mqa_logits", code);
+    const auto runtime = jit->compile("sm120_fp8_mqa_logits", code);
     SM120FP8MQALogitsRuntime::launch(runtime, args);
 }
 
-class SM120FP4MQALogitsRuntime final: public LaunchRuntime<SM120FP4MQALogitsRuntime> {
+class SM120FP4MQALogitsRuntime final: public SM120LaunchRuntime<SM120FP4MQALogitsRuntime> {
 public:
     struct Args {
         int seq_len, seq_len_kv, max_seqlen_k, stride_logits;
@@ -171,12 +177,12 @@ public:
         CUtensorMap tensor_map_weights;
         at::ScalarType logits_dtype;
         int num_tma_threads, num_math_threads;
-        LaunchArgs launch_args;
+        SM120LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
         DG_HOST_ASSERT(128 % args.num_heads == 0);
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp4_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -190,16 +196,18 @@ static void __instantiate_kernel() {{
 }};
 )", args.num_heads, args.head_dim, args.is_compressed_logits,
     args.block_q, args.block_kv, args.num_q_stages, args.num_kv_stages,
-    args.launch_args.grid_dim.first,
+    args.launch_args.blocks,
     args.num_tma_threads, args.num_math_threads, to_string(args.logits_dtype));
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.seq_len, args.seq_len_kv, args.max_seqlen_k, args.stride_logits,
+    template <typename Kernel>
+    static void launch_impl(const Kernel& kernel, const Args& args) {
+        sm120_launch_kernel(kernel, args.launch_args,
+            static_cast<uint32_t>(args.seq_len), static_cast<uint32_t>(args.seq_len_kv),
+            static_cast<uint32_t>(args.max_seqlen_k), static_cast<uint32_t>(args.stride_logits),
             args.cu_seq_len_k_start, args.cu_seq_len_k_end, args.logits,
             args.tensor_map_q, args.tensor_map_sf_q,
-            args.tensor_map_kv, args.tensor_map_sf_kv, args.tensor_map_weights));
+            args.tensor_map_kv, args.tensor_map_sf_kv, args.tensor_map_weights);
     }
 };
 
@@ -221,7 +229,7 @@ static void sm120_fp4_mqa_logits(const torch::Tensor& q,
     constexpr int num_q_stages = 2, num_kv_stages = 5;
     const bool is_compressed_logits = max_seqlen_k > 0;
 
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 12);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
     DG_HOST_ASSERT(head_dim == 128);
     const auto tensor_map_q = make_tma_2d_desc(
         q, head_dim, seq_len * num_heads,
@@ -270,11 +278,11 @@ static void sm120_fp4_mqa_logits(const torch::Tensor& q,
         .logits_dtype = logits_dtype,
         .num_tma_threads = num_tma_threads,
         .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
-                                  num_tma_threads + num_math_threads, smem_size)
+        .launch_args = SM120LaunchArgs(deep_gemm::runtime->get_num_sms(),
+                                  num_tma_threads + num_math_threads, smem_size, 1)
     };
     const auto code = SM120FP4MQALogitsRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp4_mqa_logits", code);
+    const auto runtime = jit->compile("sm120_fp4_mqa_logits", code);
     SM120FP4MQALogitsRuntime::launch(runtime, args);
 }
 
@@ -310,7 +318,7 @@ static void sm120_mqa_logits(const torch::Tensor& q,
 }
 
 class SM120PagedMQALogitsMetadataRuntime final
-    : public LaunchRuntime<SM120PagedMQALogitsMetadataRuntime> {
+    : public SM120LaunchRuntime<SM120PagedMQALogitsMetadataRuntime> {
 public:
     struct Args {
         int aligned_batch_size, split_kv, num_sms;
@@ -320,11 +328,11 @@ public:
         int* context_lens;
         int* indices;
         int* schedule_metadata;
-        LaunchArgs launch_args;
+        SM120LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/scheduler/sm120_paged_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -338,11 +346,12 @@ static void __instantiate_kernel() {{
     args.is_varlen ? "true" : "false");
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.batch_size, args.next_n, args.is_context_lens_2d,
+    template <typename Kernel>
+    static void launch_impl(const Kernel& kernel, const Args& args) {
+        sm120_launch_kernel(kernel, args.launch_args,
+            static_cast<uint32_t>(args.batch_size), static_cast<uint32_t>(args.next_n), args.is_context_lens_2d,
             static_cast<uint32_t>(args.num_next_n_atoms), args.context_lens,
-            args.indices, args.schedule_metadata));
+            args.indices, args.schedule_metadata);
     }
 };
 
@@ -373,15 +382,15 @@ static void sm120_paged_mqa_logits_metadata(
         .context_lens = context_lens.data_ptr<int>(),
         .indices = const_cast<int*>(indices_ptr),
         .schedule_metadata = schedule_metadata.data_ptr<int>(),
-        .launch_args = LaunchArgs(1, num_threads, smem_size)
+        .launch_args = SM120LaunchArgs(1, num_threads, smem_size, 1)
     };
     const auto code = SM120PagedMQALogitsMetadataRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_paged_mqa_logits_metadata", code);
+    const auto runtime = jit->compile("sm120_paged_mqa_logits_metadata", code);
     SM120PagedMQALogitsMetadataRuntime::launch(runtime, args);
 }
 
 class SM120FP8PagedMQALogitsRuntime final
-    : public LaunchRuntime<SM120FP8PagedMQALogitsRuntime> {
+    : public SM120LaunchRuntime<SM120FP8PagedMQALogitsRuntime> {
 public:
     struct Args {
         int batch_size, next_n, num_heads, head_dim, block_kv;
@@ -399,12 +408,12 @@ public:
         CUtensorMap tensor_map_weights;
         at::ScalarType logits_dtype;
         int num_tma_threads, num_math_threads;
-        LaunchArgs launch_args;
+        SM120LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
         DG_HOST_ASSERT(128 % args.num_heads == 0);
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp8_paged_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -421,13 +430,14 @@ static void __instantiate_kernel() {{
     args.num_tma_threads, args.num_math_threads, to_string(args.logits_dtype));
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.batch_size, args.logits_stride,
-            args.block_table_stride, args.context_lens, args.logits,
+    template <typename Kernel>
+    static void launch_impl(const Kernel& kernel, const Args& args) {
+        sm120_launch_kernel(kernel, args.launch_args,
+            static_cast<uint32_t>(args.batch_size), static_cast<uint32_t>(args.logits_stride),
+            static_cast<uint32_t>(args.block_table_stride), args.context_lens, args.logits,
             args.block_table, args.indices, args.schedule_meta,
             args.tensor_map_q, args.tensor_map_kv,
-            args.tensor_map_kv_scales, args.tensor_map_weights));
+            args.tensor_map_kv_scales, args.tensor_map_weights);
     }
 };
 
@@ -444,12 +454,17 @@ static void sm120_fp8_paged_mqa_logits(
     const int& num_sms, const int& split_kv) {
     constexpr int num_tma_threads = 128;
     constexpr int num_math_threads = 256;
-    constexpr int num_q_stages = 2, num_kv_stages = 3;
-    const int num_groups = split_kv / block_kv;
+    constexpr int num_q_stages = 2;
+    const int tile_kv = std::min(block_kv, 64);
+    const int num_groups = split_kv / tile_kv;
     const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 12);
-    DG_HOST_ASSERT(block_kv == 64);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128 or block_kv == 256);
     DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
+    // Four 32-row KV groups exceed the 99 KiB SMEM budget with three stages at
+    // 64 heads and paired queries (by 4 bytes). Keep the 64-row path unchanged.
+    const int num_kv_stages =
+        (block_kv == 32 and num_heads == 64 and (is_varlen or next_n >= 2)) ? 2 : 3;
 
     const auto tensor_map_q = make_tma_2d_desc(
         q, head_dim, batch_size * next_n * num_heads,
@@ -457,10 +472,10 @@ static void sm120_fp8_paged_mqa_logits(
         head_dim);
     const auto tensor_map_kv = make_tma_3d_desc(
         kv_cache, head_dim, block_kv, num_kv_blocks,
-        head_dim, block_kv, 1, static_cast<int>(kv_cache.stride(1)),
+        head_dim, tile_kv, 1, static_cast<int>(kv_cache.stride(1)),
         static_cast<int>(kv_cache.stride(0)), head_dim);
     const auto tensor_map_kv_scales = make_tma_2d_desc(
-        kv_cache_scales, block_kv, num_kv_blocks, block_kv, 1,
+        kv_cache_scales, block_kv, num_kv_blocks, tile_kv, 1,
         static_cast<int>(kv_cache_scales.stride(0)), 0);
     const auto tensor_map_weights = make_tma_2d_desc(
         weights, num_heads, batch_size * next_n, num_heads, next_n_atom,
@@ -477,9 +492,9 @@ static void sm120_fp8_paged_mqa_logits(
                         aligned_smem_weight_size_per_stage) +
         align(num_q_stages * 8 * 2, swizzle_alignment);
     const int smem_kv_size_per_stage =
-        block_kv * head_dim * static_cast<int>(kv_cache.element_size());
+        tile_kv * head_dim * static_cast<int>(kv_cache.element_size());
     const int aligned_smem_kv_scale_size_per_stage = align(
-        block_kv * static_cast<int>(kv_cache_scales.element_size()),
+        tile_kv * static_cast<int>(kv_cache_scales.element_size()),
         swizzle_alignment);
     const int smem_kv_pipe_size =
         num_kv_stages * (smem_kv_size_per_stage +
@@ -505,16 +520,16 @@ static void sm120_fp8_paged_mqa_logits(
         .tensor_map_weights = tensor_map_weights,
         .logits_dtype = logits_dtype,
         .num_tma_threads = num_tma_threads, .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(num_sms, num_tma_threads + num_math_threads,
-                                  smem_size)
+        .launch_args = SM120LaunchArgs(num_sms, num_tma_threads + num_math_threads,
+                                  smem_size, 1)
     };
     const auto code = SM120FP8PagedMQALogitsRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp8_paged_mqa_logits", code);
+    const auto runtime = jit->compile("sm120_fp8_paged_mqa_logits", code);
     SM120FP8PagedMQALogitsRuntime::launch(runtime, args);
 }
 
 class SM120FP4PagedMQALogitsRuntime final
-    : public LaunchRuntime<SM120FP4PagedMQALogitsRuntime> {
+    : public SM120LaunchRuntime<SM120FP4PagedMQALogitsRuntime> {
 public:
     struct Args {
         int batch_size, next_n, num_heads, head_dim, block_kv;
@@ -533,11 +548,11 @@ public:
         CUtensorMap tensor_map_weights;
         at::ScalarType logits_dtype;
         int num_tma_threads, num_math_threads;
-        LaunchArgs launch_args;
+        SM120LaunchArgs launch_args;
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_fp4_paged_mqa_logits.cuh>
 
 using namespace deep_gemm;
@@ -554,13 +569,14 @@ static void __instantiate_kernel() {{
     args.num_tma_threads, args.num_math_threads, to_string(args.logits_dtype));
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(
-            kernel, config, args.batch_size, args.logits_stride,
-            args.block_table_stride, args.context_lens, args.logits,
+    template <typename Kernel>
+    static void launch_impl(const Kernel& kernel, const Args& args) {
+        sm120_launch_kernel(kernel, args.launch_args,
+            static_cast<uint32_t>(args.batch_size), static_cast<uint32_t>(args.logits_stride),
+            static_cast<uint32_t>(args.block_table_stride), args.context_lens, args.logits,
             args.block_table, args.indices, args.schedule_meta,
             args.tensor_map_q, args.tensor_map_sf_q,
-            args.tensor_map_kv, args.tensor_map_sf_kv, args.tensor_map_weights));
+            args.tensor_map_kv, args.tensor_map_sf_kv, args.tensor_map_weights);
     }
 };
 
@@ -579,10 +595,11 @@ static void sm120_fp4_paged_mqa_logits(
     constexpr int num_tma_threads = 128;
     constexpr int num_math_threads = 256;
     constexpr int num_q_stages = 2, num_kv_stages = 3;
+    const int tile_kv = std::min(block_kv, 64);
     const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 12);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
     DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
-    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
+    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128 or block_kv == 256);
     DG_HOST_ASSERT(head_dim == 128);
 
     const auto tensor_map_q = make_tma_2d_desc(
@@ -597,10 +614,10 @@ static void sm120_fp4_paged_mqa_logits(
         static_cast<int>(weights.stride(0)), 0);
     const auto tensor_map_kv = make_tma_3d_desc(
         kv_cache, head_dim, block_kv, num_kv_blocks,
-        head_dim, block_kv, 1, static_cast<int>(kv_cache.stride(1)),
+        head_dim, tile_kv, 1, static_cast<int>(kv_cache.stride(1)),
         static_cast<int>(kv_cache.stride(0)), head_dim / 2, 0, false, false);
     const auto tensor_map_sf_kv = make_tma_2d_desc(
-        kv_cache_sf, block_kv, num_kv_blocks, block_kv, 1,
+        kv_cache_sf, block_kv, num_kv_blocks, tile_kv, 1,
         static_cast<int>(kv_cache_sf.stride(0)), 0);
 
     const int swizzle_alignment = head_dim / 2 * 8;
@@ -616,14 +633,14 @@ static void sm120_fp4_paged_mqa_logits(
                         aligned_smem_sf_q_size_per_stage +
                         aligned_smem_weight_size_per_stage) +
         align(num_q_stages * 8 * 2, swizzle_alignment);
-    const int smem_kv_size_per_stage = block_kv * head_dim / 2;
+    const int smem_kv_size_per_stage = tile_kv * head_dim / 2;
     const int aligned_smem_sf_kv_size_per_stage = align(
-        block_kv * static_cast<int>(sizeof(int)), swizzle_alignment);
+        tile_kv * static_cast<int>(sizeof(int)), swizzle_alignment);
     const int smem_kv_pipe_size =
         num_kv_stages * (smem_kv_size_per_stage +
                          aligned_smem_sf_kv_size_per_stage) +
         align(num_kv_stages * 8 * 2, swizzle_alignment);
-    const int num_groups = split_kv / block_kv;
+    const int num_groups = split_kv / tile_kv;
     const int smem_size =
         smem_q_pipe_size + num_groups * smem_kv_pipe_size + 4;
     DG_HOST_ASSERT(smem_size <= SM120ArchSpec::smem_capacity);
@@ -644,11 +661,11 @@ static void sm120_fp4_paged_mqa_logits(
         .tensor_map_weights = tensor_map_weights,
         .logits_dtype = logits_dtype,
         .num_tma_threads = num_tma_threads, .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(num_sms, num_tma_threads + num_math_threads,
-                                  smem_size)
+        .launch_args = SM120LaunchArgs(num_sms, num_tma_threads + num_math_threads,
+                                  smem_size, 1)
     };
     const auto code = SM120FP4PagedMQALogitsRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_fp4_paged_mqa_logits", code);
+    const auto runtime = jit->compile("sm120_fp4_paged_mqa_logits", code);
     SM120FP4PagedMQALogitsRuntime::launch(runtime, args);
 }
 
@@ -665,10 +682,7 @@ static void sm120_paged_mqa_logits(
     const bool& is_varlen, const int& logits_stride,
     const int& block_table_stride, const int& num_sms, const int& split_kv,
     const bool& is_mx_sf, const at::ScalarType& qk_dtype) {
-    // The SM120 kernel receives q.shape(0) and q.shape(1) separately, just as
-    // the pre-#377 launcher did. For varlen, q.shape(0) is already the flattened
-    // token count and tokens_per_request is one.
-    (void)num_q_tokens_total;
+    DG_HOST_ASSERT(num_q_tokens_total == num_requests * tokens_per_request);
     if (qk_dtype == kPackedFP4) {
         DG_HOST_ASSERT(is_mx_sf and sf_q.has_value());
         sm120_fp4_paged_mqa_logits(
@@ -686,6 +700,24 @@ static void sm120_paged_mqa_logits(
             num_kv_blocks, page_kv, is_context_lens_2d, is_varlen,
             logits_stride, block_table_stride, num_sms, split_kv);
     }
+}
+
+static void sm120_clean_mqa_logits(const torch::Tensor& logits,
+                                    const torch::Tensor& cu_seq_len_k_start,
+                                    const torch::Tensor& cu_seq_len_k_end,
+                                    const int seq_len, const int seq_len_kv,
+                                    const uint64_t stride_logits) {
+    const auto kernel = jit->compile("smxx_clean_logits", std::format(R"(
+#include <deep_gemm/impls/smxx_clean_logits.cuh>
+
+using namespace deep_gemm;
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&smxx_clean_logits<1, 8192, 8, {}>);
+}};
+)", to_string(logits.scalar_type())));
+    sm120_launch_kernel(kernel, SM120LaunchArgs(runtime->get_num_sms(), 256, 8192 * sizeof(float), 1),
+        static_cast<uint32_t>(seq_len), static_cast<uint32_t>(seq_len_kv), stride_logits,
+        cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(), logits.data_ptr());
 }
 
 } // namespace deep_gemm

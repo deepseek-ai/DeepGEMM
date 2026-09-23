@@ -14,6 +14,8 @@ Layers
   L4  Edge cases      : masking ratio, activation clamp (finite vs inf),
                         ``fast_math`` 0/1, ``num_tokens`` boundaries.
   L5  Stress          : ``--num-correctness-tests`` repeated random configs.
+  L6  Stateful        : optional uneven/empty ranks, exact cumulative stats,
+                        live/masked/live buffer reuse and changed-input graph replay.
 
 Notes
 -----
@@ -34,10 +36,6 @@ import sys
 import torch
 import torch.distributed as dist
 from typing import Tuple, List, Dict, Any
-
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
 
 import deep_gemm
 from deep_gemm.utils import per_token_cast_to_fp8
@@ -469,10 +467,194 @@ def _layer5_stress(num_ranks: int, num_tests: int) -> List[Tuple[str, Dict[str, 
     return out
 
 
+def test_sm90_mega_moe_host_guards():
+    import re
+    import pytest
+
+    if not torch.cuda.is_available() or get_arch_major() != 9:
+        pytest.skip('SM90 host validation requires an SM90 CUDA device')
+    y = torch.empty((2, 256), dtype=torch.bfloat16, device='cuda')
+    l1 = (torch.empty((1, 256, 256), dtype=torch.float8_e4m3fn, device='cuda'),
+          torch.empty((1, 2, 2), dtype=torch.float32, device='cuda'))
+    l2 = (torch.empty((1, 256, 128), dtype=torch.float8_e4m3fn, device='cuda'),
+          torch.empty((1, 2, 1), dtype=torch.float32, device='cuda'))
+    raw = torch.empty(16, dtype=torch.int8, device='cuda')
+    stats = torch.empty(1, dtype=torch.int32, device='cuda')
+    base = dict(y=y, l1=l1, l2=l2, raw=raw, stats=stats,
+                pointers=[raw.data_ptr()], rank=0)
+    cases = [
+        ('scalar', dict(y=y[0, 0]), 'y.dim() == 2'),
+        ('rank1', dict(y=y[0]), 'y.dim() == 2'),
+        ('rank3', dict(y=y.unsqueeze(0)), 'y.dim() == 2'),
+        ('columns', dict(y=torch.empty((2, 128), dtype=y.dtype, device='cuda')),
+         'y.size(1) == l1_weights.size(2)'),
+        ('dtype', dict(y=y.float()), 'y.scalar_type() == torch::kBFloat16'),
+        ('cpu_output', dict(y=y.cpu()), 'y.is_cuda()'),
+        ('strided', dict(y=torch.empty((2, 512), dtype=y.dtype, device='cuda')[:, ::2]),
+         'y.is_contiguous()'),
+        ('negative_rank', dict(rank=-1), 'rank_idx >= 0'),
+        ('past_rank', dict(rank=1), 'rank_idx >= 0'),
+        ('empty_pointers', dict(pointers=[]), 'rank_idx >= 0'),
+        ('mismatched_base', dict(pointers=[raw.data_ptr() + 16]),
+         'sym_buffer_ptrs[rank_idx] =='),
+        ('cpu_weights', dict(l1=(l1[0].cpu(), l1[1])), 'is_local_cuda_tensor(l1_weights)'),
+        ('cpu_l1_sf', dict(l1=(l1[0], l1[1].cpu())), 'is_local_cuda_tensor(l1_weights_sf)'),
+        ('cpu_l2_sf', dict(l2=(l2[0], l2[1].cpu())), 'is_local_cuda_tensor(l2_weights_sf)'),
+        ('cpu_stats', dict(stats=stats.cpu()),
+         'is_local_cuda_tensor(cumulative_local_expert_recv_stats.value())'),
+        ('cpu_buffer', dict(raw=raw.cpu()), 'is_local_cuda_tensor(sym_buffer)'),
+        ('strided_buffer', dict(raw=raw[::2]), 'sym_buffer.is_contiguous()'),
+    ]
+    for name, changes, guard in cases:
+        args = dict(base, **changes)
+        # Invalid recipe is a second stop before any launch if the intended guard regresses.
+        with pytest.raises(RuntimeError, match=re.escape(guard)):
+            deep_gemm._C.fp8_mega_moe(
+                args['y'], args['l1'], args['l2'], args['stats'], args['raw'],
+                args['pointers'], args['rank'], 128, 1, 1,
+                (0, 0, 0), 'swiglu', 10.0, True)
+
+
+def _layer6_stateful(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
+    counts = [0, 1, 7, 31, 32, 63, 64, 127]
+    return [
+        (f'L6.stateful.offset{offset}', dict(
+            rank_counts=[counts[(offset + rank) % len(counts)]
+                         for rank in range(num_ranks)]))
+        for offset in range(0, len(counts), num_ranks)
+    ]
+
+
+def _run_stateful_scenario(
+    name: str, cfg: Dict[str, Any],
+    rank_idx: int, num_ranks: int, group: dist.ProcessGroup,
+    diff_tol: float,
+):
+    assert int(os.environ.get('DG_COMM_KERNEL_DEBUG', '0')) == 0, (
+        'Layer 6 requires DG_COMM_KERNEL_DEBUG=0: raw workspace clearing hides reuse bugs')
+    hidden, intermediate_hidden, num_topk = 512, 512, 2
+    num_experts_per_rank = 4
+    num_experts = num_experts_per_rank * num_ranks
+    num_tokens = cfg['rank_counts'][rank_idx]
+    torch.manual_seed(6000 + rank_idx)
+    l1_fp8, l1_sf = _quantize_grouped_fp8_block_128_128(torch.randn(
+        (num_experts_per_rank, 2 * intermediate_hidden, hidden),
+        dtype=torch.bfloat16, device='cuda') * 0.05)
+    l2_fp8, l2_sf = _quantize_grouped_fp8_block_128_128(torch.randn(
+        (num_experts_per_rank, hidden, intermediate_hidden),
+        dtype=torch.bfloat16, device='cuda') * 0.05)
+    transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
+        (l1_fp8, l1_sf), (l2_fp8, l2_sf))
+    buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
+        group, num_experts, 128, num_topk, hidden, intermediate_hidden)
+    expected_stats = torch.arange(num_experts_per_rank, dtype=torch.int, device='cpu')
+    expected_stats += 17 + rank_idx * num_experts_per_rank
+    cum_stats = expected_stats.to('cuda')
+    y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    stream = torch.cuda.Stream()
+    graph = None
+
+    def launch():
+        deep_gemm.fp8_mega_moe(
+            y, transformed_l1, transformed_l2, buffer,
+            cumulative_local_expert_recv_stats=cum_stats,
+            recipe=(128, 128, 128), activation='swiglu',
+            activation_clamp=10.0, fast_math=True)
+
+    def prepare(step: int, masked: bool):
+        torch.manual_seed(6100 + rank_idx * 100 + step)
+        x_fp8, x_sf = per_token_cast_to_fp8(
+            torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda'),
+            use_ue8m0=False, gran_k=128, use_packed_ue8m0=False)
+        token_ids = torch.arange(num_tokens, device='cuda').unsqueeze(1)
+        slots = torch.arange(num_topk, device='cuda').unsqueeze(0)
+        indices = (token_ids + slots + rank_idx + step) % num_experts
+        weights = torch.rand((num_tokens, num_topk), dtype=torch.float, device='cuda') + 0.25
+        if masked:
+            indices.fill_(-1)
+            weights.zero_()
+        buffer.x[:num_tokens].copy_(x_fp8)
+        buffer.x_sf[:num_tokens].copy_(x_sf)
+        buffer.topk_idx[:num_tokens].copy_(indices)
+        buffer.topk_weights[:num_tokens].copy_(weights)
+        y.fill_(float('nan'))
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+        torch.cuda.synchronize()
+        return x_fp8, x_sf, indices, weights
+
+    def check(label: str, inputs, masked: bool):
+        nonlocal expected_stats
+        x_fp8, x_sf, indices, weights = inputs
+        gathered_indices = uneven_all_gather(indices, group=group).cpu()
+        valid = gathered_indices[gathered_indices >= 0]
+        counts = torch.bincount(valid, minlength=num_experts)
+        start = rank_idx * num_experts_per_rank
+        expected_stats += counts[start:start + num_experts_per_rank].to(torch.int)
+        actual_stats = cum_stats.cpu()
+        y_ref = _reference_fused(
+            x_fp8, x_sf, indices, weights,
+            l1_fp8, l1_sf, l2_fp8, l2_sf,
+            rank_idx, num_ranks, group, num_experts, num_topk,
+            hidden, intermediate_hidden, 10.0)
+        if num_tokens == 0:
+            diff = 0.0
+            output_ok = y.shape == y_ref.shape and y.numel() == 0
+        elif masked:
+            diff = 0.0
+            output_ok = bool((y == 0).all().item() and (y_ref == 0).all().item())
+        else:
+            diff = float(calc_diff(y, y_ref))
+            output_ok = bool(torch.isfinite(y).all().item()) and diff < diff_tol
+        stats_ok = torch.equal(actual_stats, expected_stats)
+        failed = torch.tensor([not (output_ok and stats_ok)], dtype=torch.int, device='cuda')
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
+        any_failed = bool(failed.item())
+        if not output_ok or not stats_ok:
+            print(f'[{name}/{label} rank={rank_idx}] diff={diff} '
+                  f'stats={actual_stats.tolist()} expected={expected_stats.tolist()}', flush=True)
+        assert not any_failed, f'{name}/{label}: output or exact cumulative stats mismatch'
+
+    try:
+        for step, masked in enumerate((False, True, False)):
+            inputs = prepare(step, masked)
+            with torch.cuda.stream(stream):
+                launch()
+            torch.cuda.synchronize()
+            check(f'eager{step}', inputs, masked)
+
+        # Capture only the warmed kernel calls; cross-rank coordination and oracles stay outside.
+        inputs = prepare(3, False)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            launch()
+        torch.cuda.synchronize()
+        capture_changed_stats = torch.tensor(
+            [not torch.equal(cum_stats.cpu(), expected_stats)], dtype=torch.int, device='cuda')
+        dist.all_reduce(capture_changed_stats, op=dist.ReduceOp.MAX, group=group)
+        assert not capture_changed_stats.item(), f'{name}: capture unexpectedly executed kernels'
+
+        for step, masked in enumerate((False, True, False), start=4):
+            inputs = prepare(step, masked)
+            graph.replay()
+            torch.cuda.synchronize()
+            check(f'replay{step}', inputs, masked)
+        dist_print(f'  [{name}] counts={cfg["rank_counts"]}: eager/replay reuse and exact stats OK',
+                   once_in_node=True)
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+        if graph is not None:
+            graph.reset()
+        buffer.destroy()
+        dist.barrier(group=group)
+
+
 # Entry point
 
 def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    deep_gemm.set_pdl(bool(args.pdl))
 
     # Skip on non-SM90
     if get_arch_major() != 9:
@@ -494,6 +676,8 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
         layers += _layer4_edges(num_ranks)
     if 5 in args.layers:
         layers += _layer5_stress(num_ranks, args.num_correctness_tests or 8)
+    if 6 in args.layers:
+        layers += _layer6_stateful(num_ranks)
 
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
@@ -505,7 +689,8 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
     failures: List[str] = []
     for name, cfg in layers:
         try:
-            _run_scenario(name, cfg, rank_idx, num_ranks, group, diff_tol)
+            runner = _run_stateful_scenario if name.startswith('L6.') else _run_scenario
+            runner(name, cfg, rank_idx, num_ranks, group, diff_tol)
         except AssertionError as ex:
             dist_print(f'  [{name}] FAIL: {ex}', once_in_node=True)
             failures.append(name)
@@ -530,14 +715,17 @@ if __name__ == '__main__':
     parser.add_argument('--num-processes', type=int, default=2,
                         help='Number of ranks to spawn (default: 2)')
     parser.add_argument('--layers', type=int, nargs='+', default=[1, 2, 3, 4],
-                        help='Which layers to run (1..5). Default: 1 2 3 4. '
-                             'Layer 5 runs 8 random cases unless overridden.')
+                        help='Which layers to run (1..6). Default: 1 2 3 4. '
+                             'Layer 5 runs 8 random cases unless overridden; '
+                             'optional layer 6 checks uneven stateful reuse and CUDA graphs.')
     parser.add_argument('--num-correctness-tests', type=int, default=None,
                         help='Layer 5 stress test count')
     parser.add_argument('--filter', type=str, default='',
                         help='Substring filter on scenario names')
     parser.add_argument('--diff-tol', type=float, default=0.01,
                         help='calc_diff tolerance (default: 0.01)')
+    parser.add_argument('--pdl', type=int, choices=(0, 1), default=0,
+                        help='Set the global PDL default; SM90 MegaMoE must retain stream ordering')
     parser.add_argument('--fail-fast', action='store_true',
                         help='Stop on first failing scenario')
     args = parser.parse_args()

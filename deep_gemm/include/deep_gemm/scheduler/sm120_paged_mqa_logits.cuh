@@ -69,6 +69,7 @@ void sm120_paged_mqa_logits_metadata(const uint32_t batch_size, const uint32_t n
         prefix_sum[k * 32 + lane_idx] = x;
         sum = __shfl_sync(0xffffffff, x, 31);
     }
+    __syncwarp();
 
     // SM work distribution
     if constexpr (kIsVarlen) {

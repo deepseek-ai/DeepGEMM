@@ -24,7 +24,8 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumMathThreads + kNumTMAThreads, 1)
 sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                                 const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                                float* gmem_d, float* sqr_sum) {
+                                float* gmem_d, float* sqr_sum,
+                                const int64_t stride_d_m, const int64_t stride_d_split) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
     namespace sm120_mma = mma::sm120;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -227,6 +228,8 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 }
             }
 
+            // Order shared-memory reads before the producer reuses this stage.
+            cutlass::arch::fence_view_async_shared();
             if (lane_idx == 0)
                 empty_barriers[stage_idx]->arrive();
         }
@@ -249,7 +252,7 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
         // D epilogue: direct store FP32
         // D fragment: d0=D[g, t*2], d1=D[g, t*2+1], d2=D[g+8, t*2], d3=D[g+8, t*2+1]
-        const int64_t d_split_offset = static_cast<int64_t>(k_split_idx) * shape_m * SHAPE_N;
+        const int64_t d_split_offset = static_cast<int64_t>(k_split_idx) * stride_d_split;
 
         #pragma unroll
         for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
@@ -261,11 +264,11 @@ sm120_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 const uint32_t col = nt * MMA_N + thread_id * 2;
 
                 if (row0 < shape_m and col + 1 < SHAPE_N) {
-                    auto idx = d_split_offset + static_cast<int64_t>(row0) * SHAPE_N + col;
+                    auto idx = d_split_offset + static_cast<int64_t>(row0) * stride_d_m + col;
                     *reinterpret_cast<float2*>(&gmem_d[idx]) = make_float2(accum[ai + 0], accum[ai + 1]);
                 }
                 if (row1 < shape_m and col + 1 < SHAPE_N) {
-                    auto idx = d_split_offset + static_cast<int64_t>(row1) * SHAPE_N + col;
+                    auto idx = d_split_offset + static_cast<int64_t>(row1) * stride_d_m + col;
                     *reinterpret_cast<float2*>(&gmem_d[idx]) = make_float2(accum[ai + 2], accum[ai + 3]);
                 }
             }

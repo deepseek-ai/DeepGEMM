@@ -1,21 +1,18 @@
 #pragma once
 
+#include <iostream>
+#include <sstream>
+#include <string>
 #include <unordered_set>
+
 #include <deep_gemm/common/types.cuh>
+#include <deep_jit/utils/env.hpp>
 
 #include "config.hpp"
 #include "runtime.hpp"
 #include "../../utils/layout.hpp"
-#include "../../utils/system.hpp"
 
 namespace deep_gemm {
-
-inline int get_byte_addressable_element_size(const MmaKind& mma_kind) {
-    const int element_size = get_element_size(mma_kind);
-    DG_HOST_ASSERT(element_size != -1 and "Unknown MMA kind");
-    DG_HOST_ASSERT(element_size > 0);
-    return element_size;
-}
 
 template <typename ArchSpec>
 static GemmConfig get_best_config(const GemmDesc& desc) {
@@ -44,7 +41,7 @@ static GemmConfig get_best_config(const GemmDesc& desc) {
     };
 
     // Print configs for the first time
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
+    if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
         std::stringstream ss;
         ss << desc;
         const auto key = ss.str();

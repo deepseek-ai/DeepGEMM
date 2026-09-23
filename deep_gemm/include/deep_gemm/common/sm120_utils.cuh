@@ -2,9 +2,36 @@
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)) || defined(__CLION_IDE__)
 
+// SM120 block-scaled MMA requires CUDA 13.0+. There are reports that with
+// `--gpu-architecture=sm_120a` a pre-13 ptxas falls back to plain sm_120 and drops
+// `block_scale` -- a silent wrong-numerics failure, not a build failure. On 13.x the
+// emitted PTX/SASS keeps `block_scale` (see docs/design.md); 12.x is rejected here
+// as a precaution because the failure mode would be silent.
+//
+// Placed here, before the includes, on purpose:
+//   * this file is SM120-exclusive (upstream never opens it), so the guard costs
+//     zero upstream-sync surface;
+//   * it is inside the `__CUDA_ARCH__ >= 1200` block, so it fires only in an SM120
+//     *device* pass -- i.e. exactly when the JIT invokes nvcc for an SM120 kernel.
+//     Host passes and sm90/sm100 device passes are untouched;
+//   * before the includes rather than after, so it fires without first resolving the
+//     CUDA and CuTe include graph -- which also makes it checkable with a
+//     preprocessor-only probe.
+//
+// The same guard is duplicated in `mma/sm120.cuh`, the file that actually emits the
+// `block_scale` MMA PTX, so coverage there is structural rather than incidental.
+//
+// Coverage: the SM120 kernels that issue block-scaled/FP8 MMA all include this header.
+// `impls/sm120_split_k_reduce.cuh` and `scheduler/sm120_paged_mqa_logits.cuh` do not --
+// they are plain FP32 reduce / metadata kernels with no MMA, outside the guard's remit.
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ < 13)
+#error "DeepGEMM SM120 kernels require CUDA 13.0 or newer"
+#endif
+
 #include <cuda/std/cstdint>
 #include <cuda_bf16.h>
 
+#include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/swizzle.hpp>
 #include <deep_gemm/ptx/ld_st.cuh>
 
@@ -250,6 +277,17 @@ __device__ __forceinline__ void load_b_fragment_x4(
 
 __device__ __forceinline__ uint32_t load_sf(const char* smem_sf, int idx) {
     return *reinterpret_cast<const uint32_t*>(smem_sf + idx * sizeof(int32_t));
+}
+
+// Kept in this SM120-owned header so SM120 kernels do not depend on the base repo's
+// `ptx/tma.cuh` providing it (nv_dev has it, main-lineage bases do not).
+// Consumed by `impls/sm120_bf16_gemm.cuh` and `impls/sm120_fp8_fp4_gemm_1d1d.cuh`
+// (k-grouped tensormap patching).
+CUTLASS_DEVICE void tensor_map_replace_global_dim_in_smem(cute::TmaDescriptor* smem_desc,
+                                                         const uint32_t& new_dim) {
+    auto smem_int_desc = __cvta_generic_to_shared(smem_desc);
+    asm volatile ("tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 0, %1;"
+                  :: "l"(smem_int_desc), "r"(new_dim));
 }
 
 } // namespace deep_gemm::sm120

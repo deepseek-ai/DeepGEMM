@@ -9,6 +9,15 @@
 
 namespace deep_gemm {
 
+static int get_num_element_bits(const MmaKind& mma_kind) {
+    switch (mma_kind) {
+        case MmaKind::BF16:     return 16;
+        case MmaKind::MXFP8FP4: return 8;
+        case MmaKind::MXF4:     return 4;
+        default: DG_HOST_UNREACHABLE("Unknown MMA kind");
+    }
+}
+
 template <typename size_type_t>
 static int get_swizzle_mode(const int& block_size, const size_type_t& elem_size) {
     // `> 0` means interleaving

@@ -2,18 +2,15 @@
 
 #include <torch/python.h>
 
-#include "../../jit/compiler.hpp"
-#include "../../jit/device_runtime.hpp"
-#include "../../jit/kernel_runtime.hpp"
+#include "sm120_runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/format.hpp"
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
 
-class SM120BmkBnkMnRuntime final: public LaunchRuntime<SM120BmkBnkMnRuntime> {
+class SM120BmkBnkMnRuntime final: public SM120LaunchRuntime<SM120BmkBnkMnRuntime> {
 public:
     struct Args {
         int s, m, n, k;
@@ -23,7 +20,7 @@ public:
         int num_stages;
         int num_tma_threads, num_math_threads;
 
-        LaunchArgs launch_args;
+        SM120LaunchArgs launch_args;
 
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
@@ -31,7 +28,7 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
-        return fmt::format(R"(
+        return std::format(R"(
 #include <deep_gemm/impls/sm120_bmk_bnk_mn.cuh>
 
 using namespace deep_gemm;
@@ -55,9 +52,10 @@ static void __instantiate_kernel() {{
         args.num_tma_threads, args.num_math_threads);
     }
 
-    static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
-        DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
-            args.s, args.tensor_map_a, args.tensor_map_b, args.d));
+    template <typename Kernel>
+    static void launch_impl(const Kernel& kernel, const Args& args) {
+        sm120_launch_kernel(kernel, args.launch_args,
+            args.s, args.tensor_map_a, args.tensor_map_b, args.d);
     }
 };
 
@@ -78,7 +76,7 @@ static void sm120_bmn_bnk_mn_gemm(const torch::Tensor &a,
     const int swizzle_ab_mode = get_swizzle_mode(block_k, static_cast<int>(a.element_size()));
     DG_HOST_ASSERT(swizzle_ab_mode == 128);
 
-    const int num_sms = device_runtime->get_num_sms();
+    const int num_sms = deep_gemm::runtime->get_num_sms();
     const int num_mn_blocks = ceil_div(m, block_m) * ceil_div(n, block_n);
     const int num_sk_blocks = s * (k / block_k);
     const int split_factor = ceil_div(num_sk_blocks, std::max(num_sms / num_mn_blocks, 1));
@@ -100,7 +98,7 @@ static void sm120_bmn_bnk_mn_gemm(const torch::Tensor &a,
     }
     DG_HOST_ASSERT(num_stages > 0);
 
-    if (get_env("DG_JIT_DEBUG", 0)) {
+    if (deep_jit::get_env<int>("DG_JIT_DEBUG", 0)) {
         printf("SM120 bmk_bnk_mn: S: %d, M: %d, N: %d, K: %d -> "
                "split_factor: %d, stages: %d, shared memory: %d\n",
                s, m, n, k, split_factor, num_stages, smem_size);
@@ -117,13 +115,13 @@ static void sm120_bmn_bnk_mn_gemm(const torch::Tensor &a,
         .num_stages = num_stages,
         .num_tma_threads = num_tma_threads,
         .num_math_threads = num_math_threads,
-        .launch_args = LaunchArgs(num_mn_blocks * ceil_div(num_sk_blocks, split_factor), num_tma_threads + num_math_threads, smem_size),
+        .launch_args = SM120LaunchArgs(num_mn_blocks * ceil_div(num_sk_blocks, split_factor), num_tma_threads + num_math_threads, smem_size, 1),
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .d = d.data_ptr<float>()
     };
     const auto code = SM120BmkBnkMnRuntime::generate(args);
-    const auto runtime = compiler->build("sm120_bmn_bnk_mn_gemm", code);
+    const auto runtime = jit->compile("sm120_bmn_bnk_mn_gemm", code);
     SM120BmkBnkMnRuntime::launch(runtime, args);
 }
 

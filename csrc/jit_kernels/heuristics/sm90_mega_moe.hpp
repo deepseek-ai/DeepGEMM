@@ -3,17 +3,19 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <format>
+#include <iostream>
 #include <string>
 #include <unordered_set>
 
 #include "../../utils/exception.hpp"
 
+#include <deep_jit/utils/env.hpp>
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/nv_moe_workspace.cuh>
 #include <deep_gemm/layout/sm90_mega_moe.cuh>
 
 #include "../../utils/math.hpp"
-#include "../../utils/system.hpp"
 #include "sm90.hpp"
 
 namespace deep_gemm {
@@ -455,7 +457,7 @@ static MegaMoESM90Config make_generic_mega_moe_config_sm90(
     const Sm90MoeHeuristicInput& input,
     const bool conservative = false) {
     const int block_m = 64;
-    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+    const int num_max_pool_tokens = layout::nv_moe::get_num_max_pool_tokens(
         input.num_ranks, input.num_max_tokens_per_rank,
         input.num_topk, input.num_experts_per_rank);
     const int block_k = 128;
@@ -519,7 +521,7 @@ static MegaMoESM90Config make_generic_mega_moe_config_sm90(
         swap_ab);
     DG_HOST_ASSERT(num_stages >= 2 and smem_size > 0);
     const int sf_pool_stride_tokens =
-        layout::get_num_sf_ring_tokens(num_max_pool_tokens, block_m);
+        layout::nv_moe::get_num_sf_ring_tokens(num_max_pool_tokens, block_m);
     return {
         block_m, block_n, block_k,
         num_max_pool_tokens, input.num_padded_sf_pool_tokens, sf_pool_stride_tokens,
@@ -827,7 +829,7 @@ static bool try_materialize_sm90_moe_phase_tuning(
     config.nmajor_schedule = tuning.nmajor_schedule;
     config.one_warp_cleanup = tuning.one_warp_cleanup;
     config.swap_ab = tuning.swap_ab;
-    config.sf_pool_stride_tokens = layout::get_num_sf_ring_tokens(
+    config.sf_pool_stride_tokens = layout::nv_moe::get_num_sf_ring_tokens(
         config.num_max_pool_tokens, config.block_m);
 
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
@@ -889,8 +891,8 @@ static Sm90MoeLaunchConfig select_mega_moe_sm90(
         is_sm90_moe_launch_config_legal(input, candidate, tuning.selected)) {
         result = candidate;
     }
-    if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
-        const auto key = fmt::format(
+    if (deep_jit::get_env<int>("DG_JIT_DEBUG", 0) or deep_jit::get_env<int>("DG_PRINT_CONFIGS", 0)) {
+        const auto key = std::format(
             "Sm90MoeLaunchConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
             input.num_ranks, input.num_experts, input.hidden,
             input.intermediate_hidden, input.num_max_tokens_per_rank,
