@@ -260,7 +260,16 @@ static const torch::Tensor& get_sparse_mqa_logits_workspace(const torch::TensorO
     auto& workspace = workspaces[stream];
     if (not workspace.defined()) {
         // Warm up each stream before capture so one-time zeroing is not replayed with the graph.
-        DG_HOST_ASSERT(c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None);
+        if (c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None) {
+            // Capturing on a side stream: reuse a warmed workspace on this device instead of
+            // recording an allocation (assumes one warmed stream per device, whose eager
+            // launches are serialized with the replays).
+            for (const auto& [other_stream, other_workspace] : workspaces) {
+                if (other_workspace.defined() and other_workspace.device() == options.device())
+                    return other_workspace;
+            }
+            DG_HOST_UNREACHABLE("Warm up the sparse MQA logits workspace on this device before capturing");
+        }
         workspace = torch::zeros({kNumWorkspaceBytes}, options.dtype(torch::kByte));
     }
     return workspace;
@@ -434,7 +443,7 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
                    head_dim_with_sf == (is_fp4 ? head_dim / 2 : head_dim) + static_cast<int>(sizeof(int)));
     DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kUInt8 and fused_kv_cache.stride(1) == head_dim_with_sf and
                    fused_kv_cache.stride(3) == 1 and fused_kv_cache.stride(0) <= std::numeric_limits<int>::max() and
-                   fused_kv_cache.stride(0) % 512 == 0);
+                   fused_kv_cache.stride(0) % 16 == 0);  // pages are read with 16-byte cp.async chunks
     DG_HOST_ASSERT(fused_kv_cache.is_cuda() and fused_kv_cache.device() == q_fp.device());
 
     const auto [_num_q_tokens_weights, _num_heads_weights] = get_shape<2>(weights);
@@ -442,7 +451,8 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
     DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 and weights.stride(1) == 1);
     DG_HOST_ASSERT(metadata.dim() == 1 and metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous());
     DG_HOST_ASSERT(metadata.numel() >= static_cast<int64_t>(sizeof(MetadataHeader)));
-    for (const auto& tensor: {q_fp, q_sf, weights, metadata}) {
+    // Pages start at `data_ptr() + page_idx * stride(0)`, so the base pointer needs 16-byte alignment too
+    for (const auto& tensor: {q_fp, q_sf, fused_kv_cache, weights, metadata}) {
         DG_HOST_ASSERT(tensor.is_cuda() and tensor.device() == q_fp.device());
         DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0);
     }
