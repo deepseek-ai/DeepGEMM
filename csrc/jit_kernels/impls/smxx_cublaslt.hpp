@@ -51,7 +51,6 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     DG_CUBLASLT_CHECK(cublasLtMatmulDescInit(&desc, compute_type, scale_type));
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(&desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
     DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(&desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
-    DG_CUBLASLT_CHECK(cublasLtMatmulDescSetAttribute(&desc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
 
     if (with_block_sf) {
         // NOTES: cuBLASLt only supports the NVFP4 recipe for FP4 operands
