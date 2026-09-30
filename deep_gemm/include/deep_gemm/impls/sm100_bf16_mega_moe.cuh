@@ -63,10 +63,16 @@ sm100_bf16_mega_moe_impl(void* y,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_weights,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_output,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts,
-                         const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights) {
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
+                         const uint8_t* sm_locality_domains) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
+
+    // Use one domain when clusters cannot split evenly across device locality domains
+    constexpr uint32_t kNumLocalityDomains =
+        L1_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 and
+        L2_SHAPE_N % (BLOCK_N * 2 * kNumDeviceLocalityDomains) == 0 ? kNumDeviceLocalityDomains : 1;
 
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
@@ -244,7 +250,7 @@ sm100_bf16_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumSMs, kNumRanks,
-        kNumRingBlocks,
+        kNumRingBlocks, kNumLocalityDomains,
         kNumSharedExperts>(
             workspace,
             shared_storage.task_info_full_barriers,
@@ -559,10 +565,11 @@ sm100_bf16_mega_moe_impl(void* y,
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
                 *workspace.get_expert_send_count_ptr(i) = 0;
             if (warp_idx == 0 and cute::elect_one_sync()) {
-                *workspace.get_l1_task_count_ptr() = 0;
-                *workspace.get_l2_task_count_ptr() = 0;
-                *workspace.get_shared_l1_task_count_ptr() = 0;
-                *workspace.get_shared_l2_task_count_ptr() = 0;
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumDeviceLocalityDomains; ++ i) {
+                    workspace.get_l1_task_count_ptr()[i] = workspace.get_l2_task_count_ptr()[i] = 0;
+                    workspace.get_shared_l1_task_count_ptr()[i] = workspace.get_shared_l2_task_count_ptr()[i] = 0;
+                }
             }
             __syncwarp();
             for (uint32_t i = thread_idx; i < workspace.num_shared_l2_pool_blocks; i += kNumDispatchThreads)
@@ -693,18 +700,20 @@ sm100_bf16_mega_moe_impl(void* y,
             const auto n_block_idx = task_info.n_cluster_idx * 2 + (is_leader_cta ? 0u : 1u);
             const auto num_k_blocks = math::ceil_div(shape_k, BLOCK_K);
 
+            const uint32_t half_n = shape_n / 2, n_idx = n_block_idx * BLOCK_N, half_idx = n_idx >= half_n;
+            const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx;
+
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
 
                 // Compute weight offset
-                uint32_t n_idx = task_info.is_shared() ? n_block_idx * BLOCK_N : task_info.local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                 uint32_t k_idx = k_block_idx * BLOCK_K;
 
                 // TMA copy weights
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
-                        tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], k_idx, n_idx, 2);
+                    tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
+                        tensor_map_b_ptr, &shared_storage.full_barriers[stage_idx], shared_storage.smem_b[stage_idx], 2, k_idx, half_n_idx, half_idx, expert_idx);
                     if (is_leader_cta) {
                         shared_storage.full_barriers[stage_idx].arrive_and_expect_tx(sizeof(shared_storage.smem_b[0]) * 2);
                     } else {
@@ -810,7 +819,7 @@ sm100_bf16_mega_moe_impl(void* y,
 
         // Do mainloop by the leader CTA
         if (is_leader_cta)
-            scheduler.mainloop(num_tokens);
+            scheduler.mainloop(num_tokens, sm_locality_domains);
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
@@ -1225,8 +1234,8 @@ sm100_bf16_mega_moe_impl(void* y,
             uint32_t mask = total_mask;
             const auto move_mask_and_load = [&](const uint32_t& i) {
                 if (mask) {
-                    // Move
-                    const uint32_t slot_idx = __ffs(mask) - 1;
+                    // Shared slot goes first, then routed slots in top-k order
+                    const uint32_t slot_idx = (mask >> kNumTopk) ? kNumTopk : __ffs(mask) - 1;
                     mask ^= 1 << slot_idx;
 
                     // Load

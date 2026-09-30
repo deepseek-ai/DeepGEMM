@@ -7,9 +7,11 @@
 #include "apis/config.hpp"
 #include "apis/attention.hpp"
 #include "apis/einsum.hpp"
+#include "apis/epilogue_class.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
 #include "apis/layout.hpp"
+#include "apis/locality_domain.hpp"
 #include "apis/mega_moe.hpp"
 #include "apis/mega_mhc.hpp"
 #include "apis/mega_gate.hpp"
@@ -27,6 +29,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // Register config APIs
     deep_gemm::config::register_apis(m);
+
+    // Register locality domain APIs
+    deep_gemm::locality_domain::register_apis(m);
+
+    // Register epilogue classes
+    deep_gemm::epilogue_class::register_apis(m);
 
     // Register kernels
     // TODO: make SM80 incompatible issues raise errors

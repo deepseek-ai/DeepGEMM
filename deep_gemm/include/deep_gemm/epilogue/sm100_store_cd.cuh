@@ -4,7 +4,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 
@@ -17,7 +17,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumUMMAStoreThreads,
           uint32_t kNumOverlappedTmemCols,
           GemmType kGemmType, bool kWithAccumulation,
-          typename epilogue_op_t,
+          typename epilogue_operator_t,
           typename smem_t>
 CUTLASS_DEVICE void
 sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
@@ -25,15 +25,17 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
                const uint32_t& base_m_idx, const uint32_t& base_n_idx, const uint32_t& batch_idx,
                const bool& is_empty_group,
                const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
-               const epilogue_op_t& epilogue_op,
+               const epilogue_operator_t& epilogue_operator,
                const bool& reverse_store_order,
                const cutlass::arch::ClusterTransactionBarrier* tmem_overlap_barrier,
                const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
                const cute::TmaDescriptor& tensor_map_cd) {
     using cd_dtype_t = typename smem_t::cd_dtype;
-    // Whether to cast D into FP8 with dynamic per-`kSFGranN` UE8M0 SFs (see `EpilogueDynamicScaledFP8`)
-    constexpr bool kWithOutputSF = cute::is_same_v<epilogue_op_t, transform::EpilogueDynamicScaledFP8>;
-    constexpr uint32_t kSFGranN = transform::EpilogueDynamicScaledFP8::kSFGranN;
+    // Whether to cast D into FP8 with dynamic per-`kSFGranN` UE8M0 SFs (see `QuantizeToFP8`)
+    constexpr bool kWithOutputSF = cute::is_same_v<epilogue_operator_t, operators::QuantizeToFP8>;
+    constexpr bool kWithStochasticRounding =
+        cute::is_same_v<epilogue_operator_t, operators::StochasticRoundToBF16>;
+    constexpr uint32_t kSFGranN = operators::QuantizeToFP8::kSFGranN;
     // TMA checks
     constexpr uint32_t kNumBankGroupBytes = 16;
     constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
@@ -43,6 +45,9 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
     DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
     DG_STATIC_ASSERT(not kWithOutputSF or cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t>, "FP8 output requires an E4M3 D");
     DG_STATIC_ASSERT(not kWithOutputSF or STORE_BLOCK_N % kSFGranN == 0, "A store must cover complete SF groups");
+    DG_STATIC_ASSERT(not kWithStochasticRounding or
+                     (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> and not kWithAccumulation),
+                     "Stochastic rounding only supports direct BF16 output");
 
     // Share store pipeline between blocks
     auto advance_store_pipeline = [&]() {
@@ -83,7 +88,7 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
 
             // The pipeline stage
             const auto m_idx = base_m_idx + w * STORE_BLOCK_M;
-            const auto n_idx = epilogue_op_t::apply_index_n<STORE_BLOCK_N>(base_n_idx + store_idx * STORE_BLOCK_N);
+            const auto n_idx = base_n_idx + store_idx * STORE_BLOCK_N;
 
             // Iterate over TMEM loads: each covers one swizzled bank group per lane, or one
             // complete SF group per lane (one row, `kSFGranN` columns) with FP8 output
@@ -94,7 +99,7 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
 
             // A store covering a whole packed word (with word-aligned batches) writes all 4 SF bytes at once
             const auto row_idx = m_idx + epilogue_warp_idx * 32 + lane_idx;
-            const bool store_whole_sf_word = kWithOutputSF and kNumLoads == 4 and epilogue_op.shape_n % (4 * kSFGranN) == 0;
+            const bool store_whole_sf_word = kWithOutputSF and kNumLoads == 4 and epilogue_operator.shape_n % (4 * kSFGranN) == 0;
             uint32_t sf_word = 0;
 
             #pragma unroll
@@ -116,7 +121,7 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
                     tmem_load_t::copy(tmem_addr, values[Is]...);
                 }(cute::make_index_sequence<kNumElemsPerLoad>{});
                 cutlass::arch::fence_view_async_tmem_load();
-                epilogue_op.apply_values(values);
+                epilogue_operator.apply_values(values);
                 #pragma unroll
                 for (uint32_t value_idx = 0; value_idx < kNumElemsPerLoad; ++ value_idx)
                     values[value_idx] = is_empty_group ? 0u : values[value_idx];
@@ -166,9 +171,17 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
                     if (store_whole_sf_word)
                         sf_word |= sf_exp << (load_idx * 8);
                     else
-                        epilogue_op.store_sf(row_idx, n_idx + load_idx * kSFGranN, batch_idx, static_cast<uint8_t>(sf_exp));
+                        epilogue_operator.store_sf(row_idx, n_idx + load_idx * kSFGranN, batch_idx, static_cast<uint8_t>(sf_exp));
                 } else if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                     ptx::st_shared(get_swizzled_smem_ptr(load_idx), values[0], values[1], values[2], values[3]);
+                } else if constexpr (kWithStochasticRounding) {
+                    // The eight values per load are N-contiguous: exactly two rounding quartets
+                    DG_STATIC_ASSERT(kNumElemsPerLoad == 8, "Stochastic rounding requires eight BF16 values per load");
+                    const auto quartet_n_idx = (n_idx + load_idx * kNumElemsPerLoad) / 4;
+                    uint32_t packed[4];
+                    epilogue_operator.cast_quartet(values[0], values[1], values[2], values[3], quartet_n_idx, packed[0], packed[1]);
+                    epilogue_operator.cast_quartet(values[4], values[5], values[6], values[7], quartet_n_idx + 1, packed[2], packed[3]);
+                    ptx::st_shared(get_swizzled_smem_ptr(load_idx), packed[0], packed[1], packed[2], packed[3]);
                 } else {
                     ptx::st_shared(
                         get_swizzled_smem_ptr(load_idx),
@@ -181,7 +194,7 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
             }
             if constexpr (kWithOutputSF) {
                 if (store_whole_sf_word)
-                    epilogue_op.store_sf(row_idx, n_idx, batch_idx, sf_word);
+                    epilogue_operator.store_sf(row_idx, n_idx, batch_idx, sf_word);
             }
 
             // Synchronize all threads and issue TMA

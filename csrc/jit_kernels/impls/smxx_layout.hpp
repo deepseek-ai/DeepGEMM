@@ -282,7 +282,7 @@ static torch::Tensor get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(cons
     return out;
 }
 
-// Validate a user-provided, already packed UE8M0 (`int32`) SF tensor.
+// K-grouped packed SF is [sum(packed_K_g), MN], with contiguous MN and an aligned K pitch.
 static torch::Tensor check_k_grouped_packed_ue8m0_tensor(const torch::Tensor& sf,
                                                          const torch::Tensor& grouped_layout,
                                                          const std::optional<std::vector<int>>& ks_cpu,
@@ -292,12 +292,12 @@ static torch::Tensor check_k_grouped_packed_ue8m0_tensor(const torch::Tensor& sf
     DG_HOST_ASSERT(sf.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(gran_k == 32);
     DG_HOST_ASSERT(sf.dim() == 2);
-    DG_HOST_ASSERT(sf.is_contiguous());
 
     const auto [packed_sf_k, mn] = get_shape<2>(sf);
     const auto num_groups = static_cast<int>(grouped_layout.numel());
     DG_HOST_ASSERT(mn % 4 == 0);
-    DG_HOST_ASSERT(sf.stride(0) == mn and sf.stride(1) == 1);
+    DG_HOST_ASSERT(sf.stride(0) >= mn and sf.stride(1) == 1);
+    DG_HOST_ASSERT(sf.stride(0) % 4 == 0);
     DG_HOST_ASSERT(grouped_layout.is_contiguous() and grouped_layout.scalar_type() == torch::kInt);
     DG_HOST_ASSERT(packed_sf_k > 0);
 

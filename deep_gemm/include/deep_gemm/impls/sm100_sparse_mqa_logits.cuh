@@ -34,18 +34,22 @@ CUTLASS_DEVICE uint32_t get_swizzled_kv_chunk_idx(const uint32_t logical_chunk_i
 template <uint32_t SPARSE_BLOCK_KV, typename qk_dtype_t>
 struct ContiguousSparseKVAccessor {
     static constexpr bool kSupportsContiguousTMA = true;
+    static constexpr bool kNeedsTailMask = true;
     static constexpr uint32_t kNumQKBytesPerToken = kHeadDim / get_smem_pack_factor<qk_dtype_t>();
     using KVBlockRef = uint32_t;
 
     const uint8_t* kv;
     const uint32_t* sf_kv;
+    const uint32_t num_kv_tokens;
     const cute::TmaDescriptor* tensor_map_kv;
     const cute::TmaDescriptor* tensor_map_sf_kv;
 
     CUTLASS_HOST_DEVICE ContiguousSparseKVAccessor(const uint8_t* kv, const uint32_t* sf_kv,
+                                                  const uint32_t num_kv_tokens,
                                                   const cute::TmaDescriptor* tensor_map_kv,
                                                   const cute::TmaDescriptor* tensor_map_sf_kv)
-        : kv(kv), sf_kv(sf_kv), tensor_map_kv(tensor_map_kv), tensor_map_sf_kv(tensor_map_sf_kv) {}
+        : kv(kv), sf_kv(sf_kv), num_kv_tokens(num_kv_tokens),
+          tensor_map_kv(tensor_map_kv), tensor_map_sf_kv(tensor_map_sf_kv) {}
 
     CUTLASS_DEVICE void prefetch_tma_descriptors() const {
         cute::prefetch_tma_descriptor(tensor_map_kv);
@@ -80,7 +84,6 @@ struct ContiguousSparseKVAccessor {
     CUTLASS_DEVICE const uint8_t* get_kv_block(const KVBlockRef kv_block_ref,
                                                const uint32_t src_lane_idx) const {
         const uint32_t kv_token_start = ptx::exchange(kv_block_ref, src_lane_idx);
-        // Tail reads rely on PyTorch allocator padding; extra logits are ignored
         return kv + static_cast<uint64_t>(kv_token_start) * kNumQKBytesPerToken;
     }
 
@@ -88,11 +91,17 @@ struct ContiguousSparseKVAccessor {
                                                    const uint32_t src_lane_idx) const {
         return sf_kv + ptx::exchange(kv_block_ref, src_lane_idx);
     }
+
+    // Number of tokens of the block that lie inside the KV tensor
+    CUTLASS_DEVICE uint32_t get_num_valid_tokens(const KVBlockRef kv_block_ref) const {
+        return cute::min(SPARSE_BLOCK_KV, num_kv_tokens - cute::min(kv_block_ref, num_kv_tokens));
+    }
 };
 
 template <uint32_t PAGE_KV, uint32_t SPARSE_BLOCK_KV, typename qk_dtype_t>
 struct PagedSparseKVAccessor {
     static constexpr bool kSupportsContiguousTMA = false;
+    static constexpr bool kNeedsTailMask = false;
     static constexpr uint32_t kNumQKBytesPerToken = kHeadDim / get_smem_pack_factor<qk_dtype_t>();
 
     struct KVBlockRef {
@@ -134,7 +143,7 @@ struct PagedSparseKVAccessor {
 
 } // namespace sparse_mqa_detail
 
-template <uint32_t SPARSE_BLOCK_KV, uint32_t kNumQStages, uint32_t kNumKVStages,
+template <uint32_t kNumHeads, uint32_t SPARSE_BLOCK_KV, uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumTmemStages, uint32_t kNumMathWarpGroups,
           uint32_t kNumSMs, uint32_t BLOCK_Q, bool kUseUnalignedKs,
           typename qk_dtype_t, typename KVAccessor>
@@ -150,6 +159,9 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
     constexpr uint32_t kPackFactor = get_smem_pack_factor<qk_dtype_t>();
     constexpr uint32_t UMMA_M = 128;
     constexpr uint32_t UMMA_N = BLOCK_Q * kNumHeads;
+    constexpr uint32_t kNumWeightElementsPerRow = math::constexpr_align(kNumHeads, 8u);
+    // Whole 4/8/16-head loads avoid reading beyond the last token's TMEM columns.
+    constexpr uint32_t kNumHeadsPerLoad = math::constexpr_gcd(kNumHeads, 16u);
     constexpr uint32_t UMMA_K = kIsFP4 ? 64 : 32;
     constexpr uint32_t SPLIT_KV = kNumMathWarpGroups * UMMA_M;
 
@@ -176,7 +188,8 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
     constexpr uint32_t kNumTmemCols = utils::get_num_aligned_tmem_cols<kTmemStartColOfSFKV + kNumKVStages * kNumSFKVColsPerStage>();
 
     // Template checks
-    DG_STATIC_ASSERT(BLOCK_Q == 2 and UMMA_N == 64, "Sparse MQA requires BLOCK_Q=2");
+    DG_STATIC_ASSERT(BLOCK_Q == 2, "Sparse MQA requires BLOCK_Q=2");
+    DG_STATIC_ASSERT(kNumHeads > 0 and kNumHeads <= kNumMaxHeads and kNumHeads % 4 == 0, "Invalid head count");
     DG_STATIC_ASSERT(kNumMathWarpGroups == 4 or kNumMathWarpGroups == 5,
                      "Invalid number of math warpgroups");
     DG_STATIC_ASSERT(kNumTmemStages >= kNumMathWarpGroups, "Invalid TMEM stage count");
@@ -254,6 +267,8 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
 
         const auto header = reinterpret_cast<const MetadataHeader*>(metadata);
         DG_DEVICE_ASSERT(header->use_unaligned_ks == kUseUnalignedKs);
+        // The schedule is laid out as `[wave][num_sms]`, so a changed SM count needs new metadata
+        DG_DEVICE_ASSERT(header->num_sms == kNumSMs);
         const uint32_t num_waves = header->num_waves;
         const auto schedule_entries = reinterpret_cast<const ScheduleEntry*>(
             kv_splits + header->num_kv_splits);
@@ -271,10 +286,11 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
                                                             smem.q[q_stage_idx][0], 0, entry.q_token_base * kNumHeads);
                 tma::copy<BLOCK_Q * kNumHeads, 1, 0>(&tensor_map_sf_q, &smem.full_q_barriers[q_stage_idx],
                                                      smem.sf_q[q_stage_idx], 0, entry.q_token_base);
-                tma::copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_weights, &smem.full_q_barriers[q_stage_idx],
+                tma::copy<kNumWeightElementsPerRow, BLOCK_Q, 0>(&tensor_map_weights, &smem.full_q_barriers[q_stage_idx],
                                                  smem.weights[q_stage_idx], 0, entry.q_token_base);
                 smem.full_q_barriers[q_stage_idx].arrive_and_expect_tx(
-                    BLOCK_Q * kNumHeads * (kHeadDim / kPackFactor + sizeof(uint32_t) + sizeof(nv_bfloat16)));
+                    BLOCK_Q * (kNumHeads * (kHeadDim / kPackFactor + sizeof(uint32_t)) +
+                               kNumWeightElementsPerRow * sizeof(nv_bfloat16)));
             }
 
             for (uint32_t kv_split_idx = entry.kv_split_begin; kv_split_idx < entry.kv_split_end; ++ kv_split_idx) {
@@ -442,6 +458,51 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
             }
 
             const uint32_t kv_block_base_in_split = copy_warp_idx * kNumKVBlocksPerWarp;
+            if constexpr (KVAccessor::kNeedsTailMask) {
+                // Keep clipping out of the regular copy loop
+                if (KVSplitHeader::has_partial_tail(packed_num_kv_blocks)) {
+                    if (kv_block_base_in_split < num_kv_blocks) {
+                        const auto kv_block_ref = kv_accessor.resolve_kv_block(lane_idx < kNumKVBlocksPerWarp ?
+                            smem.kv_block_infos[kv_stage_idx][kv_block_base_in_split + lane_idx].physical_kv_block_idx : 0);
+                        const uint32_t num_valid_tokens = kv_block_base_in_split + lane_idx < num_kv_blocks ?
+                            kv_accessor.get_num_valid_tokens(kv_block_ref) : 0;
+                        // Scalar SF copies also handle unaligned KS and partially valid 16-byte vectors
+                        constexpr uint32_t kNumSFBlocksPerIteration = 32 / SPARSE_BLOCK_KV;
+                        #pragma unroll
+                        for (uint32_t sf_kv_block_base = 0; sf_kv_block_base < kNumKVBlocksPerWarp; sf_kv_block_base += kNumSFBlocksPerIteration) {
+                            const uint32_t sf_kv_block_offset = sf_kv_block_base + lane_idx / SPARSE_BLOCK_KV;
+                            const uint32_t token_in_kv_block = lane_idx % SPARSE_BLOCK_KV;
+                            const auto sf_kv_block = kv_accessor.get_sf_kv_block(kv_block_ref, sf_kv_block_offset);
+                            const bool is_valid = token_in_kv_block < ptx::exchange(num_valid_tokens, sf_kv_block_offset);
+                            ptx::cp_async_ca_zfill(sf_kv_block + (is_valid ? token_in_kv_block : 0),
+                                &smem.sf_kv[kv_stage_idx][(kv_block_base_in_split + sf_kv_block_offset) * SPARSE_BLOCK_KV + token_in_kv_block],
+                                is_valid ? sizeof(uint32_t) : 0);
+                        }
+                        cutlass::arch::cpasync_barrier_arrive_noinc(reinterpret_cast<uint64_t*>(&smem.full_sf_copy_barriers[kv_stage_idx]));
+
+                        #pragma unroll
+                        for (uint32_t kv_block_pair_offset = 0; kv_block_pair_offset < kNumKVBlocksPerWarp; kv_block_pair_offset += 2) {
+                            const uint32_t kv_block_offset = kv_block_pair_offset + lane_idx / 16;
+                            const auto kv_block = reinterpret_cast<const uint4*>(kv_accessor.get_kv_block(kv_block_ref, kv_block_offset));
+                            const uint32_t num_valid_chunks = ptx::exchange(num_valid_tokens, kv_block_offset) * (kHeadDim / kPackFactor / 16);
+                            #pragma unroll
+                            for (uint32_t chunk_base = 0; chunk_base < kNumChunksPerKVBlock; chunk_base += 16) {
+                                const uint32_t chunk_idx = chunk_base + lane_idx % 16;
+                                const bool is_valid = chunk_idx < num_valid_chunks;
+                                // Invalid tokens and dummy blocks use a valid base pointer with a zero source size
+                                ptx::cp_async_cg_zfill<256>(kv_block + (is_valid ? chunk_idx : 0),
+                                    reinterpret_cast<uint4*>(smem.kv[kv_stage_idx][0]) +
+                                        (kv_block_base_in_split + kv_block_offset) * kNumChunksPerKVBlock +
+                                        get_swizzled_kv_chunk_idx<kHeadDim / kPackFactor>(chunk_idx), is_valid ? 16 : 0);
+                            }
+                        }
+                    } else {
+                        cutlass::arch::cpasync_barrier_arrive_noinc(reinterpret_cast<uint64_t*>(&smem.full_sf_copy_barriers[kv_stage_idx]));
+                    }
+                    cutlass::arch::cpasync_barrier_arrive_noinc(reinterpret_cast<uint64_t*>(&smem.full_kv_barriers[kv_stage_idx]));
+                    continue;
+                }
+            }
             if (kv_block_base_in_split < num_kv_blocks) {
                 const auto kv_block_ref = kv_accessor.resolve_kv_block(lane_idx < kNumKVBlocksPerWarp ?
                     smem.kv_block_infos[kv_stage_idx][kv_block_base_in_split + lane_idx].physical_kv_block_idx : 0);
@@ -506,14 +567,14 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
 
             nv_bfloat16* output_rows[BLOCK_Q];
             nv_bfloat162 weights[BLOCK_Q][kNumHeads / 2];
-            float accum[kNumHeads / 2];
+            float accum[kNumHeadsPerLoad];
 
             #pragma unroll
             for (uint32_t q_token_offset = 0; q_token_offset < BLOCK_Q; ++ q_token_offset) {
                 output_rows[q_token_offset] = logits + (q_token_base + q_token_offset) * static_cast<uint64_t>(logits_stride);
                 if (q_token_offset >= num_q_tokens)
                     continue;
-                const auto packed_weights = reinterpret_cast<const nv_bfloat162*>(smem.weights[q_stage_idx] + q_token_offset * kNumHeads);
+                const auto packed_weights = reinterpret_cast<const nv_bfloat162*>(smem.weights[q_stage_idx] + q_token_offset * kNumWeightElementsPerRow);
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumHeads / 2; ++ i)
                     weights[q_token_offset][i] = packed_weights[i];
@@ -544,16 +605,16 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
                     auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
                     auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
                     #pragma unroll
-                    for (uint32_t head_base = 0; head_base < kNumHeads; head_base += kNumHeads / 2) {
-                        ptx::tmem_load_32dp32b<kNumHeads / 2>(tmem_addr + head_base,
+                    for (uint32_t head_base = 0; head_base < kNumHeads; head_base += kNumHeadsPerLoad) {
+                        ptx::tmem_load_32dp32b<kNumHeadsPerLoad>(tmem_addr + head_base,
                                                               reinterpret_cast<uint32_t*>(accum));
                         cutlass::arch::fence_view_async_tmem_load();
-                        if (q_token_offset + 1 == num_q_tokens and head_base == kNumHeads / 2) {
+                        if (q_token_offset + 1 == num_q_tokens and head_base + kNumHeadsPerLoad == kNumHeads) {
                             ptx::tcgen05_before_thread_sync();
                             smem.empty_tmem_barriers[tmem_stage_idx].arrive();
                         }
                         #pragma unroll
-                        for (uint32_t head_offset = 0; head_offset < kNumHeads / 2; head_offset += 4) {
+                        for (uint32_t head_offset = 0; head_offset < kNumHeadsPerLoad; head_offset += 4) {
                             const auto accum_pair_0 = make_float2(accum[head_offset], accum[head_offset + 1]);
                             const auto accum_pair_1 = make_float2(accum[head_offset + 2], accum[head_offset + 3]);
                             sum_0 = __hfma2(ptx::cvt_relu_bf16x2_f32(accum_pair_0), weights[q_token_offset][(head_base + head_offset) / 2], sum_0);
@@ -583,11 +644,11 @@ CUTLASS_DEVICE void sm100_sparse_mqa_logits_core_impl(const uint32_t logits_stri
     }
 }
 
-template <uint32_t SPARSE_BLOCK_KV, uint32_t kNumQStages, uint32_t kNumKVStages,
+template <uint32_t kNumHeads, uint32_t SPARSE_BLOCK_KV, uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumTmemStages, uint32_t kNumMathWarpGroups, uint32_t kNumSMs, uint32_t BLOCK_Q,
           bool kUseUnalignedKs, bool kIsMXFP4>
 CUTLASS_GLOBAL __launch_bounds__(layout::sparse_mqa_logits::get_num_threads(kNumMathWarpGroups), 1)
-void sm100_sparse_mqa_logits(const uint32_t logits_stride, nv_bfloat16* logits,
+void sm100_sparse_mqa_logits(const uint32_t logits_stride, const uint32_t num_kv_tokens, nv_bfloat16* logits,
                              const uint8_t* kv, const uint32_t* sf_kv,
                              const uint8_t* metadata, const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
@@ -597,13 +658,13 @@ void sm100_sparse_mqa_logits(const uint32_t logits_stride, nv_bfloat16* logits,
     // Keep the CUTLASS dtype out of the kernel template signature to avoid ptxas register spills
     using qk_dtype_t = cute::conditional_t<kIsMXFP4, cutlass::float_e2m1_t, cutlass::float_e4m3_t>;
     const auto kv_accessor = sparse_mqa_detail::ContiguousSparseKVAccessor<SPARSE_BLOCK_KV, qk_dtype_t>(
-        kv, sf_kv, &tensor_map_kv, &tensor_map_sf_kv);
-    sm100_sparse_mqa_logits_core_impl<SPARSE_BLOCK_KV, kNumQStages, kNumKVStages, kNumTmemStages,
+        kv, sf_kv, num_kv_tokens, &tensor_map_kv, &tensor_map_sf_kv);
+    sm100_sparse_mqa_logits_core_impl<kNumHeads, SPARSE_BLOCK_KV, kNumQStages, kNumKVStages, kNumTmemStages,
         kNumMathWarpGroups, kNumSMs, BLOCK_Q, kUseUnalignedKs, qk_dtype_t>(
             logits_stride, logits, metadata, tensor_map_q, tensor_map_sf_q, tensor_map_weights, kv_accessor);
 }
 
-template <uint32_t PAGE_KV, uint32_t SPARSE_BLOCK_KV, uint32_t kNumQStages,
+template <uint32_t kNumHeads, uint32_t PAGE_KV, uint32_t SPARSE_BLOCK_KV, uint32_t kNumQStages,
           uint32_t kNumKVStages, uint32_t kNumTmemStages, uint32_t kNumMathWarpGroups,
           uint32_t kNumSMs, uint32_t BLOCK_Q, bool kIsMXFP4>
 CUTLASS_GLOBAL __launch_bounds__(layout::sparse_mqa_logits::get_num_threads(kNumMathWarpGroups), 1)
@@ -619,7 +680,7 @@ void sm100_paged_sparse_mqa_logits(const uint32_t logits_stride, const uint32_t 
     DG_DEVICE_ASSERT(kv_page_stride_bytes % 512 == 0);
     const auto kv_accessor = sparse_mqa_detail::PagedSparseKVAccessor<PAGE_KV, SPARSE_BLOCK_KV, qk_dtype_t>(
         fused_kv_cache, kv_page_stride_bytes);
-    sm100_sparse_mqa_logits_core_impl<SPARSE_BLOCK_KV, kNumQStages, kNumKVStages, kNumTmemStages,
+    sm100_sparse_mqa_logits_core_impl<kNumHeads, SPARSE_BLOCK_KV, kNumQStages, kNumKVStages, kNumTmemStages,
         kNumMathWarpGroups, kNumSMs, BLOCK_Q, false, qk_dtype_t>(
             logits_stride, logits, metadata, tensor_map_q, tensor_map_sf_q, tensor_map_weights, kv_accessor);
 }

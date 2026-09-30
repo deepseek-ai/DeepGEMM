@@ -14,19 +14,15 @@ static void sm90_fp8_mqa_logits(const torch::Tensor& q,
                                 const torch::Tensor& cu_seq_len_k_start,
                                 const torch::Tensor& cu_seq_len_k_end,
                                 const torch::Tensor& logits,
-                                const at::ScalarType& logits_dtype,
                                 const int& seq_len, const int& seq_len_kv,
-                                const int& max_seqlen_k, const int& stride_logits,
+                                const int& stride_logits,
                                 const int& num_heads, const int& head_dim,
-                                const int& block_q, const int& block_kv,
-                                const bool& clean_logits) {
+                                const int& block_q, const int& block_kv) {
     constexpr int num_specialized_threads = 128;
     constexpr int num_q_stages = 3, num_kv_stages = 3;
     constexpr int num_math_threads = 512;
 
-    const bool is_compressed_logits = (max_seqlen_k > 0);
     const int num_sms = runtime->get_num_sms();
-    DG_HOST_ASSERT(not (clean_logits and is_compressed_logits));
 
     DG_HOST_ASSERT(jit->device.get_arch_major() == 9);
     DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
@@ -67,7 +63,6 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {}, {},
         {},
         {}, {},
         {}
@@ -75,12 +70,11 @@ static void __instantiate_kernel() {{
 }};
 )",
     num_heads, head_dim,
-    is_compressed_logits, clean_logits,
     block_q, block_kv,
     num_q_stages, num_kv_stages,
     num_sms,
     num_specialized_threads, num_math_threads,
-    to_string(logits_dtype)));
+    to_string(logits.scalar_type())));
 
     // Launch
     jit->launch(
@@ -89,8 +83,7 @@ static void __instantiate_kernel() {{
             .grid_dim = dim3(num_sms, 1, 1),
             .block_dim = dim3(num_specialized_threads + num_math_threads, 1, 1),
         },
-        seq_len, seq_len_kv,
-        max_seqlen_k, stride_logits,
+        seq_len, seq_len_kv, stride_logits,
         cu_seq_len_k_start.data_ptr<int>(), cu_seq_len_k_end.data_ptr<int>(),
         logits.data_ptr(),
         tensor_map_q, tensor_map_kv,
@@ -151,7 +144,6 @@ static void sm90_fp8_paged_mqa_logits(const torch::Tensor& q,
                                       const torch::Tensor& block_table,
                                       const torch::Tensor& indices,
                                       const torch::Tensor& schedule_meta,
-                                      const at::ScalarType& logits_dtype,
                                       const int& batch_size, const int& next_n,
                                       const int& num_heads, const int& head_dim,
                                       const int& num_kv_blocks, const int& block_kv,
@@ -225,7 +217,7 @@ static void __instantiate_kernel() {{
     num_q_stages, num_kv_stages,
     split_kv,
     num_specialized_threads, num_math_threads,
-    to_string(logits_dtype)));
+    to_string(logits.scalar_type())));
 
     // Launch
     jit->launch(
