@@ -12,7 +12,7 @@
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
 #include <deep_gemm/layout/gemm.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -31,12 +31,12 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kKAlignment,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
-          typename cd_dtype_t, typename epilogue_op_t,
+          typename cd_dtype_t, typename epilogue_operator_t,
           uint64_t kTensorCoreUtilControl>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_gemm_impl(int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                     const __grid_constant__ epilogue_op_t epilogue_op,
+                     const __grid_constant__ epilogue_operator_t epilogue_operator,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
@@ -56,8 +56,8 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
     // The host launches the epilogue operator directly as a kernel argument
-    DG_STATIC_ASSERT(sizeof(epilogue_op_t) == sizeof(EpilogueArgs),
-                     "Epilogue operators must not add state to `EpilogueArgs`");
+    DG_STATIC_ASSERT(sizeof(epilogue_operator_t) == sizeof(EpilogueOperatorArgs),
+                     "Epilogue operators must not add state to `EpilogueOperatorArgs`");
 
     // C/D type: BF16 and FP32 are supported, with or without accumulation
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
@@ -391,7 +391,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                  is_empty_group,
                  effective_m,
                  epilogue_warp_idx, lane_idx,
-                 epilogue_op,
+                 epilogue_operator,
                  false,
                  &smem.tmem_empty_barriers[accum_stage_idx],
                  &smem.tmem_empty_barriers[accum_stage_idx],
@@ -405,7 +405,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
                  base_m_idx, base_n_idx, scheduler.current_group_idx,
                  is_empty_group,
                  epilogue_warp_idx, lane_idx,
-                 epilogue_op,
+                 epilogue_operator,
                  false,
                  &smem.tmem_empty_barriers[accum_stage_idx],
                  &smem.tmem_empty_barriers[accum_stage_idx],

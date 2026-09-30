@@ -7,99 +7,79 @@
 
 namespace deep_gemm::layout::mega_gate {
 
-// Kernel geometry and alignments
 static constexpr uint32_t BLOCK_K = 64;
+static constexpr uint32_t kSwizzleMode = 128;
 static constexpr uint32_t kNumNonEpilogueThreads = 128;
 static constexpr uint32_t kNumEpilogueStages = 2;
 static constexpr uint32_t kNumMaxBlockTokens = 256;
 static constexpr uint32_t kExpertAlignment = 128;
 static constexpr uint32_t kSharedMemoryAlignment = 1024;
 
-// Token bounds
 static constexpr uint32_t kNumMinBlockTokens = 16;
 static constexpr uint32_t kNumMaxTokens = 1u << 20;
 static constexpr uint32_t kNumMaxTokenBlocks = math::constexpr_ceil_div(kNumMaxTokens, kNumMinBlockTokens);
 
-// Score-barrier workspace geometry
 static constexpr uint32_t kScoreBarrierLineBytes = 128;
 static constexpr uint32_t kNumMaxLogicalCtas = 64;
 static constexpr uint32_t kNumMaxMetadataCacheBytes = 4 * 1024;
 
-enum class ScoringType : uint32_t {
-    Sigmoid = 0,
-    SqrtSoftplus = 1,
-    Identity = 3,
+// Top-k geometry: each lane holds `kNumExpertsPerLaneVector` consecutive experts of every 128-expert wave
+static constexpr uint32_t kNumExpertsPerLaneVector = 4;
+static constexpr uint32_t kNumExpertsPerWave = 32 * kNumExpertsPerLaneVector;
+DG_STATIC_ASSERT(kNumExpertsPerWave == kExpertAlignment, "Expert waves must match the expert alignment");
+
+struct RoutingArgs {
+    const int* to_physical_map;
+    const int* logical_count;
+    int64_t* topk_idx;
+    int64_t* unmapped_topk_idx;
+    float* topk_weights;
+    int64_t unmapped_topk_idx_stride;
+    uint32_t num_routed_experts;
+    uint32_t num_shared_experts;
+    uint32_t num_duplicate_experts;
+    uint32_t rank_idx;
+    float routed_scaling_factor;
 };
 
-CUTLASS_HOST_DEVICE constexpr uint32_t get_num_bias_cache_bytes(const uint32_t num_routed_experts,
-                                                                const bool has_bias,
-                                                                const bool has_image_token_mask) {
-    return num_routed_experts * ((has_bias ? 1u : 0u) + (has_image_token_mask ? 1u : 0u)) *
-           static_cast<uint32_t>(sizeof(float));
+// Bias, image bias and logical count share the 4 KiB cache in that order, the count only when it fits
+CUTLASS_HOST_DEVICE constexpr bool caches_logical_count(const uint32_t num_routed_experts, const bool has_bias,
+                                                        const bool has_image_token_mask, const bool has_physical_map) {
+    const auto num_bias_cache_bytes = num_routed_experts * ((has_bias ? 1u : 0u) + (has_image_token_mask ? 1u : 0u)) *
+                                      static_cast<uint32_t>(sizeof(float));
+    return has_physical_map and num_bias_cache_bytes + num_routed_experts * static_cast<uint32_t>(sizeof(int)) <= kNumMaxMetadataCacheBytes;
 }
 
-CUTLASS_HOST_DEVICE constexpr bool caches_logical_count(const uint32_t num_routed_experts,
-                                                        const bool has_bias, const bool has_image_token_mask,
-                                                        const bool to_physical_map_exists) {
-    return to_physical_map_exists and
-           get_num_bias_cache_bytes(num_routed_experts, has_bias, has_image_token_mask) +
-           num_routed_experts * static_cast<uint32_t>(sizeof(int)) <= kNumMaxMetadataCacheBytes;
-}
+static constexpr uint32_t kNumMaxStages = 32;
 
-CUTLASS_HOST_DEVICE constexpr uint32_t get_num_metadata_cache_bytes(const uint32_t num_routed_experts,
-                                                                    const bool has_bias,
-                                                                    const bool has_image_token_mask,
-                                                                    const bool to_physical_map_exists) {
-    return get_num_bias_cache_bytes(num_routed_experts, has_bias, has_image_token_mask) +
-           (caches_logical_count(num_routed_experts, has_bias, has_image_token_mask, to_physical_map_exists)
-                ? num_routed_experts * static_cast<uint32_t>(sizeof(int)) : 0u);
-}
-
-template <uint32_t kNumStages, uint32_t kNumEpilogueStages,
-          uint32_t kNumRoutedExperts,
-          uint32_t LOAD_BLOCK_M, uint32_t LOAD_BLOCK_N,
-          uint32_t BLOCK_K_,
-          bool kHasBias, bool kHasImageTokenMask,
-          bool kToPhysicalMapExists>
+// Fixed SMEM header, followed by `num_stages` x stages then `num_stages` weight stages (runtime strides)
 struct SharedStorage {
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
-    using x_stage_t = cutlass::bfloat16_t[LOAD_BLOCK_M * BLOCK_K_];
-    using weight_stage_t = cutlass::bfloat16_t[LOAD_BLOCK_N * BLOCK_K_];
 
-    static constexpr bool kCacheLogicalCount = caches_logical_count(kNumRoutedExperts, kHasBias,
-                                                                    kHasImageTokenMask, kToPhysicalMapExists);
-    static constexpr bool kHasMetadataCache = kHasBias or kHasImageTokenMask or kCacheLogicalCount;
-    static constexpr uint32_t kNumMetadataCacheElems = get_num_metadata_cache_bytes(kNumRoutedExperts, kHasBias,
-                                                                                    kHasImageTokenMask, kToPhysicalMapExists) / sizeof(float);
-
-    alignas(kSharedMemoryAlignment) x_stage_t x[kNumStages];
-    alignas(kSharedMemoryAlignment) weight_stage_t weight[kNumStages];
-
-    alignas(Barrier) Barrier full_barriers[kNumStages];
-    alignas(Barrier) Barrier empty_barriers[kNumStages];
+    alignas(Barrier) Barrier full_barriers[kNumMaxStages];
+    alignas(Barrier) Barrier empty_barriers[kNumMaxStages];
     alignas(Barrier) Barrier tmem_full_barriers[kNumEpilogueStages];
     alignas(Barrier) Barrier tmem_empty_barriers[kNumEpilogueStages];
-    alignas(Barrier) Barrier metadata_ready_barrier;
     alignas(uint32_t) uint32_t tmem_ptr;
-
-    alignas(4 * sizeof(float)) float metadata_cache[kNumMetadataCacheElems > 0 ? kNumMetadataCacheElems : 1];
-
-    CUTLASS_DEVICE float* get_bias_ptr() {
-        return metadata_cache;
-    }
-
-    CUTLASS_DEVICE float* get_image_bias_ptr() {
-        return metadata_cache + (kHasBias ? kNumRoutedExperts : 0);
-    }
-
-    CUTLASS_DEVICE int* get_logical_count_ptr() {
-        return reinterpret_cast<int*>(get_image_bias_ptr() + (kHasImageTokenMask ? kNumRoutedExperts : 0));
-    }
+    alignas(4 * sizeof(float)) float metadata_cache[kNumMaxMetadataCacheBytes / sizeof(float)];
 };
 
-// View over global score scratch: [num_token_blocks, kNumSplits, kBlockTokens, kNumExperts]
-template <uint32_t kNumSplits = 0, uint32_t kBlockTokens = 0, uint32_t kNumExperts = 0>
+static constexpr uint32_t kStageDataOffset = math::constexpr_align(static_cast<uint32_t>(sizeof(SharedStorage)), kSharedMemoryAlignment);
+
+CUTLASS_DEVICE cutlass::bfloat16_t* get_x_stage_ptr(uint8_t* smem_buffer, const uint32_t& stage_idx, const uint32_t& x_stage_bytes) {
+    return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + kStageDataOffset + stage_idx * x_stage_bytes);
+}
+
+CUTLASS_DEVICE cutlass::bfloat16_t* get_weight_stage_ptr(uint8_t* smem_buffer, const uint32_t& stage_idx, const uint32_t& num_stages,
+                                                         const uint32_t& x_stage_bytes, const uint32_t& w_stage_bytes) {
+    return reinterpret_cast<cutlass::bfloat16_t*>(smem_buffer + kStageDataOffset + num_stages * x_stage_bytes + stage_idx * w_stage_bytes);
+}
+
+// View over global score scratch: [num_token_blocks * block_tokens, kNumSplits, kNumExperts]
+template <uint32_t kNumSplits = 0, uint32_t kNumExperts = 0>
 struct Workspace {
+    static constexpr uint32_t kTokenStride = kNumSplits * kNumExperts;
+
     void* gmem_scratch;
     void* gmem_score_barriers;
 
@@ -116,9 +96,9 @@ struct Workspace {
     }
 
     CUTLASS_HOST_DEVICE
-    float* get_score_ptr(const uint32_t token_block_idx, const uint32_t split_idx = 0) const {
+    float* get_score_ptr(const uint32_t token_idx, const uint32_t split_idx = 0) const {
         return reinterpret_cast<float*>(gmem_scratch) +
-               (static_cast<uint64_t>(token_block_idx) * kNumSplits + split_idx) * kBlockTokens * kNumExperts;
+               static_cast<uint64_t>(token_idx) * kTokenStride + split_idx * kNumExperts;
     }
 
     CUTLASS_HOST_DEVICE uint64_t* get_score_barrier_ptr(const uint32_t token_block_idx) const {

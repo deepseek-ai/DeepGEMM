@@ -1,11 +1,16 @@
 #pragma once
 
+#include <c10/util/accumulate.h>
+#include <c10/util/strides.h>
 #include <cute/arch/mma_sm100_umma.hpp>
 #include <torch/python.h>
+
+#include <deep_gemm/common/types.cuh>
 
 #include "math.hpp"
 #include "exception.hpp"
 #include "../runtime/jit.hpp"
+#include "../runtime/runtime.hpp"
 
 namespace deep_gemm {
 
@@ -119,7 +124,9 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
             DG_HOST_ASSERT(sf.stride(-3) == sf.stride(-1) * sf.size(-1));
         // Check contiguity in the MN direction
         DG_HOST_ASSERT(sf.stride(-2) == 1 or mn == 1);
-        DG_HOST_ASSERT(sf.stride(-1) == get_tma_aligned_size(mn, sf.element_size()));
+        const auto compact_stride = get_tma_aligned_size(mn, sf.element_size());
+        DG_HOST_ASSERT(sf.stride(-1) >= compact_stride);
+        DG_HOST_ASSERT(sf.stride(-1) % 4 == 0);
     }
 
     // SM90 SFB must be contiguous, or contiguous after transposing the last two dimensions
@@ -130,6 +137,36 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
                        (sf.stride(-1) == sf.size(-2) and sf.stride(-2) == 1));
     }
     return sf;
+}
+
+static bool is_localized(const torch::Tensor& t) {
+    const auto& allocator = locality_domain_allocator;
+    const auto num_domains = LocalityDomainAllocator::get_num_locality_domains();
+    const auto slice_sizes = t.sizes().slice(1);
+    const auto num_slice_bytes = c10::multiply_integers(slice_sizes) * t.element_size();
+    bool localized = t.size(0) == num_domains and t.strides().slice(1) == c10::IntArrayRef(c10::contiguous_strides(slice_sizes));
+    for (int d = 0; localized and d < num_domains; ++ d)
+        localized = allocator.get_locality_domain(static_cast<const char*>(t.data_ptr()) + d * t.stride(0) * t.element_size(), num_slice_bytes) == d;
+    DG_HOST_ASSERT(localized or t.is_contiguous());
+    return localized;
+}
+
+// Accepts localized or unlocalized weights; returns the logical `(N, K)`
+static std::tuple<int, int> check_weights_layout_2d(const torch::Tensor& t) {
+    if (is_localized(t)) {
+        const auto [num_domains, n_per_domain, k] = get_logical_shape<3>(t);
+        return std::make_tuple(num_domains * n_per_domain, k);
+    }
+    return get_logical_shape<2>(t);
+}
+
+// Accepts localized or unlocalized weights; returns the logical `(B, N, K)`
+static std::tuple<int, int, int> check_weights_layout_3d(const torch::Tensor& t) {
+    if (is_localized(t)) {
+        const auto [num_domains, num_batches, n_per_domain, k] = get_logical_shape<4>(t);
+        return std::make_tuple(num_batches, num_domains * n_per_domain, k);
+    }
+    return get_logical_shape<3>(t);
 }
 
 } // namespace deep_gemm

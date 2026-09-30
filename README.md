@@ -8,6 +8,9 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## News
 
+- 2026.09.30
+  - DeepGEMM Ascend is available! Check [DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend/) for more details
+  - Add more optimizations, including locality domain features, check [#462](https://github.com/deepseek-ai/DeepGEMM/pull/462) for more details
 - 2026.09.10: Sparse Indexer, Mega Gate, Mega mHC, DeepJIT, MoE and Indexer optimizations and more.
     - Please see [#432](https://github.com/deepseek-ai/DeepGEMM/pull/432) for more details.
 - 2026.04.16: Mega MoE, FP8xFP4 GEMM, FP4 Indexer, PDL, faster JIT compilation and more.
@@ -85,17 +88,17 @@ Use `m_grouped_fp8_gemm_nt_masked` for this purpose and consult the relevant doc
 #### V3.2 MQA kernels for the indexer
 
 The kernel family has two versions, non-paged (for prefilling) and paged (for decoding).
-Take the non-paged version `fp8_mqa_logits` as an example. It has 6 inputs:
+Take the non-paged version `fp8_fp4_mqa_logits` as an example. Its main inputs are:
 
-- `q`, E4M3 tensor with shape `[seq_len, num_heads, head_dim]`
-- `kv`, E4M3 tensor (shaped as `[seq_len_kv, head_dim]`) with float SF (shaped as `[seq_len_kv]`)
-- `weights`, float tensor with shape `[seq_len, num_heads]`
+- `q`, a `(q_data, q_sf)` tuple; SM100 accepts MXFP4/MXFP8 data with packed UE8M0 scales
+- `kv`, a `(kv_data, kv_sf)` tuple with shape `[seq_len_kv, head_dim]` logically
+- `weights`, tensor with shape `[seq_len, num_heads]` (BF16 on SM100)
 - `cu_seq_len_k_start` and `cu_seq_len_k_end`, int tensor with shape `[seq_len]`
-- `clean_logits`, whether to clean the unfilled logits into `-inf`
+- `max_seqlen_k`, the maximum valid KV span of any query row
 
-The output tensor is shaped as `[seq_len, seq_len_kv]`, indicating token-to-token logits.
+The output is compressed to `[seq_len, max_seqlen_k]`; row `i` stores its valid KV span starting at column zero.
 For each token `i` in `q`, it will iterate all tokens `j` from `[cu_seq_len_k_start[i], cu_seq_len_k_end[i])`,
-and calculate the logit `out[i, j]` as:
+and calculate the corresponding compressed logit as:
 
 ```python
 kv_j = kv[0][j, :] * kv[1][j].unsqueeze(1)  # [head_dim]
@@ -104,7 +107,7 @@ out_ij = out_ij.relu() * weights[i, :]  # [num_heads]
 out_ij = out_ij.sum()  # Scalar
 ```
 
-For more details and the paged version `fp8_paged_mqa_logits`, please refer to `tests/test_attention.py`.
+For more details and the paged version `fp8_fp4_paged_mqa_logits`, please refer to `tests/test_attention.py`.
 
 #### Mega MoE
 
@@ -118,8 +121,13 @@ buffer = deep_gemm.get_symm_buffer_for_mega_moe(
     mma_type='fp8xfp4',  # Use 'fp8xfp8' for FP8 routed-expert weights
 )
 
-# Transform routed weights (FP4 or FP8 with UE8M0 SF) into the required layout
+# Transform weights (FP4 or FP8 with UE8M0 SF) into the required layout
 transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
+
+# (Optional) Localize weights into locality domains
+transformed_l1 = (deep_gemm.localize(transformed_l1[0]), transformed_l1[1])
+transformed_l2 = (deep_gemm.localize(transformed_l2[0]), transformed_l2[1])
+deep_gemm.destroy_localizer()
 
 # Copy inputs into the buffer before each call
 # You may fuse these into previous kernels

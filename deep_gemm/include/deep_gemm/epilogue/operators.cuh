@@ -2,26 +2,22 @@
 
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
 
-namespace deep_gemm::epilogue::transform {
+namespace deep_gemm::epilogue::operators {
 
-// Epilogue operators add behavior (never state) to `EpilogueArgs`, so kernels take
+// Epilogue operators add behavior (never state) to `EpilogueOperatorArgs`, so kernels take
 // the host-constructed operator directly as a kernel argument
 // NOTES: the operators do not compose with each other
-struct EpilogueIdentity: EpilogueArgs {
-    template <uint32_t STORE_BLOCK_N>
-    CUTLASS_DEVICE static uint32_t apply_index_n(const uint32_t& n_idx) {
-        return n_idx;
-    }
-
+struct Identity: EpilogueOperatorArgs {
     template <uint32_t kNumValues>
     CUTLASS_DEVICE void apply_values(uint32_t (&)[kNumValues]) const {}
 };
 
 // Scale only the product term of a BLAS-style linear combination. Supporting an
 // arbitrary beta requires a separate C load/initialization path and does not belong
-// in this value-only transform.
-struct EpilogueWithAlpha: EpilogueIdentity {
+// in this value-only operator.
+struct ScaleByAlpha: Identity {
     template <uint32_t kNumValues>
     CUTLASS_DEVICE void apply_values(uint32_t (&values)[kNumValues]) const {
         DG_STATIC_ASSERT(kNumValues % 2 == 0, "Alpha scaling requires float2 alignment");
@@ -33,21 +29,44 @@ struct EpilogueWithAlpha: EpilogueIdentity {
     }
 };
 
-template <uint32_t kLeft, uint32_t kMid, uint32_t kRight>
-struct EpilogueHeadSplits: EpilogueIdentity {
-    template <uint32_t STORE_BLOCK_N>
-    CUTLASS_DEVICE static uint32_t apply_index_n(const uint32_t& n_idx) {
-        DG_STATIC_ASSERT(kLeft % STORE_BLOCK_N == 0 and kMid % STORE_BLOCK_N == 0 and
-                         kRight % STORE_BLOCK_N == 0, "Invalid head splits config");
-        return n_idx + (n_idx + kRight) / (kLeft + kRight) * kMid;
+struct StochasticRoundToBF16: Identity {
+    // The quartet hash is the sum of the four members' partial terms plus `quartet_n_idx`;
+    // each member then finalizes the sum and selects its own 16-bit random half
+    CUTLASS_DEVICE static uint32_t partial_hash(const uint32_t& value, const uint32_t& quartet_offset) {
+        return value * (quartet_offset == 0 ? 0x5671d42bu :
+                        quartet_offset == 1 ? 0x9995e499u :
+                        quartet_offset == 2 ? 0xace1b8a5u : 0xe153538du);
+    }
+
+    CUTLASS_DEVICE static uint32_t select_random_bits(uint32_t h, const uint32_t& quartet_offset) {
+        h ^= h >> 23;
+        h *= 0x7feb352du;
+        h ^= h >> 16;
+        h *= quartet_offset < 2 ? 0x846ca68bu : 0xd35a2d97u;
+        h ^= h >> 11;
+        return (h >> (quartet_offset % 2 * 16)) & 0xffffu;
+    }
+
+    CUTLASS_DEVICE static void cast_quartet(const uint32_t& a, const uint32_t& b,
+                                            const uint32_t& c, const uint32_t& d,
+                                            const uint32_t& quartet_n_idx,
+                                            uint32_t& packed_ab, uint32_t& packed_cd) {
+        const auto h = partial_hash(a, 0) + partial_hash(b, 1) +
+                       partial_hash(c, 2) + partial_hash(d, 3) + quartet_n_idx;
+        packed_ab = ptx::cvt_rs_bf16x2_f32(*reinterpret_cast<const float*>(&a),
+                                           *reinterpret_cast<const float*>(&b),
+                                           select_random_bits(h, 0) | select_random_bits(h, 1) << 16);
+        packed_cd = ptx::cvt_rs_bf16x2_f32(*reinterpret_cast<const float*>(&c),
+                                           *reinterpret_cast<const float*>(&d),
+                                           select_random_bits(h, 2) | select_random_bits(h, 3) << 16);
     }
 };
 
-// Cast D into FP8 with dynamic per-row, per-32-column UE8M0 SFs, packed into `uint32_t`
+// Quantize D into FP8 with dynamic per-row, per-32-column UE8M0 SFs, packed into `uint32_t`
 // words in a TMA-aligned MN-major layout (the same layout accepted for SFA)
 // NOTES: the accumulator is rounded into BF16 before the amax/scale/cast steps, so the
 //        output bitwise matches a BF16 D followed by the standalone per-token cast kernel
-struct EpilogueDynamicScaledFP8: EpilogueIdentity {
+struct QuantizeToFP8: Identity {
     static constexpr uint32_t kSFGranN = 32;
 
     // Store one SF byte (`uint8_t`), or all four SF bytes of one packed word at once
@@ -72,4 +91,4 @@ struct EpilogueDynamicScaledFP8: EpilogueIdentity {
     }
 };
 
-} // namespace deep_gemm::epilogue::transform
+} // namespace deep_gemm::epilogue::operators

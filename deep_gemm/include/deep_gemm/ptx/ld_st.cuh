@@ -8,6 +8,14 @@
 #if defined(DG_IN_CUDA_COMPILATION)
 namespace deep_gemm::ptx {
 
+CUTLASS_DEVICE uint32_t cvt_rs_bf16x2_f32(const float& lower, const float& upper,
+                                          const uint32_t& random_bits) {
+    uint32_t packed;
+    asm volatile("cvt.rs.bf16x2.f32 %0, %1, %2, %3;\n"
+                 : "=r"(packed) : "f"(upper), "f"(lower), "r"(random_bits));
+    return packed;
+}
+
 // Compatibility: 256 bits LD/ST instructions
 #if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
 using longlong4_t = longlong4_32a;
@@ -170,6 +178,25 @@ CUTLASS_DEVICE void cp_async_cg(const uint4* global_ptr, uint4* shared_ptr) {
     }
 }
 
+// Copies the first `num_src_bytes` (0 to 16) bytes and zero-fills the rest of the 16-byte destination
+template <uint32_t kNumL2PrefetchBytes>
+CUTLASS_DEVICE void cp_async_cg_zfill(const uint4* global_ptr, uint4* shared_ptr, const uint32_t num_src_bytes) {
+    DG_STATIC_ASSERT(kNumL2PrefetchBytes == 64 or kNumL2PrefetchBytes == 256, "Invalid L2 prefetch size");
+    if constexpr (kNumL2PrefetchBytes == 64) {
+        asm volatile("cp.async.cg.shared::cta.global.L2::64B [%0], [%1], 16, %2;" ::
+            "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_ptr))), "l"(global_ptr), "r"(num_src_bytes));
+    } else {
+        asm volatile("cp.async.cg.shared::cta.global.L2::256B [%0], [%1], 16, %2;" ::
+            "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_ptr))), "l"(global_ptr), "r"(num_src_bytes));
+    }
+}
+
+// Copies the first `num_src_bytes` (0 or 4) bytes and zero-fills the rest of the 4-byte destination
+CUTLASS_DEVICE void cp_async_ca_zfill(const uint32_t* global_ptr, uint32_t* shared_ptr, const uint32_t num_src_bytes) {
+    asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;" ::
+        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_ptr))), "l"(global_ptr), "r"(num_src_bytes));
+}
+
 CUTLASS_DEVICE uint32_t mapa_shared(const uint32_t& ptr, const uint32_t& dst_cta_idx) {
     uint32_t mapped;
     asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mapped) : "r"(ptr), "r"(dst_cta_idx));
@@ -214,22 +241,15 @@ CUTLASS_DEVICE uint4 ld_evict_first(const uint4* ptr) {
     return value;
 }
 
-CUTLASS_DEVICE float ld_global(const float* ptr) {
-    float ret;
-    asm volatile("ld.weak.global.f32 %0, [%1];" : "=f"(ret) : "l"(ptr) : "memory");
-    return ret;
+// Store the low 16 bits of a packed pair: the `.b16` store truncates a 32-bit source register
+CUTLASS_DEVICE void st_global_low_bf16(nv_bfloat16* ptr, const nv_bfloat162& value) {
+    asm volatile("st.global.b16 [%0], %1;" :: "l"(ptr), "r"(*reinterpret_cast<const uint32_t*>(&value)));
 }
 
-CUTLASS_DEVICE float4 ld_global(const float4* ptr) {
-    float4 ret;
-    asm volatile("ld.weak.global.v4.f32 {%0, %1, %2, %3}, [%4];"
-                 : "=f"(ret.x), "=f"(ret.y), "=f"(ret.z), "=f"(ret.w)
-                 : "l"(ptr) : "memory");
+CUTLASS_DEVICE uint32_t ld_global_cg(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));
     return ret;
-}
-
-CUTLASS_DEVICE void st_global(float* ptr, const float& value) {
-    asm volatile("st.weak.global.f32 [%0], %1;" :: "l"(ptr), "f"(value) : "memory");
 }
 
 CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {

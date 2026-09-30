@@ -21,6 +21,9 @@
 // Layout kernels
 #include <deep_gemm/impls/smxx_layout.cuh>
 
+// Locality domain probes
+#include <deep_gemm/impls/sm100_locality_domain.cuh>
+
 // Mega kernels
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 #include <deep_gemm/impls/sm100_bf16_mega_moe.cuh>
