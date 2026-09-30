@@ -17,7 +17,6 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/mma/sm90.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>

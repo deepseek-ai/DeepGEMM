@@ -12,7 +12,6 @@
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/epilogue/clean_logits.cuh>
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
@@ -21,7 +20,6 @@
 namespace deep_gemm {
 
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsCompressedLogits, bool kCleanLogits,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
@@ -29,7 +27,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           typename logits_dtype_t>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
-                         const uint32_t max_seqlen_k, const uint32_t stride_logits,
+                         const uint32_t stride_logits,
                          uint32_t* cu_seq_len_k_start,
                          uint32_t* cu_seq_len_k_end,
                          logits_dtype_t* logits,
@@ -48,7 +46,6 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // Prefetch TMA descriptors
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
-    DG_STATIC_ASSERT(not (kIsCompressedLogits and kCleanLogits), "Compressed logits cannot be cleaned in-kernel");
     if (threadIdx.x / 32 == kNumMathThreads / 32 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_q);
         cute::prefetch_tma_descriptor(&tensor_map_kv);
@@ -307,37 +304,16 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
                     // Store into the global memory
                     const auto q_offset = (block_q_idx * BLOCK_Q + i) * static_cast<uint64_t>(stride_logits);
-                    if constexpr (kIsCompressedLogits) {
-                        if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
-                            logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_0);
-                        if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
-                            logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_1);
-                    } else {
-                        logits[q_offset + kv_offset + v_0_offset] = static_cast<logits_dtype_t>(v_0);
-                        logits[q_offset + kv_offset + v_1_offset] = static_cast<logits_dtype_t>(v_1);
-                    }
+                    if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
+                        logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_0);
+                    if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
+                        logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_1);
                 }
             }
             num_total_kv_blocks += num_kv_blocks;
 
             // Release Q empty
             empty_q_barriers[q_stage_idx]->arrive();
-
-            if constexpr (kCleanLogits) {
-                static constexpr uint32_t kNumWarpsPerRow = kNumMathThreads / 32 / BLOCK_Q;
-                DG_STATIC_ASSERT((kNumMathThreads / 32) % BLOCK_Q == 0, "Invalid warp assignment");
-                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 1);
-                const auto& row_idx = warp_idx / kNumWarpsPerRow;
-                const auto& q_idx = min(block_q_idx * BLOCK_Q + row_idx, seq_len - 1);
-                const auto& fill_ks = min(cu_seq_len_k_start[q_idx], stride_logits);
-                const auto& fill_ke = cu_seq_len_k_end[q_idx];
-
-                const auto cleaner = epilogue::LogitsCleaner<logits_dtype_t, kNumWarpsPerRow * 32>(
-                    (warp_idx % kNumWarpsPerRow) * 32 + lane_idx);
-                const auto row = logits + (block_q_idx * BLOCK_Q + row_idx) * static_cast<uint64_t>(stride_logits);
-                cleaner.fill_row(row, 0, fill_ks);
-                cleaner.fill_row(row, min(fill_ke, stride_logits), stride_logits);
-            }
 
             // Jump to the next block
             CUTE_TIE(get_next_block_q_idx(), block_q_idx, q_iter_idx);

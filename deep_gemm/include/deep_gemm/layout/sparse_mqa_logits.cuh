@@ -10,7 +10,7 @@ namespace deep_gemm::layout::sparse_mqa_logits {
 
 inline constexpr uint32_t kNumSparseSlotBits = 16;
 inline constexpr uint32_t kInvalidSparseSlot = (1u << kNumSparseSlotBits) - 1;
-inline constexpr uint32_t kNumHeads = 32;
+inline constexpr uint32_t kNumMaxHeads = 32;
 inline constexpr uint32_t kHeadDim = 128;
 inline constexpr uint32_t kNumUTCCPAlignedElems = 128;
 inline constexpr uint32_t kNumKVTokensPerTMA = 128;
@@ -24,10 +24,15 @@ struct alignas(16) MetadataHeader {
     uint32_t num_kv_splits;
     uint32_t num_waves;
     uint32_t use_unaligned_ks;
+    // Schedule entries are indexed by the SM count used at generation time
+    uint32_t num_sms;
 };
 
 struct alignas(16) KVSplitHeader {
     static constexpr uint32_t kContiguousFlag = 0x80000000u;
+    // A generic-copy split whose last block extends past the end of the KV tensor (non-paged only)
+    static constexpr uint32_t kPartialTailFlag = 0x40000000u;
+    static constexpr uint32_t kFlagMask = kContiguousFlag | kPartialTailFlag;
 
     uint32_t q_token_base;
     uint32_t packed_num_kv_blocks;
@@ -36,17 +41,22 @@ struct alignas(16) KVSplitHeader {
 
     KVSplitHeader() = default;
     CUTLASS_HOST_DEVICE KVSplitHeader(const uint32_t q_token_base, const uint32_t num_kv_blocks,
-                                     const bool is_contiguous, const uint32_t q0_slot_base,
-                                     const uint32_t q1_slot_base):
-            q_token_base(q_token_base), packed_num_kv_blocks(num_kv_blocks | (is_contiguous ? kContiguousFlag : 0)),
+                                     const bool is_contiguous, const bool has_partial_tail,
+                                     const uint32_t q0_slot_base, const uint32_t q1_slot_base):
+            q_token_base(q_token_base),
+            packed_num_kv_blocks(num_kv_blocks | (is_contiguous ? kContiguousFlag : 0) | (has_partial_tail ? kPartialTailFlag : 0)),
             q0_slot_base(q0_slot_base), q1_slot_base(q1_slot_base) {}
 
     CUTLASS_HOST_DEVICE static constexpr uint32_t get_num_kv_blocks(const uint32_t packed_num_kv_blocks) {
-        return packed_num_kv_blocks & ~kContiguousFlag;
+        return packed_num_kv_blocks & ~kFlagMask;
     }
 
     CUTLASS_HOST_DEVICE static constexpr bool is_contiguous(const uint32_t packed_num_kv_blocks) {
         return (packed_num_kv_blocks & kContiguousFlag) != 0;
+    }
+
+    CUTLASS_HOST_DEVICE static constexpr bool has_partial_tail(const uint32_t packed_num_kv_blocks) {
+        return (packed_num_kv_blocks & kPartialTailFlag) != 0;
     }
 };
 
@@ -97,7 +107,7 @@ struct SharedStorage {
 
     static constexpr uint32_t kPackFactor = get_smem_pack_factor<qk_dtype_t>();
     static constexpr uint32_t kNumKVBlocksPerSplit = SPLIT_KV / SPARSE_BLOCK_KV;
-    static constexpr uint32_t kNumSFQ = math::constexpr_align(BLOCK_Q * kNumHeads, kNumUTCCPAlignedElems);
+    static constexpr uint32_t kNumSFQ = math::constexpr_align(BLOCK_Q * kNumMaxHeads, kNumUTCCPAlignedElems);
     static constexpr uint32_t kSwizzleAlignment = 8 * kHeadDim / kPackFactor;
 
     DG_STATIC_ASSERT(BLOCK_Q == 2, "Sparse metadata packs exactly two Q slots");
@@ -106,11 +116,11 @@ struct SharedStorage {
     DG_STATIC_ASSERT(kNumKVBlocksPerSplit <= kInvalidSparseSlot,
                      "Sparse split-local slots must not use the invalid-slot value");
 
-    alignas(kSwizzleAlignment) qk_dtype_t q[kNumQStages][BLOCK_Q * kNumHeads][kHeadDim / kPackFactor];
+    alignas(kSwizzleAlignment) qk_dtype_t q[kNumQStages][BLOCK_Q * kNumMaxHeads][kHeadDim / kPackFactor];
     alignas(kSwizzleAlignment) qk_dtype_t kv[kNumKVStages][SPLIT_KV][kHeadDim / kPackFactor];
     alignas(128) uint32_t sf_q[kNumQStages][kNumSFQ];
     alignas(128) uint32_t sf_kv[kNumKVStages][SPLIT_KV];
-    alignas(128) nv_bfloat16 weights[kNumQStages][BLOCK_Q * kNumHeads];
+    alignas(128) nv_bfloat16 weights[kNumQStages][BLOCK_Q * kNumMaxHeads];
     alignas(16) KVBlockInfo kv_block_infos[kNumKVStages][kNumKVBlocksPerSplit];
     alignas(16) QBlock q_blocks[kNumQStages];
     alignas(16) KVSplitHeader kv_split_headers[kNumKVStages];

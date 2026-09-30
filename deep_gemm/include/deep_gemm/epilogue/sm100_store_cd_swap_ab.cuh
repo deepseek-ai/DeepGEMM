@@ -4,7 +4,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 
@@ -17,7 +17,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumUMMAStoreThreads,
           uint32_t kNumOverlappedTmemCols,
           GemmType kGemmType, bool kWithAccumulation,
-          typename epilogue_op_t,
+          typename epilogue_operator_t,
           typename smem_t>
 CUTLASS_DEVICE void
 sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
@@ -26,7 +26,7 @@ sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
                        const bool& is_empty_group,
                        const uint32_t& effective_m,
                        const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
-                       const epilogue_op_t& epilogue_op,
+                       const epilogue_operator_t& epilogue_operator,
                        const bool& reverse_store_order,
                        const cutlass::arch::ClusterTransactionBarrier* tmem_overlap_barrier,
                        const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
@@ -36,9 +36,11 @@ sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
     //          implying STORE_BLOCK_N must be 128.
     DG_STATIC_ASSERT(STORE_BLOCK_N == 128, "STORE_BLOCK_N must be 128 to match TMEM rows");
 
-    // Whether to cast D into FP8 with dynamic per-`kSFGranN` UE8M0 SFs (see `EpilogueDynamicScaledFP8`)
-    constexpr bool kWithOutputSF = cute::is_same_v<epilogue_op_t, transform::EpilogueDynamicScaledFP8>;
-    constexpr uint32_t kSFGranN = transform::EpilogueDynamicScaledFP8::kSFGranN;
+    // Whether to cast D into FP8 with dynamic per-`kSFGranN` UE8M0 SFs (see `QuantizeToFP8`)
+    constexpr bool kWithOutputSF = cute::is_same_v<epilogue_operator_t, operators::QuantizeToFP8>;
+    constexpr bool kWithStochasticRounding =
+        cute::is_same_v<epilogue_operator_t, operators::StochasticRoundToBF16>;
+    constexpr uint32_t kSFGranN = operators::QuantizeToFP8::kSFGranN;
 
     // TMA checks
     constexpr uint32_t STORE_BLOCK_N_ATOM = kSwizzleCDMode / sizeof(cd_dtype_t);
@@ -52,6 +54,9 @@ sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
     DG_STATIC_ASSERT(not kWithOutputSF or cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t>, "FP8 output requires an E4M3 D");
     DG_STATIC_ASSERT(not kWithOutputSF or (STORE_BLOCK_M == 16 and kNumUMMAStoreThreads == 128),
                      "Swap-AB FP8 output requires one warpgroup and a 16x128 store shape");
+    DG_STATIC_ASSERT(not kWithStochasticRounding or
+                     (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> and not kWithAccumulation),
+                     "Stochastic rounding only supports direct BF16 output");
 
     // Share store pipeline between blocks
     auto advance_store_pipeline = [&]() {
@@ -92,7 +97,7 @@ sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
                 cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr, values[0], values[1], values[2], values[3],
                                                                  values[4], values[5], values[6], values[7]);
                 cutlass::arch::fence_view_async_tmem_load();
-                epilogue_op.apply_values(values);
+                epilogue_operator.apply_values(values);
             } else {
                 // Load from TMEM using `.16x256b` shape to satisfy the STSM layout requirements
                 // (`.b16` for the BF16 store, `.b8` for the FP8 store): each lane receives
@@ -104,7 +109,7 @@ sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
                 cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
                                                        values[4], values[5], values[6], values[7]);
                 cutlass::arch::fence_view_async_tmem_load();
-                epilogue_op.apply_values(values);
+                epilogue_operator.apply_values(values);
             }
             #pragma unroll
             for (uint32_t value_idx = 0; value_idx < kNumSwizzleAtomRows; ++ value_idx)
@@ -162,7 +167,7 @@ sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
                 // Store the SF byte into the packed word
                 // NOTES: lanes 0-3 own their row pair's even row, lanes 4-7 the odd row
                 if (lane_idx < kNumSwizzleAtomRows)
-                    epilogue_op.store_sf(base_m_idx + store_idx * STORE_BLOCK_M + load_idx * kNumSwizzleAtomRows +
+                    epilogue_operator.store_sf(base_m_idx + store_idx * STORE_BLOCK_M + load_idx * kNumSwizzleAtomRows +
                                           2 * (lane_idx % 4) + lane_idx / 4,
                                       base_n_idx + epilogue_warp_idx * kSFGranN, batch_idx,
                                       static_cast<uint8_t>(lane_idx < 4 ? sf_exp_lower : sf_exp_upper));
@@ -184,11 +189,43 @@ sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
                                               + (col ^ row) * kNumBankGroupBytes;
 
                 // Store matrix with transposition
-                ptx::SM90_U32x4_STSM_T<int>::copy(math::cast_into_bf16_and_pack(values[0], values[1]),
-                                                  math::cast_into_bf16_and_pack(values[2], values[3]),
-                                                  math::cast_into_bf16_and_pack(values[4], values[5]),
-                                                  math::cast_into_bf16_and_pack(values[6], values[7]),
-                                                  smem_ptr);
+                if constexpr (kWithStochasticRounding) {
+                    // Per the `.16x256b` loads, `values[value_idx]`/`values[value_idx + 1]` hold two
+                    // M-adjacent rows of one N value, at warp-relative N column
+                    // `value_idx * 4 + lane_idx / 16 * 4 + lane_idx / 4 % 4`, so both halves of a
+                    // packed pair share one N-quartet: lanes spaced by four own one row's four
+                    // adjacent N values, and each quartet hash is reduced across those lanes with
+                    // batched shuffles (level by level, keeping all eight chains overlapped);
+                    // each lane keeps its own quartet offset's 16-bit half
+                    DG_STATIC_ASSERT(kNumSwizzleAtomRows == 8, "The hash chains and STSM require eight values");
+                    const auto quartet_offset = lane_idx / 4 % 4;
+                    uint32_t hashes[kNumSwizzleAtomRows], packed[kNumSwizzleAtomRows / 2];
+                    #pragma unroll
+                    for (uint32_t value_idx = 0; value_idx < kNumSwizzleAtomRows; ++ value_idx)
+                        hashes[value_idx] = epilogue_operator.partial_hash(values[value_idx], quartet_offset);
+                    #pragma unroll
+                    for (uint32_t xor_mask = 4; xor_mask <= 8; xor_mask <<= 1) {
+                        #pragma unroll
+                        for (uint32_t value_idx = 0; value_idx < kNumSwizzleAtomRows; ++ value_idx)
+                            hashes[value_idx] += __shfl_xor_sync(0xffffffffu, hashes[value_idx], xor_mask);
+                    }
+                    #pragma unroll
+                    for (uint32_t value_idx = 0; value_idx < kNumSwizzleAtomRows; value_idx += 2) {
+                        const auto quartet_n_idx = (base_n_idx + epilogue_warp_idx * 32 + value_idx * 4 + lane_idx / 16 * 4) / 4;
+                        packed[value_idx / 2] = ptx::cvt_rs_bf16x2_f32(
+                            *reinterpret_cast<const float*>(&values[value_idx]),
+                            *reinterpret_cast<const float*>(&values[value_idx + 1]),
+                            epilogue_operator.select_random_bits(hashes[value_idx] + quartet_n_idx, quartet_offset) |
+                            epilogue_operator.select_random_bits(hashes[value_idx + 1] + quartet_n_idx, quartet_offset) << 16);
+                    }
+                    ptx::SM90_U32x4_STSM_T<uint32_t>::copy(packed[0], packed[1], packed[2], packed[3], smem_ptr);
+                } else {
+                    ptx::SM90_U32x4_STSM_T<int>::copy(math::cast_into_bf16_and_pack(values[0], values[1]),
+                                                      math::cast_into_bf16_and_pack(values[2], values[3]),
+                                                      math::cast_into_bf16_and_pack(values[4], values[5]),
+                                                      math::cast_into_bf16_and_pack(values[6], values[7]),
+                                                      smem_ptr);
+                }
             }
         }
 
@@ -200,7 +237,7 @@ sm100_store_cd_swap_ab(smem_t& smem, uint32_t& tma_stage_idx,
             for (uint32_t i = 0; i < STORE_BLOCK_N / STORE_BLOCK_N_ATOM; ++ i) {
                 auto smem_ptr = smem.cd[tma_stage_idx] + i * STORE_BLOCK_M * STORE_BLOCK_N_ATOM;
                 uint32_t m_idx = base_m_idx + store_idx * STORE_BLOCK_M;
-                uint32_t n_idx = epilogue_op_t::apply_index_n<STORE_BLOCK_N_ATOM>(base_n_idx + i * STORE_BLOCK_N_ATOM);
+                uint32_t n_idx = base_n_idx + i * STORE_BLOCK_N_ATOM;
 
                 // Issue 2D or 3D TMA store
                 if constexpr (kGemmType == GemmType::Batched or is_k_grouped_contiguous(kGemmType)) {

@@ -1,3 +1,4 @@
+import atexit
 import os
 import torch
 
@@ -14,6 +15,7 @@ except ImportError:
 # Configs
 from . import _C
 from ._C import (
+    shutdown,
     set_num_sms,
     get_num_sms,
     set_tc_util,
@@ -45,7 +47,6 @@ from ._C import (
     fp4_gemm_nt,
     fp8_gemm_nt, fp8_gemm_nn,
     fp8_gemm_tn, fp8_gemm_tt,
-    fp8_gemm_nt_skip_head_mid,
     m_grouped_fp4_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nn_contiguous,
@@ -63,22 +64,19 @@ from ._C import (
     m_grouped_bf16_gemm_nt_masked,
     k_grouped_bf16_gemm_tn_contiguous,
     # MegaGate kernels
-    bf16_mega_gate, get_bf16_mega_gate_config,
+    bf16_mega_gate,
     # Einsum kernels
     einsum,
     fp8_einsum,
     # Attention kernels
-    fp8_fp4_mqa_logits,
     get_mqa_logits_metadata,
+    fp8_fp4_mqa_logits,
     get_paged_mqa_logits_metadata,
+    fp8_fp4_paged_mqa_logits,
     get_sparse_mqa_logits_metadata,
     get_paged_sparse_mqa_logits_metadata,
     fp8_fp4_sparse_mqa_logits,
     fp8_fp4_paged_sparse_mqa_logits,
-    fp8_fp4_paged_mqa_logits,
-    # Attention kernels (legacy)
-    fp8_mqa_logits,
-    fp8_paged_mqa_logits,
     # Hyperconnection kernels
     mega_mhc,
     tf32_hc_prenorm_gemm,
@@ -97,6 +95,19 @@ from .mega import (
     bf16_mega_moe,
 )
 
+# Epilogue classes
+from ._C import epilogue
+
+# Locality domain helpers
+from . import locality_domain
+from .locality_domain import (
+    get_num_locality_domains,
+    is_localization_available,
+    localize,
+    is_localized,
+    destroy_localizer,
+)
+
 # Some utils
 from . import testing
 from . import utils
@@ -110,5 +121,8 @@ except Exception as e:
 
 # Initialize CPP modules
 _C.init(os.path.dirname(os.path.abspath(__file__)))
+# Native cuBLASLt exit callbacks can free handle storage before C++ static destructors.
+# Release handles and workspaces while Python, PyTorch and CUDA are still available.
+atexit.register(shutdown)
 
-__version__ = '2.8.0'
+__version__ = '2.8.1'

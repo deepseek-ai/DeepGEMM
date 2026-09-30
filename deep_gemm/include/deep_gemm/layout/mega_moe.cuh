@@ -5,6 +5,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
 namespace deep_gemm::layout {
@@ -63,10 +64,10 @@ struct alignas(128) MegaMoESignals {
     int nvl_barrier_signals[2];
 
     // Task scheduling
-    uint32_t l1_task_count;
-    uint32_t l2_task_count;
-    uint32_t shared_l1_task_count;
-    uint32_t shared_l2_task_count;
+    uint32_t l1_task_count[kNumDeviceLocalityDomains];
+    uint32_t l2_task_count[kNumDeviceLocalityDomains];
+    uint32_t shared_l1_task_count[kNumDeviceLocalityDomains];
+    uint32_t shared_l2_task_count[kNumDeviceLocalityDomains];
 
     // Combine readiness: `combine_ready_grid_idx[peer] == own grid index` means the peer's L2 writes into this
     // rank are done; grid indices are unique per launch, so no reset is needed. Peers push theirs during dispatch.
@@ -177,22 +178,22 @@ struct Workspace {
 
     CUTLASS_DEVICE
     uint32_t* get_l1_task_count_ptr() const {
-        return &signals->l1_task_count;
+        return signals->l1_task_count;
     }
 
     CUTLASS_DEVICE
     uint32_t* get_l2_task_count_ptr() const {
-        return &signals->l2_task_count;
+        return signals->l2_task_count;
     }
 
     CUTLASS_DEVICE
     uint32_t* get_shared_l1_task_count_ptr() const {
-        return &signals->shared_l1_task_count;
+        return signals->shared_l1_task_count;
     }
 
     CUTLASS_DEVICE
     uint32_t* get_shared_l2_task_count_ptr() const {
-        return &signals->shared_l2_task_count;
+        return signals->shared_l2_task_count;
     }
 
     CUTLASS_DEVICE
