@@ -390,20 +390,26 @@ void sm100_sparse_mqa_logits_metadata(
             const uint32_t q1_slot_offset = in_q1 ? q1_slot_idx - q1_slot_base : kInvalidSparseSlot;
             if (kv_block_idx_in_split == 0) {
                 const uint32_t num_kv_blocks_in_split = cute::min(kNumKVBlocksPerSplit, num_merged_kv_blocks - merged_kv_block_idx);
-                bool is_contiguous = false;
-                if constexpr (not kIsPaged and not kUseUnalignedKs) {
-                    // TMA copies full splits; partial splits stay on the generic path
+                bool is_contiguous = false, has_partial_tail = false;
+                if constexpr (not kIsPaged) {
+                    // Merged blocks are sorted, so only the last one can run past the KV tensor
                     const uint32_t last_packed_slots = ptx::ld_shared(smem.packed_slots_by_merged_kv_block + merged_kv_block_idx + num_kv_blocks_in_split - 1);
                     const bool last_in_q0 = (last_packed_slots & kPresentBit) != 0;
                     const uint32_t last_q_slot_idx = last_in_q0 ? last_packed_slots & kSlotIndexMask
                                                                 : (last_packed_slots >> kNumSparseSlotBits) & kSlotIndexMask;
                     const auto last_logical_kv_block_indices = smem.logical_kv_block_indices[last_in_q0 ? 0 : 1];
                     const uint32_t last_logical_kv_block_idx = ptx::ld_shared(last_logical_kv_block_indices + last_q_slot_idx);
-                    is_contiguous = num_kv_blocks_in_split == kNumKVBlocksPerSplit and
-                                    last_logical_kv_block_idx == logical_kv_block_idx + num_kv_blocks_in_split - 1;
+                    const uint32_t last_kv_token_start = last_logical_kv_block_idx * (kUseUnalignedKs ? 1 : SPARSE_BLOCK_KV);
+                    // TMA copies full splits; partial splits stay on the generic path
+                    if constexpr (not kUseUnalignedKs) {
+                        is_contiguous = num_kv_blocks_in_split == kNumKVBlocksPerSplit and
+                                        last_logical_kv_block_idx == logical_kv_block_idx + num_kv_blocks_in_split - 1;
+                    }
+                    // TMA zero-fills past the tensor itself, so only generic copies need the clipped path
+                    has_partial_tail = not is_contiguous and last_kv_token_start + SPARSE_BLOCK_KV > num_kv_tokens;
                 }
-                kv_splits[kv_split_idx].header = KVSplitHeader(q_token_base, num_kv_blocks_in_split, is_contiguous, q0_slot_base,
-                    num_q_block_tokens == BLOCK_Q ? q1_slot_base : ~0u);
+                kv_splits[kv_split_idx].header = KVSplitHeader(q_token_base, num_kv_blocks_in_split, is_contiguous, has_partial_tail,
+                    q0_slot_base, num_q_block_tokens == BLOCK_Q ? q1_slot_base : ~0u);
             }
             kv_splits[kv_split_idx].kv_block_infos[kv_block_idx_in_split] = KVBlockInfo(physical_kv_block_idx, q0_slot_offset, q1_slot_offset);
         };
@@ -459,6 +465,7 @@ void sm100_sparse_mqa_logits_metadata(
         header->num_kv_splits = total_kv_splits;
         header->num_waves = num_waves;
         header->use_unaligned_ks = kUseUnalignedKs;
+        header->num_sms = kNumSMs;
         workspace_state->num_kv_splits = 0;
         workspace_state->next_q_offset = 0;
         workspace_state->num_finished_ctas = 0;

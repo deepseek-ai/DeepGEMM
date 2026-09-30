@@ -52,23 +52,23 @@ static void launch_sm100_sparse_mqa_logits(const bool is_paged, const bool use_u
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     DG_HOST_ASSERT(metadata.dim() == 1 and metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous() and
                    metadata.numel() >= static_cast<int64_t>(sizeof(MetadataHeader)));
+    const uint32_t num_heads = static_cast<uint32_t>(weights.size(1));
     const int num_q_tokens = static_cast<int>(q.size(0));
     const int swizzle_mode = is_fp4 ? kHeadDim / 2 : kHeadDim;
-    const auto tensor_map_q = make_tma_2d_desc(q, kHeadDim, num_q_tokens * kNumHeads, kHeadDim, kBlockQ * kNumHeads,
+    const auto tensor_map_q = make_tma_2d_desc(q, kHeadDim, num_q_tokens * num_heads, kHeadDim, kBlockQ * num_heads,
                                                static_cast<int>(q.stride(is_paged ? 2 : 1)), swizzle_mode,
                                                0, false, not is_fp4);
-    const auto tensor_map_sf_q = make_tma_2d_desc(sf_q, kNumHeads, num_q_tokens, kNumHeads, kBlockQ,
+    const auto tensor_map_sf_q = make_tma_2d_desc(sf_q, num_heads, num_q_tokens, num_heads, kBlockQ,
                                                   static_cast<int>(sf_q.stride(is_paged ? 1 : 0)), 0);
-    const auto tensor_map_weights = make_tma_2d_desc(weights, kNumHeads, num_q_tokens, kNumHeads, kBlockQ,
+    const auto tensor_map_weights = make_tma_2d_desc(weights, num_heads, num_q_tokens, align(num_heads, 8u), kBlockQ,
                                                      static_cast<int>(weights.stride(0)), 0);
     CUtensorMap tensor_map_kv{};
     CUtensorMap tensor_map_sf_kv{};
+    const int num_kv_tokens = static_cast<int>(kv.size(0));
     if (not is_paged) {
-        const int num_kv_tokens = static_cast<int>(kv.size(0));
         tensor_map_kv = make_tma_2d_desc(kv, kHeadDim, num_kv_tokens, kHeadDim, kNumKVTokensPerTMA,
                                          static_cast<int>(kv.stride(0)), swizzle_mode, 0, false, not is_fp4);
-        tensor_map_sf_kv = make_tma_2d_desc(sf_kv, get_tma_aligned_size(num_kv_tokens, static_cast<int>(sf_kv.element_size())), 1,
-                                            kNumKVTokensPerTMA, 1, 0, 0);
+        tensor_map_sf_kv = make_tma_2d_desc(sf_kv, num_kv_tokens, 1, kNumKVTokensPerTMA, 1, 0, 0);
     }
     const int num_smem_bytes = is_fp4 ?
         (sparse_block_kv == 8 ?
@@ -82,14 +82,14 @@ static void launch_sm100_sparse_mqa_logits(const bool is_paged, const bool use_u
     const int num_sms = runtime->get_num_sms();
     const auto instantiate = is_paged ? std::format(R"(
     auto ptr = reinterpret_cast<void*>(&sm100_paged_sparse_mqa_logits<
-        {}, {}, {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
     >);
-)", static_cast<int>(kv.size(1)), sparse_block_kv, kNumQStages, num_kv_stages, kNumTmemStages,
+)", num_heads, static_cast<int>(kv.size(1)), sparse_block_kv, kNumQStages, num_kv_stages, kNumTmemStages,
         num_math_warpgroups, num_sms, kBlockQ, is_fp4) : std::format(R"(
     auto ptr = reinterpret_cast<void*>(&sm100_sparse_mqa_logits<
-        {}, {}, {}, {}, {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
     >);
-)", sparse_block_kv, kNumQStages, num_kv_stages, kNumTmemStages, num_math_warpgroups, num_sms, kBlockQ,
+)", num_heads, sparse_block_kv, kNumQStages, num_kv_stages, kNumTmemStages, num_math_warpgroups, num_sms, kBlockQ,
         use_unaligned_ks, is_fp4);
     const auto kernel_name = is_paged ? "sm100_paged_sparse_mqa_logits" : "sm100_sparse_mqa_logits";
     const auto kernel = jit->compile(kernel_name, std::format(R"(
@@ -125,7 +125,7 @@ static void __instantiate_kernel() {{
                 .grid_dim = dim3(num_sms, 1, 1),
                 .block_dim = dim3(get_num_threads(num_math_warpgroups), 1, 1),
             },
-            static_cast<int>(logits.stride(0)), logits.data_ptr(), kv.data_ptr(), sf_kv.data_ptr<int>(),
+            static_cast<int>(logits.stride(0)), num_kv_tokens, logits.data_ptr(), kv.data_ptr(), sf_kv.data_ptr<int>(),
             metadata.data_ptr<uint8_t>(), tensor_map_q, tensor_map_sf_q, tensor_map_weights,
             tensor_map_kv, tensor_map_sf_kv
         );

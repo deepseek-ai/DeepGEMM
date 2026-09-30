@@ -42,14 +42,15 @@ enum class KernelType {
     KernelNoSF = 2
 };
 
-// Host-visible runtime state of the `epilogue::transform` operators, which derive from
-// this struct without adding members, so the host fully determines the operator on launch.
-// Only the fields consumed by the selected epilogue type are meaningful
-struct EpilogueArgs {
+// Runtime state of the `epilogue::operators`, which derive from this struct without adding
+// members; only the fields consumed by the selected operator are meaningful
+struct EpilogueOperatorArgs {
     uint32_t* sfd = nullptr;
     uint32_t sfd_stride = 0;
     uint32_t shape_m = 0, shape_n = 0;
     float alpha = 1.0f;
 };
+
+static constexpr uint32_t kNumDeviceLocalityDomains = 2;
 
 } // namespace deep_gemm

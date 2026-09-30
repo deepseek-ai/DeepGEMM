@@ -9,7 +9,7 @@
 #include <deep_gemm/common/packing.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
 #include <deep_gemm/layout/gemm.cuh>
@@ -34,11 +34,11 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
-          typename epilogue_op_t>
+          typename epilogue_operator_t>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                             const __grid_constant__ epilogue_op_t epilogue_op,
+                             const __grid_constant__ epilogue_operator_t epilogue_operator,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
@@ -54,12 +54,12 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              cute::is_same_v<b_dtype_t, cutlass::float_e2m1_t>;
 
     // The host launches the epilogue operator directly as a kernel argument
-    DG_STATIC_ASSERT(sizeof(epilogue_op_t) == sizeof(EpilogueArgs),
-                     "Epilogue operators must not add state to `EpilogueArgs`");
+    DG_STATIC_ASSERT(sizeof(epilogue_operator_t) == sizeof(EpilogueOperatorArgs),
+                     "Epilogue operators must not add state to `EpilogueOperatorArgs`");
 
     // C/D type: BF16 and FP32 are supported, with or without accumulation; FP8 C/D requires the
     // dynamically-scaled epilogue with per-32 UE8M0 SFD output, batched only, without accumulation
-    constexpr bool kWithOutputSF = cute::is_same_v<epilogue_op_t, epilogue::transform::EpilogueDynamicScaledFP8>;
+    constexpr bool kWithOutputSF = cute::is_same_v<epilogue_operator_t, epilogue::operators::QuantizeToFP8>;
     DG_STATIC_ASSERT(kWithOutputSF ? (cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t> and
                                       kGemmType == GemmType::Batched and not kWithAccumulation) :
                                      (cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
@@ -537,7 +537,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                  is_empty_group,
                  effective_m,
                  epilogue_warp_idx, lane_idx,
-                 epilogue_op,
+                 epilogue_operator,
                  reverse_store_order,
                  &smem.tmem_overlap_barriers[accum_stage_idx],
                  &smem.tmem_empty_barriers[accum_stage_idx],
@@ -552,7 +552,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                  base_m_idx, base_n_idx, scheduler.current_group_idx,
                  is_empty_group,
                  epilogue_warp_idx, lane_idx,
-                 epilogue_op,
+                 epilogue_operator,
                  reverse_store_order,
                  &smem.tmem_overlap_barriers[accum_stage_idx],
                  &smem.tmem_empty_barriers[accum_stage_idx],
