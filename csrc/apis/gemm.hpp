@@ -11,6 +11,7 @@
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 
 #include "layout.hpp"
+#include "gathered.hpp"
 
 namespace deep_gemm::gemm {
 
@@ -953,6 +954,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "mn",
           py::arg("alpha") = std::nullopt,
           py::arg("epilogue") = nullptr);
+    m.def("m_grouped_bf16_gemm_nt_contiguous_gathered", &m_grouped_bf16_gemm_nt_contiguous_gathered,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"), py::arg("a_row_indices"));
     m.def("m_grouped_bf16_gemm_nt_contiguous", &m_grouped_bf16_gemm_nt_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("compiled_dims") = "nk",
