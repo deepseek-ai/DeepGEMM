@@ -14,8 +14,7 @@ struct SM90GatheredArchSpec : SM90ArchSpec {
     }
 };
 
-// The row map has the same padded, expert-major M layout as grouped_layout.
-// All entries must select valid source rows, including expert padding entries.
+// Padding row indices must also reference valid source rows.
 static void m_grouped_bf16_gemm_nt_contiguous_gathered(
     const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& d,
     const torch::Tensor& grouped_layout, const torch::Tensor& a_row_indices) {

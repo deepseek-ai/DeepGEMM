@@ -127,8 +127,7 @@ sm90_bf16_gemm_impl(int* grouped_layout,
     (kNumTMAMulticast > 1) ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Register reconfigurations
-    // A 384-thread CTA starts with 168 registers per thread. Producers must
-    // leave room for both 128-thread math warpgroups to grow to 224 registers.
+    // Leave enough registers for both math warpgroups to grow to 224.
     constexpr uint32_t kNumTMARegisters = kGatherA ? 56 : 48;
     constexpr uint32_t kNumMathRegisters = kNumMathThreads == 128 ? 248 : 224;
 
@@ -205,8 +204,7 @@ sm90_bf16_gemm_impl(int* grouped_layout,
                             "r"(static_cast<uint32_t>(__cvta_generic_to_shared(destination))),
                             "l"(source), "r"(valid_rows[i] ? 16 : 0) : "memory");
                     }
-                    // Every loader contributes one asynchronous arrival; the B
-                    // issuer contributes the additional transaction arrival.
+                    // The barrier counts every loader plus the B transaction issuer.
                     cutlass::arch::cpasync_barrier_arrive_noinc(reinterpret_cast<uint64_t*>(&full_barrier));
                 }
             }
