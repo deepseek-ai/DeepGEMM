@@ -21,6 +21,10 @@ public:
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_cd;
+        void* gathered_a = nullptr;
+        void* a_row_indices = nullptr;
+        uint64_t gathered_a_stride = 0;
+        uint32_t gathered_a_rows = 0;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -41,7 +45,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -61,7 +65,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
-        to_string(args.gemm_desc.cd_dtype)));
+        to_string(args.gemm_desc.cd_dtype), args.a_row_indices != nullptr));
 
         // Launch
         jit->launch(
@@ -69,7 +73,8 @@ static void __instantiate_kernel() {{
             args.grouped_layout,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b,
-            args.tensor_map_cd
+            args.tensor_map_cd,
+            args.gathered_a, args.a_row_indices, args.gathered_a_stride, args.gathered_a_rows
         );
     }
 };

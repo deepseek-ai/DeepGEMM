@@ -74,6 +74,12 @@ To perform a basic non-grouped FP8 GEMM, call the `fp8_gemm_{nt, nn, tn, tt}` fu
 
 Unlike traditional grouped GEMMs in CUTLASS, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape. For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_mk_alignment_for_contiguous_layout()`).  For more information, please refer to the `m_grouped_fp8_gemm_{nt, nn}_contiguous` function documentation.
 
+On SM90, `m_grouped_bf16_gemm_nt_contiguous_gathered(a, b, d, grouped_layout, a_row_indices)` reads source rows directly inside the BF16 GEMM. It computes the same grouped product as `m_grouped_bf16_gemm_nt_contiguous(a.index_select(0, a_row_indices), b, d, grouped_layout)` without allocating that gathered activation tensor.
+
+The initial API requires a dense M-grouped layout with alignment 128, contiguous int64 CUDA row indices, contiguous BF16 weights, and BF16 output. Source rows have contiguous K elements, a 16-byte aligned starting address, and a row stride divisible by 8 BF16 elements; K is a positive multiple of 64. All row indices, including expert padding entries, must address valid source rows. All tensors must be on the same CUDA device. The last group may end in a partial M tile. PSUM layouts, FP8, accumulation, and TMA multicast are outside this API. See `tests/test_gathered_bf16.py` for examples and boundary checks.
+
+Gate/up weights can be packed along N by the caller to produce both projections in one GEMM. SwiGLU remains a separate epilogue. The benefit depends on the shape and workload; the existing materialized-input API remains available.
+
 We also provide a K-axis-grouped API for MoE weight backward (with M and N must remain fixed), please refer to `k_grouped_fp8_gemm_tn_contiguous` for more information.
 
 #### Grouped GEMMs (masked layout)

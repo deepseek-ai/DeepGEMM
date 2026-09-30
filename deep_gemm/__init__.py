@@ -58,6 +58,7 @@ from ._C import (
     bf16_gemm_nt, bf16_gemm_nn,
     bf16_gemm_tn, bf16_gemm_tt,
     m_grouped_bf16_gemm_nt_contiguous,
+    m_grouped_bf16_gemm_nt_contiguous_gathered,
     m_grouped_bf16_gemm_nn_contiguous,
     m_grouped_bf16_gemm_nt_masked,
     k_grouped_bf16_gemm_tn_contiguous,

@@ -35,13 +35,15 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs,
           GemmType kGemmType, bool kWithAccumulation,
-          typename cd_dtype_t>
+          typename cd_dtype_t, bool kGatherA = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_bf16_gemm_impl(int* grouped_layout,
                     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                    const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                    const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                    const nv_bfloat16* gathered_a, const int64_t* a_row_indices,
+                    uint64_t gathered_a_stride, uint32_t gathered_a_rows) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `warpgroup_wait<0>()` overhead
@@ -84,7 +86,8 @@ sm90_bf16_gemm_impl(int* grouped_layout,
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == kNumMathThreads / 32 and cute::elect_one_sync()) {
-        cute::prefetch_tma_descriptor(&tensor_map_a);
+        if constexpr (not kGatherA)
+            cute::prefetch_tma_descriptor(&tensor_map_a);
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
@@ -113,7 +116,7 @@ sm90_bf16_gemm_impl(int* grouped_layout,
     if (warp_idx == kNumMathThreads / 32 + 1 and cute::elect_one_sync()) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumStages; ++ i) {
-            full_barriers[i]->init(1);
+            full_barriers[i]->init(kGatherA ? kNumTMAThreads + 1 : 1);
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
@@ -125,7 +128,9 @@ sm90_bf16_gemm_impl(int* grouped_layout,
     (kNumTMAMulticast > 1) ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Register reconfigurations
-    constexpr uint32_t kNumTMARegisters = 48;
+    // A 384-thread CTA starts with 168 registers per thread. Producers must
+    // leave room for both 128-thread math warpgroups to grow to 224 registers.
+    constexpr uint32_t kNumTMARegisters = kGatherA ? 56 : 48;
     constexpr uint32_t kNumMathRegisters = kNumMathThreads == 128 ? 248 : 224;
 
     // Wait for primary kernel completion
@@ -151,7 +156,62 @@ sm90_bf16_gemm_impl(int* grouped_layout,
 
         // NOTES: only one thread (or warp) will be used
         // We use the third warp, as warp 0/1 may be doing WGMMA with `BLOCK_M == 32`
-        if (warp_idx == kNumMathThreads / 32 + 2 and cute::elect_one_sync()) {
+        if constexpr (kGatherA) {
+            DG_STATIC_ASSERT(kMajorA == cute::UMMA::Major::K and kMajorB == cute::UMMA::Major::K,
+                             "Gathered A requires K-major BF16 inputs");
+            DG_STATIC_ASSERT(kGemmType == GemmType::MGroupedContiguous and kNumTMAMulticast == 1,
+                             "Gathered A supports contiguous M groups without multicast");
+            DG_STATIC_ASSERT(BLOCK_K == 64 and kSwizzleAMode == 128 and BLOCK_M == 128,
+                             "Gathered A currently supports 128x64 A tiles with 128-byte swizzle");
+            constexpr uint32_t kVectorsPerRow = BLOCK_K * sizeof(nv_bfloat16) / 16;
+            constexpr uint32_t kVectorsPerThread = BLOCK_M * kVectorsPerRow / kNumTMAThreads;
+            const uint32_t loader_idx = threadIdx.x - kNumMathThreads;
+            const bool issue_b = warp_idx == kNumMathThreads / 32 + 2 and cute::elect_one_sync();
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                const auto m_idx = m_block_idx * BLOCK_M;
+                const auto n_idx = scheduler.template get_global_idx<true, sched::IndexType::MN>(
+                    shape_n, BLOCK_N, n_block_idx, m_block_idx);
+                uint64_t source_offsets[kVectorsPerThread];
+                bool valid_rows[kVectorsPerThread];
+                #pragma unroll
+                for (uint32_t i = 0; i < kVectorsPerThread; ++ i) {
+                    const auto vector_idx = loader_idx + i * kNumTMAThreads;
+                    const auto row = vector_idx / kVectorsPerRow;
+                    valid_rows[i] = m_idx + row < shape_m;
+                    const auto source = valid_rows[i] ? a_row_indices[m_idx + row] : 0;
+                    DG_TRAP_ONLY_DEVICE_ASSERT(not valid_rows[i] or (source >= 0 and source < gathered_a_rows));
+                    source_offsets[i] = static_cast<uint64_t>(source) * gathered_a_stride;
+                }
+                const auto num_total_k_blocks = math::ceil_div(shape_k, BLOCK_K);
+                for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
+                    empty_barriers[stage_idx]->wait(phase ^ 1);
+                    auto& full_barrier = *full_barriers[stage_idx];
+                    if (issue_b) {
+                        tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode, cutlass::bfloat16_t>(
+                            &tensor_map_b, &full_barrier, smem_b[stage_idx],
+                            k_block_idx * BLOCK_K, n_idx);
+                        full_barrier.arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE);
+                    }
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kVectorsPerThread; ++ i) {
+                        const auto vector_idx = loader_idx + i * kNumTMAThreads;
+                        const auto row = vector_idx / kVectorsPerRow;
+                        const auto column = vector_idx % kVectorsPerRow;
+                        // Match the existing TMA descriptor's 128-byte XOR swizzle.
+                        const auto destination = reinterpret_cast<uint4*>(smem_a[stage_idx]) +
+                            row * kVectorsPerRow + (column ^ (row % 8));
+                        const auto source = gathered_a + source_offsets[i] +
+                            k_block_idx * BLOCK_K + column * 8;
+                        asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16, %2;" ::
+                            "r"(static_cast<uint32_t>(__cvta_generic_to_shared(destination))),
+                            "l"(source), "r"(valid_rows[i] ? 16 : 0) : "memory");
+                    }
+                    // Every loader contributes one asynchronous arrival; the B
+                    // issuer contributes the additional transaction arrival.
+                    cutlass::arch::cpasync_barrier_arrive_noinc(reinterpret_cast<uint64_t*>(&full_barrier));
+                }
+            }
+        } else if (warp_idx == kNumMathThreads / 32 + 2 and cute::elect_one_sync()) {
             DG_STATIC_ASSERT(kNumTMAThreads >= 128, "Need at least 128 threads for TMA warp-group");
 
             // Persistently schedule over blocks
