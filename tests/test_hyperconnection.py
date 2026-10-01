@@ -45,6 +45,40 @@ def test_hc_prenorm_gemm() -> None:
     print()
 
 
+@test_filter(lambda: get_arch_major() >= 9)
+def test_hc_prenorm_gemm_torch_op() -> None:
+    # The torch dispatcher op (torch.ops.deep_gemm.tf32_hc_prenorm_gemm) must
+    # match the pybind entry point exactly; this also guards the schema /
+    # forwarder signature against future pybind changes.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    print('Testing hyperconnection prenorm GEMM (torch op):')
+    for m in (13, 4096):
+        for n, k in [(24, 7168)]:
+            for num_splits in [None, 16]:
+                a = torch.randn((m, k), dtype=torch.bfloat16, device='cuda')
+                b = torch.randn((n, k), dtype=torch.float, device='cuda')
+
+                def make_out():
+                    d = torch.empty((m, n), dtype=torch.float, device='cuda') if num_splits is None else \
+                            torch.empty((num_splits, m, n), dtype=torch.float, device='cuda')
+                    s = torch.empty((m, ), dtype=torch.float, device='cuda') if num_splits is None else \
+                            torch.empty((num_splits, m), dtype=torch.float, device='cuda')
+                    return d, s
+
+                d_ref, s_ref = make_out()
+                deep_gemm.tf32_hc_prenorm_gemm(a, b, d_ref, s_ref, num_splits=num_splits)
+
+                d_op, s_op = make_out()
+                torch.ops.deep_gemm.tf32_hc_prenorm_gemm(a, b, d_op, s_op, num_splits)
+
+                assert calc_diff(d_op, d_ref) < 1e-10, f'd mismatch: {m=}, {n=}, {k=}, {num_splits=}'
+                assert calc_diff(s_op, s_ref) < 1e-10, f's mismatch: {m=}, {n=}, {k=}, {num_splits=}'
+                print(f' > OK (m={m:5}, n={n:5}, k={k:5}, num_splits={(num_splits or 0):2})')
+    print()
+
+
 
 
 if __name__ == '__main__':
@@ -55,3 +89,4 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_hc_prenorm_gemm()
+    test_hc_prenorm_gemm_torch_op()
