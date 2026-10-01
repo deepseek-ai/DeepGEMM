@@ -2,6 +2,8 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
+#include <cuda_device_runtime_api.h>
+
 #include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/cute_tie.cuh>
