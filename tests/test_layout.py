@@ -1,5 +1,6 @@
 import torch
 import random
+from deep_gemm import transform_sf_into_required_layout
 from deep_gemm.testing import bench_kineto, count_bytes, get_arch_major
 from deep_gemm.utils import (
     align, ceil_div, ceil_to_ue8m0,
@@ -77,6 +78,32 @@ def test_sf_layout_kernels() -> None:
             t = 0
         print(f' > Perf ({num_groups=:2}, {mn=:5}, {k=:5}, transpose={int(with_transpose)}, use_ue8m0={int(use_ue8m0)}, gran_k={gran_k:3}): '
               f'{t * 1e6:4.0f} us | {count_bytes(fp32_sf, impl(fp32_sf)) / 1e9 / t if t else 0:4.0f} GB/s')
+    print()
+
+
+def test_transform_sf_into_required_layout_mxfp4_recipe() -> None:
+    # Mirror the MXFP4 weight-prep call made by SGLang for Kimi-K3 /
+    # DeepSeek-V4: FP32 per-tile (1, 32) scales -> packed-UE8M0 int32 output.
+    # The (1, 32) UE8M0 branch of transform_sf_into_required_layout only
+    # exists on SM100 (SM90 uses the (1, 128) FP32 TMA layout; SM120 support
+    # lives on the sgl-project fork, see sgl-project/DeepGEMM).
+    print('Testing transform_sf_into_required_layout (MXFP4, recipe (1, 32)):')
+    if get_arch_major() in (9, 12):
+        print(' > Skipped ((1, 32) UE8M0 layout transform is SM100-only upstream)')
+        return
+
+    for num_groups, mn, k in [(1, 3072, 3584), (4, 1024, 3584), (8, 3072, 7168)]:
+        # Exponent-only FP32 values (0.5 -> 0x3f000000) are valid UE8M0
+        # payloads; the pack kernels assert zero sign/mantissa bits.
+        sf = torch.full((num_groups, mn, k // 32), 0.5, dtype=torch.float, device='cuda')
+        packed_sf = transform_sf_into_required_layout(
+            sf, mn=mn, k=k, recipe=(1, 32), num_groups=num_groups,
+            disable_ue8m0_cast=False,
+        )
+        ref_packed_sf = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(sf)
+        assert torch.equal(packed_sf, ref_packed_sf), f'{num_groups=}, {mn=}, {k=}'
+        assert packed_sf.shape == ref_packed_sf.shape
+        assert all([packed_sf.stride(i) == ref_packed_sf.stride(i) for i in range(packed_sf.dim())])
     print()
 
 
@@ -159,5 +186,6 @@ if __name__ == '__main__':
     random.seed(1)
 
     test_sf_layout_kernels()
+    test_transform_sf_into_required_layout_mxfp4_recipe()
     test_k_grouped_sf_layout_kernels()
     test_k_grouped_psum_sf_layout_kernels()
