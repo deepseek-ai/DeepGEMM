@@ -71,11 +71,16 @@ def make_parser() -> argparse.ArgumentParser:
                         help="JIT cache directory; defaults to a new /tmp directory")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--layout", type=parse_shape, help=argparse.SUPPRESS)
+    parser.add_argument("--result-file", type=Path, help=argparse.SUPPRESS)
     return parser
 
 
-def emit(record: dict) -> None:
-    print(f"{WORKER_RECORD_PREFIX}{json.dumps(record, sort_keys=True)}", flush=True)
+def emit(record: dict, result_file: Path | None) -> None:
+    payload = json.dumps(record, sort_keys=True)
+    if result_file is None:
+        print(f"{WORKER_RECORD_PREFIX}{payload}", flush=True)
+    else:
+        result_file.write_text(payload)
 
 
 def is_acceptable_diff(diff: float, tolerance: float) -> bool:
@@ -84,6 +89,7 @@ def is_acceptable_diff(diff: float, tolerance: float) -> bool:
 
 def run_worker(args: argparse.Namespace) -> int:
     os.environ["DG_PRINT_CONFIGS"] = "1"
+    os.environ["DG_JIT_DEBUG"] = "0"
     if args.layout is None:
         os.environ.pop("DG_JIT_FORCE_LAYOUT", None)
     else:
@@ -97,7 +103,7 @@ def run_worker(args: argparse.Namespace) -> int:
     from deep_gemm.testing import calc_diff
 
     if torch.cuda.get_device_capability()[0] != 12:
-        emit({"status": "error", "error": "SM120 GPU required"})
+        emit({"status": "error", "error": "SM120 GPU required"}, args.result_file)
         return 1
 
     torch.manual_seed(args.seed)
@@ -133,7 +139,8 @@ def run_worker(args: argparse.Namespace) -> int:
         torch.cuda.synchronize()
     except RuntimeError as exc:
         if "DG_JIT_FORCE_LAYOUT is not a valid candidate" in str(exc):
-            emit({"status": "invalid", "shape": (m, n, k), "layout": args.layout})
+            emit({"status": "invalid", "shape": (m, n, k), "layout": args.layout},
+                 args.result_file)
             return 0
         raise
 
@@ -145,9 +152,10 @@ def run_worker(args: argparse.Namespace) -> int:
             "layout": args.layout,
             "diff": diff,
             "tolerance": tolerance,
-        })
+        }, args.result_file)
         return 1
 
+    os.environ["DG_PRINT_CONFIGS"] = "0"
     for _ in range(args.warmups):
         run()
     torch.cuda.synchronize()
@@ -183,12 +191,18 @@ def run_worker(args: argparse.Namespace) -> int:
         "torch_cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
         "sm_count": torch.cuda.get_device_properties(0).multi_processor_count,
-    })
+    }, args.result_file)
     return 0
 
 
+def effective_shape(dtype: str, shape: tuple[int, int, int]) -> tuple[int, int, int]:
+    # The FP8 API swaps operands for small M with contiguous output and no C.
+    m, n, k = shape
+    return (n, m, k) if dtype == "fp8" and m <= 16 else (m, n, k)
+
+
 def candidate_layouts(dtype: str, shape: tuple[int, int, int]):
-    m, n, _ = shape
+    m, n, _ = effective_shape(dtype, shape)
     block_ms = (64, 128) if n <= 32 else (128, 64)
     if n <= 16:
         block_ns = (16,)
@@ -201,14 +215,10 @@ def candidate_layouts(dtype: str, shape: tuple[int, int, int]):
     return itertools.product(block_ms, block_ks, block_ns)
 
 
-def parse_worker_output(output: str) -> tuple[dict, tuple[int, ...] | None]:
-    record = None
-    for line in reversed(output.splitlines()):
-        if line.startswith(WORKER_RECORD_PREFIX):
-            record = json.loads(line[len(WORKER_RECORD_PREFIX):])
-            break
-    if record is None:
+def parse_worker_output(output: str, payload: str) -> tuple[dict, tuple[int, ...] | None]:
+    if not payload:
         raise RuntimeError(f"worker produced no JSON record:\n{output}")
+    record = json.loads(payload)
 
     match = CONFIG_RE.search(output.replace("\n", " "))
     config = tuple(map(int, match.groups())) if match else None
@@ -234,19 +244,27 @@ def run_candidate(args: argparse.Namespace, shape: tuple[int, int, int],
     env["DG_PRINT_CONFIGS"] = "1"
     env["DG_JIT_CACHE_DIR"] = str(args.cache_dir)
     env.pop("DG_JIT_FORCE_LAYOUT", None)
-    completed = subprocess.run(command, env=env, text=True, capture_output=True)
-    output = completed.stdout + completed.stderr
-    record, config = parse_worker_output(output)
+    with tempfile.TemporaryDirectory(prefix="deepgemm-calibration-worker-") as directory:
+        result_file = Path(directory) / "result.json"
+        command.extend(("--result-file", str(result_file)))
+        completed = subprocess.run(command, env=env, text=True, capture_output=True)
+        output = completed.stdout + completed.stderr
+        payload = result_file.read_text() if result_file.exists() else ""
+    record, config = parse_worker_output(output, payload)
     if completed.returncode != 0 or record["status"] not in ("ok", "invalid"):
-        raise RuntimeError(output)
+        raise RuntimeError(f"worker failed: {json.dumps(record, sort_keys=True)}\n{output}")
     if record["status"] == "invalid":
         return record
     if config is None:
         raise RuntimeError(f"worker produced no config:\n{output}")
 
     block_m, block_n, block_k, stages, waves, last_wave_util, predicted_cycles = config
+    actual_layout = (block_m, block_n, block_k)
+    if layout is not None and actual_layout != layout:
+        raise RuntimeError(f"forced layout mismatch: requested {layout}, got {actual_layout}")
     record.update({
-        "layout": (block_m, block_n, block_k),
+        "layout": actual_layout,
+        "effective_shape": effective_shape(args.dtype, shape),
         "num_stages": stages,
         "num_waves": waves,
         "last_wave_util": last_wave_util,
@@ -266,7 +284,7 @@ def split_k_factor(record: dict) -> int:
     if record["dtype"] == "bf16":
         return 1
 
-    m, n, k = record["shape"]
+    m, n, k = effective_shape(record["dtype"], record["shape"])
     block_m, block_n, block_k = record["layout"]
     num_mn_blocks = math.ceil(m / block_m) * math.ceil(n / block_n)
     if num_mn_blocks >= record["sm_count"] // 2:
@@ -291,7 +309,7 @@ def split_k_factor(record: dict) -> int:
 
 def model_features(record: dict) -> np.ndarray:
     """Mirror sm120.hpp cost-model terms for reconstruction checks."""
-    m, n, k = record["shape"]
+    m, n, k = effective_shape(record["dtype"], record["shape"])
     block_m, block_n, block_k = record["layout"]
     elem_size = 2 if record["dtype"] == "bf16" else 1
     sf_bytes = 0
