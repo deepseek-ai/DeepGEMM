@@ -8,7 +8,7 @@ on:
         type: string
         default: '["ZW-M890P", "OAM-810E"]'
       source_mode:
-        description: "Source layout mode. Supported values: deepgemm, actlize0.5.0, actlize1.0.0."
+        description: "Source layout mode. Supported values: deepgemm, actlize1.0.0."
         required: false
         type: string
         default: deepgemm
@@ -66,46 +66,17 @@ jobs:
               ""|deepgemm)
                 cd /workspace/source
                 ;;
-              actlize0.5.0)
-                cd /workspace
-                DEEPGEMM_SOURCE=$(mktemp -d /workspace/deepgemm-source.XXXXXX)
-                rmdir "$DEEPGEMM_SOURCE"
-                git clone --recurse-submodules -b main \
-                  https://github.com/t-head/DeepGEMM-for-sail.git "$DEEPGEMM_SOURCE"
-                ACTLIZE_V100_SOURCE=$(mktemp -d /workspace/actlize-v100-source.XXXXXX)
-                rmdir "$ACTLIZE_V100_SOURCE"
-                git clone --recurse-submodules -b v1.0.0 \
-                  https://github.com/t-head/actlize.git "$ACTLIZE_V100_SOURCE"
-
-                ACTLIZE_V050_SOURCE=$(mktemp -d /workspace/actlize-v050-source.XXXXXX)
-                rmdir "$ACTLIZE_V050_SOURCE"
-                mv /workspace/source "$ACTLIZE_V050_SOURCE"
-                rm -rf "$DEEPGEMM_SOURCE/third-party/actlize_v0.5.0"
-                rm -rf "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
-                mkdir -p "$DEEPGEMM_SOURCE/third-party"
-                mv "$ACTLIZE_V050_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v0.5.0"
-                mv "$ACTLIZE_V100_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
-                mv "$DEEPGEMM_SOURCE" /workspace/source
-                cd /workspace/source
-                ;;
               actlize1.0.0)
                 cd /workspace
                 DEEPGEMM_SOURCE=$(mktemp -d /workspace/deepgemm-source.XXXXXX)
                 rmdir "$DEEPGEMM_SOURCE"
                 git clone --recurse-submodules -b main \
                   https://github.com/t-head/DeepGEMM-for-sail.git "$DEEPGEMM_SOURCE"
-                ACTLIZE_V050_SOURCE=$(mktemp -d /workspace/actlize-v050-source.XXXXXX)
-                rmdir "$ACTLIZE_V050_SOURCE"
-                git clone --recurse-submodules -b v0.5.0 \
-                  https://github.com/t-head/actlize.git "$ACTLIZE_V050_SOURCE"
-
                 ACTLIZE_V100_SOURCE=$(mktemp -d /workspace/actlize-v100-source.XXXXXX)
                 rmdir "$ACTLIZE_V100_SOURCE"
                 mv /workspace/source "$ACTLIZE_V100_SOURCE"
-                rm -rf "$DEEPGEMM_SOURCE/third-party/actlize_v0.5.0"
                 rm -rf "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
                 mkdir -p "$DEEPGEMM_SOURCE/third-party"
-                mv "$ACTLIZE_V050_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v0.5.0"
                 mv "$ACTLIZE_V100_SOURCE" "$DEEPGEMM_SOURCE/third-party/actlize_v1.0.0"
                 mv "$DEEPGEMM_SOURCE" /workspace/source
                 cd /workspace/source

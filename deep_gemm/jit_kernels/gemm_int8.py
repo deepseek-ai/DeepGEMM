@@ -6,35 +6,36 @@ from typing import Tuple
 import re
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, get_sm_count, GemmType
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, is_ppu1v5_device, get_sm_count, GemmType
 from .gemm_int8_lut import get_best_configs_from_lut
 from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_int8_adaptive_enabled, get_warp_k
 
 # C++ code templates
-includes = ('<deep_gemm/impls/int8_gemm.cuh>', )
-template = """
+includes_int8_cutlass3 = ('<deep_gemm/impls/int8_gemm_cutlass3.cuh>', )
+template_int8_cutlass3 = """
 using namespace deep_gemm;
 
-// Templated args from Python JIT call
+using ElementAB = {ElementAB};
+using ElementAcc = {ElementAcc};
 constexpr auto N = {N}, K = {K};
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
+constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto WARP_M = {WARP_M};
 constexpr auto WARP_N = {WARP_N};
-constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
-// Make a templated grouped GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
+using gemm_t = Gemm<ElementAB, ElementAcc, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
+                    WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm,
+                    false, KernelType::{KERNEL_TYPE}>;
 
-// Launch kernel
 gemm_t::run(out, nullptr, nullptr,
-            m, 0, lhs, lhs_scales, rhs, rhs_scales,
+            m, 0, (ElementAB*)lhs, lhs_scales, (ElementAB*)rhs, rhs_scales,
             stream, num_sms, smem_size);
 """
 
-# DenseGemm-only cutlass3 path: standalone kernel that reads N/K at runtime.
+# PPU1.5 DenseGemm-only cutlass3 path: standalone kernel that reads N/K at runtime.
 # Do NOT reuse includes_densegemm/template_densegemm for grouped or MoE paths.
 includes_densegemm = ('<deep_gemm/impls/int8_densegemm_cutlass3.cuh>', )
 template_densegemm = """
@@ -679,8 +680,6 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     #     kernel_type = 'OverlapPrologue'
 
     # Auto-tuning with compilation
-    global includes, template, includes_cutlass3, template_cutlass3, includes_densegemm, template_densegemm
-
     num_sms = get_num_sms()
     if configs is not None:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
@@ -698,16 +697,13 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
             warp_k = get_warp_k(block_m, block_n, block_k // 2, warp_m, warp_n, num_stages) * 2
         else:
             dense_s2_opt = False
-    extra_info = get_extra_info()
-
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
 
-    if extra_info['use_actlize_v100']:
-        # Standalone DenseGemm path: N and K are runtime args, not compile keys
+    if is_ppu1v5_device():
+        # PPU1.5 DenseGemm path: N and K are runtime args, not compile keys.
         args = (lhs, lhs_scales, rhs, rhs_scales, out,
                 m, n, k, torch.cuda.current_stream(), num_sms, smem_config[0])
-
         runtime = jit_tuner.compile_and_tune(
             name='gemm_' + ElementAB + '_bf16_nt',
             keys={'ElementAB': ElementAB, 'ElementAcc': ElementAcc,
@@ -728,28 +724,24 @@ def gemm_a8w8_per_channel_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
             args=args
         )
     else:
-        # Legacy non-cutlass3 path
         args = (lhs, lhs_scales, rhs, rhs_scales, out,
                 m, torch.cuda.current_stream(), num_sms, smem_config[0])
-
         runtime = jit_tuner.compile_and_tune(
             name='gemm_' + ElementAB + '_bf16_nt',
             keys={'ElementAB': ElementAB, 'ElementAcc': ElementAcc,
                   'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
-                  'WARP_M': warp_m, 'WARP_N': warp_n,
-                  'NUM_STAGES': num_stages,
+                  'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages,
                   'KERNEL_TYPE': kernel_type},
             space=(),
-            includes=includes,
+            includes=includes_int8_cutlass3,
             arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
                       ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                       ('out', torch.bfloat16), ('m', int),
                       ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-            template=template,
-            jit_include_dir=None,
+            template=template_int8_cutlass3,
+            jit_include_dir='actlize_v1.0.0',
             args=args
         )
-    # Run the kernel
     runtime(*args)
 
 def gemm_int8_int8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],

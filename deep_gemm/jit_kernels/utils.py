@@ -184,16 +184,8 @@ def get_sm_count():
 @functools.lru_cache(maxsize=None)
 def get_extra_info(m=0, n=0, k=0, dtype=torch.int8, api_type="dense") -> dict:
     extra_info = {}
-    use_actlize_v100 = False
     use_multistage_on_N = False
     use_moe_dynamic_tile = False
-
-    if is_ppu1v5_device():
-        use_actlize_v100 = True
-
-    if 'DG_USE_ACTLIZE_V100' in os.environ:
-        use_actlize_v100 = int(os.getenv('DG_USE_ACTLIZE_V100'))
-    extra_info['use_actlize_v100'] = use_actlize_v100
 
     if 'DG_USE_MULTISTAGE_ON_N' in os.environ:
         use_multistage_on_N = int(os.getenv('DG_USE_MULTISTAGE_ON_N'))

@@ -35,7 +35,6 @@ int get_sm_count() {
 std::unordered_map<std::string, int> get_extra_info(int m = 0, int n = 0, int k = 0, int dtype = 1,
                                                     const std::string& api_type = "dense") {
     std::unordered_map<std::string, int> extra_info;
-    extra_info["use_actlize_v100"] = is_ppu1v5_device() || get_env<int>("DG_USE_ACTLIZE_V100", 0);
     extra_info["use_multistage_on_N"] = get_env<int>("DG_USE_MULTISTAGE_ON_N", 0);
     extra_info["use_moe_dynamic_tile"] = get_env<int>("DG_USE_MOE_DYNAMIC_TILE", 0);
 

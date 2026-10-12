@@ -3,7 +3,7 @@ import torch
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout,get_col_major_tma_aligned_tensor,get_extra_info, GemmType
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout,get_col_major_tma_aligned_tensor, GemmType
 from .gemm_fp8 import get_best_configs
 from .gemm_int8 import get_best_configs as get_best_int8_configs
 # C++ code templates
@@ -29,29 +29,6 @@ using gemm_t = Fp8Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, BLOCK_N_
 // Launch kernel
 gemm_t::run(d, a, b, sfa,
             sfb, nullptr, nullptr, m, 0,
-            stream, num_sms, smem_size);
-"""
-
-includes_cutlass2_int8 = ('<deep_gemm/impls/int8_gemm.cuh>', )
-template_cutlass2_int8 = """
-using namespace deep_gemm;
-
-// Templated args from Python JIT call
-constexpr auto N = {N}, K = {K};
-constexpr auto BLOCK_M = {BLOCK_M};
-constexpr auto BLOCK_N = {BLOCK_N};
-constexpr auto WARP_M = {WARP_M};
-constexpr auto WARP_N = {WARP_N};
-constexpr auto BLOCK_K = {BLOCK_K};
-constexpr auto kNumGroups = {NUM_GROUPS};
-constexpr auto kNumStages = {NUM_STAGES};
-
-// Make a templated grouped GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::BatchGemm>;
-
-// Launch kernel
-gemm_t::run(d, nullptr, nullptr,
-            m, 0, a, sfa, b, sfb,
             stream, num_sms, smem_size);
 """
 
@@ -377,9 +354,6 @@ def int8_bmm(a: torch.Tensor, sfa: torch.Tensor,
         return
 
     # Auto-tuning with compilation
-    global includes_cutlass2_int8, template_cutlass2_int8, includes_cutlass3, template_cutlass3
-
-    extra_info = get_extra_info()
     num_sms = get_num_sms()
     if configs is not None:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
@@ -400,13 +374,13 @@ def int8_bmm(a: torch.Tensor, sfa: torch.Tensor,
               'BLOCK_N_PADDING': smem_config[2],
               'NUM_STAGES': num_stages},
         space=(),
-        includes=includes_cutlass3 if extra_info['use_actlize_v100'] else includes_cutlass2_int8,
+        includes=includes_cutlass3,
         arg_defs=(('a', a.dtype), ('sfa', torch.float),
                   ('b', b.dtype), ('sfb', torch.float),
                   ('d', torch.bfloat16), ('m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-        template=template_cutlass3 if extra_info['use_actlize_v100'] else template_cutlass2_int8,
-        jit_include_dir='actlize_v1.0.0' if extra_info['use_actlize_v100'] else None,
+        template=template_cutlass3,
+        jit_include_dir='actlize_v1.0.0',
         args=args,
     )
     # Run the kernel

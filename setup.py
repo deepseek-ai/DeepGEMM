@@ -43,9 +43,6 @@ build_include_dirs = [
     current_dir + '/third-party/actlize_v1.0.0/tools',
     current_dir + '/third-party/fmt/include',
     current_dir + '/third-party/actlize_v1.0.0/include/cute',
-    current_dir + '/third-party/actlize_v0.5.0/include/accutlass.h',
-    current_dir + '/third-party/actlize_v0.5.0/include/cutlass',
-    current_dir + '/third-party/actlize_v0.5.0/include/',
 ]
 
 build_libraries = ['hggc', 'hggcrt1', 'hgrtc', 'acblasLt']
@@ -54,9 +51,6 @@ build_library_dirs = [
 ]
 
 third_party_include_dirs = [
-    'third-party/actlize_v0.5.0/include/accutlass.h',
-    'third-party/actlize_v0.5.0/include/cutlass',
-    'third-party/actlize_v0.5.0/include/aiu',
     'third-party/actlize_v1.0.0/include/cute',
     'third-party/actlize_v1.0.0/include/cutlass',
     'third-party/actlize_v1.0.0/include/ppu_include.hpp',
@@ -179,7 +173,6 @@ if __name__ == '__main__':
         package_data={
             'deep_gemm': [
                 'include/deep_gemm/**/*',
-                'include/actlize_v0.5.0/**/*',
                 'include/actlize_v1.0.0/**/*',
                 'deep_gemm_tuner/configs/*',
             ]

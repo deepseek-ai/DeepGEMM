@@ -42,7 +42,6 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
 
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
     int expected_m = ceil_div(m, num_groups);
-    auto extra_info = get_extra_info();
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
@@ -65,138 +64,62 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_contiguous_impl(const torch::Tensor
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
     bool enable_sbo_overlap = false;
-    if (extra_info["use_actlize_v100"]) {
-        const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
-            .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-            .problem_shape = {m, n, k, 1},
-            .mainloopargs = {input_a, stride_A, input_b, stride_B},
-            .epilogueargs =
-                {
-                    {1, 0},
-                    output,
-                    stride_D,
-                    output,
-                    stride_D,
-                },
-            .hw_info = hw_info,
-            .scheduler = {(uint32_t)m, grouped_layout},
-            .signal = nullptr};
+    const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
+        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+        .problem_shape = {m, n, k, 1},
+        .mainloopargs = {input_a, stride_A, input_b, stride_B},
+        .epilogueargs =
+            {
+                {1, 0},
+                output,
+                stride_D,
+                output,
+                stride_D,
+            },
+        .hw_info = hw_info,
+        .scheduler = {(uint32_t)m, grouped_layout},
+        .signal = nullptr};
 
-        BF16GemmCutlass3Runtime::GemmKernelParams params =
-            BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
-        auto args = BF16GemmCutlass3Runtime::Args{
-            .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "GroupedContiguous",
-                            "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
-            .launch_args = {grid, block, SMSIZE},
-            .kernel_params = params};
-        const auto& code = BF16GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous", code);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
+    BF16GemmCutlass3Runtime::GemmKernelParams params =
+        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+    auto args = BF16GemmCutlass3Runtime::Args{
+        .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, "GroupedContiguous",
+                        "Default", "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
+        .launch_args = {grid, block, SMSIZE},
+        .kernel_params = params};
+    const auto& code = BF16GemmCutlass3Runtime::generate(args);
+    const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous", code);
+    const auto& kernel = runtime->kernel;
+    int blocks_per_cu = 0;
+    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    args.launch_args.grid_dim.x *= blocks_per_cu;
 
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        BF16GemmCutlass3Runtime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-            printf("[GroupedContiguous:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
-                   block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
-        }
-    } else {
-        int64_t stride, increment_row, increment_group, increment_cluster;
-        int64_t advance_row, advance_group, advance_cluster, advance_tile;
-        using ElementType = cutlass::bfloat16_t;
-
-        int ElementsPerAccess = 128 / cutlass::sizeof_bits<ElementType>::value;
-        int LimitedPerAccessC_ = (block_n * 8 / (block_n / warp_n) / 32);
-        int ElementsPerAccessC = LimitedPerAccessC_ < ElementsPerAccess ? LimitedPerAccessC_ : ElementsPerAccess;
-
-        deep_gemm::compute_predicated_tile_iterator_params(block_m, block_n, block_k, // block_m, block_n, block_k
-                                                           warp_m, warp_n, block_k,   // warp_m, warp_n, warp_k
-                                                           ElementsPerAccessC,        // elements_per_access
-                                                           16, // element_size_bits (16 for bfloat16)
-                                                           n,  // shape_n (runtime value)
-                                                           &stride, &increment_row, &increment_group,
-                                                           &increment_cluster, &advance_row, &advance_group,
-                                                           &advance_cluster, &advance_tile);
-        const int threadblock_count = num_sms < 20 ? num_sms : num_sms; // * max_active_tb_num;
-        // printf("block_m is %ld, block_n is %ld, block_k is %ld, warp_m is %ld, warp_n is %ld, ElementsPerAccessC is
-        // %ld, n is %ld", block_m, block_n, block_k, warp_m, warp_n, ElementsPerAccessC, n); printf("stride is %ld,
-        // increment_row is %ld, increment_group is %ld, increment_cluster is %ld, advance_row is %ld, advance_group is
-        // %ld, advance_cluster is %ld, advance_tile is %ld", stride, increment_row, increment_group, increment_cluster,
-        // advance_row, advance_group, advance_cluster, advance_tile);
-        BF16GemmRuntime::GemmKernelParams params = BF16GemmRuntime::GemmKernelParams{
-            .problem_visitor = {grouped_layout, n, k, m, kNumGroups},
-            .threadblock_count = threadblock_count,
-            .problem_count = kNumGroups,
-            .output_op = {float(1), float(0)},
-            .ptr_A = input_a,
-            .params_A = cutlass::layout::RowMajor(k),
-            .ptr_B = input_b,
-            .params_B = cutlass::layout::ColumnMajor(k),
-            .ptr_D = output,
-            .params_D = {stride, increment_row, increment_group, increment_cluster, advance_row, advance_group,
-                         advance_cluster, advance_tile}, // cutlass::layout::RowMajor(n),
-            .signal = nullptr};
-
-        auto args = BF16GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                          num_stages, n, k, "GroupedContiguous",
-                                                          "bf16_grouped_deep_gemm_contiguous", enable_sbo_overlap},
-                                          .launch_args = {grid, block, SMSIZE},
-                                          .kernel_params = params};
-
-        const auto& code = BF16GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_contiguous", code, ActlizeLib::kV050);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        BF16GemmRuntime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-            printf("[GroupedContiguous:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
-                   block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
-        }
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
+                                  grouped_layout, current_stream());
     }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+    BF16GemmCutlass3Runtime::launch(runtime, args);
+
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int numRegs = 0, localSize = 0;
+        hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+        hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+        printf("[GroupedContiguous:]\n");
+        printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
+        printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+               args.launch_args.grid_dim.x);
+        printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
+               block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
+    }
+
 }
 
 static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const torch::Tensor& lhs, const torch::Tensor& rhs,
@@ -220,7 +143,6 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
 
     // int expected_m = ceil_div(m, num_groups);
-    auto extra_info = get_extra_info();
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
@@ -244,139 +166,63 @@ static std::pair<int, int> m_grouped_gemm_bf16_bf16_bf16_nt_masked_impl(const to
     hw_info.cu_count = num_sms_new;
     dim3 const block = (block_m / warp_m) * (block_n / warp_n) * 32;
     dim3 grid = get_grid_shape(hw_info.cu_count);
-    if (extra_info["use_actlize_v100"]) {
-        const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
-            .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-            .problem_shape = {m, n, k, 1},
-            .mainloopargs = {input_a, stride_A, input_b, stride_B},
-            .epilogueargs =
-                {
-                    {1, 0},
-                    output,
-                    stride_D,
-                    output,
-                    stride_D,
-                },
-            .hw_info = hw_info,
-            .scheduler = {(uint32_t)m, grouped_layout},
-            .signal = signal_ptr};
+    const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
+        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+        .problem_shape = {m, n, k, 1},
+        .mainloopargs = {input_a, stride_A, input_b, stride_B},
+        .epilogueargs =
+            {
+                {1, 0},
+                output,
+                stride_D,
+                output,
+                stride_D,
+            },
+        .hw_info = hw_info,
+        .scheduler = {(uint32_t)m, grouped_layout},
+        .signal = signal_ptr};
 
-        BF16GemmCutlass3Runtime::GemmKernelParams params =
-            BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+    BF16GemmCutlass3Runtime::GemmKernelParams params =
+        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
-        auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                                  num_stages, "GroupedMasked", "Default",
-                                                                  "bf16_grouped_deep_gemm_masked", enable_sbo_overlap},
-                                                  .launch_args = {grid, block, SMSIZE},
-                                                  .kernel_params = params};
-        const auto& code = BF16GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_masked", code);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
+    auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
+                                                              num_stages, "GroupedMasked", "Default",
+                                                              "bf16_grouped_deep_gemm_masked", enable_sbo_overlap},
+                                              .launch_args = {grid, block, SMSIZE},
+                                              .kernel_params = params};
+    const auto& code = BF16GemmCutlass3Runtime::generate(args);
+    const auto& runtime = compiler->build("bf16_grouped_deep_gemm_masked", code);
+    const auto& kernel = runtime->kernel;
+    int blocks_per_cu = 0;
+    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    args.launch_args.grid_dim.x *= blocks_per_cu;
 
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        BF16GemmCutlass3Runtime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-            printf("[GroupedMasked:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
-                   block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
-        }
-    } else {
-        int64_t stride, increment_row, increment_group, increment_cluster;
-        int64_t advance_row, advance_group, advance_cluster, advance_tile;
-        using ElementType = cutlass::bfloat16_t;
-
-        int ElementsPerAccess = 128 / cutlass::sizeof_bits<ElementType>::value;
-        int LimitedPerAccessC_ = (block_n * 8 / (block_n / warp_n) / 32);
-        int ElementsPerAccessC = LimitedPerAccessC_ < ElementsPerAccess ? LimitedPerAccessC_ : ElementsPerAccess;
-
-        deep_gemm::compute_predicated_tile_iterator_params(block_m, block_n, block_k, // block_m, block_n, block_k
-                                                           warp_m, warp_n, block_k,   // warp_m, warp_n, warp_k
-                                                           ElementsPerAccessC,        // elements_per_access
-                                                           16, // element_size_bits (16 for bfloat16)
-                                                           n,  // shape_n (runtime value)
-                                                           &stride, &increment_row, &increment_group,
-                                                           &increment_cluster, &advance_row, &advance_group,
-                                                           &advance_cluster, &advance_tile);
-        const int threadblock_count = num_sms < 20 ? num_sms : num_sms; // * max_active_tb_num;
-        // printf("block_m is %ld, block_n is %ld, block_k is %ld, warp_m is %ld, warp_n is %ld, ElementsPerAccessC is
-        // %ld, n is %ld", block_m, block_n, block_k, warp_m, warp_n, ElementsPerAccessC, n); printf("stride is %ld,
-        // increment_row is %ld, increment_group is %ld, increment_cluster is %ld, advance_row is %ld, advance_group is
-        // %ld, advance_cluster is %ld, advance_tile is %ld", stride, increment_row, increment_group, increment_cluster,
-        // advance_row, advance_group, advance_cluster, advance_tile);
-        BF16GemmRuntime::GemmKernelParams params = BF16GemmRuntime::GemmKernelParams{
-            .problem_visitor = {grouped_layout, n, k, m, kNumGroups},
-            .threadblock_count = threadblock_count,
-            .problem_count = kNumGroups,
-            .output_op = {float(1), float(0)},
-            .ptr_A = input_a,
-            .params_A = cutlass::layout::RowMajor(k),
-            .ptr_B = input_b,
-            .params_B = cutlass::layout::ColumnMajor(k),
-            .ptr_D = output,
-            .params_D = {stride, increment_row, increment_group, increment_cluster, advance_row, advance_group,
-                         advance_cluster, advance_tile}, // cutlass::layout::RowMajor(n),
-            .signal = signal_ptr};
-
-        auto args = BF16GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                          num_stages, n, k, "GroupedMasked",
-                                                          "bf16_grouped_deep_gemm_masked", enable_sbo_overlap},
-                                          .launch_args = {grid, block, SMSIZE},
-                                          .kernel_params = params};
-
-        const auto& code = BF16GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_masked", code, ActlizeLib::kV050);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      grouped_layout, current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        BF16GemmRuntime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-            printf("[GroupedMasked:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
-                   block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
-        }
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
+                                  grouped_layout, current_stream());
     }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+    BF16GemmCutlass3Runtime::launch(runtime, args);
+
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int numRegs = 0, localSize = 0;
+        hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+        hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+        printf("[GroupedMasked:]\n");
+        printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
+        printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+               args.launch_args.grid_dim.x);
+        printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
+               block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
+    }
+
     return std::make_pair(block_m, ceil_div(n, block_n));
 }
 
@@ -538,7 +384,6 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
     auto [num_sms_new, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config] = cfg;
 
     // int expected_m = ceil_div(m, num_groups);
-    auto extra_info = get_extra_info();
     auto SMSIZE = std::get<0>(smem_config);
 
     int kNumGroups = num_groups;
@@ -602,139 +447,63 @@ static void m_grouped_gemm_bf16_bf16_bf16_nt_nopad_impl(const torch::Tensor& lhs
         ComputeBlockInfoKernelRuntime::launch(runtime_blockinfo, compute_block_info_args);
         layout_info = reinterpret_cast<int32_t*>(block_m_info.data_ptr<int32_t>());
     }
-    if (extra_info["use_actlize_v100"]) {
-        const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
-            .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-            .problem_shape = {m, n, k, 1},
-            .mainloopargs = {input_a, stride_A, input_b, stride_B},
-            .epilogueargs =
-                {
-                    {1, 0},
-                    output,
-                    stride_D,
-                    output,
-                    stride_D,
-                },
-            .hw_info = hw_info,
-            .scheduler = {(uint32_t)m, layout_info},
-            .signal = nullptr};
+    const auto gemm_args = BF16GemmCutlass3Runtime::GemmArguments{
+        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+        .problem_shape = {m, n, k, 1},
+        .mainloopargs = {input_a, stride_A, input_b, stride_B},
+        .epilogueargs =
+            {
+                {1, 0},
+                output,
+                stride_D,
+                output,
+                stride_D,
+            },
+        .hw_info = hw_info,
+        .scheduler = {(uint32_t)m, layout_info},
+        .signal = nullptr};
 
-        BF16GemmCutlass3Runtime::GemmKernelParams params =
-            BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
-        auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                                                                  num_stages, "GroupedNoPad", "Default",
-                                                                  "bf16_grouped_deep_gemm_NoPad", false},
-                                                  .launch_args = {grid, block, SMSIZE},
-                                                  .kernel_params = params};
-        const auto& code = BF16GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_NoPad", code);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
+    BF16GemmCutlass3Runtime::GemmKernelParams params =
+        BF16GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+    auto args = BF16GemmCutlass3Runtime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
+                                                              num_stages, "GroupedNoPad", "Default",
+                                                              "bf16_grouped_deep_gemm_NoPad", false},
+                                              .launch_args = {grid, block, SMSIZE},
+                                              .kernel_params = params};
+    const auto& code = BF16GemmCutlass3Runtime::generate(args);
+    const auto& runtime = compiler->build("bf16_grouped_deep_gemm_NoPad", code);
+    const auto& kernel = runtime->kernel;
+    int blocks_per_cu = 0;
+    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    args.launch_args.grid_dim.x *= blocks_per_cu;
 
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      m_rows_tensor.data_ptr<int32_t>(), current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        BF16GemmCutlass3Runtime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-            printf("[GroupedNoPad:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
-                   block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
-        }
-
-    } else {
-        int64_t stride, increment_row, increment_group, increment_cluster;
-        int64_t advance_row, advance_group, advance_cluster, advance_tile;
-        using ElementType = cutlass::bfloat16_t;
-
-        int ElementsPerAccess = 128 / cutlass::sizeof_bits<ElementType>::value;
-        int LimitedPerAccessC_ = (block_n * 8 / (block_n / warp_n) / 32);
-        int ElementsPerAccessC = LimitedPerAccessC_ < ElementsPerAccess ? LimitedPerAccessC_ : ElementsPerAccess;
-
-        deep_gemm::compute_predicated_tile_iterator_params(block_m, block_n, block_k, // block_m, block_n, block_k
-                                                           warp_m, warp_n, block_k,   // warp_m, warp_n, warp_k
-                                                           ElementsPerAccessC,        // elements_per_access
-                                                           16, // element_size_bits (16 for bfloat16)
-                                                           n,  // shape_n (runtime value)
-                                                           &stride, &increment_row, &increment_group,
-                                                           &increment_cluster, &advance_row, &advance_group,
-                                                           &advance_cluster, &advance_tile);
-        const int threadblock_count = num_sms < 20 ? num_sms : num_sms; // * max_active_tb_num;
-        // printf("block_m is %ld, block_n is %ld, block_k is %ld, warp_m is %ld, warp_n is %ld, ElementsPerAccessC is
-        // %ld, n is %ld", block_m, block_n, block_k, warp_m, warp_n, ElementsPerAccessC, n); printf("stride is %ld,
-        // increment_row is %ld, increment_group is %ld, increment_cluster is %ld, advance_row is %ld, advance_group is
-        // %ld, advance_cluster is %ld, advance_tile is %ld", stride, increment_row, increment_group, increment_cluster,
-        // advance_row, advance_group, advance_cluster, advance_tile);
-        BF16GemmRuntime::GemmKernelParams params = BF16GemmRuntime::GemmKernelParams{
-            .problem_visitor = {layout_info, n, k, m, kNumGroups},
-            .threadblock_count = threadblock_count,
-            .problem_count = kNumGroups,
-            .output_op = {float(1), float(0)},
-            .ptr_A = input_a,
-            .params_A = cutlass::layout::RowMajor(k),
-            .ptr_B = input_b,
-            .params_B = cutlass::layout::ColumnMajor(k),
-            .ptr_D = output,
-            .params_D = {stride, increment_row, increment_group, increment_cluster, advance_row, advance_group,
-                         advance_cluster, advance_tile}, // cutlass::layout::RowMajor(n),
-            .signal = nullptr};
-
-        auto args =
-            BF16GemmRuntime::Args{.launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages, n,
-                                                  k, "GroupedNoPad", "bf16_grouped_deep_gemm_NoPad", enable_sbo_overlap},
-                                  .launch_args = {grid, block, SMSIZE},
-                                  .kernel_params = params};
-
-        const auto& code = BF16GemmRuntime::generate(args);
-        const auto& runtime = compiler->build("bf16_grouped_deep_gemm_NoPad", code, ActlizeLib::kV050);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
-                                      m_rows_tensor.data_ptr<int32_t>(), current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        BF16GemmRuntime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-            printf("[GroupedNoPad:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
-                   block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
-        }
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_params(kGemmType, false, std::string("bf16"), kNumGroups, m, n, k, expected_m,
+                                  m_rows_tensor.data_ptr<int32_t>(), current_stream());
     }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+    BF16GemmCutlass3Runtime::launch(runtime, args);
+
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int numRegs = 0, localSize = 0;
+        hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+        hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+        printf("[GroupedNoPad:]\n");
+        printf("group:%d, problem:[%d, %d, %d]\n", num_groups, m, n, k);
+        printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+               args.launch_args.grid_dim.x);
+        printf("ThreadblockShape[%d, %d, %d], expected_m:%d, WarpShape[%d, %d, %d], num_stages:%d\n", block_m,
+               block_n, block_k, expected_m, warp_m, warp_n, block_k, num_stages);
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n",int(SMSIZE), int(numRegs), int(localSize));
+    }
+
+
 }
 
 } // namespace deep_gemm

@@ -5,16 +5,15 @@ from functools import lru_cache
 from typing import Tuple
 
 from .tuner import jit_tuner
-from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, get_extra_info, is_ppu1v5_device, GemmType
+from .utils import get_num_sms, ceil_div, get_m_alignment_for_contiguous_layout, is_ppu1v5_device, GemmType
 from .gemm_search_space import MatmulHeuristicsTile
 from .densegemm_adaptive_select_strategy import get_adaptive_configs, is_bf16_adaptive_enabled, get_warp_k
 
 # C++ code templates
-includes = ('<deep_gemm/impls/bf16_gemm.cuh>', )
-template = """
+includes_bf16_cutlass3 = ('<deep_gemm/impls/bf16_gemm_cutlass3.cuh>', )
+template_bf16_cutlass3 = """
 using namespace deep_gemm;
 
-// Templated args from Python JIT call
 constexpr auto N = {N}, K = {K};
 constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
@@ -24,15 +23,15 @@ constexpr auto BLOCK_K = {BLOCK_K};
 constexpr auto kNumGroups = 1;
 constexpr auto kNumStages = {NUM_STAGES};
 
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::DenseGemm>;
+using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N,
+                    kNumGroups, kNumStages, GemmType::DenseGemm>;
 
-// Launch kernel
 gemm_t::run(out, nullptr, nullptr,
             m, 0, lhs, rhs,
             stream, num_sms, smem_size);
 """
 
-# BF16 DenseGemm-only cutlass3 path: standalone kernel that reads N/K at runtime.
+# PPU1.5 DenseGemm-only cutlass3 path: standalone kernel that reads N/K at runtime.
 # Do NOT reuse includes_bf16_densegemm/template_bf16_densegemm for grouped or MoE paths.
 includes_bf16_densegemm = ('<deep_gemm/impls/bf16_densegemm_cutlass3.cuh>', )
 template_bf16_densegemm = """
@@ -426,7 +425,6 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
         return
 
     # Auto-tuning with compilation
-    global includes, template
     num_sms = get_num_sms()
     shape = [m, n, k]
     device_props = torch.cuda.get_device_properties(device='cuda')
@@ -451,13 +449,11 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
         else:
             dense_s2_opt = False
 
-    extra_info = get_extra_info()
     kernel_type = 'Default'
 
-    if extra_info['use_actlize_v100']:
-        # Standalone BF16 DenseGemm path: N and K are runtime args, not compile keys
+    if is_ppu1v5_device():
+        # PPU1.5 DenseGemm path: N and K are runtime args, not compile keys.
         args = (lhs, rhs, out, m, n, k, torch.cuda.current_stream(), num_sms, smem_config[0])
-
         runtime = jit_tuner.compile_and_tune(
             name='gemm_bf16_bf16_bf16_nt',
             keys={'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
@@ -478,20 +474,17 @@ def gemm_bf16_bf16_bf16_nt(lhs: Tuple[torch.Tensor],
         )
     else:
         args = (lhs, rhs, out, m, torch.cuda.current_stream(), num_sms, smem_config[0])
-
         runtime = jit_tuner.compile_and_tune(
             name='gemm_bf16_bf16_bf16_nt',
             keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'BLOCK_K': block_k,
-                  'WARP_M': warp_m, 'WARP_N': warp_n,
-                  'NUM_STAGES': num_stages},
+                  'WARP_M': warp_m, 'WARP_N': warp_n, 'NUM_STAGES': num_stages},
             space=(),
-            includes=includes,
-            arg_defs=(('lhs', torch.bfloat16),
-                      ('rhs', torch.bfloat16),
+            includes=includes_bf16_cutlass3,
+            arg_defs=(('lhs', torch.bfloat16), ('rhs', torch.bfloat16),
                       ('out', torch.bfloat16), ('m', int),
                       ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int)),
-            template=template,
-            jit_include_dir=None,
+            template=template_bf16_cutlass3,
+            jit_include_dir='actlize_v1.0.0',
             args=args
         )
     runtime(*args)

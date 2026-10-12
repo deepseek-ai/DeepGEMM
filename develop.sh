@@ -4,16 +4,9 @@ script_dir=$(realpath "$(dirname "$0")")
 cd "$script_dir"
 
 # Link includes for JIT (matching setup.py make_jit_include_symlinks)
-# Remove old root-level v0.5.0 symlinks (now moved to subfolder)
-rm -f deep_gemm/include/accutlass.h deep_gemm/include/cutlass deep_gemm/include/aiu
-# Ensure include dirs are real directories, not symlinks (prevent symlink traversal)
-for d in deep_gemm/include/actlize_v0.5.0 deep_gemm/include/actlize_v1.0.0; do
-    [ -L "$d" ] && rm -f "$d"
-done
-mkdir -p deep_gemm/include/actlize_v0.5.0 deep_gemm/include/actlize_v1.0.0
-ln -sfn $script_dir/third-party/actlize_v0.5.0/include/accutlass.h deep_gemm/include/actlize_v0.5.0/accutlass.h
-ln -sfn $script_dir/third-party/actlize_v0.5.0/include/cutlass deep_gemm/include/actlize_v0.5.0/cutlass
-ln -sfn $script_dir/third-party/actlize_v0.5.0/include/aiu deep_gemm/include/actlize_v0.5.0/aiu
+# Ensure include dir is a real directory, not a symlink (prevent symlink traversal)
+[ -L deep_gemm/include/actlize_v1.0.0 ] && rm -f deep_gemm/include/actlize_v1.0.0
+mkdir -p deep_gemm/include/actlize_v1.0.0
 ln -sfn $script_dir/third-party/actlize_v1.0.0/include/cute deep_gemm/include/actlize_v1.0.0/cute
 ln -sfn $script_dir/third-party/actlize_v1.0.0/include/cutlass deep_gemm/include/actlize_v1.0.0/cutlass
 ln -sfn $script_dir/third-party/actlize_v1.0.0/include/ppu_include.hpp deep_gemm/include/actlize_v1.0.0/ppu_include.hpp

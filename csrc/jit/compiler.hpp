@@ -23,12 +23,6 @@
 
 namespace deep_gemm {
 
-// Selects which actlize library a kernel is compiled against (actlize_v1.0.0 or actlize_v0.5.0).
-// The choice belongs to the kernel (its generated code includes a header from one library or
-// the other), not to the chip: the host side already picks the runtime -- and thus the
-// library -- via `extra_info["use_actlize_v100"]`, so this is simply forwarded down to us.
-enum class ActlizeLib { kV100, kV050 };
-
 class Compiler {
 public:
     static std::filesystem::path library_root_path;
@@ -37,21 +31,10 @@ public:
     mutable int blocks_per_cu = 1;
 
     // Single source of truth for the actlize include search paths, shared by the offline (HGCC)
-    // and runtime (HGRTC) compilers. The two libraries have colliding header names, so exactly
-    // one of them is put on the search path.
-    // NOTE: both branches need the include root itself so that angle-bracket
-    // includes like <deep_gemm/...> resolve correctly via -I include/.
-    static std::vector<std::string> actlize_include_paths(ActlizeLib lib) {
+    // and runtime (HGRTC) compilers.
+    static std::vector<std::string> actlize_include_paths() {
         const std::string inc = library_include_path.string();
-        std::vector<std::string> paths;
-        if (lib == ActlizeLib::kV050) {
-            paths.push_back(inc);
-            paths.push_back(inc + "/actlize_v0.5.0");
-        } else {
-            paths.push_back(inc + "/actlize_v1.0.0");
-            paths.push_back(inc);   // Resolve <deep_gemm/...> angle-bracket includes
-        }
-        return paths;
+        return {inc + "/actlize_v1.0.0", inc};
     }
 
     static void prepare_init(const std::string& library_root_path,
@@ -123,10 +106,8 @@ public:
         fsync_path(path);
     }
 
-    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code, ActlizeLib lib = ActlizeLib::kV100) const {
-        // NOTE: `lib` participates in the signature because the include paths and tuning flags
-        // it selects are no longer part of `flags` (they are resolved per kernel in `compile`).
-        const auto kernel_signature = fmt::format("{}$${}$${}$${}$${}", name, signature, flags, static_cast<int>(lib), code);
+    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
+        const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
         const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
 
         // Hit the runtime cache
@@ -141,7 +122,7 @@ public:
 
         // Compile into a temporary HGBIN
         const auto tmp_hgbin_path = tmp_dir_path / "kernel.hgbin";
-        compile(code, tmp_dir_path, tmp_hgbin_path, name, lib);
+        compile(code, tmp_dir_path, tmp_hgbin_path, name);
 
         // Fsync before rename to ensure visibility on distributed filesystems
         fsync_dir(tmp_dir_path);
@@ -165,7 +146,7 @@ public:
         return runtime;
     }
 
-    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, ActlizeLib lib) const = 0;
+    virtual void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const = 0;
 };
 
 DG_DECLARE_STATIC_VAR_IN_CLASS(Compiler, library_root_path);
@@ -218,8 +199,7 @@ public:
         }
 
         // --- Include paths ---
-        // NOTE: the actlize include paths depend on the library each kernel was written
-        // against, so they are resolved per kernel in `compile` instead of being seeded here.
+        // Resolved in `compile` for both offline and runtime compilers.
 
         // --- Output format & optimization ---
         flags += "-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG ";
@@ -229,9 +209,6 @@ public:
         flags += "-Xcompiler -Wno-deprecated-declarations -Xcompiler -Wno-abi ";
 
         // NOTE: --ptxas-options=--register-usage-level=10 is intentionally not passed here
-        std::string hgcc_extra_flags;
-        // NOTE: the v1.0.0 codegen tuning flags moved into `compile` as well -- they apply to
-        // actlize_v1.0.0 kernels only, which is a per-kernel property.
 
         // >>> PORTING LANDMARK: source-language flag — dropped by the offline compat script
         //     (matched by the code below, NOT by this note); unused by the ported build.
@@ -240,7 +217,7 @@ public:
         // <<< PORTING LANDMARK: end of dropped source-language flag.
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, ActlizeLib lib) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
         // Write the code into the cache directory
         const auto code_path = dir_path / "kernel.cu";
         put(code_path, code);
@@ -273,9 +250,9 @@ public:
                 per_kernel_flags += " -Xllvm -sort-copy-before-coalesce";
             }
         }
-        // Include paths for the library this kernel was written against
+        // Include paths for actlize and DeepGEMM headers
         std::string include_flags;
-        for (const auto& path: actlize_include_paths(lib))
+        for (const auto& path: actlize_include_paths())
             include_flags += fmt::format("-I{} ", path);
 
         // Compile
@@ -307,7 +284,7 @@ public:
     class RtcOptions {
         public:
         RtcOptions() = delete;
-        RtcOptions(acArch_t arch, ActlizeLib lib, const std::string& name = "") {
+        RtcOptions(acArch_t arch, const std::string& name = "") {
             opts = {
             "--device-as-default-execution-space",
             "-DHGGC_COMPILER_WRAPPER_MODE",
@@ -333,8 +310,8 @@ public:
         #else
             includes_insert({sdk_include});
         #endif
-            // Include paths for the library this kernel was written against
-            includes_insert(Compiler::actlize_include_paths(lib));
+            // Include paths for actlize and DeepGEMM headers
+            includes_insert(Compiler::actlize_include_paths());
         // #else
             opts_insert({
                 "-DNDEBUG",
@@ -426,12 +403,12 @@ public:
 
     }
 
-    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name, ActlizeLib lib) const override {
+    void compile(const std::string &code, const std::filesystem::path& dir_path, const std::filesystem::path &hgbin_path, const std::string& name) const override {
         // Write the code into the cache directory
         const auto& code_path = dir_path / "kernel.cu";
         put(code_path, code);
         acArch_t arch = is_ppu1v5_device() ? AC_PPU0015 : AC_PPU0010;
-        RtcOptions opts(arch, lib, name);
+        RtcOptions opts(arch, name);
         // Print HGRTC compile options when DG_JIT_DEBUG is enabled
         if (get_env<int>("DG_JIT_DEBUG", 0)) {
             printf("HGRTC compile options (%zu):\n", opts.size());

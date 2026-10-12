@@ -8,30 +8,6 @@ from .gemm import get_gemv_best_configs
 import os
 
 # C++ code templates
-includes = ('<deep_gemm/impls/int8_gemm.cuh>', )
-template = """
-using namespace deep_gemm;
-
-// Templated args from Python JIT call
-constexpr auto N = {N}, K = {K};
-constexpr auto BLOCK_M = {BLOCK_M};
-constexpr auto BLOCK_N = {BLOCK_N};
-constexpr auto BLOCK_K = {BLOCK_K};
-constexpr auto WARP_M = {WARP_M};
-constexpr auto WARP_N = {WARP_N};
-constexpr auto kNumGroups = {NUM_GROUPS};
-constexpr auto kNumStages = {NUM_STAGES};
-constexpr auto kEnableSboOverlap = {ENABLE_SBO_OVERLAP};
-
-// Make a templated grouped GEMM
-using gemm_t = Gemm<N, K, BLOCK_M, BLOCK_N, BLOCK_K, WARP_M, WARP_N, kNumGroups, kNumStages, GemmType::{GEMM_TYPE}, kEnableSboOverlap>;
-
-// Launch kernel
-gemm_t::run(out, grouped_layout, block_m_info,
-            m, expected_m, lhs, lhs_scales, rhs, rhs_scales,
-            stream, num_sms, smem_size, signal);
-"""
-
 includes_cutlass3 = ('<deep_gemm/impls/int8_gemm_cutlass3.cuh>', )
 template_cutlass3 = """
 using namespace deep_gemm;
@@ -115,14 +91,12 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
         return
 
     # Auto-tuning with compilation
-    global includes, template, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedContiguous)
     expected_m = ceil_div(m, num_groups)
-    extra_info = get_extra_info()
 
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
@@ -145,7 +119,7 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
               'GEMM_TYPE': 'GroupedContiguous',
               'KERNEL_TYPE': kernel_type},
         space=(),
-        includes=includes_cutlass3 if extra_info['use_actlize_v100'] else includes,
+        includes=includes_cutlass3,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
                   ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
@@ -153,8 +127,8 @@ def m_grouped_gemm_a8w8_per_channel_nt_contiguous(lhs: Tuple[torch.Tensor, torch
                   ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),
-        template=template_cutlass3 if extra_info['use_actlize_v100'] else template,
-        jit_include_dir='actlize_v1.0.0' if extra_info['use_actlize_v100'] else None,
+        template=template_cutlass3,
+        jit_include_dir='actlize_v1.0.0',
         args=args
     )
     # Run the kernel
@@ -204,21 +178,18 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
 
 
     # Auto-tuning with compilation
-    global includes, template, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
     if configs:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = configs
     else:
         num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedMasked, max_block_n=max_block_n)
 
-    extra_info = get_extra_info()
-
     ## Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
     kernel_type = 'Default'
 
     ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
     ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
-    enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
+    enable_moe_dynamic_tile = get_extra_info()['use_moe_dynamic_tile']
 
     supported_N_K_list = [
         (4096, 7168), (7168, 2048), # dpsk
@@ -249,15 +220,15 @@ def m_grouped_gemm_a8w8_per_channel_nt_masked(lhs: Tuple[torch.Tensor, torch.Ten
               'GEMM_TYPE': 'GroupedMasked',
               'KERNEL_TYPE': kernel_type},
         space=(),
-        includes=includes_cutlass3 if extra_info['use_actlize_v100'] else includes,
+        includes=includes_cutlass3,
         arg_defs=(('lhs', lhs.dtype), ('lhs_scales', torch.float),
                   ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                   ('out', torch.bfloat16),
                   ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('m', int), ('expected_m', int),
                   ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                   ('signal', torch.int32)),
-        template=template_cutlass3 if extra_info['use_actlize_v100'] else template,
-        jit_include_dir='actlize_v1.0.0' if extra_info['use_actlize_v100'] else None,
+        template=template_cutlass3,
+        jit_include_dir='actlize_v1.0.0',
         args=args
     )
     # Run the kernel
@@ -308,7 +279,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
     expected_m = ceil_div(m, num_groups)
 
     # Auto-tuning with compilation
-    global includes, template, includes_gemv, template_gemv, includes_cutlass3, template_cutlass3
     num_sms = get_num_sms()
     use_gemv = False
     if k % 16 == 0 and ((m <= 2 * num_groups * 0.75 and k <= 32 * 8) or (m < 0.65 * num_groups and k > 256)) and not is_ppu1v5_device():
@@ -356,8 +326,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
         else:
             num_sms, block_m, block_n, block_k, warp_m, warp_n, num_stages, smem_config = get_best_configs(expected_m, n, k, num_groups, num_sms, gemm_type=GemmType.GroupedNoPad)
 
-        extra_info = get_extra_info()
-
         ## Default, MultistageOnN, MoeDynamicTile, OverlapPrologue, OverlapMainloop
         kernel_type = 'Default'
         if k < 4096:
@@ -365,7 +333,6 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
 
         ElementAB = "cutlass::float_e4m3_t" if lhs.dtype == torch.float8_e4m3fn else "int8_t"
         ElementAcc = "float" if lhs.dtype == torch.float8_e4m3fn else "int32_t"
-        enable_moe_dynamic_tile = extra_info['use_moe_dynamic_tile']
         # if enable_moe_dynamic_tile:
         #     # fix the block config to avoid unecessary jit compile
         #     block_m, block_n, block_k, warp_m, warp_n, num_stages = (128, 128, 128, 64, 64, 3)
@@ -398,15 +365,15 @@ def m_grouped_gemm_a8w8_per_channel_nt_nopad(lhs: Tuple[torch.Tensor],
                   'KERNEL_TYPE': kernel_type
                   },
             space=(),
-            includes=includes_cutlass3 if extra_info['use_actlize_v100'] else includes,
+            includes=includes_cutlass3,
             arg_defs=(  ('lhs', lhs.dtype), ('lhs_scales', torch.float),
                         ('rhs', rhs.dtype), ('rhs_scales', torch.float),
                         ('out', torch.bfloat16),
                         ('grouped_layout', torch.int32), ('block_m_info', torch.int32), ('m', int), ('expected_m', int),
                         ('stream', torch.cuda.Stream), ('num_sms', int), ('smem_size', int),
                         ('signal', torch.int32)),
-            template=template_cutlass3 if extra_info['use_actlize_v100'] else template,
-            jit_include_dir='actlize_v1.0.0' if extra_info['use_actlize_v100'] else None,
+            template=template_cutlass3,
+            jit_include_dir='actlize_v1.0.0',
             args=args
         )
     # Run the kernel

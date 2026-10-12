@@ -16,7 +16,6 @@
 #include "cute/arch/mma.hpp"
 #include "../heuristics/common_fp8.hpp"
 #include "../heuristics/common_int8.hpp"
-#include "../heuristics/predicated_tile_iterator_params.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "util/include/cutlass/util/packed_stride.hpp"
 #include "cutlass/detail/blockwise_scale_layout.hpp"
@@ -167,7 +166,6 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     const auto& [groups, m, k] = get_shape<3>(a);
     const auto& [_, n, __] = get_shape<3>(b);
 
-    auto extra_info = get_extra_info();
     int num_sms = get_num_sms();
 
     ConfigTuple selected_config;
@@ -233,142 +231,67 @@ static void int8_bmm_impl(const torch::Tensor& a, const torch::Tensor& sfa,
     dim3 grid = get_grid_shape(hw_info.cu_count);
 
     static constexpr GemmType kGemmType = GemmType::BatchGemm;
-    bool is_use_actlize_v100 = extra_info["use_actlize_v100"] || !transposed_out;
-    if (is_use_actlize_v100) {
-        const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
-            .mode = cutlass::gemm::GemmUniversalMode::kGemm,
-            .problem_shape = {m, n, k, groups},
-            .mainloopargs = {converted_input_a, stride_A, converted_input_b, stride_B,
-                             scales_a_ptr, scales_b_ptr},
-            .epilogueargs =
-                {
-                    {1, 0},
-                    nullptr,
-                    stride_D,
-                    converted_output,
-                    stride_D,
-                },
-            .hw_info = hw_info,
-            .scheduler = {(uint32_t)m, nullptr},
-            .signal = nullptr};
 
-        INT8GemmCutlass3Runtime::GemmKernelParams params =
-            INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
+    const auto gemm_args = INT8GemmCutlass3Runtime::GemmArguments{
+        .mode = cutlass::gemm::GemmUniversalMode::kGemm,
+        .problem_shape = {m, n, k, groups},
+        .mainloopargs = {converted_input_a, stride_A, converted_input_b, stride_B,
+                         scales_a_ptr, scales_b_ptr},
+        .epilogueargs =
+            {
+                {1, 0},
+                nullptr,
+                stride_D,
+                converted_output,
+                stride_D,
+            },
+        .hw_info = hw_info,
+        .scheduler = {(uint32_t)m, nullptr},
+        .signal = nullptr};
 
-        auto args = INT8GemmCutlass3Runtime::Args{
-            .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
-                            "BatchGemm", "Default", kernel_name, false, transposed_out},
-            .launch_args = {grid, block, SMSIZE},
-            .kernel_params = params,
-            .type_info = type_info};
+    INT8GemmCutlass3Runtime::GemmKernelParams params =
+        INT8GemmCutlass3Runtime::to_underlying_arguments_rtc(gemm_args, nullptr);
 
-        const auto& code = INT8GemmCutlass3Runtime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
+    auto args = INT8GemmCutlass3Runtime::Args{
+        .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups, num_stages,
+                        "BatchGemm", "Default", kernel_name, false, transposed_out},
+        .launch_args = {grid, block, SMSIZE},
+        .kernel_params = params,
+        .type_info = type_info};
 
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, nullptr,
-                                      current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
+    const auto& code = INT8GemmCutlass3Runtime::generate(args);
+    const auto& runtime = compiler->build(kernel_name, code);
+    const auto& kernel = runtime->kernel;
+    int blocks_per_cu = 0;
+    HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
+    args.launch_args.grid_dim.x *= blocks_per_cu;
 
-        INT8GemmCutlass3Runtime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-            printf("[BatchGemm_INT8:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
-                   block_k, warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
-        }
-    } else {
-        int64_t stride, increment_row, increment_group, increment_cluster;
-        int64_t advance_row, advance_group, advance_cluster, advance_tile;
-        using ElementType = int8_t;
-        int ElementsPerAccess = 128 / cutlass::sizeof_bits<ElementType>::value;
-        int LimitedPerAccessC_ = (block_n * 8 / (block_n / warp_n) / 32);
-        int ElementsPerAccessC = LimitedPerAccessC_ < ElementsPerAccess ? LimitedPerAccessC_ : ElementsPerAccess;
-        deep_gemm::compute_predicated_tile_iterator_params(block_m, block_n, block_k,
-                                                           warp_m, warp_n, block_k,
-                                                           ElementsPerAccessC, 16,
-                                                           n,
-                                                           &stride, &increment_row, &increment_group,
-                                                           &increment_cluster, &advance_row, &advance_group,
-                                                           &advance_cluster, &advance_tile);
-
-        INT8GemmRuntime::GemmKernelParams params = INT8GemmRuntime::GemmKernelParams{
-            .problem_visitor = {nullptr, n, k, m, (int32_t)kNumGroups},
-            .threadblock_count = num_sms,
-            .problem_count = kNumGroups,
-            .ptr_A = converted_input_a,
-            .params_A = cutlass::layout::RowMajor(k),
-            .ptr_B = converted_input_b,
-            .params_B = cutlass::layout::ColumnMajor(k),
-            .ptr_D = converted_output,
-            .params_D = {stride, increment_row, increment_group, increment_cluster, advance_row, advance_group,
-                         advance_cluster, advance_tile},
-            .ptr_alpha_col = scales_b_ptr,
-            .ptr_alpha_row = scales_a_ptr,
-            .params_alpha_col = {0, 0, 0, 0, 0, 0, 0, 0},
-            .params_alpha_row = {0, 0, 0, 0, 0, 0, 0, 0},
-            .batch_stride_A = 0,
-            .batch_stride_B = 0,
-            .epilogue_visitor_params = {},
-            .signal = nullptr,
-        };
-
-        auto args = INT8GemmRuntime::Args{
-            .launch_info = {block_m, block_n, block_k, warp_m, warp_n, kNumGroups,
-                            num_stages, n, k, "BatchGemm", kernel_name, false},
-            .launch_args = {grid, block, SMSIZE},
-            .kernel_params = params};
-
-        const auto& code = INT8GemmRuntime::generate(args);
-        const auto& runtime = compiler->build(kernel_name, code, ActlizeLib::kV050);
-        const auto& kernel = runtime->kernel;
-        int blocks_per_cu = 0;
-        HGresult result = hgOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu, kernel, block.x, SMSIZE);
-        args.launch_args.grid_dim.x *= blocks_per_cu;
-
-        DgProfParam dg_prof_params;
-        if (ProfilingInterface::Instance().get_op_info()) {
-            dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, nullptr,
-                                      current_stream());
-        }
-        ProfilingInterface::Instance().instrument(true, dg_prof_params);
-
-        INT8GemmRuntime::launch(runtime, args);
-
-        ProfilingInterface::Instance().instrument(false, dg_prof_params);
-
-        char* pEnv_params = std::getenv("show_log");
-        if (pEnv_params && isdigit(*pEnv_params)) {
-            int numRegs = 0, localSize = 0;
-            hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-            hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-
-            printf("[BatchGemm_INT8:]\n");
-            printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
-            printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
-                   args.launch_args.grid_dim.x);
-            printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
-                   block_k, warp_m, warp_n, block_k, num_stages);
-            printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
-        }
+    DgProfParam dg_prof_params;
+    if (ProfilingInterface::Instance().get_op_info()) {
+        dg_prof_params.set_params(kGemmType, false, profile_type, kNumGroups, m, n, k, 0, nullptr,
+                                  current_stream());
     }
+    ProfilingInterface::Instance().instrument(true, dg_prof_params);
+
+    INT8GemmCutlass3Runtime::launch(runtime, args);
+
+    ProfilingInterface::Instance().instrument(false, dg_prof_params);
+
+    char* pEnv_params = std::getenv("show_log");
+    if (pEnv_params && isdigit(*pEnv_params)) {
+        int numRegs = 0, localSize = 0;
+        hgFuncGetAttribute(&numRegs, HG_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+        hgFuncGetAttribute(&localSize, HG_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+
+        printf("[BatchGemm_INT8:]\n");
+        printf("group:%d, problem:[%d, %d, %d]\n", kNumGroups, m, n, k);
+        printf("num_sms:%d, max_active_tb_num:%d, threadblock_count:%d\n", num_sms_new, blocks_per_cu,
+               args.launch_args.grid_dim.x);
+        printf("ThreadblockShape[%d, %d, %d], WarpShape[%d, %d, %d], num_stages:%d\n", block_m, block_n,
+               block_k, warp_m, warp_n, block_k, num_stages);
+        printf("SMSIZE:%d, vreg:%d, stack:%d\n", int(SMSIZE), int(numRegs), int(localSize));
+    }
+
 }
 
 } // namespace deep_gemm
