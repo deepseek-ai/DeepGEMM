@@ -423,14 +423,13 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
 
             // Use TMA store to write back to global memory
             // TODO: compatible with FP32 output
-            constexpr bool kWithGroupOffsetD = kGemmType == GemmType::MGroupedMasked;
             DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
                 auto n_idx = n_block_idx * BLOCK_N + in_block_n_offset;
-                auto m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
-                if constexpr (kGemmType == GemmType::Batched) {
+                auto m_idx = scheduler.get_global_idx<false>(shape_m, BLOCK_M, m_block_idx);
+                if constexpr (kGemmType == GemmType::Batched or kGemmType == GemmType::MGroupedMasked) {
                     cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,
                                                   n_idx, m_idx, scheduler.current_group_idx);
                 } else {
