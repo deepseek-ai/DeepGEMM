@@ -184,7 +184,7 @@ The library provides some utility functions besides the above kernels:
 
 The library also provides some environment variables, which may be useful:
 
-Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` variable when unset.
+Except for `DG_JIT_FORCE_LAYOUT`, each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` variable when unset.
 
 - General
     - `DG_JIT_DEBUG`: `0` or `1`, enable JIT debugging features, including compiler command and PTXAS output, load-time reporting, line info, and PTX/SASS dumps; `0` by default
