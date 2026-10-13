@@ -342,15 +342,16 @@ struct SM120ArchSpec {
         const int kSFTileKBlocks = (4 * desc.max_gran_k) / layout.block_k;
         if (kSFTileKBlocks == 0)
             return 1;
-        while (split_k > 1 and (num_k_blocks % split_k != 0 or (num_k_blocks / split_k) % kSFTileKBlocks != 0))
-            --split_k;
-
         split_k = std::min(split_k, num_k_blocks / (2 * kSFTileKBlocks));
 
         constexpr int64_t kMaxWorkspaceBytes = 32 * 1024 * 1024;
         const int64_t mn_bytes = static_cast<int64_t>(desc.get_expected_m()) * desc.get_expected_n() * sizeof(float);
         if (mn_bytes > 0)
             split_k = std::min(split_k, std::max(static_cast<int>(kMaxWorkspaceBytes / mn_bytes), 1));
+
+        // Apply alignment after all caps, which can otherwise invalidate the partition.
+        while (split_k > 1 and (num_k_blocks % split_k != 0 or (num_k_blocks / split_k) % kSFTileKBlocks != 0))
+            --split_k;
 
         return std::max(split_k, 1);
     }
