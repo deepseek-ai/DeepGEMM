@@ -366,12 +366,12 @@ sm90_bf16_gemm_impl(int* grouped_layout,
             cutlass::arch::NamedBarrier::sync(kNumWGMMAStoreThreads, 0);
 
             // Use TMA store to write back to global memory
-            const auto m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType)), sched::IndexType::MN>(shape_m, BLOCK_M, m_block_idx);
+            const auto m_idx = scheduler.template get_global_idx<(not is_m_grouped_contiguous(kGemmType) and kGemmType != GemmType::MGroupedMasked), sched::IndexType::MN>(shape_m, BLOCK_M, m_block_idx);
             DG_STATIC_ASSERT(kNumWGMMAStoreThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
             if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
                 auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
-                if constexpr (kGemmType == GemmType::Batched) {
+                if constexpr (kGemmType == GemmType::Batched or kGemmType == GemmType::MGroupedMasked) {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
                                                            cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
                     cute_tma_t::copy(&tensor_map_cd, smem_ptr,

@@ -10,6 +10,7 @@ from deep_gemm.testing import (
     get_arch_major
 )
 from utils import (
+    assert_masked_gemm_capacity_boundaries,
     add_sf_k_padding, assert_direct_output_matches_fp32_accumulation,
     assert_stochastic_bf16_matches_fp32_accumulation,
     assert_psum_zero_padding, convert_to_fp8, make_cublas_gemm,
@@ -173,6 +174,11 @@ def test_m_grouped_gemm_contiguous() -> None:
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
     print()
+
+
+def test_m_grouped_gemm_masked_boundaries() -> None:
+    if get_arch_major() == 9:
+        assert_masked_gemm_capacity_boundaries(use_bf16=False)
 
 
 def test_m_grouped_gemm_masked() -> None:
@@ -402,5 +408,6 @@ if __name__ == '__main__':
 
     test_gemm()
     test_m_grouped_gemm_contiguous()
+    test_m_grouped_gemm_masked_boundaries()
     test_m_grouped_gemm_masked()
     test_k_grouped_gemm_contiguous()

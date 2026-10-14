@@ -118,3 +118,35 @@ def make_cublas_gemm(a: Tuple[torch.Tensor, torch.Tensor], b: Tuple[torch.Tensor
         return lambda: deep_gemm.cublaslt_nvfp4_gemm_nt(a_nvfp4, b_nvfp4, d, c=c)
     a_fp8, b_fp8 = convert_to_fp8(a), convert_to_fp8(b)
     return lambda: deep_gemm.cublaslt_gemm_nt(a_fp8[0], b_fp8[0], d, c=c)
+
+
+def assert_masked_gemm_capacity_boundaries(use_bf16: bool) -> None:
+    from deep_gemm.testing import calc_diff
+    from deep_gemm.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+
+    for capacity in (16, 32, 64, 96, 128):
+        a = torch.randn((8, capacity, 256), device='cuda', dtype=torch.bfloat16)
+        b = torch.randn((8, 256, 256), device='cuda', dtype=torch.bfloat16)
+        reference = torch.bmm(a.float(), b.float().mT).bfloat16()
+        output = torch.empty_like(reference)
+        counts = torch.tensor([0, 1, capacity // 2, capacity - 1, capacity, 1, capacity, capacity],
+                              device='cuda', dtype=torch.int)
+        valid = torch.arange(capacity, device='cuda')[None, :] < counts[:, None]
+        if use_bf16:
+            launch = lambda: deep_gemm.m_grouped_bf16_gemm_nt_masked(a, b, output, counts, capacity)
+        else:
+            a_parts = [per_token_cast_to_fp8(x, use_ue8m0=False) for x in a]
+            b_parts = [per_block_cast_to_fp8(x, use_ue8m0=False) for x in b]
+            a_fp8 = tuple(torch.stack([x[i] for x in a_parts]) for i in (0, 1))
+            b_fp8 = tuple(torch.stack([x[i] for x in b_parts]) for i in (0, 1))
+            launch = lambda: deep_gemm.m_grouped_fp8_gemm_nt_masked(a_fp8, b_fp8, output, counts, capacity)
+
+        launch()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        for run in (launch, graph.replay):
+            for _ in range(8):
+                run()
+                diff = calc_diff(output[valid], reference[valid])
+                assert diff < (1e-5 if use_bf16 else 1e-3), f'{use_bf16=}, {capacity=}, {diff=}'

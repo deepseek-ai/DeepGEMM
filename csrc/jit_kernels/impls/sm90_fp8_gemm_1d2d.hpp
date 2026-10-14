@@ -252,11 +252,13 @@ static void sm90_m_grouped_fp8_gemm_masked_1d2d(const torch::Tensor& a, const to
                                               config.layout.block_k,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode);
-    const auto tensor_map_d = make_tma_cd_desc(d, m, n,
-                                               config.storage_config.store_block_m,
-                                               config.storage_config.store_block_n,
-                                               static_cast<int>(d.stride(-2)), num_groups,
-                                               config.storage_config.swizzle_cd_mode);
+    // Keep each expert's output boundary visible to TMA stores.
+    const auto tensor_map_d = make_tma_3d_desc(d, n, m, num_groups,
+                                                config.storage_config.store_block_n,
+                                                config.storage_config.store_block_m, 1,
+                                                static_cast<int>(d.stride(-2)),
+                                                static_cast<int>(d.stride(-3)),
+                                                config.storage_config.swizzle_cd_mode);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
                                                  config.layout.block_m, config.layout.block_k, num_groups, 0);
 
