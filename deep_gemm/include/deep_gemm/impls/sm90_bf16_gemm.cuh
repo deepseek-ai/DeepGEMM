@@ -373,13 +373,13 @@ sm90_bf16_gemm_impl(int* grouped_layout,
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
                 if constexpr (kGemmType == GemmType::Batched) {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
-                        cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
+                                                           cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
                     cute_tma_t::copy(&tensor_map_cd, smem_ptr,
                                      n_block_idx * BLOCK_N + in_block_n_offset,
                                      m_idx, scheduler.current_group_idx);
                 } else {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
-                        cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
+                                                           cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                     cute_tma_t::copy(&tensor_map_cd, smem_ptr,
                                      n_block_idx * BLOCK_N + in_block_n_offset, m_idx);
                 }

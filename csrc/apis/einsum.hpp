@@ -187,7 +187,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                     std::optional<std::tuple<int, int, int>> recipe,
                     const std::string& compiled_dims,
                     const std::shared_ptr<EpilogueClass>& epilogue_class) {
-    // The FP8 output pair and a user `FP8Quantization` are two spellings of the same epilogue
+    // The FP8 output pair is shorthand for `FP8CastWithClamp` without clamping
     const auto d_fp8 = std::get_if<std::pair<torch::Tensor, torch::Tensor>>(&d);
     const auto d_tensor = d_fp8 != nullptr ? d_fp8->first : std::get<torch::Tensor>(d);
     auto merged_epilogue_class = epilogue_class;
@@ -195,7 +195,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     if (d_fp8 != nullptr) {
         DG_HOST_ASSERT(epilogue_class == nullptr and "The FP8 output pair supports no other epilogue");
         sfd = d_fp8->second;
-        merged_epilogue_class = std::make_shared<FP8QuantizationEpilogue>(d_fp8->second);
+        merged_epilogue_class = std::make_shared<FP8CastWithClampEpilogue>(d_fp8->second);
     } else {
         sfd = merged_epilogue_class != nullptr ? merged_epilogue_class->output_sfd() : std::nullopt;
     }

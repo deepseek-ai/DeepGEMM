@@ -16,6 +16,16 @@ CUTLASS_DEVICE uint32_t cvt_rs_bf16x2_f32(const float& lower, const float& upper
     return packed;
 }
 
+// Symmetric clamp for a nonnegative bound: retain the input sign and propagate NaNs.
+CUTLASS_DEVICE nv_bfloat162 clamp_bf16x2(const nv_bfloat162& value, const nv_bfloat162& bound) {
+    uint32_t packed;
+    asm("min.NaN.xorsign.abs.bf16x2 %0, %1, %2;"
+        : "=r"(packed)
+        : "r"(reinterpret_cast<const uint32_t&>(value)),
+          "r"(reinterpret_cast<const uint32_t&>(bound)));
+    return reinterpret_cast<const nv_bfloat162&>(packed);
+}
+
 // Compatibility: 256 bits LD/ST instructions
 #if defined(CUDART_VERSION) and CUDART_VERSION >= 13000
 using longlong4_t = longlong4_32a;
