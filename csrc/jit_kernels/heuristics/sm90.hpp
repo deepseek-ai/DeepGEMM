@@ -22,8 +22,12 @@ struct SM90ArchSpec {
             // TODO: check 256's performance
             block_m_candidates = {64, 128};
             // NOTES: smaller block M can avoid TMA L2 OOB bound
-            if (desc.m <= 16) block_m_candidates.push_back(16);
-            if (desc.m <= 32) block_m_candidates.push_back(32);
+            // NOTES: the 1D1D kernel only supports 64 (one math warpgroup) or 128 (two math warpgroups),
+            // so the smaller candidates are only for the 1D2D and BF16 kernels
+            if (desc.kernel_type != KernelType::Kernel1D1D) {
+                if (desc.m <= 16) block_m_candidates.push_back(16);
+                if (desc.m <= 32) block_m_candidates.push_back(32);
+            }
 
             // BF16 output GEMM supports 256
             if (desc.cd_dtype != torch::kFloat)
