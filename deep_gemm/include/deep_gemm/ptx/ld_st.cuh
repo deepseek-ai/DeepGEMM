@@ -363,5 +363,69 @@ CUTLASS_DEVICE void prefetch_l1(void *ptr) {
     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
 }
 
+// Helpers for fused SM90 MegaMoE.
+CUTLASS_DEVICE uint32_t ld_volatile_shared(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.volatile.shared.u32 %0, [%1];" : "=r"(ret) : "l"(__cvta_generic_to_shared(ptr)) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE uint32_t ld_acquire_cta_shared(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.acquire.cta.shared::cta.u32 %0, [%1];" : "=r"(ret) : "l"(__cvta_generic_to_shared(ptr)) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE void st_release_cta_shared(const uint32_t* ptr, const uint32_t& value) {
+    asm volatile("st.release.cta.shared::cta.u32 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE void red_release_cta_shared_add(const uint32_t* ptr, const uint32_t& value) {
+    asm volatile("red.release.cta.shared::cta.add.u32 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE void fence_acq_rel_gpu() {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+
+CUTLASS_DEVICE void fence_acq_rel_sys() {
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+}
+
+CUTLASS_DEVICE uint32_t atom_add_relaxed_gpu(const uint32_t* ptr, const uint32_t& value) {
+    uint32_t ret;
+    asm volatile("atom.relaxed.gpu.global.add.u32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE void red_add_relaxed_sys(const uint32_t* ptr, const uint32_t& value) {
+    asm volatile("red.relaxed.sys.global.add.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE void st_release_sys_u32(uint32_t* ptr, const uint32_t& value) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
+}
+
+CUTLASS_DEVICE uint32_t ld_relaxed_sys(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE void st_global_v2(void* ptr, const uint32_t& x, const uint32_t& y) {
+    asm volatile("st.global.v2.u32 [%0], {%1, %2};" :: "l"(ptr), "r"(x), "r"(y) : "memory");
+}
+
+CUTLASS_DEVICE void prefetch_bulk_l2(const void* ptr, const uint32_t& num_bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(ptr), "r"(num_bytes) : "memory");
+}
+
+CUTLASS_DEVICE uint2 ld_shared(const uint2* ptr) {
+    uint2 ret;
+    asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];" : "=r"(ret.x), "=r"(ret.y) : "l"(__cvta_generic_to_shared(ptr)));
+    return ret;
+}
+
+
 } // namespace deep_gemm::ptx
 #endif

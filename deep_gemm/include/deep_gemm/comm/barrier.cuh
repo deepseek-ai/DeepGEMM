@@ -52,14 +52,18 @@ CUTLASS_DEVICE void grid_sync(const WorkspaceT& workspace,
             });
         } else {
             const auto start_clock = clock64();
+            bool timed_out = false;
             do {
                 new_value = ptx::ld_acq(count_ptr);
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    handle_grid_sync_timeout<kTimeoutPolicy>(
-                        sm_idx, thread_idx, kGridSyncIndex, old_value, new_value,
-                        old_value ^ kFinishSumTag);
+                    timed_out = true;
+                    break;
                 }
             } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+            if (timed_out)
+                handle_grid_sync_timeout<kTimeoutPolicy>(
+                    sm_idx, thread_idx, kGridSyncIndex, old_value, new_value,
+                    old_value ^ kFinishSumTag);
         }
     }
     sync_scope();
@@ -104,13 +108,18 @@ CUTLASS_DEVICE void nvlink_barrier(const WorkspaceT& workspace,
                 });
             } else {
                 const auto start_clock = clock64();
+                bool timed_out = false;
                 while (ptx::ld_acq_sys(signal_ptr) != target) {
                     if (clock64() - start_clock >= kNumTimeoutCycles) {
-                        handle_nvlink_barrier_timeout<kTimeoutPolicy>(
-                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target,
-                            signal_phase, signal_sign, kTag);
+                        timed_out = true;
+                        break;
                     }
                 }
+                if (timed_out)
+                    handle_nvlink_barrier_timeout<kTimeoutPolicy>(
+                        sym_buffer.rank_idx, *counter_ptr,
+                        ptx::ld_acq_sys(signal_ptr), target,
+                        signal_phase, signal_sign, kTag);
             }
         }
     }

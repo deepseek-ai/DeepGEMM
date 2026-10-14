@@ -6,6 +6,8 @@ DeepGEMM leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlas
 
 Despite its lightweight design, DeepGEMM's performance matches or exceeds expert-tuned libraries across various matrix shapes.
 
+For fused SM90 FP8 and MXFP4 MegaMoE, see the [API, provenance, and validation guide](docs/sm90-fused-mxfp4.md).
+
 ## News
 
 - 2026.09.10: Sparse Indexer, Mega Gate, Mega mHC, DeepJIT, MoE and Indexer optimizations and more.
