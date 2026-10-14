@@ -5,7 +5,7 @@ import torch
 from math import prod
 from typing import Generator, List, Optional, Tuple
 
-from deep_gemm.testing import get_arch_major
+from deep_gemm.testing import get_arch_major, is_sm89
 from deep_gemm.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
@@ -158,7 +158,8 @@ def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) ->
                     for n, k in nk_list:
                         override_major = MajorTypeAB.MNMajor
                         override_kernel_type = kernel_type
-                        if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
+                        # SM89 (Ada) and SM90 (Hopper) FP8 GEMMs only support the K-major NT layout
+                        if dtype == torch.float8_e4m3fn and (is_sm89() or get_arch_major() == 9):
                             override_major = MajorTypeAB.KMajor
                             override_kernel_type = KernelType.Kernel1D1D
                         yield emit(kernel_type,          quant_config, m, k, n, MajorTypeAB.KMajor, override_major, False, torch.bfloat16)  # Dgrad
@@ -234,8 +235,8 @@ def enumerate_k_grouped_contiguous(dtype: torch.dtype):
     else:
         sf_layout_list = ([(128, 128)] if get_arch_major() == 9 else
                           [(32, 128), (128, 128), (32, 256), (128, 256), (32, 384), (128, 384)])
-    # Only K-major is supported for SM90 FP8
-    if get_arch_major() == 9 and dtype == torch.float8_e4m3fn:
+    # Only K-major is supported for SM89/SM90 FP8
+    if dtype == torch.float8_e4m3fn and (is_sm89() or get_arch_major() == 9):
         major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor
     elif dtype == torch.float4_e2m1fn_x2:
         major_a, major_b = MajorTypeAB.KMajor, MajorTypeAB.KMajor

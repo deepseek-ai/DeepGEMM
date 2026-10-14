@@ -8,6 +8,15 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## News
 
+- 2026.10.15
+  - Added support for NVIDIA **SM89 (Ada Lovelace)**, the first architecture with FP8 Tensor
+    Cores: **native FP8 GEMMs** (`fp8_gemm_*`, both the 1D1D and 1D2D scaling recipes) built on
+    `mma.sync.m16n8k32` + `ldmatrix` + `cp.async`, reaching ~85% of cuBLASLt FP8 on Ada, plus
+    cuBLASLt-backed BF16 GEMMs. See
+    [docs/architecture_support.md](docs/architecture_support.md) for the porting notes.
+  - Fixed the cuBLASLt fallback silently running BF16 GEMMs at TF32 precision
+    (`CUBLAS_COMPUTE_32F_FAST_TF32` is now only used for genuine FP32 inputs).
+  - Note: NVIDIA **SM80 (Ampere) has no FP8 Tensor Cores** and is not a supported target.
 - 2026.09.30
   - DeepGEMM Ascend is available! Check [DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend/) for more details
   - Add more optimizations, including locality domain features, check [#462](https://github.com/deepseek-ai/DeepGEMM/pull/462) for more details
@@ -22,50 +31,69 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
     - As NVCC 12.9 will automatically do the FFMA interleaving, all post optimizations will be no longer supported.
     - Please see [#112](https://github.com/deepseek-ai/DeepGEMM/pull/112) for more details.
 - 2025.05.14: DeepGEMM now offers weight gradient kernels for dense and MoE backward! See [#95](https://github.com/deepseek-ai/DeepGEMM/pull/95) for details.
-- 2025.04.18: DeepGEMM now achieves up to **1550 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81), [#86](https://github.com/deepseek-ai/DeepGEMM/pull/86) and [340d988](https://github.com/deepseek-ai/DeepGEMM/commit/340d9880f4a418d943d34260d20a79f41f4c0526) for details.
+- 2025.04.18: DeepGEMM now achieves up to **1550 TFLOPS** on H800! See [#74](https://github.com/deepseek-ai/DeepGEMM/pull/74), [#78](https://github.com/deepseek-ai/DeepGEMM/pull/78), [#81](https://github.com/deepseek-ai/DeepGEMM/pull/81), [#86](https://github.com/deepseek-ai/DeepGEMM/commit/340d9880f4a418d943d34260d20a79f41f4c0526) for details.
 
 ## Quick start
 
 ### Requirements
 
-- NVIDIA SM90 or SM100 architecture GPU
+- NVIDIA GPU architecture support:
+  - **SM89 (Ada Lovelace)**: Native FP8 GEMM (`fp8_gemm_*`, 1D1D and 1D2D recipes) and BF16 GEMM via cuBLASLt.
+  - **SM90 (Hopper)**: Native FP8 and BF16 GEMMs.
+  - **SM100 (Blackwell)**: Native FP8, FP4, and BF16 GEMMs.
+  - **SM80 (Ampere)** is **not** supported: it predates the FP8 Tensor Cores (introduced in SM89).
+
+  Operations a given architecture cannot run raise an explicit error naming the minimum
+  supported architecture; see the full [support matrix](docs/architecture_support.md).
 - Python 3.8 or higher
 - Compilers and standard libraries with C++20 `<format>` support
 - CUDA Toolkit 12.9 or higher
 - PyTorch 2.3 or higher
 - CUTLASS 4.0 or higher (could be cloned by Git submodule)
 
-### Development
+### Development & Installation Guide
 
 ```bash
-# Submodule must be cloned
+# Clone the repository with submodules
 git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
 cd DeepGEMM
 
-# Link some essential includes and build the C++ extension
-cat develop.sh
+# Setup C++ development extension
 ./develop.sh
-```
 
-### Installation
-
-```bash
-cat install.sh
+# Install DeepGEMM into python environment
 ./install.sh
 ```
 
-Then, import `deep_gemm` in your Python project, and enjoy!
+### Running Hardware Validation Tests
+
+To verify the DeepGEMM installation and the architecture dispatch on your GPU:
+
+```bash
+python3 -m unittest tests/test_sm89.py
+```
+
+The suite covers native FP8 GEMMs (both scaling recipes, both output dtypes, accumulation,
+ragged shapes, determinism), BF16 GEMMs in every operand layout, the FP32 scaling-factor layout
+kernels, and the explicit error paths for operations SM89 cannot perform. It skips itself
+automatically on other architectures, so it is safe to run from a cross-architecture CI matrix.
+For the detailed architecture matrix and the SM89 porting notes, refer to
+[docs/architecture_support.md](docs/architecture_support.md).
 
 ## Interfaces
 
 #### Notices
 
-This library provides optimized GEMM kernels for NVIDIA GPUs with a naming convention: `D = C + A @ B`. The input shape layout is NT (non-transposed A, transposed B). While the SM90 implementation supports only the NT memory layout (row-major, col-major), the SM100 implementation supports all memory layouts (NT, TN, NN, TT). For example, `fp8_gemm_nt` will do a `D = C + A @ B.T`
+This library provides optimized GEMM kernels for NVIDIA GPUs with a naming convention: `D = C + A @ B`. The input shape layout is NT (non-transposed A, transposed B). While the SM89 and SM90 implementations support only the NT memory layout (row-major, col-major), the SM100 implementation supports all memory layouts (NT, TN, NN, TT). For example, `fp8_gemm_nt` will do a `D = C + A @ B.T`
 
-For both architectures, the LHS scaling factor is required to have a TMA-aligned and transposed layout. And the data format for the scaling factor of SM90 and SM100 is different:
+The LHS scaling factor is required to have a TMA-aligned and transposed layout. And the data format for the scaling factor of SM89, SM90 and SM100 is different:
 
-- SM90 requires scaling factors in FP32 format.
+- SM89 and SM90 require scaling factors in FP32 format, with a K granularity of 128.
 - SM100 requires scaling factors in packed [UE8M0](https://docs.nvidia.com/cuda/parallel-thread-execution/#alternate-floating-point-data-formats) format, which packs 4 UE8M0 into a single `torch.int`.
+
+On SM89 and SM90 both scaling recipes are available: `(1, 1, 128)` (1D1D, per-token scales for
+A and B) and `(1, 128, 128)` (1D2D, per-token A scales and one scale per 128-wide N block for
+B, which is also the default when FP32 scales are used).
 
 Please note that operations like input transposition or FP8 casting must be handled separately by the user, please implement or fuse them into prior kernels independently. While the library provides some simple PyTorch utility functions, these may result in slower performance, but our primary focus is on optimizing the GEMM kernels themselves.
 

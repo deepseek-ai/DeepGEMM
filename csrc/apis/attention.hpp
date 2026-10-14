@@ -46,7 +46,9 @@ static void check_mqa_logits_q_and_weights(const torch::Tensor& q_fp, const std:
 static torch::Tensor get_mqa_logits_metadata(const torch::Tensor& cu_seq_len_k_start,
                                              const torch::Tensor& cu_seq_len_k_end,
                                              const int& num_kv_tokens, const int& num_heads) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    if (jit->device.get_arch_major() < 10) {
+        DG_PANIC("mqa_logits_metadata is only supported on NVIDIA Blackwell (SM100) or newer GPUs.");
+    }
     const int num_q_tokens = static_cast<int>(cu_seq_len_k_start.size(0));
     DG_HOST_ASSERT(num_q_tokens > 0 and cu_seq_len_k_end.size(0) == num_q_tokens);
     DG_HOST_ASSERT(cu_seq_len_k_start.is_cuda() and cu_seq_len_k_end.is_cuda());
@@ -77,6 +79,9 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     const bool is_fp4 = qk_dtype == kPackedFP4;
     const bool is_mx_sf = q_sf.has_value();
     const auto arch_major = jit->device.get_arch_major();
+    if (arch_major < 9) {
+        DG_PANIC("mqa_logits operations require NVIDIA Hopper (SM90) or Blackwell (SM100) GPU architecture.");
+    }
     const auto out_dtype = arch_major == 10 ? torch::kBFloat16 : torch::kFloat32;
 
     // Check Q, SF Q and weights
@@ -165,7 +170,7 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
         DG_HOST_ASSERT(block_kv == 64);
         sm90_paged_mqa_logits_metadata(context_lens, schedule_metadata, batch_size, next_n, block_kv, num_sms, is_context_lens_2d, false, nullptr);
     } else {
-        DG_HOST_UNREACHABLE("Unsupported architecture");
+        DG_PANIC("paged_mqa_logits_metadata requires NVIDIA Hopper (SM90) or Blackwell (SM100) GPU architecture.");
     }
 
     return schedule_metadata;
@@ -189,6 +194,9 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     int block_table_stride = block_table.stride(0);
     int num_sms = runtime->get_num_sms();
     const auto arch_major = jit->device.get_arch_major();
+    if (arch_major < 9) {
+        DG_PANIC("paged_mqa_logits requires NVIDIA Hopper (SM90) or Blackwell (SM100) GPU architecture.");
+    }
     const auto out_dtype = arch_major == 10 ? torch::kBFloat16 : torch::kFloat32;
 
     // Check Q, SF Q and weights
@@ -310,7 +318,9 @@ static torch::Tensor get_sparse_mqa_logits_metadata(const torch::Tensor& cu_seq_
                                                     const at::ScalarType& qk_dtype,
                                                     const int& sparse_block_kv,
                                                     const bool& use_unaligned_ks) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    if (jit->device.get_arch_major() < 10) {
+        DG_PANIC("sparse_mqa_logits is only supported on NVIDIA Blackwell (SM100) or newer GPUs.");
+    }
     const auto [num_q_tokens, num_max_sparse_blocks] = get_shape<2>(sparse_kv_block_indices);
     DG_HOST_ASSERT(num_q_tokens > 0 and num_kv_tokens >= 0);
     DG_HOST_ASSERT(cu_seq_len_k_start.dim() == 1 and cu_seq_len_k_start.size(0) == num_q_tokens);
@@ -341,7 +351,9 @@ static torch::Tensor get_paged_sparse_mqa_logits_metadata(const torch::Tensor& c
                                                           const torch::Tensor& sparse_kv_block_indices,
                                                           const at::ScalarType& qk_dtype,
                                                           const int& sparse_block_kv) {
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    if (jit->device.get_arch_major() < 10) {
+        DG_PANIC("paged_sparse_mqa_logits is only supported on NVIDIA Blackwell (SM100) or newer GPUs.");
+    }
     const auto [num_q_tokens, num_max_sparse_blocks] = get_shape<2>(sparse_kv_block_indices);
     DG_HOST_ASSERT(num_q_tokens > 0);
     DG_HOST_ASSERT(context_lens.numel() == num_q_tokens and context_lens.scalar_type() == torch::kInt and context_lens.is_contiguous());
@@ -377,7 +389,9 @@ static torch::Tensor fp8_fp4_sparse_mqa_logits(const std::tuple<torch::Tensor, s
     using namespace layout::sparse_mqa_logits;
     const auto [q_fp, q_sf_optional] = q;
     const auto [kv_fp, kv_sf] = kv;
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and q_sf_optional.has_value());
+    if (jit->device.get_arch_major() < 10) {
+        DG_PANIC("sparse_mqa_logits is only supported on NVIDIA Blackwell (SM100) or newer GPUs.");
+    }
     DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     const auto& q_sf = q_sf_optional.value();
@@ -411,7 +425,9 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
                                                      const int& sparse_block_kv) {
     using namespace layout::sparse_mqa_logits;
     const auto [q_fp, q_sf_optional] = q;
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and q_sf_optional.has_value());
+    if (jit->device.get_arch_major() < 10) {
+        DG_PANIC("paged_sparse_mqa_logits is only supported on NVIDIA Blackwell (SM100) or newer GPUs.");
+    }
     DG_HOST_ASSERT(num_max_sparse_blocks > 0 and num_max_sparse_blocks % 4 == 0 and num_max_sparse_blocks <= 4096);
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     const auto& q_sf = q_sf_optional.value();
