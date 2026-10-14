@@ -26,6 +26,15 @@ CUTLASS_DEVICE uint64_t get_grid_idx() {
     return grid_idx;
 }
 
+// Programmatic dependent launch (PDL) grid synchronization.
+// NOTES: `griddepcontrol` requires `.target sm_90` or higher, so this is a no-op below SM90,
+//        where PDL must also stay disabled on the host side (see `set_pdl` in `csrc/apis/config.hpp`).
+CUTLASS_DEVICE void grid_dependency_synchronize() {
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
+}
+
 CUTLASS_DEVICE void sync_aligned(const uint32_t& num_threads, const uint32_t& barrier_idx) {
     asm volatile("bar.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads));
 }

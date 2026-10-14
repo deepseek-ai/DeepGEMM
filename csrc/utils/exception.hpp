@@ -40,6 +40,17 @@ do { \
 #define DG_HOST_UNREACHABLE(reason) (throw DGException("Assertion", __FILE__, __LINE__, reason))
 #endif
 
+// An unconditional, always-thrown error carrying a human readable message
+// (e.g. architecture capability limits); surfaces as a Python `RuntimeError`
+#ifndef DG_PANIC
+#define DG_PANIC(...) \
+do { \
+    std::ostringstream dg_panic_ss; \
+    dg_panic_ss << __VA_ARGS__; \
+    throw DGException("Panic", __FILE__, __LINE__, dg_panic_ss.str()); \
+} while (0)
+#endif
+
 #ifndef DG_CUDA_RUNTIME_CHECK
 #define DG_CUDA_RUNTIME_CHECK(cmd) \
 do { \

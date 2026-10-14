@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm89_fp8_gemm.hpp"
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 
@@ -135,7 +136,17 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
         sm100_fp8_fp4_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, gran_k_a, gran_k_b,
                                 major_a, major_b, compiled_dims, resolve_epilogue_class(epilogue_class, c, d, alpha));
     } else if (arch_major == 8) {
-        DG_PANIC("FP8 Tensor Core GEMM is not natively supported on NVIDIA Ampere/Ada (SM80/SM89) due to hardware limits. Use BF16 GEMM instead.");
+        // Ada Lovelace (SM89): native FP8 Tensor Core GEMM via `mma.sync` + `cp.async`
+        // NOTES: Ampere (SM80) has no FP8 Tensor Cores at all, so only SM89 reaches this path.
+        DG_HOST_ASSERT(is_sm89() and
+                       "FP8 Tensor Core GEMM requires NVIDIA Ada Lovelace (SM89) or newer GPUs.");
+        DG_HOST_ASSERT(not alpha.has_value() and "FP8 GEMM alpha requires SM100");
+        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
+        DG_HOST_ASSERT(sfa.scalar_type() == torch::kFloat and sfb.scalar_type() == torch::kFloat and
+                       "SM89 FP8 GEMM requires FP32 scaling factors with a granularity of (1, 128) or (128, 128).");
+        const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());
+        sm89_fp8_gemm(a.first, sfa, b.first, sfb, c, d, m, n, k, compiled_dims,
+                      gran_n == 1 ? KernelType::Kernel1D1D : KernelType::Kernel1D2D);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }
@@ -212,7 +223,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
     const auto arch_major = jit->device.get_arch_major();
 
     if (arch_major == 8) {
-        DG_PANIC("Grouped FP8 GEMM is not supported on SM80/SM89 hardware due to hardware limits.");
+        DG_PANIC("Grouped FP8 GEMM requires NVIDIA Hopper (SM90) or newer GPUs; "
+                 "the Ada Lovelace (SM89) kernel only implements dense GEMMs.");
     }
 
     const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
@@ -300,7 +312,8 @@ static void m_grouped_fp8_fp4_gemm_nt_masked(const std::pair<torch::Tensor, torc
     // Type and shape checks
     const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 8) {
-        DG_PANIC("Masked grouped FP8 GEMM is not supported on SM80/SM89 hardware due to hardware limits.");
+        DG_PANIC("Masked grouped FP8 GEMM requires NVIDIA Hopper (SM90) or newer GPUs; "
+                 "the Ada Lovelace (SM89) kernel only implements dense GEMMs.");
     }
 
     const auto [num_groups  , m , k ] = check_grouped_ab_fp8_fp4(a.first, major_a, arch_major);
@@ -534,7 +547,8 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, c, d, alpha);
     const auto epilogue_alpha = resolved_epilogue_class->get_alpha();
 
-    // Dispatch into different implements; cuBLASLt covers standard store and alpha scaling across SM80/SM89/SM90/SM100
+    // Dispatch into different implementations; cuBLASLt covers standard store and alpha scaling
+    // on architectures without a native dense BF16 kernel (SM80/SM89) and as a fallback elsewhere
     if (not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()
         and epilogue_alpha.has_value()) {
         cublaslt_gemm(a, b, d, m, n, k, major_a, major_b, c.has_value(), epilogue_alpha.value());
@@ -549,7 +563,7 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     } else if (arch_major == 10) {
         sm100_bf16_gemm(a, b, c, d, m, n, k, major_a, major_b, compiled_dims, resolved_epilogue_class);
     } else if (arch_major == 8) {
-        // Fallback to cuBLASLt on Ampere (SM80) and Ada Lovelace (SM89)
+        // Fallback to cuBLASLt on architectures without a native dense BF16 kernel
         cublaslt_gemm(a, b, d, m, n, k, major_a, major_b, c.has_value(), epilogue_alpha.value_or(1.0f));
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -640,7 +654,7 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
                                              use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
                                              resolve_epilogue_class(epilogue_class, std::nullopt, d));
     } else if (arch_major == 8) {
-        DG_PANIC("m_grouped_bf16_gemm_nt_contiguous is not supported on SM80/SM89 hardware.");
+        DG_PANIC("m_grouped_bf16_gemm_nt_contiguous requires NVIDIA Hopper (SM90) or newer GPUs.");
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -693,7 +707,7 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
                                          num_groups, m, n, k, expected_m, major_a, major_b, compiled_dims,
                                          resolve_epilogue_class(epilogue_class, std::nullopt, d));
     } else if (arch_major == 8) {
-        DG_PANIC("m_grouped_bf16_gemm_nt_masked is not supported on SM80/SM89 hardware.");
+        DG_PANIC("m_grouped_bf16_gemm_nt_masked requires NVIDIA Hopper (SM90) or newer GPUs.");
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -743,7 +757,7 @@ static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                                   cute::UMMA::Major::MN, cute::UMMA::Major::MN, compiled_dims, use_psum_layout,
                                   resolve_epilogue_class(epilogue_class, c, d));
     } else if (arch_major == 8) {
-        DG_PANIC("k_grouped_bf16_gemm_tn_contiguous is not supported on SM80/SM89 hardware.");
+        DG_PANIC("k_grouped_bf16_gemm_tn_contiguous requires NVIDIA Hopper (SM90) or newer GPUs.");
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

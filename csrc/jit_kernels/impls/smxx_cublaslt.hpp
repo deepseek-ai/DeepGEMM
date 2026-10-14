@@ -43,7 +43,11 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     DG_HOST_ASSERT(with_block_sf == (b_block_sf != nullptr));
 
     // Block-scaled matmuls require the plain FP32 compute type
-    cublasComputeType_t compute_type = with_block_sf ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
+    // NOTES: `CUBLAS_COMPUTE_32F_FAST_TF32` only down-casts *FP32* inputs to TF32; it must never be
+    //        used for BF16/FP8 operands, otherwise cuBLASLt silently runs them at TF32 precision.
+    const bool is_fp32_input = a.scalar_type() == torch::kFloat and b.scalar_type() == torch::kFloat;
+    cublasComputeType_t compute_type = (with_block_sf or not is_fp32_input) ?
+        CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
     cudaDataType_t scale_type = CUDA_R_32F;
 
     // Operation description
