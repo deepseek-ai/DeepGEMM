@@ -632,6 +632,44 @@ static void m_grouped_bf16_gemm_nn_contiguous(const torch::Tensor& a, const torc
                                       d, grouped_layout, compiled_dims, use_psum_layout, ensure_zero_padding, std::nullopt, epilogue_class);
 }
 
+static void m_grouped_bf16_gemm_nt_contiguous_gathered(const torch::Tensor& a, const torch::Tensor& b,
+                                                       const torch::Tensor& d, const torch::Tensor& grouped_layout,
+                                                       const torch::Tensor& a_row_indices) {
+    // Shape must be `[M, K] @ [G, N, K].mT`, where row `i` of the GEMM input is `a[a_row_indices[i]]`
+    // NOTES: padding rows must also reference valid source rows
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 9 and "Gathered A requires SM90");
+    DG_HOST_ASSERT(a.is_cuda() and b.device() == a.device() and d.device() == a.device() and
+                   grouped_layout.device() == a.device() and a_row_indices.device() == a.device());
+    DG_HOST_ASSERT(grouped_layout.is_contiguous() and a_row_indices.is_contiguous());
+
+    // Type and shape checks
+    const auto [num_rows, k] = get_shape<2>(a);
+    const auto [num_groups, n, k_] = get_shape<3>(b);
+    const auto [m, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(n == n_ and k == k_);
+    DG_HOST_ASSERT(n > 0 and k > 0 and k % 64 == 0 and num_groups > 0);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+    const auto [num_layout_rows] = get_shape<1>(grouped_layout);
+    const auto [num_row_indices] = get_shape<1>(a_row_indices);
+    DG_HOST_ASSERT(num_layout_rows == m and num_row_indices == m);
+    DG_HOST_ASSERT(grouped_layout.scalar_type() == torch::kInt and a_row_indices.scalar_type() == torch::kInt64);
+
+    // Layout checks: K-major A with 16-byte aligned rows (a padded row stride is allowed), contiguous B, N-major D
+    DG_HOST_ASSERT(heuristics_runtime->get_mk_alignment_for_contiguous_layout() == 128);
+    DG_HOST_ASSERT(a.stride(1) == 1 and a.stride(0) % 8 == 0 and reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0);
+    DG_HOST_ASSERT(b.is_contiguous());
+    check_major_type_cd(d);
+
+    // Do nothing if empty
+    if (m == 0)
+        return;
+    DG_HOST_ASSERT(num_rows > 0);
+
+    sm90_m_grouped_bf16_gemm_contiguous_gathered(a, b, d, grouped_layout, a_row_indices, num_groups, m, n, k);
+}
+
 static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
                                           const torch::Tensor& d, const torch::Tensor& masked_m,
                                           const int& expected_m, const std::string& compiled_dims,
@@ -966,6 +1004,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true,
           py::arg("epilogue") = nullptr);
+    m.def("m_grouped_bf16_gemm_nt_contiguous_gathered", &m_grouped_bf16_gemm_nt_contiguous_gathered,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"), py::arg("a_row_indices"));
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("compiled_dims") = "nk",

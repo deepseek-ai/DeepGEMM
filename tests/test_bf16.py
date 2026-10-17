@@ -4,7 +4,7 @@ import torch
 
 import deep_gemm
 from deep_gemm.testing import (
-    bench_kineto,
+    bench, bench_kineto,
     calc_diff, count_bytes
 )
 from utils import (
@@ -13,7 +13,7 @@ from utils import (
     assert_psum_zero_padding,
 )
 from generators import (
-    get_arch_major,
+    get_arch_major, MajorTypeAB,
     enumerate_normal, enumerate_batched_syrk_symm, enumerate_m_grouped_contiguous, enumerate_m_grouped_masked, enumerate_k_grouped_contiguous,
     enumerate_k_grouped_contiguous_test_variants,
     generate_normal, generate_m_grouped_contiguous, generate_m_grouped_masked, generate_k_grouped_contiguous,
@@ -105,6 +105,81 @@ def test_m_grouped_gemm_contiguous() -> None:
               f'{t * 1e6:4.0f} us | '
               f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
               f'{count_bytes(a, b, d) / 1e9 / t:4.0f} GB/s')
+    print()
+
+
+def test_m_grouped_gemm_contiguous_gathered() -> None:
+    print('Testing m-grouped contiguous GEMM with gathered A:')
+
+    # The gathered kernel requires 128-row expert alignment
+    deep_gemm.use_deterministic_algorithms(True)
+    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
+    gathered = deep_gemm.m_grouped_bf16_gemm_nt_contiguous_gathered
+    materialized = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
+    for num_groups, expected_m_per_group, n, k, row_padding in ((4, 8192, 4096, 7168, 0), (8, 4096, 7168, 2048, 64), (16, 1024, 1280, 3072, 0)):
+        m, _, b, grouped_layout, d, _, valid_mask = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k,
+                                                                                  MajorTypeAB.KMajor, MajorTypeAB.KMajor, use_bf16=True)
+        # Source rows may come from a padded view, as long as every row stays 16-byte aligned
+        num_rows = max(m // 2, 1)
+        a = torch.randn((num_rows, k + row_padding), device='cuda', dtype=torch.bfloat16)[:, :k]
+        row_indices = torch.randint(num_rows, (m, ), device='cuda', dtype=torch.int64)
+        ref_d = torch.empty_like(d)
+        materialized(a.index_select(0, row_indices), b, ref_d, grouped_layout)
+        gathered(a, b, d, grouped_layout, row_indices)
+        # The same pipeline consumes the same rows, so the outputs must match bitwise
+        assert torch.equal(d[valid_mask], ref_d[valid_mask]), f'{num_groups=}, {m=}, {n=}, {k=}, {row_padding=}'
+
+        # noinspection PyShadowingNames
+        def test_func():
+            gathered(a, b, d, grouped_layout, row_indices)
+
+        # Compare both complete GEMM paths with the same CUDA-event timer
+        t = bench(test_func)
+        materialized_t = bench(lambda: materialized(a.index_select(0, row_indices), b, ref_d, grouped_layout))
+        print(f' > Perf ({num_groups=}, m={m:5}, n={n:5}, k={k:5}): '
+              f'{t * 1e6:4.0f} us gathered | {materialized_t * 1e6:4.0f} us index_select + GEMM | '
+              f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+              f'{materialized_t / t:.2f}x (CUDA events)')
+
+    # Small/partial M, empty experts, padded strides, aligned offsets, and A=M=0
+    for counts, hidden, features, source_padding, output_padding, source_offset in (
+        ([1], 64, 64, 0, 0, 0), ([17], 256, 144, 0, 0, 0),
+        ([128, 0, 256, 128], 512, 256, 0, 0, 0),
+        ([128, 256], 256, 128, 8, 8, 0), ([128, 256], 256, 128, 8, 0, 8),
+        ([0], 64, 64, 0, 0, 0),
+    ):
+        m = sum(counts)
+        num_rows = 1031 if m else 0
+        x = torch.randn((num_rows, hidden + source_padding), device='cuda', dtype=torch.bfloat16)[:, source_offset:source_offset + hidden]
+        weights = torch.randn((len(counts), features, hidden), device='cuda', dtype=torch.bfloat16)
+        row_indices = torch.randint(num_rows, (m, ), device='cuda', dtype=torch.int64) if m else \
+                      torch.empty(0, device='cuda', dtype=torch.int64)
+        grouped_layout = torch.repeat_interleave(torch.arange(len(counts), device='cuda', dtype=torch.int32),
+                                                 torch.tensor(counts, device='cuda', dtype=torch.int64), output_size=m)
+        reference = torch.empty((m, features), device='cuda', dtype=torch.bfloat16)
+        output_storage = torch.full((m, features + output_padding), float('nan'), device='cuda', dtype=torch.bfloat16)
+        output = output_storage[:, :features]
+        materialized(x.index_select(0, row_indices), weights, reference, grouped_layout)
+        gathered(x, weights, output, grouped_layout, row_indices)
+        assert torch.isfinite(output).all() and torch.equal(output, reference), \
+            f'{counts=}, {hidden=}, {features=}, {source_padding=}, {output_padding=}, {source_offset=}'
+        assert torch.isnan(output_storage[:, features:]).all(), 'Output row padding was overwritten'
+
+        if source_offset:
+            misaligned_x = torch.empty((num_rows, hidden + 8), device='cuda', dtype=x.dtype)[:, 1:hidden + 1]
+            for source, layout, indices, expected in (
+                (misaligned_x, grouped_layout, row_indices, 'reinterpret_cast<uintptr_t>'),
+                (x, grouped_layout.view(1, -1), row_indices, 't.dim() == N'),
+                (x, grouped_layout, row_indices.view(1, -1), 't.dim() == N'),
+            ):
+                try:
+                    gathered(source, weights, output, layout, indices)
+                except RuntimeError as error:
+                    assert 'Assertion error' in str(error) and expected in str(error), str(error)
+                else:
+                    raise AssertionError('Invalid gathered GEMM input was accepted')
+    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
     print()
 
 
@@ -333,6 +408,8 @@ if __name__ == '__main__':
     if get_arch_major() >= 9:
         test_gemm()
         test_m_grouped_gemm_contiguous()
+        if get_arch_major() == 9:
+            test_m_grouped_gemm_contiguous_gathered()
         test_m_grouped_gemm_masked()
         test_k_grouped_gemm_contiguous()
 
