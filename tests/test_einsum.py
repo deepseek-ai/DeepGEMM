@@ -191,6 +191,15 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
                                              epilogue=deep_gemm.epilogue.BF16StochasticRounding())
                         assert_stochastic_bf16_matches_fp32_accumulation(
                             z_sr, launch_accumulated, f'{b=}, {h=}, {r=}, {d=}')
+                    else:
+                        # SM90's FP8 BMM kernel cannot add C into D, so C must be rejected
+                        acc = torch.zeros((h, b, d), device='cuda', dtype=torch.bfloat16).permute(1, 0, 2)
+                        try:
+                            deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, acc, c=acc)
+                        except RuntimeError:
+                            pass
+                        else:
+                            raise AssertionError(f'{b=}, {h=}, {r=}, {d=}: C must be rejected on SM90')
                 assert diff < (2e-3 if output_dtype == torch.float8_e4m3fn else 1e-3), \
                     f'{b=}, {h=}, {r=}, {d=}, {output_dtype=}, {diff=:.5f}'
 
