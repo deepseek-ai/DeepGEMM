@@ -591,7 +591,7 @@ def test_sparse_mqa_logits() -> None:
             num_pages_per_request = [ceil_div(context_len, page_kv) for context_len in max_context_lens]
             max_num_pages, num_pages = max(num_pages_per_request), sum(num_pages_per_request)
             page_bytes = page_kv * (elem_dim + 4)
-            page_stride_bytes = ceil_div(page_bytes, 512) * 512
+            page_stride_bytes = ceil_div(page_bytes, 128) * 128
             kv_storage = torch.empty((num_pages, page_stride_bytes), device='cuda', dtype=torch.uint8)
             kv_cache = kv_storage.as_strided((num_pages, page_kv, 1, elem_dim + 4),
                                              (page_stride_bytes, elem_dim + 4, elem_dim + 4, 1))

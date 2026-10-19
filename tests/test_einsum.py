@@ -147,21 +147,34 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
                     output = torch.empty_like(z, dtype=output_dtype)
                     sfd = torch.empty_strided(
                         (b, ceil_div(h * d, 32 * 4)), (1, align(b, 4)), dtype=torch.int32, device='cuda')
-                    deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, (output, sfd))
-                    restored_output = cast_back_from_fp8(
-                        output.view(b, h * d), sfd.contiguous(), gran_k=32, use_packed_ue8m0=True)
-                    diff = calc_diff(restored_output, ref_z.reshape(b, h * d))
-
-                    # The fused output must align with the production pipeline (a BF16 D
-                    # followed by a per-token cast): the epilogue rounds the accumulator into
-                    # BF16 before the same amax/scale/rounding steps, so both the FP8 data
-                    # and the packed SF words must match bitwise
-                    d_bf16 = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
+                    count_cuda = torch.empty(1, device='cuda', dtype=torch.uint32)
+                    d_bf16 = torch.empty_like(z)
                     deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, d_bf16)
-                    ref_fp8, ref_sfd = per_token_cast_to_fp8(d_bf16.view(b, h * d), use_ue8m0=True,
-                                                             gran_k=32, use_packed_ue8m0=True)
-                    assert torch.equal(output.view(b, h * d), ref_fp8), f'{b=}, {h=}, {r=}, {d=}'
-                    assert torch.equal(sfd.contiguous(), ref_sfd), f'{b=}, {h=}, {r=}, {d=}'
+
+                    # Random dot products have variance r; 2.576 sigma clips about 1%.
+                    for clamp_value in (None, 2.576 * r ** 0.5):
+                        expected = d_bf16 if clamp_value is None else d_bf16.clamp(-clamp_value, clamp_value)
+                        ref_fp8, ref_sfd = per_token_cast_to_fp8(
+                            expected.view(b, h * d), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+                        ref_count = 0 if clamp_value is None else (d_bf16.abs() > clamp_value).sum().item()
+                        # The scalar output must overwrite its previous contents.
+                        for clamped_count in (None, count_cuda):
+                            epilogue = deep_gemm.epilogue.FP8CastWithClamp(
+                                sfd=sfd, clamp_value=clamp_value, clamped_count=clamped_count)
+                            if clamped_count is not None:
+                                clamped_count.fill_(0xffffffff)
+                            if clamp_value is None and clamped_count is None:
+                                deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, (output, sfd))
+                            else:
+                                deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, output, epilogue=epilogue)
+                            if clamped_count is not None:
+                                assert clamped_count.item() == ref_count, f'{b=}, {clamp_value=}: count'
+                            assert torch.equal(output.view(b, h * d), ref_fp8), f'{b=}, {clamp_value=}: FP8'
+                            assert torch.equal(sfd.contiguous(), ref_sfd), f'{b=}, {clamp_value=}: SF'
+                        if clamp_value is None:
+                            restored_output = cast_back_from_fp8(
+                                output.view(b, h * d), sfd.contiguous(), gran_k=32, use_packed_ue8m0=True)
+                            diff = calc_diff(restored_output, ref_z.reshape(b, h * d))
                 else:
                     output = z
                     deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, output)

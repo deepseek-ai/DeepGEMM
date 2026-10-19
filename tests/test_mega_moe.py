@@ -184,7 +184,6 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             transformed_l1_weights, transformed_l2_weights = localize(transformed_l1_weights), localize(transformed_l2_weights)
             if num_shared_experts > 0:
                 transformed_shared_l1_weights, transformed_shared_l2_weights = localize(transformed_shared_l1_weights), localize(transformed_shared_l2_weights)
-            deep_gemm.destroy_localizer()
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
@@ -239,6 +238,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         # Destroy and exit
         dist.barrier()
         buffer.destroy()
+        deep_gemm.destroy_localizer()
         dist.destroy_process_group()
         return
 
@@ -423,6 +423,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.barrier()
     buffer.destroy()
     ep_buffer.destroy() if is_legacy_loaded else None
+    deep_gemm.destroy_localizer()
     dist.destroy_process_group()
 
 
