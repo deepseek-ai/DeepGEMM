@@ -39,6 +39,12 @@ static constexpr uint32_t kNumSplitBarriers = 2;
 static constexpr uint64_t kSplitBarrierLineBytes = 128;
 static constexpr uint32_t kNumMaxTokens = 1u << 20;
 static constexpr uint32_t kNumMaxMBlocks = math::constexpr_ceil_div(kNumMaxTokens, BLOCK_M);
+// A barrier line holds one 8-byte state; the execution epoch and the exit count
+// live in the unused tail of the buffer's first line, so the buffer is unchanged.
+static constexpr uint64_t kSplitBarrierEpochOffset = kSplitBarrierLineBytes / 2;
+static constexpr uint64_t kSplitBarrierExitCountOffset = kSplitBarrierEpochOffset + sizeof(uint64_t);
+DG_STATIC_ASSERT(kSplitBarrierExitCountOffset + sizeof(uint32_t) <= kSplitBarrierLineBytes,
+                 "Epoch and exit count must fit in the first barrier line");
 
 // Host/device ABI payloads for the two consumer domains. Tensor maps remain
 // standalone kernel parameters so TMA descriptors keep direct grid-constant access.
