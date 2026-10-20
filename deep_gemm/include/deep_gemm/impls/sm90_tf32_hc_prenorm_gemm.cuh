@@ -202,7 +202,6 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 sqr_sum_acc_1 += a_float2_0.y * a_float2_0.y + a_float2_1.y * a_float2_1.y;
             }
 
-            ptx::warpgroup_wait<0>();
             if (s > 0)
                 empty_barriers[(s - 1) % kNumStages]->arrive();
 
@@ -225,6 +224,8 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 }
             }
             ptx::warpgroup_commit_batch();
+            // Keep register A operands live until the asynchronous WGMMA completes.
+            ptx::warpgroup_wait<0>();
             #pragma unroll
             for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
                 ptx::warpgroup_fence_operand(accum[i]);
