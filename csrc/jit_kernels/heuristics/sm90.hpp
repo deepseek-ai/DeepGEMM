@@ -90,6 +90,14 @@ struct SM90ArchSpec {
                             ceil_div(desc.n, block_n) % (cluster_m * cluster_n) != 0)
                             continue;
 
+                        // Multicast legality for k-grouped layout: the scheduler lays the groups'
+                        // block grids back-to-back, while SM90 clusters are consecutive block pairs,
+                        // so the per-group grid must be divisible by the cluster size or a cluster
+                        // may straddle a group boundary (hanging or corrupting the multicast)
+                        if (desc.gemm_type == GemmType::KGroupedContiguous and
+                            (ceil_div(desc.m, block_m) * ceil_div(desc.n, block_n)) % (cluster_m * cluster_n) != 0)
+                            continue;
+
                         // The block sizes cannot be too large (for enough registers), so at least one dim less than 128
                         if (block_m > 128 and block_n > 128)
                             continue;
