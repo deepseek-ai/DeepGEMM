@@ -23,7 +23,7 @@ static void bmk_bnk_mn(const torch::Tensor& a, const torch::Tensor& b, const tor
                        const std::optional<torch::Tensor>& c) {
     // Currently FP32 only support the accumulated expression
     if (d.scalar_type() == torch::kFloat) {
-        DG_HOST_ASSERT(c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());
+        DG_HOST_ASSERT(c.has_value() and c->data_ptr() == d.data_ptr() and c->sizes() == d.sizes() and c->strides() == d.strides());
     } else {
         DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
         DG_HOST_ASSERT(not c.has_value());
