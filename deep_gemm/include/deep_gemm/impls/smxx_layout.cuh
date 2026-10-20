@@ -33,7 +33,7 @@ void transpose_fp32(const float* sf, float* out, const uint32_t mn) {
     const auto local_sf = sf + static_cast<uint64_t>(block_mn_idx) * BLOCK_MN * SF_K + block_sf_k_start;
 
     // Wait for primary kernel completion
-    cudaGridDependencySynchronize();
+    ptx::grid_dependency_synchronize();
 
     // Load
     if constexpr (SF_K < BLOCK_SF_K) {
@@ -96,7 +96,7 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
     const auto tma_aligned_mn = math::align<uint64_t>(mn, kNumTMAAlignedElems);
 
     // Wait for primary kernel completion before reading SFs or PSUM layout
-    cudaGridDependencySynchronize();
+    ptx::grid_dependency_synchronize();
 
     constexpr auto kNumPsumLayoutElems = kUsePsumLayout ? math::constexpr_align(kNumPsumGroups * 2, 4u) : 0;
     const auto group_mn_start = smem_buffer;
@@ -219,7 +219,7 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
         return;
 
     // Wait for primary kernel completion
-    cudaGridDependencySynchronize();
+    ptx::grid_dependency_synchronize();
 
     // Find the owner group of this warp's packed row and its input SF row range
     uint32_t num_padding_sf_rows = 0;

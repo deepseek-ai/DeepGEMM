@@ -207,6 +207,25 @@ CUTLASS_DEVICE void cp_async_ca_zfill(const uint32_t* global_ptr, uint32_t* shar
         "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_ptr))), "l"(global_ptr), "r"(num_src_bytes));
 }
 
+/// Ampere/Ada asynchronous copy
+// Copies 16 bytes, zero-filling the last `16 - num_src_bytes` bytes of the destination.
+// `num_src_bytes` may be any value in `[0, 16]`, which lets callers handle ragged M/N/K tails
+// without any separate epilogue. Requires both addresses to be 16-byte aligned.
+CUTLASS_DEVICE void cp_async_zfill16(const void* global_ptr, void* shared_ptr, const uint32_t num_src_bytes) {
+    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;" ::
+        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(shared_ptr))), "l"(global_ptr), "r"(num_src_bytes));
+}
+
+CUTLASS_DEVICE void cp_async_commit() {
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+// Waits until at most `kNumPendingGroups` `cp.async` groups are still in flight
+template <uint32_t kNumPendingGroups>
+CUTLASS_DEVICE void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;" :: "n"(kNumPendingGroups) : "memory");
+}
+
 CUTLASS_DEVICE uint32_t mapa_shared(const uint32_t& ptr, const uint32_t& dst_cta_idx) {
     uint32_t mapped;
     asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(mapped) : "r"(ptr), "r"(dst_cta_idx));

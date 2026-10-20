@@ -14,6 +14,13 @@
 
 namespace deep_gemm {
 
+// Ada Lovelace is the only pre-Hopper architecture with FP8 Tensor Cores: it is the first one
+// that implements `mma.sync.aligned.m16n8k32...e4m3`. Ampere (SM80) has BF16 Tensor Cores only,
+// so SM80/SM89 must never be lumped together when FP8 is involved.
+static bool is_sm89() {
+    return jit->device.get_arch_major() == 8 and jit->device.get_arch_minor() == 9;
+}
+
 // Major-ness stuffs
 template <bool kRequireContiguousBatch = true>
 static void major_check(const torch::Tensor& t) {
@@ -40,7 +47,9 @@ static void check_major_type_cd(const torch::Tensor& t) {
 }
 
 static bool fp8_fp4_requires_k_major(const torch::Tensor& a, const torch::Tensor& b) {
-    return jit->device.get_arch_major() == 9 or
+    // SM89 (Ada) and SM90 (Hopper) FP8 kernels only support the K-major (NT) operand layout
+    const auto arch_major = jit->device.get_arch_major();
+    return arch_major == 8 or arch_major == 9 or
            (a.scalar_type() == kPackedFP4 and b.scalar_type() == kPackedFP4);
 }
 
@@ -85,7 +94,9 @@ static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& a
 static std::tuple<int, int, int>
 get_default_recipe(const torch::ScalarType& sfa_dtype, const torch::ScalarType& sfb_dtype) {
     const auto arch_major = jit->device.get_arch_major();
-    if (arch_major == 9) {
+    if (arch_major == 8 or arch_major == 9) {
+        // SM89 (Ada) consumes exactly the same FP32 SF layouts as SM90: per-token A scales and
+        // per-128-column B scales (the "1D2D" recipe), with a 128-wide K granularity
         DG_HOST_ASSERT(sfa_dtype == torch::kFloat and sfb_dtype == torch::kFloat);
         return {1, 128, 128};
     } else if (arch_major == 10) {

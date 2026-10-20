@@ -25,6 +25,9 @@ static void register_apis(pybind11::module_& m) {
         return runtime->get_tc_util();
     });
     m.def("set_pdl", [](const bool& new_enable_pdl) {
+        // NOTES: `griddepcontrol` requires SM90 or newer, so PDL stays off on SM80/SM89/SM8x
+        if (new_enable_pdl and jit->device.get_arch_major() < 9)
+            DG_PANIC("Programmatic dependent launch (PDL) requires NVIDIA Hopper (SM90) or newer GPUs.");
         jit->default_launch_options.enable_pdl = new_enable_pdl;
     });
     m.def("get_pdl", []() {

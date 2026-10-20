@@ -34,12 +34,16 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     // Pre-transform checks
     check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
 
-    // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    // SM89 (Ada) consumes the same FP32 SF layouts as SM90: MN-major and TMA-aligned for 1D1D,
+    // and the raw `[ceil(N / 128), ceil(K / 128)]` SFB for 1D2D
+    const bool is_fp32_sf_arch = arch_major == 8 or arch_major == 9;
+
+    // (FP32, 1, 128) on SM89/SM90: transform to TMA-aligned and MN-major
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (is_fp32_sf_arch or disable_ue8m0_cast))
         return get_mn_major_tma_aligned_tensor(sf);
 
-    // (FP32, 128, 128) on SM90: no need to transform, check SFB requirements
-    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+    // (FP32, 128, 128) on SM89/SM90: no need to transform, check SFB requirements
+    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and (is_fp32_sf_arch or disable_ue8m0_cast))
         return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
 
     // (FP32, x, gran_k) on SM100: transform to (INT, 1, gran_k), TMA-aligned and MN-major
