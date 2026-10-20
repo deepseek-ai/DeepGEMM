@@ -77,6 +77,8 @@ To perform a basic non-grouped FP8 GEMM, call the `fp8_gemm_{nt, nn, tn, tt}` fu
 
 Unlike traditional grouped GEMMs in CUTLASS, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape. For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_mk_alignment_for_contiguous_layout()`).  For more information, please refer to the `m_grouped_fp8_gemm_{nt, nn}_contiguous` function documentation.
 
+On SM90, `m_grouped_bf16_gemm_nt_contiguous_gathered(a, b, d, grouped_layout, a_row_indices)` gathers the rows of `a` inside the kernel, which equals `m_grouped_bf16_gemm_nt_contiguous(a.index_select(0, a_row_indices), b, d, grouped_layout)` without materializing the gathered activations. It requires K-major BF16 inputs with `K % 64 == 0`, an M alignment of 128, and contiguous int64 row indices that address valid rows (including padding rows); see `test_m_grouped_gemm_contiguous_gathered` in `tests/test_bf16.py` for an example.
+
 We also provide a K-axis-grouped API for MoE weight backward (with M and N must remain fixed), please refer to `k_grouped_fp8_gemm_tn_contiguous` for more information.
 
 #### Grouped GEMMs (masked layout)

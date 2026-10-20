@@ -21,6 +21,10 @@ public:
         CUtensorMap tensor_map_a;
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_cd;
+        void* gathered_a = nullptr;
+        void* a_row_indices = nullptr;
+        uint64_t gathered_a_stride = 0;
+        uint32_t gathered_a_rows = 0;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -41,7 +45,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -61,7 +65,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
-        to_string(args.gemm_desc.cd_dtype)));
+        to_string(args.gemm_desc.cd_dtype), args.a_row_indices != nullptr));
 
         // Launch
         jit->launch(
@@ -69,7 +73,8 @@ static void __instantiate_kernel() {{
             args.grouped_layout,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b,
-            args.tensor_map_cd
+            args.tensor_map_cd,
+            args.gathered_a, args.a_row_indices, args.gathered_a_stride, args.gathered_a_rows
         );
     }
 };
@@ -197,6 +202,70 @@ static void sm90_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
+    });
+}
+
+// Gathered A is loaded with `cp.async` by each CTA, so TMA multicast clusters do not apply
+struct SM90GatheredArchSpec: SM90ArchSpec {
+    static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
+        auto layouts = SM90ArchSpec::get_layout_candidates(desc);
+        std::erase_if(layouts, [](const Layout& layout) { return layout.get_cluster_size() != 1; });
+        return layouts;
+    }
+};
+
+static void sm90_m_grouped_bf16_gemm_contiguous_gathered(const torch::Tensor& a,
+                                                         const torch::Tensor& b,
+                                                         const torch::Tensor& d,
+                                                         const torch::Tensor& m_indices,
+                                                         const torch::Tensor& a_row_indices,
+                                                         const int& num_groups, const int& m, const int& n, const int& k) {
+    const auto desc = GemmDesc {
+        .gemm_type = GemmType::MGroupedContiguous,
+        .kernel_type = KernelType::KernelNoSF,
+        .m = m, .n = n, .k = k, .num_groups = num_groups,
+        .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
+        .cd_dtype = d.scalar_type(),
+        .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
+        .with_accumulation = false,
+        .num_sms = runtime->get_num_sms(),
+        .tc_util = runtime->get_tc_util(),
+        .compiled_dims = "nk",
+        .expected_m = m, .expected_n = n, .expected_k = k,
+        .expected_num_groups = 1
+    };
+    const auto config = get_best_config<SM90GatheredArchSpec>(desc);
+
+    // A is gathered by the kernel itself, so only B and D use TMA
+    const auto tensor_map_b = make_tma_b_desc(desc.major_b, b, n, k,
+                                              config.storage_config.load_block_n,
+                                              config.layout.block_k,
+                                              static_cast<int>(b.stride(get_non_contiguous_dim(desc.major_b))), num_groups,
+                                              config.storage_config.swizzle_b_mode);
+    const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
+                                                config.storage_config.store_block_m,
+                                                config.storage_config.store_block_n,
+                                                static_cast<int>(d.stride(-2)), 1,
+                                                config.storage_config.swizzle_cd_mode);
+
+    // Compile and launch
+    SM90BF16GemmRuntime::compile_and_launch("sm90_m_grouped_bf16_gemm_contiguous_gathered", {
+        .gemm_desc = desc,
+        .gemm_config = config,
+        .options = {
+            .num_smem_bytes = config.pipeline_config.smem_size,
+            .grid_dim = dim3(config.launch_config.num_sms, 1, 1),
+            .block_dim = dim3(config.launch_config.num_threads, 1, 1),
+            .cluster_dim = dim3(1, 1, 1),
+        },
+        .grouped_layout = m_indices.data_ptr(),
+        .tensor_map_a = {},
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_cd = tensor_map_cd,
+        .gathered_a = a.data_ptr(),
+        .a_row_indices = a_row_indices.data_ptr(),
+        .gathered_a_stride = static_cast<uint64_t>(a.stride(0)),
+        .gathered_a_rows = static_cast<uint32_t>(a.size(0))
     });
 }
 
