@@ -70,12 +70,13 @@ struct SM90ArchSpec {
         std::vector<Layout> candidates;
         for (int cluster_m = 1; cluster_m <= (disable_multicast ? 1 : 2); ++ cluster_m) {
             for (int cluster_n = 1; cluster_n <= (disable_multicast ? 1 : 2); ++ cluster_n) {
+                const int cluster_size = cluster_m * cluster_n;
                 // We only support cluster 2
-                if (cluster_m * cluster_n > 2)
+                if (cluster_size > 2)
                     continue;
 
                 // SM count must be divisible
-                if (desc.num_sms % (cluster_m * cluster_n) != 0)
+                if (desc.num_sms % cluster_size != 0)
                     continue;
 
                 for (int block_m: block_m_candidates) {
@@ -87,9 +88,13 @@ struct SM90ArchSpec {
                         // Multicast legality for masked layout
                         // TODO: add some comments about it
                         if ((desc.gemm_type == GemmType::MGroupedMasked or desc.gemm_type == GemmType::MGroupedContiguousWithPsumLayout) and
-                            ceil_div(desc.n, block_n) % (cluster_m * cluster_n) != 0)
+                            ceil_div(desc.n, block_n) % cluster_size != 0)
                             continue;
 
+                        // Multicast legality for K-grouped: tiles per group must align to cluster size to avoid barrier deadlocks
+                        if (desc.gemm_type == GemmType::KGroupedContiguous and ((ceil_div(desc.m, block_m) * ceil_div(desc.n, block_n)) % cluster_size != 0)) {
+                            continue;
+                        }
                         // The block sizes cannot be too large (for enough registers), so at least one dim less than 128
                         if (block_m > 128 and block_n > 128)
                             continue;
