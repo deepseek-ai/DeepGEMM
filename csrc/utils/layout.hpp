@@ -7,7 +7,7 @@
 
 #include <deep_gemm/common/types.cuh>
 
-#include "math.hpp"
+#include <deep_gemm/common/math.cuh>
 #include "exception.hpp"
 #include "../runtime/jit.hpp"
 #include "../runtime/runtime.hpp"
@@ -41,7 +41,7 @@ static void check_major_type_cd(const torch::Tensor& t) {
 
 static bool fp8_fp4_requires_k_major(const torch::Tensor& a, const torch::Tensor& b) {
     return jit->device.get_arch_major() == 9 or
-           (a.scalar_type() == kPackedFP4 and b.scalar_type() == kPackedFP4);
+           (a.scalar_type() == torch::kFloat4_e2m1fn_x2 and b.scalar_type() == torch::kFloat4_e2m1fn_x2);
 }
 
 // Tensor utils
@@ -58,7 +58,7 @@ static auto get_shape(const torch::Tensor& t) {
 template <int N>
 static auto get_logical_shape(const torch::Tensor& t) {
     auto shape = get_shape<N>(t);
-    if (t.scalar_type() == kPackedFP4)
+    if (t.scalar_type() == torch::kFloat4_e2m1fn_x2)
         std::get<N - 1>(shape) *= 2;
     return shape;
 }
@@ -66,7 +66,7 @@ static auto get_logical_shape(const torch::Tensor& t) {
 static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
     auto [mn, k] = get_shape<2>(ab);
     if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
-        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10);
+        DG_HOST_ASSERT(ab.scalar_type() == torch::kFloat4_e2m1fn_x2 and arch_major == 10);
         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
     }
     return std::make_tuple(mn, k);
@@ -75,7 +75,7 @@ static std::tuple<int, int> check_ab_fp8_fp4(const torch::Tensor& ab, const cute
 static std::tuple<int, int, int> check_grouped_ab_fp8_fp4(const torch::Tensor& ab, const cute::UMMA::Major& major, const int& arch_major) {
     auto [num_groups, mn, k] = get_shape<3>(ab);
     if (ab.scalar_type() != torch::kFloat8_e4m3fn) {
-        DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 and arch_major == 10);
+        DG_HOST_ASSERT(ab.scalar_type() == torch::kFloat4_e2m1fn_x2 and arch_major == 10);
         major == cute::UMMA::Major::K ? (k *= 2) : (mn *= 2);
     }
     return std::make_tuple(num_groups, mn, k);

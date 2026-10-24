@@ -4,7 +4,7 @@
 #include <c10/core/ScalarType.h>
 #include <deep_gemm/common/types.cuh>
 
-#include "../../utils/math.hpp"
+#include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm {
 
@@ -33,7 +33,7 @@ struct GemmDesc {
     int get_expected_num_groups() const { return expected_num_groups > 0 ? expected_num_groups : num_groups; }
 
     bool is_mxf4_mma() const {
-        return a_dtype == kPackedFP4 and b_dtype == kPackedFP4;
+        return a_dtype == torch::kFloat4_e2m1fn_x2 and b_dtype == torch::kFloat4_e2m1fn_x2;
     }
 
     MmaKind get_mma_kind() const {
@@ -50,8 +50,8 @@ struct GemmDesc {
         if (get_mma_kind() == MmaKind::BF16) {
             DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
         } else {
-            DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
-            DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
+            DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == torch::kFloat4_e2m1fn_x2);
+            DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == torch::kFloat4_e2m1fn_x2);
         }
         // FP8 D implies casting with dynamic per-32 UE8M0 SFD output, only exposed for batched GEMMs
         DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat or

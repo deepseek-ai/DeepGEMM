@@ -19,14 +19,14 @@ static void check_mqa_logits_q_and_weights(const torch::Tensor& q_fp, const std:
                                            const torch::Tensor& weights,
                                            const int& num_q_tokens, const int& num_heads, const int& head_dim,
                                            const int& arch_major) {
-    const bool is_fp4 = q_fp.scalar_type() == kPackedFP4;
+    const bool is_fp4 = q_fp.scalar_type() == torch::kFloat4_e2m1fn_x2;
     const bool is_mx_sf = q_sf.has_value();
     DG_HOST_ASSERT(not is_fp4 or is_mx_sf);
 
     // Check Q
     DG_HOST_ASSERT((not is_fp4 and head_dim == 32) or head_dim == 64 or head_dim == 128);
     DG_HOST_ASSERT(q_fp.is_contiguous());
-    DG_HOST_ASSERT(q_fp.scalar_type() == (is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn));
+    DG_HOST_ASSERT(q_fp.scalar_type() == (is_fp4 ? torch::kFloat4_e2m1fn_x2 : torch::kFloat8_e4m3fn));
 
     // Check SF Q (SM100 uses MX scale factors, SM90 per-token float KV scales)
     DG_HOST_ASSERT(is_mx_sf == (arch_major == 10));
@@ -74,7 +74,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     const auto [q_fp, q_sf] = q;
     const auto [kv_fp, kv_sf] = kv;
     const auto qk_dtype = q_fp.scalar_type();
-    const bool is_fp4 = qk_dtype == kPackedFP4;
+    const bool is_fp4 = qk_dtype == torch::kFloat4_e2m1fn_x2;
     const bool is_mx_sf = q_sf.has_value();
     const auto arch_major = jit->device.get_arch_major();
     const auto out_dtype = arch_major == 10 ? torch::kBFloat16 : torch::kFloat32;
@@ -87,7 +87,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     const auto [seq_len_kv, _head_dim] = get_logical_shape<2>(kv_fp);
     DG_HOST_ASSERT(head_dim == _head_dim);
     DG_HOST_ASSERT(kv_fp.is_contiguous());
-    DG_HOST_ASSERT(kv_fp.scalar_type() == (is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn));
+    DG_HOST_ASSERT(kv_fp.scalar_type() == (is_fp4 ? torch::kFloat4_e2m1fn_x2 : torch::kFloat8_e4m3fn));
 
     // Check SF KV
     auto [_seq_len_kv] = get_shape<1>(kv_sf);
@@ -181,7 +181,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                               const std::optional<torch::Tensor>& indices) {
     const auto [q_fp, q_sf] = q;
     const auto qk_dtype = q_fp.scalar_type();
-    const bool is_fp4 = qk_dtype == kPackedFP4;
+    const bool is_fp4 = qk_dtype == torch::kFloat4_e2m1fn_x2;
     const bool is_mx_sf = q_sf.has_value();
 
     torch::Tensor kv_cache, kv_cache_sf;
@@ -213,7 +213,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         fused_kv_cache.data_ptr(),
         {num_kv_blocks, block_kv, kv_head_dim},
         {kv_cache_stride_bytes, kv_head_dim, 1},
-        torch::TensorOptions().dtype(is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn)
+        torch::TensorOptions().dtype(is_fp4 ? torch::kFloat4_e2m1fn_x2 : torch::kFloat8_e4m3fn)
     );
     kv_cache_sf = torch::from_blob(
         fused_kv_cache.data_ptr<uint8_t>() + block_kv * kv_head_dim,
@@ -416,7 +416,7 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
     DG_HOST_ASSERT(sparse_block_kv == 8 or sparse_block_kv == 16);
     const auto& q_sf = q_sf_optional.value();
     const auto qk_dtype = q_fp.scalar_type();
-    const bool is_fp4 = qk_dtype == kPackedFP4;
+    const bool is_fp4 = qk_dtype == torch::kFloat4_e2m1fn_x2;
 
     const auto [num_q_tokens, next_n, num_heads, head_dim] = get_logical_shape<4>(q_fp);
     DG_HOST_ASSERT(num_q_tokens > 0 and next_n == 1 and head_dim == kHeadDim);

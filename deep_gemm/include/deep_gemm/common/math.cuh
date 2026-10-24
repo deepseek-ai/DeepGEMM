@@ -7,6 +7,34 @@
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
+// Host-only utilities (merged from the host math header)
+#ifndef DG_IN_CUDA_COMPILATION
+
+#include <stdexcept>
+
+namespace deep_gemm {
+
+template <typename T>
+static T ceil_div(const T& a, const T& b) {
+    return (a + b - 1) / b;
+}
+
+template <typename T>
+static constexpr T align(const T& a, const T& b) {
+    return ceil_div(a, b) * b;
+}
+
+static int get_tma_aligned_size(const int& x, const int& element_size) {
+    constexpr int kNumTMAAlignmentBytes = 16;
+    if (kNumTMAAlignmentBytes % element_size != 0)
+        throw std::runtime_error("TMA alignment bytes must be divisible by element size");
+    return align(x, kNumTMAAlignmentBytes / element_size);
+}
+
+} // namespace deep_gemm
+
+#endif
+
 namespace deep_gemm::math {
 
 /// Pointer operations

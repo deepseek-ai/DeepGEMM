@@ -15,7 +15,7 @@
 
 #include "../heuristics/sm90.hpp"
 #include "../../runtime/locality_domain.hpp"
-#include "../../utils/math.hpp"
+#include <deep_gemm/common/math.cuh>
 #include "../../utils/exception.hpp"
 
 namespace deep_gemm {
@@ -62,12 +62,12 @@ static std::string to_string(const GemmType& type) {
 
 static std::string to_string(const at::ScalarType& dtype, const bool& fp4_unpacked_smem = true) {
     switch (dtype) {
-        case torch::kInt:           return "int";
-        case torch::kFloat:         return "float";
-        case torch::kBFloat16:      return "cutlass::bfloat16_t";
-        case torch::kFloat8_e4m3fn: return "cutlass::float_e4m3_t";
-        case kPackedFP4:            return fp4_unpacked_smem ? "cutlass::detail::float_e2m1_unpacksmem_t"
-                                                             : "cutlass::float_e2m1_t";
+        case torch::kInt:              return "int";
+        case torch::kFloat:            return "float";
+        case torch::kBFloat16:         return "cutlass::bfloat16_t";
+        case torch::kFloat8_e4m3fn:    return "cutlass::float_e4m3_t";
+        case torch::kFloat4_e2m1fn_x2: return fp4_unpacked_smem ? "cutlass::detail::float_e2m1_unpacksmem_t"
+                                       : "cutlass::float_e2m1_t";
         default: DG_HOST_UNREACHABLE("Unsupported dtype");
     }
 }
@@ -89,12 +89,12 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         return CU_TENSOR_MAP_DATA_TYPE_TFLOAT32;
 
     switch (dtype) {
-        case torch::kInt:           return CU_TENSOR_MAP_DATA_TYPE_INT32;
-        case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
-        case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
-        case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
-        case kPackedFP4:            return fp4_unpacked_smem ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
-                                                             : CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
+        case torch::kInt:              return CU_TENSOR_MAP_DATA_TYPE_INT32;
+        case torch::kFloat:            return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+        case torch::kBFloat16:         return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+        case torch::kFloat8_e4m3fn:    return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+        case torch::kFloat4_e2m1fn_x2: return fp4_unpacked_smem ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B
+                                       : CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
         default: DG_HOST_UNREACHABLE("Unsupported dtype");
     }
 }
@@ -130,7 +130,7 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
     if (swizzle_mode != 0)
         smem_inner_dim = swizzle_mode / elem_size;
 
-    if (t.scalar_type() == kPackedFP4) {
+    if (t.scalar_type() == torch::kFloat4_e2m1fn_x2) {
         // Inner dim must be a multiple of 64B for .b4x16_p64
         DG_HOST_ASSERT(not fp4_unpacked_smem or gmem_inner_dim % 128 == 0);
 
@@ -174,7 +174,7 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
     if (swizzle_mode != 0)
         smem_dim_0 = swizzle_mode / elem_size;
 
-    if (t.scalar_type() == kPackedFP4) {
+    if (t.scalar_type() == torch::kFloat4_e2m1fn_x2) {
         // Inner dim must be a multiple of 64B for .b4x16_p64
         DG_HOST_ASSERT(not fp4_unpacked_smem or gmem_dim_0 % 128 == 0);
 
@@ -219,7 +219,7 @@ static CUtensorMap make_tma_4d_desc(const torch::Tensor& t,
     if (swizzle_mode != 0)
         smem_dim_0 = swizzle_mode / elem_size;
 
-    if (t.scalar_type() == kPackedFP4) {
+    if (t.scalar_type() == torch::kFloat4_e2m1fn_x2) {
         // Inner dim must be a multiple of 64B for .b4x16_p64
         DG_HOST_ASSERT(not fp4_unpacked_smem or gmem_dim_0 % 128 == 0);
 
@@ -266,7 +266,7 @@ static CUtensorMap make_tma_5d_desc(const torch::Tensor& t,
     if (swizzle_mode != 0)
         smem_dim_0 = swizzle_mode / elem_size;
 
-    if (t.scalar_type() == kPackedFP4) {
+    if (t.scalar_type() == torch::kFloat4_e2m1fn_x2) {
         // Inner dim must be a multiple of 64B for .b4x16_p64
         DG_HOST_ASSERT(not fp4_unpacked_smem or gmem_dim_0 % 128 == 0);
 
@@ -298,7 +298,7 @@ static CUtensorMap make_tma_weights_2d_desc(const torch::Tensor& t, const int& b
     const auto num_domains = LocalityDomainAllocator::get_num_locality_domains();
     const bool localized = t.dim() == 3;
     const auto n_per_domain = static_cast<int>(localized ? t.size(1) : t.size(0) / num_domains);
-    const auto k = static_cast<int>(t.size(-1)) * (t.scalar_type() == kPackedFP4 ? 2 : 1);
+    const auto k = static_cast<int>(t.size(-1)) * (t.scalar_type() == torch::kFloat4_e2m1fn_x2 ? 2 : 1);
     const int64_t slice_stride = localized ? t.stride(0) : n_per_domain * t.stride(-2);
     return make_tma_4d_desc(t,
                             k, n_per_domain, num_domains, 1,
@@ -313,7 +313,7 @@ static CUtensorMap make_tma_weights_3d_desc(const torch::Tensor& t, const int& b
     const bool localized = t.dim() == 4;
     const auto num_batches = static_cast<int>(t.size(localized ? 1 : 0));
     const auto n_per_domain = static_cast<int>(localized ? t.size(2) : t.size(1) / num_domains);
-    const auto k = static_cast<int>(t.size(-1)) * (t.scalar_type() == kPackedFP4 ? 2 : 1);
+    const auto k = static_cast<int>(t.size(-1)) * (t.scalar_type() == torch::kFloat4_e2m1fn_x2 ? 2 : 1);
     const int64_t slice_stride = localized ? t.stride(0) : n_per_domain * t.stride(-2);
     return make_tma_4d_desc(t,
                             k, n_per_domain, num_domains, num_batches,

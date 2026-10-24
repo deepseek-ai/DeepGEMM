@@ -438,7 +438,7 @@ static void k_grouped_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, torc
                                              const std::shared_ptr<EpilogueClass>& epilogue_class) {
     // Must be 1D1D kernel
     DG_HOST_ASSERT(recipe == std::make_tuple(1, 1, 32));
-    DG_HOST_ASSERT(a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat4_e2m1fn_x2 and b.first.scalar_type() == torch::kFloat4_e2m1fn_x2);
 
     const auto major_a = get_major_type_ab(a.first);
     const auto major_b = get_major_type_ab(b.first);
@@ -759,7 +759,7 @@ static void cublaslt_nvfp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>
                                    const torch::Tensor& d,
                                    const std::optional<torch::Tensor>& c) {
     // Shape must be `[M, K] @ [N, K].T` with both operands packed FP4 and K-major
-    DG_HOST_ASSERT(a.first.scalar_type() == kPackedFP4 and b.first.scalar_type() == kPackedFP4);
+    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat4_e2m1fn_x2 and b.first.scalar_type() == torch::kFloat4_e2m1fn_x2);
     DG_HOST_ASSERT(a.first.is_contiguous() and b.first.is_contiguous());
 
     // Type and shape checks
