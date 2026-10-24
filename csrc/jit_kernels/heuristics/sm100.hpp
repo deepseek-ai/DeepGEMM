@@ -96,7 +96,7 @@ struct SM100ArchSpec {
 
                     for (int block_m: block_m_candidates) {
                         // Ensure large swizzle sizes (32B swizzle yields poor performance)
-                        const auto swizzle_a_requirement = desc.a_dtype == kPackedFP4 ? 128 : 64;
+                        const auto swizzle_a_requirement = desc.a_dtype == torch::kFloat4_e2m1fn_x2 ? 128 : 64;
                         // Enforce swizzle alignment for MN major; otherwise check base MMA shape
                         const auto load_block_m_requirement = desc.major_a == cute::UMMA::Major::MN ? swizzle_a_requirement : 8;
                         if ((block_m / cluster_n) % load_block_m_requirement != 0)
@@ -108,7 +108,7 @@ struct SM100ArchSpec {
 
                         for (int block_n: block_n_candidates) {
                             // Ensure large swizzle sizes (32B swizzle yields poor performance)
-                            const auto swizzle_b_requirement = desc.b_dtype == kPackedFP4 ? 128 : 64;
+                            const auto swizzle_b_requirement = desc.b_dtype == torch::kFloat4_e2m1fn_x2 ? 128 : 64;
                             // Enforce swizzle alignment for MN major; otherwise check base MMA shape
                             const auto load_block_n_requirement = desc.major_b == cute::UMMA::Major::MN ? swizzle_b_requirement : 8;
                             if ((block_n / cluster_m) % load_block_n_requirement != 0)

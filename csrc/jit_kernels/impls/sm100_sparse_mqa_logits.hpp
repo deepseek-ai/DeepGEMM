@@ -13,8 +13,8 @@ namespace deep_gemm {
 using namespace layout::sparse_mqa_logits;
 
 static int get_sparse_mqa_split_kv(const at::ScalarType qk_dtype) {
-    DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::kFloat8_e4m3fn);
-    return qk_dtype == kPackedFP4 ? 640 : 512;
+    DG_HOST_ASSERT(qk_dtype == torch::kFloat4_e2m1fn_x2 or qk_dtype == torch::kFloat8_e4m3fn);
+    return qk_dtype == torch::kFloat4_e2m1fn_x2 ? 640 : 512;
 }
 
 static int64_t get_num_metadata_bytes(const int num_q_tokens, const int num_max_sparse_blocks,
@@ -43,7 +43,7 @@ static void launch_sm100_sparse_mqa_logits(const bool is_paged, const bool use_u
                                            const torch::Tensor& logits) {
     constexpr int kNumQStages = 2;
     constexpr int kNumTmemStages = 5;
-    const bool is_fp4 = q.scalar_type() == kPackedFP4;
+    const bool is_fp4 = q.scalar_type() == torch::kFloat4_e2m1fn_x2;
     const int split_kv = get_sparse_mqa_split_kv(q.scalar_type());
     const int num_math_warpgroups = split_kv / 128;
     const int num_kv_stages = is_fp4 ? 5 : 3;

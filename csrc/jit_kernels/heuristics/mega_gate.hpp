@@ -10,7 +10,7 @@
 #include <deep_jit/utils/env.hpp>
 
 #include "../../utils/exception.hpp"
-#include "../../utils/math.hpp"
+#include <deep_gemm/common/math.cuh>
 #include "sm100.hpp"
 
 namespace deep_gemm {

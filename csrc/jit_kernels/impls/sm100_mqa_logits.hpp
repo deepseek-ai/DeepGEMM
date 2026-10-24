@@ -126,9 +126,9 @@ struct MQALogitsConfig {
     static constexpr int num_math_threads = (kMQALogitsSplitKV / 128) * 128;
 
     MQALogitsConfig(const int& num_heads, const int& head_dim, const at::ScalarType& qk_dtype, const bool& is_paged):
-            is_fp4(qk_dtype == kPackedFP4), is_paged(is_paged), num_heads(num_heads), head_dim(head_dim),
+            is_fp4(qk_dtype == torch::kFloat4_e2m1fn_x2), is_paged(is_paged), num_heads(num_heads), head_dim(head_dim),
             block_q(get_mqa_logits_block_q(num_heads)) {
-        DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(qk_dtype == torch::kFloat4_e2m1fn_x2 or qk_dtype == torch::kFloat8_e4m3fn);
         if (is_fp4)
             DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
         else
