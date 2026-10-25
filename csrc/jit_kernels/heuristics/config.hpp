@@ -4,7 +4,7 @@
 #include <c10/core/ScalarType.h>
 #include <deep_gemm/common/types.cuh>
 
-#include "../../utils/math.hpp"
+#include <deep_gemm/common/math.cuh>
 
 namespace deep_gemm {
 

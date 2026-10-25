@@ -15,7 +15,7 @@
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/math.hpp"
+#include <deep_gemm/common/math.cuh>
 #include "sm100.hpp"
 
 namespace deep_gemm {

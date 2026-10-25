@@ -7,7 +7,7 @@
 
 #include <deep_gemm/common/types.cuh>
 
-#include "math.hpp"
+#include <deep_gemm/common/math.cuh>
 #include "exception.hpp"
 #include "../runtime/jit.hpp"
 #include "../runtime/runtime.hpp"

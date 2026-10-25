@@ -6,7 +6,7 @@
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
-#include "../../utils/math.hpp"
+#include <deep_gemm/common/math.cuh>
 #include "../heuristics/sm100.hpp"
 #include "runtime_utils.hpp"
 

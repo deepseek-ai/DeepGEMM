@@ -15,7 +15,7 @@
 
 #include "../heuristics/sm90.hpp"
 #include "../../runtime/locality_domain.hpp"
-#include "../../utils/math.hpp"
+#include <deep_gemm/common/math.cuh>
 #include "../../utils/exception.hpp"
 
 namespace deep_gemm {
