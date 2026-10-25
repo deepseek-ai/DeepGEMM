@@ -4,7 +4,11 @@ from pathlib import Path
 
 def build_cpp_function_index(root_path):
     func_index = {}
-    extensions = {'.cpp', '.cc', '.cxx', '.c', '.hpp', '.h'}
+    # Include CUDA sources/headers: bound functions in this project may be
+    # defined in `.cu` or declared in `.cuh`, and the `is_header` check below
+    # already treats `.cuh` as a header. Without them such functions are missed
+    # and fall back to a generic `(*args, **kwargs) -> Any` stub.
+    extensions = {'.cpp', '.cc', '.cxx', '.c', '.cu', '.hpp', '.h', '.cuh'}
 
     pattern = re.compile(
         r'([\w:\s*<&>,\[\]\(\)]+?)'
@@ -153,7 +157,7 @@ def extract_m_def_statements(root_path):
     Scan all c files under root_path and extract all m.def(...) statements.
     """
     results = []
-    extensions = {'.hpp', '.cpp', '.h', '.cc'}
+    extensions = {'.hpp', '.cpp', '.h', '.cc', '.cu', '.cuh'}
 
     # Regex: match m.def( ... ), supports multi-line
     pattern = re.compile(r'm\.def\s*\(')
