@@ -52,6 +52,11 @@ static void sm90_fp8_mqa_logits(const torch::Tensor& q,
 
     DG_HOST_ASSERT(128 % num_heads == 0);
 
+    // Keep short rows on the original path: interleaving the Q tile pays off
+    // once the logits row spans at least four KV tiles.
+    const bool interleave_q_heads = num_heads == 32 and head_dim == 128 and block_q == 4 and
+                                   stride_logits >= 4 * block_kv;
+
     // Compile
     const auto kernel = jit->compile("sm90_fp8_mqa_logits", std::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mqa_logits.cuh>
@@ -65,7 +70,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -74,7 +79,7 @@ static void __instantiate_kernel() {{
     num_q_stages, num_kv_stages,
     num_sms,
     num_specialized_threads, num_math_threads,
-    to_string(logits.scalar_type())));
+    to_string(logits.scalar_type()), interleave_q_heads ? "true" : "false"));
 
     // Launch
     jit->launch(

@@ -222,6 +222,88 @@ def test_mqa_logits():
     print()
 
 
+def test_mqa_logits_ranges():
+    if get_arch_major() != 9:
+        return
+
+    print('Testing SM90 MQA Logits Ranges:')
+    # Cross three persistent-CTA Q stages, including a partial final four-token block.
+    persistent_seq_len = 4 * 3 * deep_gemm.get_num_sms() + 1
+    cases = [(seq_len, 1025, 'mixed') for seq_len in (1, 3, 4, 5, 7, 8, 17, persistent_seq_len)]
+    cases += [(8, 257, 'empty'), (8, 257, 'short')]
+    cases += [(1, seq_len_kv, 'full') for seq_len_kv in (256, 257, 768, 769, 1024)]
+    for seq_len, seq_len_kv, ranges in cases:
+        num_heads, head_dim = 32, 128
+        if ranges == 'full':
+            spans = [(0, seq_len_kv)] * seq_len
+        elif ranges == 'empty':
+            spans = [(0, 0)] * seq_len
+        elif ranges == 'short':
+            spans = [(1, 2), (3, 4), (4, 4), (255, 257)] * (seq_len // 4)
+        else:
+            # Nonzero, unaligned starts; empty rows; and ends on either side of a KV tile boundary.
+            patterns = [(0, seq_len_kv), (0, 0), (1, 2), (3, 4), (4, 4), (255, 257),
+                        (256, 512), (257, seq_len_kv), (seq_len_kv, seq_len_kv),
+                        (seq_len_kv - 1, seq_len_kv), (511, 512), (512, 1024)]
+            spans = [patterns[i % len(patterns)] for i in range(seq_len)]
+        ks = torch.tensor([start for start, _ in spans], device='cuda', dtype=torch.int)
+        ke = torch.tensor([end for _, end in spans], device='cuda', dtype=torch.int)
+        lengths = ke - ks
+        # The API requires a positive output width even when all rows are empty.
+        max_seqlen_k = max(1, max(end - start for start, end in spans))
+        valid = torch.arange(max_seqlen_k, device='cuda')[None, :] < lengths[:, None]
+        for structured in (False, True):
+            if structured:
+                # One nonzero per head makes each dot product exact. All values are
+                # small integers or powers of two, so the head reduction is exact
+                # regardless of its order. This separately tests layout and range
+                # handling without imposing an FP32 elementwise contract on FP8 MMA.
+                rows = torch.arange(seq_len, device='cuda')[:, None]
+                heads = torch.arange(num_heads, device='cuda')[None, :]
+                key_rows = torch.arange(seq_len_kv, device='cuda')
+                dims = torch.arange(head_dim, device='cuda')
+                q = torch.zeros(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+                q_dims = (heads + rows * 3) % head_dim
+                amplitudes = torch.tensor([1, 2, -1, -2], device='cuda', dtype=q.dtype)[(rows + heads) % 4]
+                q.scatter_(2, q_dims[:, :, None], amplitudes[:, :, None])
+                kv = ((key_rows[:, None] + dims[None, :] * 3) % 5 - 2).to(torch.float8_e4m3fn)
+                scales = torch.tensor([0.25, 0.5, 1, 2, 4], device='cuda')[key_rows % 5]
+                weights = to_mqa_weights(((rows * 3 + heads) % 7 - 3).float())
+                q_in, q_simulated = quantize_mqa_q(q, 'fp8')
+                kv_in = kv, scales
+            else:
+                q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+                kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
+                weights = to_mqa_weights(torch.randn(seq_len, num_heads, device='cuda', dtype=torch.float))
+                q_in, q_simulated = quantize_mqa_q(q, 'fp8')
+                kv_in = per_custom_dims_cast_to_fp8(kv, (0, ), False)
+            # Keep the reference in FP32 after dequantization to isolate kernel arithmetic.
+            kv_simulated = kv_in[0].float() * kv_in[1][:, None]
+            kwargs = dict(q=q_in, kv=kv_in, weights=weights,
+                          cu_seq_len_k_start=ks, cu_seq_len_k_end=ke, max_seqlen_k=max_seqlen_k)
+            reference, _ = ref_mqa_logits(q_simulated, kv_simulated, weights, ks, ke)
+            expected = torch.zeros((seq_len, max_seqlen_k), device='cuda', dtype=torch.float)
+            for i, (start, end) in enumerate(spans):
+                expected[i, :end - start] = reference[i, start:end]
+
+            logits = deep_gemm.fp8_fp4_mqa_logits(**kwargs)
+            assert logits.shape == expected.shape and logits.dtype == torch.float
+            # Compressed column zero corresponds to ks[row], not to KV position zero.
+            # Entries past each row's valid span are explicitly undefined by the API.
+            assert torch.isfinite(logits[valid]).all()
+            if structured:
+                torch.testing.assert_close(logits[valid], expected[valid], rtol=0, atol=0)
+            diff = calc_diff(logits[valid], expected[valid])
+            assert diff < mqa_logits_tolerances('fp8')[1], f'MQA range diff: {diff}'
+            masked_logits = logits.masked_fill(~valid, 0)
+            for _ in range(20):
+                repeated = deep_gemm.fp8_fp4_mqa_logits(**kwargs).masked_fill(~valid, 0)
+                assert_bitwise_equal(repeated, masked_logits, 'mqa logits ranges self-consistency')
+            print(f' > SQ={seq_len:4}, SK={seq_len_kv:4}, Ranges={ranges:5}, '
+                  f'Structured={int(structured)}: diff={diff:.3e}')
+    print()
+
+
 def ref_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
                          weights: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor,
                          max_model_len: int):
@@ -711,5 +793,6 @@ if __name__ == '__main__':
     random.seed(0)
 
     test_mqa_logits()
+    test_mqa_logits_ranges()
     test_paged_mqa_logits()
     test_sparse_mqa_logits()

@@ -24,7 +24,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
-          typename logits_dtype_t>
+          typename logits_dtype_t, bool kInterleaveQHeads = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1)
 void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                          const uint32_t stride_logits,
@@ -43,6 +43,9 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // Types
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_Q * kNumHeads>::type;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+    DG_STATIC_ASSERT(not kInterleaveQHeads or
+                     (kNumHeads == 32 and kHeadDim == 128 and BLOCK_Q == 4 and kNumMathThreads == 512),
+                     "Invalid interleaved Q configuration");
 
     // Prefetch TMA descriptors
     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid threads");
@@ -212,7 +215,7 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         const auto& warp_idx = __shfl_sync(0xffffffff, thread_idx / 32, 0);
         const auto& warpgroup_idx = warp_idx / 4;
         const auto& lane_idx = ptx::get_lane_idx();
-        float accum[WGMMA::kNumAccum], weights[BLOCK_Q][kNumHeads / 4];
+        float accum[WGMMA::kNumAccum], weights[BLOCK_Q * kNumHeads / 4];
 
         const auto& warp_offset = warp_idx * 16;
         const auto& v_0_offset = lane_idx / 4 + 0;
@@ -221,15 +224,75 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
         while (block_q_idx < num_q_blocks) {
             CUTE_TIE_DECL(load_schedule(), q_stage_idx, q_phase, kv_start, num_kv_blocks);
 
+            const auto own_token = lane_idx % 4;
+            const auto own_q_idx = block_q_idx * BLOCK_Q + own_token;
+            const auto own_q_offset = own_q_idx * static_cast<uint64_t>(stride_logits);
+            uint32_t own_seq_k_start = 0, own_seq_k_end = 0;
+            if constexpr (kInterleaveQHeads) {
+                // Select with compile-time array indices once per Q block. A
+                // dynamic seq_k_start[own_token] in the KV loop would place the
+                // small arrays in local memory instead of keeping them in registers.
+                #pragma unroll
+                for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
+                    own_seq_k_start = own_token == i ? seq_k_start[i] : own_seq_k_start;
+                    own_seq_k_end = own_token == i ? seq_k_end[i] : own_seq_k_end;
+                }
+            }
+
             // Wait TMA Q arrival
             full_q_barriers[q_stage_idx]->wait(q_phase);
 
-            // Read weights
-            #pragma unroll
-            for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
+            if constexpr (kInterleaveQHeads) {
+                // Interleave pairs of heads from the four query tokens in shared memory:
+                // [token, head_pair, head_in_pair, dim] ->
+                // [head_pair, token, head_in_pair, dim]. Each lane of a quad then owns
+                // all 32 heads of one token in the WGMMA accumulator. TMA and the
+                // public Q layout stay unchanged; no extra kernel or buffer is needed.
+                static constexpr uint32_t kVectorBytes = sizeof(uint4);
+                static constexpr uint32_t kVectorsPerRow = kHeadDim / kVectorBytes;
+                static constexpr uint32_t kVectorsPerThread = SMEM_Q_SIZE_PER_STAGE / (kNumMathThreads * kVectorBytes);
+                uint4 fragments[kVectorsPerThread];
+
+                // Both accesses account for TMA's 128-byte shared-memory swizzle.
+                const auto q_vector_offset = [&](const uint32_t row, const uint32_t col) {
+                    return row * kHeadDim + (col ^ (row & 7)) * kVectorBytes;
+                };
                 #pragma unroll
-                for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
-                    weights[i][j] = ptx::ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
+                for (uint32_t i = 0; i < kVectorsPerThread; ++ i) {
+                    const auto vector_idx = thread_idx + i * kNumMathThreads;
+                    const auto row = vector_idx / kVectorsPerRow;
+                    const auto col = vector_idx % kVectorsPerRow;
+                    fragments[i] = ptx::ld_shared(reinterpret_cast<const uint4*>(smem_q[q_stage_idx] + q_vector_offset(row, col)));
+                }
+                // Finish every read before overwriting the same shared-memory tile.
+                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+                #pragma unroll
+                for (uint32_t i = 0; i < kVectorsPerThread; ++ i) {
+                    const auto vector_idx = thread_idx + i * kNumMathThreads;
+                    const auto row = vector_idx / kVectorsPerRow;
+                    const auto col = vector_idx % kVectorsPerRow;
+                    const auto token = row / kNumHeads;
+                    const auto head = row % kNumHeads;
+                    const auto interleaved_row = (head / 2) * (BLOCK_Q * 2) + token * 2 + (head & 1);
+                    const auto& fragment = fragments[i];
+                    ptx::st_shared(smem_q[q_stage_idx] + q_vector_offset(interleaved_row, col),
+                                   fragment.x, fragment.y, fragment.z, fragment.w);
+                }
+                cutlass::arch::fence_view_async_shared();
+                cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+
+                const auto token = lane_idx % 4;
+                #pragma unroll
+                for (uint32_t h = 0; h < kNumHeads; ++ h)
+                    weights[h] = ptx::ld_shared(smem_weights[q_stage_idx] + token * kNumHeads + h);
+            } else {
+                // Read weights
+                #pragma unroll
+                for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumHeads / 4; ++ j)
+                        weights[i * (kNumHeads / 4) + j] = ptx::ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + (j / 2) * 8 + (j & 1) + (lane_idx % 4) * 2);
+                }
             }
 
             // Compute over KV blocks
@@ -241,8 +304,20 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 full_kv_barriers[kv_stage_idx]->wait(kv_phase);
 
                 // Read per-KV scales
-                float scale_kv_0 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_0_offset);
-                float scale_kv_1 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_1_offset);
+                float scale_kv_0, scale_kv_1;
+                if constexpr (kInterleaveQHeads) {
+                    const auto scale_addr = static_cast<uint32_t>(__cvta_generic_to_shared(
+                        smem_kv_scales[kv_stage_idx] + warp_offset + v_0_offset));
+                    // Expose the implicit shared-memory reads to the compiler, so
+                    // they stay before the generic-to-async fence below.
+                    asm volatile("ld.shared.f32 %0, [%2];\n\t"
+                                 "ld.shared.f32 %1, [%2 + 32];"
+                                 : "=f"(scale_kv_0), "=f"(scale_kv_1)
+                                 : "r"(scale_addr) : "memory");
+                } else {
+                    scale_kv_0 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_0_offset);
+                    scale_kv_1 = ptx::ld_shared(smem_kv_scales[kv_stage_idx] + warp_offset + v_1_offset);
+                }
 
                 // Issue WGMMA
                 DG_STATIC_ASSERT(BLOCK_KV == kNumMathThreads / 2, "Invalid block size");
@@ -267,47 +342,75 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                     ptx::warpgroup_fence_operand(accum[i]);
                 ptx::warpgroup_wait<0>();
 
-                // Release KV empty
-                empty_kv_barriers[kv_stage_idx]->arrive();
+                if constexpr (not kInterleaveQHeads) {
+                    // Release KV empty
+                    empty_kv_barriers[kv_stage_idx]->arrive();
+                }
 
                 // Reduce over the head dim and store
                 const auto& kv_offset = kv_start + kv_block_idx * BLOCK_KV + warp_offset;
-                static constexpr uint32_t kNumAccumPerReduce = kNumHeads / 2;
-                DG_STATIC_ASSERT(WGMMA::kNumAccum % kNumAccumPerReduce == 0, "Invalid accumulation");
-                DG_STATIC_ASSERT(WGMMA::kNumAccum / kNumAccumPerReduce == BLOCK_Q, "Invalid accumulation");
-                DG_STATIC_ASSERT(kNumHeads % 8 == 0, "Invalid head");
-                #pragma unroll
-                for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-                    auto shifted_accum = accum + i * kNumAccumPerReduce;
-                    const auto transform = [&](const uint32_t& j) {
-                        return fmaxf(shifted_accum[j], 0) * weights[i][(j / 4) * 2 + (j & 1)];
-                    };
-
-                    // Intra-thread reduction
-                    float sum[4] = {transform(0), transform(1), transform(2), transform(3)};
+                if constexpr (kInterleaveQHeads) {
+                    DG_STATIC_ASSERT(WGMMA::kNumAccum == kNumHeads * 2, "Invalid accumulation");
+                    // Eight independent accumulation chains avoid a long FFMA dependency.
+                    float sum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                     #pragma unroll
-                    for (uint32_t j = 1; j < kNumHeads / 8; ++ j) {
+                    for (uint32_t h = 0; h < kNumHeads / 2; ++ h) {
+                        const auto p = (h & 1) * 4;
+                        sum[p + 0] += fmaxf(accum[h * 4 + 0], 0) * weights[h * 2 + 0];
+                        sum[p + 1] += fmaxf(accum[h * 4 + 1], 0) * weights[h * 2 + 1];
+                        sum[p + 2] += fmaxf(accum[h * 4 + 2], 0) * weights[h * 2 + 0];
+                        sum[p + 3] += fmaxf(accum[h * 4 + 3], 0) * weights[h * 2 + 1];
+                    }
+                    const auto v_0 = ((sum[0] + sum[1]) + (sum[4] + sum[5])) * scale_kv_0;
+                    const auto v_1 = ((sum[2] + sum[3]) + (sum[6] + sum[7])) * scale_kv_1;
+                    if (own_q_idx < seq_len and own_seq_k_start <= kv_offset + v_0_offset and kv_offset + v_0_offset < own_seq_k_end)
+                        logits[own_q_offset + kv_offset + v_0_offset - own_seq_k_start] = static_cast<logits_dtype_t>(v_0);
+                    if (own_q_idx < seq_len and own_seq_k_start <= kv_offset + v_1_offset and kv_offset + v_1_offset < own_seq_k_end)
+                        logits[own_q_offset + kv_offset + v_1_offset - own_seq_k_start] = static_cast<logits_dtype_t>(v_1);
+
+                    // Order generic-proxy scale reads before TMA's async-proxy
+                    // overwrite. The existing release-arrive/acquire-wait handshake
+                    // counts every reader before the producer reuses this stage.
+                    cutlass::arch::fence_view_async_shared();
+                    empty_kv_barriers[kv_stage_idx]->arrive();
+                } else {
+                    static constexpr uint32_t kNumAccumPerReduce = kNumHeads / 2;
+                    DG_STATIC_ASSERT(WGMMA::kNumAccum % kNumAccumPerReduce == 0, "Invalid accumulation");
+                    DG_STATIC_ASSERT(WGMMA::kNumAccum / kNumAccumPerReduce == BLOCK_Q, "Invalid accumulation");
+                    DG_STATIC_ASSERT(kNumHeads % 8 == 0, "Invalid head");
+                    #pragma unroll
+                    for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
+                        auto shifted_accum = accum + i * kNumAccumPerReduce;
+                        const auto transform = [&](const uint32_t& j) {
+                            return fmaxf(shifted_accum[j], 0) * weights[i * (kNumHeads / 4) + (j / 4) * 2 + (j & 1)];
+                        };
+
+                        // Intra-thread reduction
+                        float sum[4] = {transform(0), transform(1), transform(2), transform(3)};
                         #pragma unroll
-                        for (uint32_t k = 0; k < 4; k ++)
-                            sum[k] += transform(j * 4 + k);
-                    }
-                    float v_0 = (sum[0] + sum[1]) * scale_kv_0;
-                    float v_1 = (sum[2] + sum[3]) * scale_kv_1;
+                        for (uint32_t j = 1; j < kNumHeads / 8; ++ j) {
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 4; k ++)
+                                sum[k] += transform(j * 4 + k);
+                        }
+                        float v_0 = (sum[0] + sum[1]) * scale_kv_0;
+                        float v_1 = (sum[2] + sum[3]) * scale_kv_1;
 
-                    // Inter-thread reduction
-                    #pragma unroll
-                    for (uint32_t j = 0; j < 2; ++ j) {
-                        const auto& offset = static_cast<int>(1u << j);
-                        v_0 += __shfl_xor_sync(0xffffffffu, v_0, offset);
-                        v_1 += __shfl_xor_sync(0xffffffffu, v_1, offset);
-                    }
+                        // Inter-thread reduction
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 2; ++ j) {
+                            const auto& offset = static_cast<int>(1u << j);
+                            v_0 += __shfl_xor_sync(0xffffffffu, v_0, offset);
+                            v_1 += __shfl_xor_sync(0xffffffffu, v_1, offset);
+                        }
 
-                    // Store into the global memory
-                    const auto q_offset = (block_q_idx * BLOCK_Q + i) * static_cast<uint64_t>(stride_logits);
-                    if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
-                        logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_0);
-                    if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
-                        logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_1);
+                        // Store into the global memory
+                        const auto q_offset = (block_q_idx * BLOCK_Q + i) * static_cast<uint64_t>(stride_logits);
+                        if (seq_k_start[i] <= kv_offset + v_0_offset and kv_offset + v_0_offset < seq_k_end[i])
+                            logits[q_offset + kv_offset + v_0_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_0);
+                        if (seq_k_start[i] <= kv_offset + v_1_offset and kv_offset + v_1_offset < seq_k_end[i])
+                            logits[q_offset + kv_offset + v_1_offset - seq_k_start[i]] = static_cast<logits_dtype_t>(v_1);
+                    }
                 }
             }
             num_total_kv_blocks += num_kv_blocks;
