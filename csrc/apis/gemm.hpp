@@ -820,6 +820,39 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
     }
 }
 
+static void m_grouped_bf16_swiglu_nt_masked(const torch::Tensor& a,
+                                             const torch::Tensor& b,
+                                             const torch::Tensor& d,
+                                             const torch::Tensor& masked_m,
+                                             const int expected_m) {
+    DG_HOST_ASSERT(a.is_cuda());
+    c10::cuda::OptionalCUDAGuard device_guard;
+    device_guard.set_device(a.device());
+    DG_HOST_ASSERT(at::cuda::getDeviceProperties(a.get_device())->major == 12);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 12);
+    for (const auto& tensor: {b, d, masked_m})
+        DG_HOST_ASSERT(tensor.is_cuda() and tensor.device() == a.device());
+
+    const auto [groups, m, k] = get_shape<3>(a);
+    const auto [weight_groups, twice_n, weight_k] = get_shape<3>(b);
+    const auto [output_groups, output_m, n] = get_shape<3>(d);
+    DG_HOST_ASSERT(groups > 0 and m > 0 and k > 0 and n > 0);
+    DG_HOST_ASSERT(groups == weight_groups and groups == output_groups and
+                   groups == masked_m.numel());
+    DG_HOST_ASSERT(m == output_m and k == weight_k and twice_n == 2 * n);
+    DG_HOST_ASSERT(expected_m > 0 and expected_m <= m);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and
+                   b.scalar_type() == torch::kBFloat16 and
+                   d.scalar_type() == torch::kBFloat16 and
+                   masked_m.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and d.is_contiguous() and
+                   masked_m.is_contiguous());
+    DG_HOST_ASSERT(get_major_type_ab(a) == cute::UMMA::Major::K and
+                   get_major_type_ab(b) == cute::UMMA::Major::K);
+
+    sm120_m_grouped_bf16_swiglu_masked(a, b, d, masked_m, expected_m);
+}
+
 static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                                               const torch::Tensor& b,
                                               const torch::Tensor& d,
@@ -1109,6 +1142,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("compiled_dims") = "nk");
+    m.def("m_grouped_bf16_swiglu_nt_masked", &m_grouped_bf16_swiglu_nt_masked,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
+          py::arg("expected_m"));
     m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("ks_cpu"), py::arg("grouped_layout"),
