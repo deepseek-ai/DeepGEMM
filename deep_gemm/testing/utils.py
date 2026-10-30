@@ -28,11 +28,13 @@ def ignore_env(name: str, condition: Callable):
         def wrapper(*args, **kwargs):
             if condition():
                 saved = os.environ.pop(name, None)
-                func(*args, **kwargs)
-                if saved is not None:
-                    os.environ[name] = saved
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    if saved is not None:
+                        os.environ[name] = saved
             else:
-                func(*args, **kwargs)
-                
+                return func(*args, **kwargs)
+
         return wrapper
     return decorator
