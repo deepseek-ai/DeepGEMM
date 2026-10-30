@@ -189,6 +189,7 @@ Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` varia
 - Build options
     - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
+    - `DG_USE_LOCAL_VERSION`: `0` or `1`, use a git-revision-suffixed local version and always build from source instead of downloading pre-built wheels, `1` by default (so the download path only runs when this is explicitly set to `0`)
 
 For additional examples and details, please refer to [the test code](tests) or review the corresponding Python documentation.
 
