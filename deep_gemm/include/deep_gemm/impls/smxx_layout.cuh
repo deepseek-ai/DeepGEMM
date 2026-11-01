@@ -25,7 +25,7 @@ void transpose_fp32(const float* sf, float* out, const uint32_t mn) {
     const auto block_sf_k_start = block_sf_k_idx * BLOCK_SF_K;
     const auto in_block_mn = min(BLOCK_MN, mn - block_mn_idx * BLOCK_MN);
     const auto in_block_sf_k = SF_K < BLOCK_SF_K ? SF_K : min(BLOCK_SF_K, SF_K - block_sf_k_start);
-    const auto tma_aligned_mn = math::align<uint32_t>(mn, kNumTMAAlignedElems);
+    const auto tma_aligned_mn = math::align<uint64_t>(mn, kNumTMAAlignedElems);
 
     // Shift into the block
     sf = sf + static_cast<uint64_t>(blockIdx.y) * mn * SF_K;
@@ -274,7 +274,7 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* gro
             values[j] = make_uint4(0, 0, 0, 0);
             const uint32_t sf_row_idx = static_cast<uint32_t>(packed_sf_k_idx) * 4 + j - num_padding_sf_rows;
             if (sf_row_idx >= group_sf_row_start and sf_row_idx < group_sf_row_end)
-                values[j] = reinterpret_cast<const uint4*>(sf + sf_row_idx * mn)[mn_idx];
+                values[j] = reinterpret_cast<const uint4*>(sf + static_cast<uint64_t>(sf_row_idx) * mn)[mn_idx];
             // FP32 SFs must have a zero sign and mantissa (only the exponent is packed)
             DG_TRAP_ONLY_DEVICE_ASSERT((values[j].x & 0x807fffffu) == 0);
             DG_TRAP_ONLY_DEVICE_ASSERT((values[j].y & 0x807fffffu) == 0);
