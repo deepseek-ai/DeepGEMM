@@ -38,6 +38,12 @@ struct SM100ArchSpec {
             const bool swap_ab = true;
             const auto block_n = 128;
             const auto block_m = heuristics_runtime->get_mk_alignment_for_contiguous_layout();
+            // Masked groups share a flattened 2D TMA descriptor. The epilogue
+            // stores whole M tiles, so an unaligned group stride would let a
+            // group's last tile overwrite the next group's valid output.
+            if (desc.gemm_type == GemmType::MGroupedMasked)
+                DG_HOST_ASSERT(desc.m % block_m == 0 and
+                               "SM100 masked GEMM requires physical M aligned to get_mk_alignment_for_contiguous_layout()");
             const auto cluster_m = 1;
             const auto cluster_n = ceil_div(desc.n, block_n) % 2 == 0 and desc.num_sms % 2 == 0 ? 2 : 1;
             const auto layout = Layout{swap_ab, block_m, block_n, block_k, cluster_m, cluster_n};

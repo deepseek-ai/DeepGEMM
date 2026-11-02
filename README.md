@@ -83,6 +83,8 @@ We also provide a K-axis-grouped API for MoE weight backward (with M and N must 
 
 During the inference decoding phase, when CUDA graph is enabled and the CPU is unaware of the number of tokens each expert receives, we support masked grouped GEMMs. By providing a mask tensor, the kernel computes only the valid portions.
 
+On SM100, the physical per-group M dimension of masked A and D must be a multiple of `get_mk_alignment_for_contiguous_layout()` (the selected M tile size). Pad the tensors to this size; individual `masked_m` counts may remain unaligned or zero. This applies to BF16 and FP8/FP4 masked GEMMs. Unaligned physical M is rejected because a full-tile TMA store could otherwise overwrite the next group's output.
+
 Use `m_grouped_fp8_gemm_nt_masked` for this purpose and consult the relevant documentation. An example usage is to use the output of low-latency kernels from [DeepEP](https://github.com/deepseek-ai/DeepEP) as input.
 
 #### V3.2 MQA kernels for the indexer
