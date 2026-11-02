@@ -13,6 +13,17 @@ using deep_gemm::GemmType;
 using Tile = std::tuple<uint32_t, uint32_t, uint32_t>;
 static size_t cases = 0;
 
+// Model a concatenated tensor axis by enumerating its element coordinates.
+// The oracle never reads current_group_idx, current_psum_m or num_m_blocks.
+static std::array<std::vector<uint32_t>, 5> axis_coordinates(uint32_t extent) {
+    std::array<std::vector<uint32_t>, 5> coordinates;
+    uint32_t next = 0;
+    for (auto& group : coordinates)
+        for (uint32_t element = 0; element < extent; ++ element)
+            group.push_back(next++);
+    return coordinates;
+}
+
 static void require(bool condition, const char* message) {
     if (not condition) {
         std::cerr << "Case " << cases << ": " << message << '\n';
@@ -21,10 +32,10 @@ static void require(bool condition, const char* message) {
 }
 
 template <GemmType Layout, uint32_t Workers, bool OnA, uint32_t Multicast = 1,
-          uint32_t BlockM = 64, uint32_t BlockN = 64>
+          uint32_t BlockM = 64, uint32_t BlockN = 64, bool EnsureZeroPadding = true>
 void check(const std::array<uint32_t, 5>& rows, uint32_t n) {
     using Scheduler = deep_gemm::sched::Scheduler<
-        Layout, BlockM, BlockN, 5, Multicast, OnA, Workers>;
+        Layout, BlockM, BlockN, 5, Multicast, OnA, Workers, EnsureZeroPadding>;
     ++ cases;
     std::array<int, 5> layout{};
     std::array<uint32_t, 5> starts{};
@@ -44,12 +55,16 @@ void check(const std::array<uint32_t, 5>& rows, uint32_t n) {
             ++ end;
     }
 
+    const auto shape_m = Layout == GemmType::MGroupedMasked ?
+        *std::max_element(rows.begin(), rows.end()) : end;
+    const auto m_coordinates = axis_coordinates(shape_m);
+    const auto n_coordinates = axis_coordinates(n);
+    const auto k_coordinates = axis_coordinates(384);
+    const auto sf_coordinates = axis_coordinates(3);
     size_t visited = 0;
     for (uint32_t worker = 0; worker < Workers; ++ worker) {
         blockIdx.x = worker;
-        const auto shape_m = Layout == GemmType::MGroupedMasked ?
-            *std::max_element(rows.begin(), rows.end()) : end;
-        Scheduler scheduler(shape_m, n, 128, layout.data());
+        Scheduler scheduler(shape_m, n, 384, layout.data());
         size_t iterations = 0;
         while (true) {
             // Reset on every call: a missing output assignment must not reuse
@@ -63,12 +78,43 @@ void check(const std::array<uint32_t, 5>& rows, uint32_t n) {
             require(found != expected.end(), "out-of-range or empty-group tile");
             require(++ found->second == 1, "tile has multiple owners");
             ++ visited;
+            using deep_gemm::sched::IndexType;
+            // Masked A/D have a group axis; psum A/D already use physical M.
+            constexpr bool m_group_offset = Layout == GemmType::MGroupedMasked;
+            require(scheduler.template get_global_idx<m_group_offset>(shape_m, BlockM, m) ==
+                    m_coordinates[m_group_offset ? group : 0].at(m * BlockM), "incorrect M coordinate");
+            require(scheduler.template get_global_idx<false>(n, BlockN, col, m) ==
+                    n_coordinates[0].at(col * BlockN), "incorrect local N coordinate");
+            require(scheduler.template get_global_idx<true>(n, BlockN, col, m) ==
+                    n_coordinates[group].at(col * BlockN), "incorrect grouped N coordinate");
+            for (uint32_t k = 0; k < 3; ++ k) {
+                require(scheduler.template get_global_idx<false, IndexType::K>(384, 128, k, m) ==
+                        k_coordinates[0].at(k * 128), "incorrect local K coordinate");
+                require(scheduler.template get_global_idx<true, IndexType::K>(384, 128, k, m) ==
+                        k_coordinates[group].at(k * 128), "incorrect grouped K coordinate");
+                require(scheduler.template get_global_idx<false, IndexType::SF_K>(3, 1, k, m) ==
+                        sf_coordinates[0].at(k), "incorrect local scale coordinate");
+                require(scheduler.template get_global_idx<true, IndexType::SF_K>(3, 1, k, m) ==
+                        sf_coordinates[group].at(k), "incorrect grouped scale coordinate");
+            }
             // Check every row of a tail, including the first invalid row.
+            uint32_t valid_rows = 0;
             for (uint32_t offset = 0; offset < BlockM; ++ offset) {
                 const auto local_row = m * BlockM + offset - starts[group];
+                valid_rows += local_row < rows[group];
                 require(scheduler.is_computation_valid(m, offset) == (local_row < rows[group]),
                         "incorrect row validity at tile tail");
             }
+            uint32_t effective_m = BlockM;
+            if constexpr (Layout == GemmType::MGroupedContiguousWithPsumLayout and not EnsureZeroPadding) {
+                // Smallest legal UMMA extent covering the independently counted
+                // valid rows, without scheduler tail detection or math::align.
+                effective_m = 16;
+                while (effective_m < valid_rows)
+                    effective_m += 16;
+            }
+            require(scheduler.get_aligned_effective_m_in_block(m) == effective_m,
+                    "incorrect effective M extent");
         }
     }
     require(visited == expected.size(), "missing tiles");
@@ -81,6 +127,7 @@ void run() {
     const std::vector<std::array<uint32_t, 5>> examples = {
         {0, 0, 0, 0, 0}, {0, 0, 1, 0, 0}, {1, 0, 0, 0, 0}, {0, 0, 0, 0, 1},
         {0, 63, 64, 65, 0}, {65, 0, 1, 0, 129}, {511, 512, 513, 1023, 1025},
+        {1, 15, 16, 17, 31}, {32, 33, 47, 48, 49}, {127, 128, 129, 0, 17},
     };
     // N tails plus both sides of the 8/16-block swizzle group boundaries.
     for (const auto& rows : examples) {
@@ -89,6 +136,9 @@ void run() {
             check<GemmType::MGroupedContiguousWithPsumLayout, Workers, OnA>(rows, n);
             check<GemmType::MGroupedMasked, Workers, OnA, 1, 128, 64>(rows, n);
             check<GemmType::MGroupedContiguousWithPsumLayout, Workers, OnA, 1, 64, 128>(rows, n);
+            check<GemmType::MGroupedContiguousWithPsumLayout, Workers, OnA, 1, 64, 64, false>(rows, n);
+            check<GemmType::MGroupedContiguousWithPsumLayout, Workers, OnA, 1, 128, 64, false>(rows, n);
+            check<GemmType::MGroupedMasked, Workers, OnA, 1, 64, 64, false>(rows, n);
         }
     }
     // Exact wave boundaries: total tiles = Workers - 1, Workers, Workers + 1.
