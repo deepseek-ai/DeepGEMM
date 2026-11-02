@@ -61,7 +61,6 @@ void check(const std::array<uint32_t, 5>& rows, uint32_t n) {
     const auto n_coordinates = axis_coordinates(n);
     const auto k_coordinates = axis_coordinates(384);
     const auto sf_coordinates = axis_coordinates(3);
-    size_t visited = 0;
     for (uint32_t worker = 0; worker < Workers; ++ worker) {
         blockIdx.x = worker;
         Scheduler scheduler(shape_m, n, 384, layout.data());
@@ -77,7 +76,6 @@ void check(const std::array<uint32_t, 5>& rows, uint32_t n) {
             auto found = expected.find({group, m, col});
             require(found != expected.end(), "out-of-range or empty-group tile");
             require(++ found->second == 1, "tile has multiple owners");
-            ++ visited;
             using deep_gemm::sched::IndexType;
             // Masked A/D have a group axis; psum A/D already use physical M.
             constexpr bool m_group_offset = Layout == GemmType::MGroupedMasked;
@@ -117,7 +115,6 @@ void check(const std::array<uint32_t, 5>& rows, uint32_t n) {
                     "incorrect effective M extent");
         }
     }
-    require(visited == expected.size(), "missing tiles");
     for (const auto& entry : expected)
         require(entry.second == 1, "tile was not assigned exactly once");
 }
@@ -138,9 +135,12 @@ void run() {
             check<GemmType::MGroupedContiguousWithPsumLayout, Workers, OnA, 1, 64, 128>(rows, n);
             check<GemmType::MGroupedContiguousWithPsumLayout, Workers, OnA, 1, 64, 64, false>(rows, n);
             check<GemmType::MGroupedContiguousWithPsumLayout, Workers, OnA, 1, 128, 64, false>(rows, n);
-            check<GemmType::MGroupedMasked, Workers, OnA, 1, 64, 64, false>(rows, n);
         }
     }
+    // The padding flag only affects psum layout. One masked case per worker/
+    // swizzle configuration checks that it remains a no-op without repeating
+    // the entire masked boundary matrix with both flag values.
+    check<GemmType::MGroupedMasked, Workers, OnA, 1, 64, 64, false>({0, 1, 65, 0, 129}, 65);
     // Exact wave boundaries: total tiles = Workers - 1, Workers, Workers + 1.
     for (auto tiles : {Workers - 1, Workers, Workers + 1}) {
         std::array<uint32_t, 5> rows = {0, 64 * tiles, 0, 0, 0};
