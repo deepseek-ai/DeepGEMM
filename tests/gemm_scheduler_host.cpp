@@ -45,13 +45,18 @@ void check(const std::array<uint32_t, 5>& rows, uint32_t n) {
     }
 
     size_t visited = 0;
-    for (blockIdx.x = 0; blockIdx.x < Workers; ++ blockIdx.x) {
+    for (uint32_t worker = 0; worker < Workers; ++ worker) {
+        blockIdx.x = worker;
         const auto shape_m = Layout == GemmType::MGroupedMasked ?
             *std::max_element(rows.begin(), rows.end()) : end;
         Scheduler scheduler(shape_m, n, 128, layout.data());
-        uint32_t m, col;
         size_t iterations = 0;
-        while (scheduler.get_next_block(m, col)) {
+        while (true) {
+            // Reset on every call: a missing output assignment must not reuse
+            // a previous valid tile (or read an uninitialized host variable).
+            uint32_t m = UINT32_MAX, col = UINT32_MAX;
+            if (not scheduler.get_next_block(m, col))
+                break;
             require(++ iterations <= expected.size(), "scheduler did not terminate");
             const auto group = scheduler.current_group_idx;
             auto found = expected.find({group, m, col});
