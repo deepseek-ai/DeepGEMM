@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import warnings
@@ -27,6 +28,7 @@ class MLOPart:
 
     def __init__(self, device_uuid: bytes) -> None:
         self.device_uuid = device_uuid
+        self._request_lock = threading.Lock()
         self.sock, client_sock = socket.socketpair()
         env = {k: v for k, v in os.environ.items() if k not in ('CUDA_VISIBLE_DEVICES', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT')}
         with client_sock:
@@ -37,11 +39,14 @@ class MLOPart:
             warnings.warn('MLOPart is unavailable; localization has been disabled')
 
     def create_memory(self, num_bytes: int, domain_idx: int) -> int:
-        assert self.available, 'MLOPart is unavailable, so no localized memory can be allocated'
-        self.sock.sendall(REQUEST.pack(num_bytes, domain_idx))
-        msg, fds, _, _ = socket.recv_fds(self.sock, 1, 1)
-        assert msg == b'f', 'The MLOPart client exited'
-        return fds[0]
+        # Responses carry no request ID, so one caller must own the socket
+        # until it has received the descriptor for its request.
+        with self._request_lock:
+            assert self.available, 'MLOPart is unavailable, so no localized memory can be allocated'
+            self.sock.sendall(REQUEST.pack(num_bytes, domain_idx))
+            msg, fds, _, _ = socket.recv_fds(self.sock, 1, 1)
+            assert msg == b'f', 'The MLOPart client exited'
+            return fds[0]
 
     def close(self) -> None:
         """Quit the processes; the exported memory outlives them"""
