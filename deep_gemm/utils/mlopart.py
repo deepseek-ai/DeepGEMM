@@ -7,6 +7,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import warnings
@@ -50,14 +51,16 @@ class MLOPart:
 
 
 _mlopart: Optional[MLOPart] = None
+_mlopart_lock = threading.Lock()
 
 
 def _get(device_uuid: bytes) -> MLOPart:
     global _mlopart
-    if _mlopart is None:
-        _mlopart = MLOPart(device_uuid)
-    assert _mlopart.device_uuid == device_uuid
-    return _mlopart
+    with _mlopart_lock:
+        if _mlopart is None:
+            _mlopart = MLOPart(device_uuid)
+        assert _mlopart.device_uuid == device_uuid
+        return _mlopart
 
 
 def is_available(device_uuid: bytes) -> bool:
@@ -70,9 +73,10 @@ def create_memory(device_uuid: bytes, num_bytes: int, domain_idx: int) -> int:
 
 def release() -> None:
     global _mlopart
-    if _mlopart is not None:
-        _mlopart.close()
-        _mlopart = None
+    with _mlopart_lock:
+        if _mlopart is not None:
+            _mlopart.close()
+            _mlopart = None
 
 
 CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_LOCATION_TYPE_DEVICE, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1, 1, 1
