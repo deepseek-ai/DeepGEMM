@@ -168,6 +168,7 @@ Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` varia
 - General
     - `DG_JIT_DEBUG`: `0` or `1`, enable JIT debugging features, including compiler command and PTXAS output, load-time reporting, line info, and PTX/SASS dumps; `0` by default
     - `DG_PRINT_CONFIGS`: `0` or `1`, print selected configs for each shape, `0` by default
+    - `DG_MLOPART_STARTUP_TIMEOUT`: nonnegative seconds to wait for MLOPart startup; defaults to `60`, and `0` disables the timeout. A timeout disables localization for that client.
 - JIT cache
     - `DG_JIT_CACHE_DIR`: string, cache directory (or a `:`-separated list of directories) for compiled kernels; lookup searches all paths front-to-back (first hit wins) and a cache miss compiles into the first path, `$HOME/.dj` by default
 - Compiler selection
