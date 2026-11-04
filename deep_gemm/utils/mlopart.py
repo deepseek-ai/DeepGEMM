@@ -1,5 +1,6 @@
 """An IPC wrapper for allocating localized memory via MLOPart"""
 import ctypes
+import math
 import os
 import signal
 import socket
@@ -26,14 +27,49 @@ class MLOPart:
     """
 
     def __init__(self, device_uuid: bytes) -> None:
+        timeout = float(os.getenv('DG_MLOPART_STARTUP_TIMEOUT', '60'))
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError('DG_MLOPART_STARTUP_TIMEOUT must be a finite, nonnegative number')
         self.device_uuid = device_uuid
         self.sock, client_sock = socket.socketpair()
         env = {k: v for k, v in os.environ.items() if k not in ('CUDA_VISIBLE_DEVICES', 'CUDA_MPS_PINNED_DEVICE_MEM_LIMIT')}
-        with client_sock:
-            self.client = subprocess.Popen([sys.executable, '-I', __file__, str(client_sock.fileno()), f'GPU-{uuid.UUID(bytes=device_uuid)}'],
-                                           env=env, pass_fds=(client_sock.fileno(), ), start_new_session=True)
-        self.available = self.sock.recv(1) == READY
-        if not self.available:
+        try:
+            self.sock.settimeout(timeout or None)
+            with client_sock:
+                self.client = subprocess.Popen([sys.executable, '-I', __file__, str(client_sock.fileno()), f'GPU-{uuid.UUID(bytes=device_uuid)}'],
+                                               env=env, pass_fds=(client_sock.fileno(), ), start_new_session=True)
+        except BaseException:
+            self.sock.close()
+            client_sock.close()
+            raise
+        timed_out = False
+        try:
+            self.available = self.sock.recv(1) == READY
+        except socket.timeout:
+            timed_out = True
+            self.available = False
+            if self.client.poll() is None:
+                try:
+                    self.client.terminate()
+                except ProcessLookupError:
+                    pass
+            try:
+                self.client.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                try:
+                    self.client.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    self.client.wait(timeout=1)
+                except subprocess.TimeoutExpired as e:
+                    self.sock.close()
+                    raise RuntimeError('MLOPart helper did not exit after startup timeout') from e
+            warnings.warn(f'MLOPart startup timed out after {timeout:g}s; localization has been disabled')
+        finally:
+            if self.sock.fileno() >= 0:
+                self.sock.settimeout(None)
+        if not self.available and not timed_out:
             warnings.warn('MLOPart is unavailable; localization has been disabled')
 
     def create_memory(self, num_bytes: int, domain_idx: int) -> int:
