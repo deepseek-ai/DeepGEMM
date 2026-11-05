@@ -87,6 +87,44 @@ def is_acceptable_diff(diff: float, tolerance: float) -> bool:
     return math.isfinite(diff) and diff < tolerance
 
 
+def measure_samples(run, *, cache_policy: str, warmups: int,
+                    repeats: int, iterations: int) -> list[float]:
+    import torch
+
+    cache = None
+    if cache_policy == "cold":
+        cache = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int32, device="cuda")
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Prime stream-local library state even when warmups are disabled.
+        for _ in range(max(warmups, 1)):
+            run()
+    stream.synchronize()
+
+    iterations = iterations if cache_policy == "steady" else 1
+    start = torch.cuda.Event(enable_timing=True, external=True)
+    end = torch.cuda.Event(enable_timing=True, external=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        if cache is not None:
+            cache.zero_()
+        start.record()
+        for _ in range(iterations):
+            run()
+        end.record()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    samples_us = []
+    for _ in range(repeats):
+        graph.replay()
+        end.synchronize()
+        samples_us.append(start.elapsed_time(end) * 1000 / iterations)
+    return samples_us
+
+
 def run_worker(args: argparse.Namespace) -> int:
     os.environ["DG_PRINT_CONFIGS"] = "1"
     os.environ["DG_JIT_DEBUG"] = "0"
@@ -156,27 +194,13 @@ def run_worker(args: argparse.Namespace) -> int:
         return 1
 
     os.environ["DG_PRINT_CONFIGS"] = "0"
-    for _ in range(args.warmups):
-        run()
-    torch.cuda.synchronize()
-
-    cache = None
-    if args.cache_policy == "cold":
-        cache = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int32, device="cuda")
-
-    samples_us = []
-    iterations = args.iterations if args.cache_policy == "steady" else 1
-    for _ in range(args.repeats):
-        if cache is not None:
-            cache.zero_()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iterations):
-            run()
-        end.record()
-        end.synchronize()
-        samples_us.append(start.elapsed_time(end) * 1000 / iterations)
+    samples_us = measure_samples(
+        run, cache_policy=args.cache_policy, warmups=args.warmups,
+        repeats=args.repeats, iterations=args.iterations)
+    replay_diff = float(calc_diff(d, reference))
+    if not is_acceptable_diff(replay_diff, tolerance):
+        raise RuntimeError(
+            f"CUDA graph replay correctness failed: diff={replay_diff}, tolerance={tolerance}")
 
     emit({
         "status": "ok",
@@ -184,7 +208,9 @@ def run_worker(args: argparse.Namespace) -> int:
         "layout": args.layout,
         "dtype": args.dtype,
         "cache_policy": args.cache_policy,
+        "timing_method": "cuda_graph",
         "diff": diff,
+        "replay_diff": replay_diff,
         "samples_us": samples_us,
         "median_us": statistics.median(samples_us),
         "torch": torch.__version__,
@@ -494,6 +520,7 @@ def run_sweep(args: argparse.Namespace) -> int:
                 ("git", "status", "--porcelain"), cwd=REPO_ROOT, text=True).strip()),
             "dtype": args.dtype,
             "cache_policy": args.cache_policy,
+            "timing_method": "cuda_graph",
             "warmups": args.warmups,
             "repeats": args.repeats,
             "iterations": args.iterations,

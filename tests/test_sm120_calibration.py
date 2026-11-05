@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,27 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import calibrate_sm120_heuristic as calibration
+
+
+@pytest.mark.parametrize("cache_policy", ("steady", "cold"))
+def test_timing_excludes_host_submission_delays(cache_policy):
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA GPU")
+
+    a = torch.ones((64, 64), device="cuda")
+    b = torch.ones_like(a)
+    output = torch.empty_like(a)
+
+    def run():
+        time.sleep(0.02)
+        torch.mm(a, b, out=output)
+
+    samples = calibration.measure_samples(
+        run, cache_policy=cache_policy, warmups=0, repeats=3, iterations=4)
+
+    assert len(samples) == 3
+    assert all(0 < sample < 10_000 for sample in samples), samples
+    assert torch.equal(output, torch.full_like(output, 64))
 
 
 def test_fp8_small_m_calibration_uses_effective_descriptor():
@@ -97,6 +119,7 @@ def test_run_candidate_includes_worker_record_on_failure(tmp_path, monkeypatch):
     assert '"tolerance": 0.001' in str(exc_info.value)
 
 
+@pytest.mark.parametrize("cache_policy", ("steady", "cold"))
 @pytest.mark.parametrize(
     ("dtype", "shape", "layout", "expected_status"),
     (
@@ -107,17 +130,20 @@ def test_run_candidate_includes_worker_record_on_failure(tmp_path, monkeypatch):
         ("fp8", (16, 1024, 2048), (1, 1, 1), "invalid"),
     ),
 )
-def test_sm120_worker_candidates(dtype, shape, layout, expected_status, tmp_path):
+def test_sm120_worker_candidates(dtype, shape, layout, expected_status, cache_policy, tmp_path):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("requires an SM120 GPU")
 
     args = argparse.Namespace(
-        dtype=dtype, cache_policy="steady", warmups=0, repeats=3,
+        dtype=dtype, cache_policy=cache_policy, warmups=0, repeats=3,
         iterations=1, seed=0, cache_dir=tmp_path,
     )
     record = calibration.run_candidate(args, shape, layout)
 
     assert record["status"] == expected_status
+    if expected_status == "ok":
+        assert calibration.is_acceptable_diff(
+            record["replay_diff"], 1e-5 if dtype == "bf16" else 0.001)
     if expected_status == "ok" and layout is not None:
         assert record["layout"] == layout
     if dtype == "fp8" and shape[0] <= 16 and expected_status == "ok":

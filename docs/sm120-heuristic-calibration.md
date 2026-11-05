@@ -50,6 +50,15 @@ cannot corrupt the result. Configuration logging is enabled only for the first
 correctness check and disabled before warmup and timing; JIT debug logging is
 also disabled.
 
+Timing samples replay a CUDA graph with external timing events around the GEMM
+launches. Python submission delays and graph launch overhead are outside the
+events. This requires PyTorch support for `torch.cuda.Event(external=True)`.
+The harness primes stream-local state and replays the graph once before taking
+samples, even with `--warmups 0`. Records identify this method as
+`timing_method: cuda_graph` and include a post-replay correctness check.
+Earlier eager-launch measurements cannot establish
+coefficient quality or layout rankings and should be rerun.
+
 The fit uses within-shape centered features. This removes shape-specific timing
 intercepts, then applies nonnegative least squares to TMA bytes, barrier work,
 wave count, and the fixed split-K term. Output includes:
@@ -64,8 +73,10 @@ Use repeated `--shape MxNxK` arguments to calibrate another workload. First two
 thirds form the fit set; remaining shapes form the validation set. Use distinct
 `--seed` values across sessions to change candidate order and tensor data.
 
-`steady` measures repeated launches after warmup. `cold` flushes a 256 MiB
-buffer before each measured launch. Do not compare these policies directly.
+`steady` captures `--iterations` consecutive GEMMs per sample. `cold` captures
+one GEMM per sample with a 256 MiB buffer flush before its start event. The flush
+runs on every replay and is excluded from the measured interval. Do not compare
+these policies directly.
 
 ## Interpreting results
 
