@@ -92,10 +92,14 @@ static SM120GemmConfig get_best_sm120_config(const SM120GemmDesc& desc) {
     DG_HOST_ASSERT(not layout_candidates.empty());
     auto layout = layout_candidates[0];
     auto layout_info = ArchSpec::get_layout_info(desc, layout);
-    for (int i = 1; i < static_cast<int>(layout_candidates.size()); ++ i) {
-        const auto candidate_info = ArchSpec::get_layout_info(desc, layout_candidates[i]);
-        if (ArchSpec::compare(candidate_info, layout_info))
-            layout = layout_candidates[i], layout_info = candidate_info;
+    if (not use_forced_layout(desc, layout_candidates, layout)) {
+        for (int i = 1; i < static_cast<int>(layout_candidates.size()); ++ i) {
+            const auto candidate_info = ArchSpec::get_layout_info(desc, layout_candidates[i]);
+            if (ArchSpec::compare(candidate_info, layout_info))
+                layout = layout_candidates[i], layout_info = candidate_info;
+        }
+    } else {
+        layout_info = ArchSpec::get_layout_info(desc, layout);
     }
     const auto storage_config = ArchSpec::get_storage_config(desc, layout);
     const auto pipeline_config = ArchSpec::get_pipeline_config(desc, layout, storage_config);

@@ -258,7 +258,9 @@ struct SM120ArchSpec {
         const auto num_last_blocks = num_blocks % desc.num_sms;
         const auto last_wave_util = num_last_blocks == 0 ? desc.num_sms : num_last_blocks;
 
-        // TMA-bound latency model (empirically tuned on SM120a). Discrete num_waves
+        // TMA-bound latency model (empirically tuned on SM120a). See
+        // docs/sm120-heuristic-calibration.md for coefficient definitions and calibration.
+        // Discrete num_waves
         // (ceil division) dominates the BM=64 vs BM=128 choice; more pipeline stages
         // reduce per-kblock barrier stall (modeled as kSyncBaseCy / sqrt(stages)).
         static constexpr double kCyPerTmaByte = 0.07;     // ~35 GB/s per SM
