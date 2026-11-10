@@ -427,6 +427,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 for (uint32_t j = 0; j < 2; ++j) {
                                     if (col + j < shape_n) {
                                         const uint32_t index = ai + pair * 2 + j;
+                                        // Match materialized BF16 gate/up before activation.
+                                        // Applying SwiGLU to raw FP32 accumulators changes the contract.
                                         const float gate = __bfloat162float(__float2bfloat16_rn(accum[index]));
                                         const float up = __bfloat162float(__float2bfloat16_rn(accum_up[index]));
                                         const float hidden = (gate / (1.f + expf(-gate))) * up;

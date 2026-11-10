@@ -31,7 +31,7 @@ def main():
     parser.add_argument("--max-m", type=int, default=128)
     parser.add_argument("--n", type=int, default=4864)
     parser.add_argument("--k", type=int, default=896)
-    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--repeats", type=int, default=6)
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         parser.error("SM120 GPU required")
@@ -40,6 +40,9 @@ def main():
     if not 0 < args.max_m or not 0 < args.n or not 0 < args.k or not 0 < args.repeats:
         parser.error("max-m, n, k, and repeats must be positive")
 
+    if args.n % 4:
+        parser.error("benchmark n must be divisible by 4; odd-N tails are covered by pytest")
+    deep_gemm.set_mk_alignment_for_contiguous_layout(128)
     groups = len(args.rows)
     torch.manual_seed(0)
     a = torch.randn((groups, args.max_m, args.k), device="cuda", dtype=torch.bfloat16)
@@ -61,6 +64,7 @@ def main():
     grouped_plus_swiglu()
     grouped_fused()
     torch.cuda.synchronize()
+    torch.testing.assert_close(fused[row_mask], baseline[row_mask], rtol=1e-2, atol=2e-3)
     delta = (baseline[row_mask].float() - fused[row_mask].float()).abs()
     bad = delta > 0.002 + 0.01 * baseline[row_mask].float().abs()
     print(f"valid_rows={sum(args.rows)}, max_m={args.max_m}, n={args.n}, k={args.k}")
@@ -69,6 +73,8 @@ def main():
     if bad.any():
         raise AssertionError("Fused output differs from grouped BF16 baseline")
 
+    print(f"gpu={torch.cuda.get_device_name()}, torch={torch.__version__}, cuda={torch.version.cuda}")
+    print("scope=L1 GEMM plus activation only; Graph timing; reused weights; excludes down GEMM and routing")
     samples = {"grouped_plus_swiglu": [], "grouped_fused": []}
     for repeat in range(args.repeats):
         order = ("grouped_plus_swiglu", "grouped_fused") if repeat % 2 == 0 else ("grouped_fused", "grouped_plus_swiglu")

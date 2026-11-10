@@ -838,7 +838,7 @@ static void m_grouped_bf16_swiglu_nt_masked(const torch::Tensor& a,
     const auto [output_groups, output_m, n] = get_shape<3>(d);
     DG_HOST_ASSERT(groups > 0 and m > 0 and k > 0 and n > 0);
     DG_HOST_ASSERT(groups == weight_groups and groups == output_groups and
-                   groups == masked_m.numel());
+                   groups == masked_m.numel() and masked_m.dim() == 1);
     DG_HOST_ASSERT(m == output_m and k == weight_k and twice_n == 2 * n);
     DG_HOST_ASSERT(expected_m > 0 and expected_m <= m);
     DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and

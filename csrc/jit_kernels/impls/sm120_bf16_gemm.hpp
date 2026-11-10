@@ -61,7 +61,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}, {}, {}, {}
+        {}, {}, {}{}
     >);
 }};
 )",
@@ -80,7 +80,7 @@ static void __instantiate_kernel() {{
         get_default_epilogue_type(args.epilogue_type),
         args.gemm_desc.major_b == cute::UMMA::Major::K ? "true" : "false",
         k_n_warps, args.k_grouped_constant_stride, args.k_alignment,
-        args.fused_swiglu ? "true" : "false");
+        args.fused_swiglu ? ", true" : "");
     }
 
     template <typename Kernel>
