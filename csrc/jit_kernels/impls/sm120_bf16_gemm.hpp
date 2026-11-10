@@ -24,6 +24,7 @@ public:
         int stride_d_m = 0;
         int stride_c_m = 0;
         int stride_d_batch = 0;
+        bool fused_swiglu = false;
 
         void* gmem_d;
         void* gmem_c;
@@ -60,7 +61,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}, {}, {}
+        {}, {}, {}{}
     >);
 }};
 )",
@@ -78,7 +79,8 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.cd_dtype),
         get_default_epilogue_type(args.epilogue_type),
         args.gemm_desc.major_b == cute::UMMA::Major::K ? "true" : "false",
-        k_n_warps, args.k_grouped_constant_stride, args.k_alignment);
+        k_n_warps, args.k_grouped_constant_stride, args.k_alignment,
+        args.fused_swiglu ? ", true" : "");
     }
 
     template <typename Kernel>
@@ -295,6 +297,69 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
     };
     const auto code = SM120BF16GemmRuntime::generate(args);
     const auto runtime = jit->compile("sm120_m_grouped_bf16_gemm_masked", code);
+    SM120BF16GemmRuntime::launch(runtime, args);
+}
+
+static void sm120_m_grouped_bf16_swiglu_masked(const torch::Tensor& a,
+                                                const torch::Tensor& b,
+                                                const torch::Tensor& d,
+                                                const torch::Tensor& masked_m,
+                                                const int expected_m) {
+    const auto [groups, m, k] = get_shape<3>(a);
+    const auto [weight_groups, twice_n, weight_k] = get_shape<3>(b);
+    DG_HOST_ASSERT(groups == weight_groups and k == weight_k);
+    const int n = twice_n / 2;
+    const auto desc = SM120GemmDesc {
+        .gemm_type = GemmType::MGroupedMasked,
+        .kernel_type = KernelType::KernelNoSF,
+        .m = m, .n = n, .k = k, .num_groups = groups,
+        .a_dtype = a.scalar_type(), .b_dtype = b.scalar_type(),
+        .cd_dtype = d.scalar_type(),
+        .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
+        .with_accumulation = false,
+        .num_sms = deep_gemm::runtime->get_num_sms(),
+        .tc_util = deep_gemm::runtime->get_tc_util(),
+        .compiled_dims = "nk",
+        .expected_m = expected_m, .expected_n = n, .expected_k = k,
+        .expected_num_groups = groups
+    };
+    auto config = get_best_sm120_config<SM120ArchSpec>(desc);
+    config.storage_config.swizzle_cd_mode = 0;
+    const int stage_bytes = (config.layout.block_m + 2 * config.layout.block_n) *
+                            config.layout.block_k * static_cast<int>(sizeof(cutlass::bfloat16_t)) + 16;
+    config.pipeline_config.num_stages = std::min(16,
+        (SM120ArchSpec::smem_capacity - 1024) / stage_bytes);
+    DG_HOST_ASSERT(config.pipeline_config.num_stages >= 2);
+    config.pipeline_config.smem_size = config.pipeline_config.num_stages * stage_bytes;
+
+    const auto tensor_map_a = make_tma_a_desc(cute::UMMA::Major::K, a, m, k,
+                                              config.layout.block_m, config.layout.block_k,
+                                              static_cast<int>(a.stride(-2)), groups,
+                                              config.storage_config.swizzle_a_mode);
+    const auto tensor_map_b = make_tma_b_desc(cute::UMMA::Major::K, b, twice_n, k,
+                                              config.layout.block_n, config.layout.block_k,
+                                              static_cast<int>(b.stride(-2)), groups,
+                                              config.storage_config.swizzle_b_mode);
+    const SM120BF16GemmRuntime::Args args = {
+        .gemm_desc = desc,
+        .gemm_config = config,
+        .launch_args = SM120LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
+                                       config.pipeline_config.smem_size, 1),
+        .epilogue_type = std::nullopt,
+        .stride_d_m = static_cast<int>(d.stride(-2)),
+        .fused_swiglu = true,
+        .gmem_d = d.data_ptr(),
+        .gmem_c = nullptr,
+        .gmem_a_ptr = nullptr,
+        .gmem_b_ptr = nullptr,
+        .grouped_layout = masked_m.data_ptr(),
+        .tensor_map_buffer = nullptr,
+        .tensor_map_a = tensor_map_a,
+        .tensor_map_b = tensor_map_b,
+        .tensor_map_cd = {},
+    };
+    const auto code = SM120BF16GemmRuntime::generate(args);
+    const auto runtime = jit->compile("sm120_m_grouped_bf16_swiglu_masked", code);
     SM120BF16GemmRuntime::launch(runtime, args);
 }
 

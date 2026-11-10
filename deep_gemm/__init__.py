@@ -60,6 +60,7 @@ from ._C import (
     m_grouped_bf16_gemm_nt_contiguous,
     m_grouped_bf16_gemm_nn_contiguous,
     m_grouped_bf16_gemm_nt_masked,
+    m_grouped_bf16_swiglu_nt_masked,
     k_grouped_bf16_gemm_tn_contiguous,
     # MegaGate kernels
     bf16_mega_gate, get_bf16_mega_gate_config,

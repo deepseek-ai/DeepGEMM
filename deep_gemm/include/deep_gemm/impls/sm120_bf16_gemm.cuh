@@ -40,7 +40,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBKMajor = true,
           uint32_t kNWarps_ = 1,
           bool kKGroupedConstantStride = false,
-          uint32_t kKAlignment = 128>
+          uint32_t kKAlignment = 128,
+          bool kFusedSwiGLU = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                      cutlass::bfloat16_t* gmem_a_ptr, cutlass::bfloat16_t* gmem_b_ptr,
@@ -64,6 +65,9 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
                      "Only float or bfloat16 output supported");
     DG_STATIC_ASSERT(kNumTMAThreads > 0, "SM120a always uses warp-specialized pipeline");
+    DG_STATIC_ASSERT(not kFusedSwiGLU or (kGemmType == GemmType::MGroupedMasked and
+                     cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> and kBKMajor and not kWithAccumulation),
+                     "Fused SwiGLU currently supports masked grouped BF16 only");
     DG_STATIC_ASSERT(kNumMathThreads % 32 == 0, "Invalid math threads");
     DG_STATIC_ASSERT(BLOCK_M % MMA_M == 0 and BLOCK_N % MMA_N == 0 and BLOCK_K % MMA_K == 0, "Invalid block dims");
 
@@ -91,7 +95,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // SMEM D buffer for TMA store epilogue
     // Require BLOCK_N to be a multiple of the TMA store atom (kSwizzleCDMode / sizeof(cd_dtype_t))
     // to avoid partial sub-tile writes corrupting adjacent N-tiles in global memory
-    static constexpr bool kUseTMAStoreEpilogue = sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
+    static constexpr bool kUseTMAStoreEpilogue = not kFusedSwiGLU and sizeof(cd_dtype_t) <= 2 and kSwizzleCDMode > 0
         and BLOCK_N * sizeof(cd_dtype_t) >= kSwizzleCDMode
         and (BLOCK_N * sizeof(cd_dtype_t)) % kSwizzleCDMode == 0;
     static constexpr uint32_t SMEM_D = kUseTMAStoreEpilogue
@@ -129,7 +133,10 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     auto smem_b = utils::PatternVisitor([&](const uint32_t& s) {
         return reinterpret_cast<char*>(smem_buffer + PIPE_BASE + kNumStages * SMEM_A + s * SMEM_B);
     });
-    constexpr uint32_t BAR_BASE = PIPE_BASE + kNumStages * (SMEM_A + SMEM_B);
+    auto smem_b_up = utils::PatternVisitor([&](const uint32_t& s) {
+        return reinterpret_cast<char*>(smem_buffer + PIPE_BASE + kNumStages * (SMEM_A + SMEM_B) + s * SMEM_B);
+    });
+    constexpr uint32_t BAR_BASE = PIPE_BASE + kNumStages * (SMEM_A + (kFusedSwiGLU ? 2 : 1) * SMEM_B);
     auto full_barriers = utils::PatternVisitor([&](const uint32_t& s) {
         return reinterpret_cast<Barrier*>(smem_buffer + BAR_BASE + s * sizeof(Barrier));
     });
@@ -146,7 +153,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     if (warp_idx == 0 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_a_base);
         cute::prefetch_tma_descriptor(&tensor_map_b_base);
-        cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (not kFusedSwiGLU)
+            cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
     __syncwarp();
 
@@ -224,7 +232,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 const uint32_t m_idx = scheduler.template get_global_idx<kAGroupOffset>(shape_m, BLOCK_M, m_block_idx);
                 constexpr bool kBGroupOffset = not (kGemmType == GemmType::Normal or is_k_grouped_contiguous(kGemmType));
                 // For K-major B: group offset on outer=N. For MN-major B: group offset on outer=K.
-                const uint32_t n_idx = scheduler.template get_global_idx<kBGroupOffset and kBKMajor>(shape_n, BLOCK_N, n_block_idx, m_block_idx);
+                const uint32_t n_idx = scheduler.template get_global_idx<kBGroupOffset and kBKMajor>(
+                    kFusedSwiGLU ? shape_n * 2 : shape_n, BLOCK_N, n_block_idx, m_block_idx);
                 const uint32_t k_group_offset = (kBGroupOffset and not kBKMajor) ?
                     scheduler.template get_global_idx<true>(shape_k, 0, 0, m_block_idx) : 0;
                 const auto tma_a_desc = (is_k_grouped_contiguous(kGemmType) ? gmem_tm_a : &tensor_map_a_base);
@@ -241,12 +250,15 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     tma::copy<kSMEMKBytes, BLOCK_M, kSwizzleAMode, char, kIsBatchedMM>(tma_a_desc, full_barriers[s], smem_a[s], k_idx, m_idx, 1, batch_idx);
                     if constexpr (kBKMajor) {
                         tma::copy<kSMEMKBytes, BLOCK_N, kSwizzleBMode, char, kIsBatchedMM>(tma_b_desc, full_barriers[s], smem_b[s], k_idx, n_idx, 1, batch_idx);
+                        if constexpr (kFusedSwiGLU)
+                            tma::copy<kSMEMKBytes, BLOCK_N, kSwizzleBMode, char>(
+                                tma_b_desc, full_barriers[s], smem_b_up[s], k_idx, n_idx + shape_n, 1);
                     } else {
                         tma::copy<BLOCK_N, BLOCK_K, kSwizzleBMode, cutlass::bfloat16_t, kIsBatchedMM>(
                             tma_b_desc, full_barriers[s], reinterpret_cast<cutlass::bfloat16_t*>(smem_b[s]),
                             n_idx, k_group_offset + k_idx, 1, batch_idx);
                     }
-                    full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES);
+                    full_barriers[s]->arrive_and_expect_tx(SMEM_TMA_BYTES + (kFusedSwiGLU ? SMEM_B : 0));
                 }
             }
         }
@@ -264,6 +276,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         const uint32_t n_tile_base = warp_n * kNTilesPerWarp;
 
         float accum[kAccumPerWarp];
+        float accum_up[kFusedSwiGLU ? kAccumPerWarp : 1];
         uint32_t iter_idx = 0;
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -271,7 +284,10 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             const uint32_t num_k_blocks = math::ceil_div(current_shape_k, BLOCK_K);
 
             #pragma unroll
-            for (uint32_t i = 0; i < kAccumPerWarp; ++i) accum[i] = 0.f;
+            for (uint32_t i = 0; i < kAccumPerWarp; ++i) {
+                accum[i] = 0.f;
+                if constexpr (kFusedSwiGLU) accum_up[i] = 0.f;
+            }
 
             for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
                 CUTE_TIE_DECL(get_pipeline(iter_idx++), stage, phase);
@@ -297,12 +313,18 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                 uint32_t a_frag[2][kMTilesPerWarp][4];
                 uint32_t b_tile[2][kNTilesPerWarp][2];
+                uint32_t b_tile_up[2][kFusedSwiGLU ? kNTilesPerWarp : 1][2];
 
                 auto load_kstep = [&](int buf, uint32_t ks) {
                     if constexpr (kBKMajor) {
                         #pragma unroll
                         for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
                             sm120::load_b_fragment_x2(b_tile[buf][nt], smem_b[stage], b_ctx[nt], lane_idx, ks, kLdmK);
+                        if constexpr (kFusedSwiGLU) {
+                            #pragma unroll
+                            for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt)
+                                sm120::load_b_fragment_x2(b_tile_up[buf][nt], smem_b_up[stage], b_ctx[nt], lane_idx, ks, kLdmK);
+                        }
                     } else {
                         static constexpr uint32_t kBAtomElems = kSwizzleBMode > 0 ? kSwizzleBMode / 2 : BLOCK_N;
                         static constexpr uint32_t kBNumAtoms = (BLOCK_N + kBAtomElems - 1) / kBAtomElems;
@@ -336,6 +358,10 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                             float (&d)[4] = *reinterpret_cast<float(*)[4]>(&accum[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
                             sm120_mma::bf16_mma(d, a_frag[buf][mt], b_tile[buf][nt]);
+                            if constexpr (kFusedSwiGLU) {
+                                float (&u)[4] = *reinterpret_cast<float(*)[4]>(&accum_up[(mt * kNTilesPerWarp + nt) * MMA_ACCUM]);
+                                sm120_mma::bf16_mma(u, a_frag[buf][mt], b_tile_up[buf][nt]);
+                            }
                         }
                     }
                 };
@@ -359,7 +385,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             }
 
             // Epilogue
-            epilogue.apply_values(*reinterpret_cast<uint32_t(*)[kAccumPerWarp]>(accum));
+            if constexpr (not kFusedSwiGLU)
+                epilogue.apply_values(*reinterpret_cast<uint32_t(*)[kAccumPerWarp]>(accum));
             constexpr bool kEpilogueGroupOffset = not is_m_grouped_contiguous(kGemmType);
             const uint32_t m_base = scheduler.template get_global_idx<kEpilogueGroupOffset>(shape_m, BLOCK_M, m_block_idx);
             const uint32_t n_base = n_block_idx * BLOCK_N;
@@ -381,7 +408,51 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 return idx;
             };
 
-            if constexpr (kUseTMAStoreEpilogue) {
+            if constexpr (kFusedSwiGLU) {
+                const uint32_t group_base = scheduler.current_group_idx * shape_m;
+                const uint32_t valid_end = group_base + static_cast<uint32_t>(grouped_layout[scheduler.current_group_idx]);
+                #pragma unroll
+                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                    #pragma unroll
+                    for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                        const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                        const uint32_t col = n_base + (n_tile_base + nt) * MMA_N + thread_id * 2;
+                        const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
+                        const uint32_t row1 = row0 + 8;
+                        #pragma unroll
+                        for (uint32_t pair = 0; pair < 2; ++pair) {
+                            const uint32_t row = pair == 0 ? row0 : row1;
+                            if (row < valid_end and col < shape_n) {
+                                alignas(4) cd_dtype_t values[2];
+                                #pragma unroll
+                                for (uint32_t j = 0; j < 2; ++j) {
+                                    if (col + j < shape_n) {
+                                        const uint32_t index = ai + pair * 2 + j;
+                                        // Match materialized BF16 gate/up before activation.
+                                        // Applying SwiGLU to raw FP32 accumulators changes the contract.
+                                        const float gate = __bfloat162float(__float2bfloat16_rn(accum[index]));
+                                        const float up = __bfloat162float(__float2bfloat16_rn(accum_up[index]));
+                                        const float hidden = (gate / (1.f + expf(-gate))) * up;
+                                        values[j] = cd_dtype_t(hidden);
+                                    }
+                                }
+                                auto* output = gmem_d + static_cast<int64_t>(row) * cd_m_stride + col;
+                                // Adjacent MMA accumulators belong to the same lane. Pack
+                                // their BF16 results without changing projection rounding.
+                                // Odd strides and offset output views can be only 2-byte aligned.
+                                if (col + 1 < shape_n and (reinterpret_cast<uintptr_t>(output) & 3u) == 0) {
+                                    *reinterpret_cast<uint32_t*>(output) =
+                                        *reinterpret_cast<const uint32_t*>(values);
+                                } else {
+                                    output[0] = values[0];
+                                    if (col + 1 < shape_n)
+                                        output[1] = values[1];
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if constexpr (kUseTMAStoreEpilogue) {
                 if (math_warp_idx == 0 and lane_idx == 0)
                     cute::tma_store_wait<0>();
                 cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
