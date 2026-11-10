@@ -51,7 +51,11 @@ def compare_valid(actual, reference, rows):
     ((0, 7, 129, 255), 256, 832, 128),
     ((1025,) * 4, 1152, 256, 128),
     ((0,) * 4, 128, 256, 128),
-])
+    ((65, 1, 0, 31), 65, 136, 17),
+    ((32,) * 8, 128, 256, 32),
+    ((16,) * 32, 128, 256, 128),
+], ids=["e4_m16", "e4_m128", "e48_m16", "mixed_odd_n", "mixed_k_tail",
+        "m1025", "all_empty", "capacity_tail", "e8_n32", "e32_n128"])
 def test_materialized(rows, m, k, n, seed):
     torch.manual_seed(seed)
     groups = len(rows)
@@ -117,11 +121,63 @@ def test_graph_replay_updates_inputs_weights_and_counts():
         compare_valid(actual, reference, rows)
 
 
-@pytest.mark.parametrize("invalid", ["weights", "counts_rank", "counts_dtype", "output", "hint"])
+@pytest.mark.parametrize("alignment", [32, 64, 128])
+def test_runtime_alignment(alignment):
+    deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
+    torch.manual_seed(37)
+    rows = (0, 1, 31, 65)
+    a = torch.randn((4, 128, 256), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((4, 256, 256), device="cuda", dtype=torch.bfloat16) / 16
+    counts = torch.tensor(rows, device="cuda", dtype=torch.int32)
+    actual = torch.full((4, 128, 128), float("nan"), device="cuda", dtype=torch.bfloat16)
+    reference = materialized(a, b, counts, 128, 65)
+    deep_gemm.m_grouped_bf16_swiglu_nt_masked(a, b, actual, counts, 65)
+    compare_valid(actual, reference, rows)
+
+
+def test_small_n_rejects_alignment32():
+    deep_gemm.set_mk_alignment_for_contiguous_layout(32)
+    a = torch.zeros((4, 128, 256), device="cuda", dtype=torch.bfloat16)
+    b = torch.zeros((4, 34, 256), device="cuda", dtype=torch.bfloat16)
+    actual = torch.full((4, 128, 17), 7, device="cuda", dtype=torch.bfloat16)
+    counts = torch.tensor([0, 1, 31, 65], device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="requires alignment >= 64"):
+        deep_gemm.m_grouped_bf16_swiglu_nt_masked(a, b, actual, counts, 65)
+    assert (actual == 7).all()
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_random_selected_experts_fp64_oracle(seed):
+    # Keep the full 48-expert launch. Independently evaluate three fixed experts;
+    # do not substitute the ordinary GEMM result for the mathematical reference.
+    torch.manual_seed(seed)
+    groups, m, k, n = 48, 128, 896, 4864
+    a = torch.randn((groups, m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((groups, 2 * n, k), device="cuda", dtype=torch.bfloat16) / k**0.5
+    counts = torch.full((groups,), m, device="cuda", dtype=torch.int32)
+    actual = torch.empty((groups, m, n), device="cuda", dtype=torch.bfloat16)
+    reference = materialized(a, b, counts, n, m)
+    deep_gemm.m_grouped_bf16_swiglu_nt_masked(a, b, actual, counts, m)
+    failures = []
+    for group in (0, 24, 47):
+        projections = (a[group].double() @ b[group].double().T).bfloat16().float()
+        oracle = (torch.nn.functional.silu(projections[:, :n]) * projections[:, n:]).bfloat16()
+        for label, value in (("materialized", reference[group]), ("fused", actual[group])):
+            try:
+                torch.testing.assert_close(value, oracle, rtol=1e-2, atol=2e-3)
+            except AssertionError as error:
+                failures.append(f"seed={seed}, expert={group}, path={label}\n{error}")
+    assert not failures, "\n\n".join(failures)
+
+
+@pytest.mark.parametrize("invalid", [
+    "weights", "counts_rank", "counts_dtype", "output", "hint",
+    "hint_large", "a_dtype", "a_offset", "b_offset", "noncontiguous",
+])
 def test_reject_invalid_contract(invalid):
     a = torch.empty((2, 128, 256), device="cuda", dtype=torch.bfloat16)
     b = torch.empty((2, 256, 256), device="cuda", dtype=torch.bfloat16)
-    d = torch.empty((2, 128, 128), device="cuda", dtype=torch.bfloat16)
+    d = torch.full((2, 128, 128), 7, device="cuda", dtype=torch.bfloat16)
     counts = torch.tensor([0, 7], device="cuda", dtype=torch.int32)
     hint = 7
     if invalid == "weights":
@@ -134,5 +190,19 @@ def test_reject_invalid_contract(invalid):
         d = d.float()
     elif invalid == "hint":
         hint = 0
+    elif invalid == "hint_large":
+        hint = 129
+    elif invalid == "a_dtype":
+        a = a.float()
+    elif invalid in ("a_offset", "b_offset"):
+        tensor = a if invalid == "a_offset" else b
+        misaligned = torch.empty(tensor.numel() + 1, device="cuda", dtype=tensor.dtype)[1:].view_as(tensor)
+        if invalid == "a_offset":
+            a = misaligned
+        else:
+            b = misaligned
+    elif invalid == "noncontiguous":
+        a = torch.empty((2, 256, 128), device="cuda", dtype=a.dtype).transpose(-1, -2)
     with pytest.raises(RuntimeError):
         deep_gemm.m_grouped_bf16_swiglu_nt_masked(a, b, d, counts, hint)
+    assert (d == 7).all()

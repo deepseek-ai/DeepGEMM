@@ -1,6 +1,9 @@
 """Measure single-launch SM120 grouped BF16 SwiGLU against grouped GEMM plus epilogue."""
 
 import argparse
+import json
+import math
+from pathlib import Path
 from statistics import median
 
 import deep_gemm
@@ -32,6 +35,9 @@ def main():
     parser.add_argument("--n", type=int, default=4864)
     parser.add_argument("--k", type=int, default=896)
     parser.add_argument("--repeats", type=int, default=6)
+    parser.add_argument("--output", type=Path, help="Save full precision timing samples as JSON")
+    parser.add_argument("--profile-path", choices=("grouped_plus_swiglu", "grouped_fused"),
+                        help="Profile one validated invocation using cudaProfilerStart/Stop")
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         parser.error("SM120 GPU required")
@@ -75,15 +81,33 @@ def main():
 
     print(f"gpu={torch.cuda.get_device_name()}, torch={torch.__version__}, cuda={torch.version.cuda}")
     print("scope=L1 GEMM plus activation only; Graph timing; reused weights; excludes down GEMM and routing")
+    if args.profile_path:
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStart()
+        (grouped_plus_swiglu if args.profile_path == "grouped_plus_swiglu" else grouped_fused)()
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        print(f"profile_region=completed, path={args.profile_path}")
+        return
     samples = {"grouped_plus_swiglu": [], "grouped_fused": []}
     for repeat in range(args.repeats):
         order = ("grouped_plus_swiglu", "grouped_fused") if repeat % 2 == 0 else ("grouped_fused", "grouped_plus_swiglu")
         for name in order:
             fn = grouped_plus_swiglu if name == "grouped_plus_swiglu" else grouped_fused
-            samples[name].append(triton.testing.do_bench_cudagraph(fn) * 1000)
+            value = triton.testing.do_bench_cudagraph(fn, rep=20) * 1000
+            if not math.isfinite(value) or value <= 0:
+                raise RuntimeError(f"Invalid timing sample: {name}={value}")
+            samples[name].append(value)
     for name, values in samples.items():
         print(f"{name}_us: {[round(value, 2) for value in values]}, median={median(values):.2f}")
     print(f"speedup={median(samples['grouped_plus_swiglu']) / median(samples['grouped_fused']):.3f}x")
+    if args.output:
+        report = dict(rows=args.rows, max_m=args.max_m, n=args.n, k=args.k, seed=0,
+                      scope="L1 plus activation; Graph timing; reused weights",
+                      gpu=torch.cuda.get_device_name(), torch=torch.__version__, cuda=torch.version.cuda,
+                      samples_us=samples, medians_us={name: median(values) for name, values in samples.items()},
+                      speedup=median(samples["grouped_plus_swiglu"]) / median(samples["grouped_fused"]))
+        args.output.write_text(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":
