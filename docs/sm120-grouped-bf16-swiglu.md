@@ -34,8 +34,11 @@ The explicit BF16 rounding of the projections preserves the materialized BF16
 pipeline's semantics. This does not promise bitwise equality to every GEMM
 specialization or a real-number matrix product. Tests compare to the materialized
 pipeline and include an independently computed, exactly representable dot-product
-fixture. Existing random-input mathematical-oracle failures in the research
-baseline remain unresolved; no tolerance was relaxed for this contribution.
+fixture. The random-input FP64 test currently fails for both ordinary and fused
+paths on RTX 5090. Independent exact-dot diagnostics locate projection differences
+near BF16 rounding boundaries. This failure is retained; no test threshold has
+been relaxed. See the [validation results](sm120-grouped-bf16-swiglu-validation.md)
+for the evidence and the remaining numerical-contract question.
 
 ## Validation
 
@@ -57,8 +60,14 @@ Compute, `--profile-path grouped_fused` (or `grouped_plus_swiglu`) brackets one
 validated invocation with the CUDA profiler API; pass `--profile-from-start off`
 to Nsight Compute. These captures do not produce ordinary timing samples.
 
-Status: this reduced source is prepared for review. Its CUDA compilation,
-SM120 correctness, sanitizer results, and performance must be recorded before
-marking a draft PR ready. Historical research results are not measurements of
-this reduced source. RTX PRO 6000 measurements from other implementations are
-not RTX 5090 results.
+The fused epilogue packs two adjacent BF16 results into a 32-bit store when the
+output address is four-byte aligned and both columns are valid. Odd-N tails and
+two-byte-offset output views use scalar stores. Projection rounding and activation
+are identical in these branches.
+
+Status: compiled and measured on RTX 5090, with a retained random-input FP64
+failure. This is still a draft, not an all-tests-passing contribution. Detailed
+test counts, measured speedups, regressions and known BK32 spilling are recorded
+in the [validation results](sm120-grouped-bf16-swiglu-validation.md). Measurements
+from RTX PRO 6000 or the broader research prototype are not used as validation
+of this patch.

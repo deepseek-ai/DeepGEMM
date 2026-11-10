@@ -75,6 +75,26 @@ def test_materialized(rows, m, k, n, seed):
         torch.testing.assert_close(original, old, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("n", [65, 128])
+@pytest.mark.parametrize("offset", [16, 17])
+def test_output_pair_alignment_and_tail(n, offset):
+    # A contiguous BF16 output may start at a 2-byte offset. With odd N,
+    # successive rows also alternate between 2-byte and 4-byte alignment.
+    torch.manual_seed(73)
+    groups, m, k = 4, 128, 256
+    rows = (0, 1, 31, 65)
+    a = torch.randn((groups, m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((groups, 2 * n, k), device="cuda", dtype=torch.bfloat16) / k**0.5
+    counts = torch.tensor(rows, device="cuda", dtype=torch.int32)
+    storage = torch.full((offset + groups * m * n + 16,), float("nan"),
+                         device="cuda", dtype=torch.bfloat16)
+    actual = storage[offset:-16].view(groups, m, n)
+    reference = materialized(a, b, counts, n, 65)
+    deep_gemm.m_grouped_bf16_swiglu_nt_masked(a, b, actual, counts, 65)
+    compare_valid(actual, reference, rows)
+    assert torch.isnan(storage[:offset]).all() and torch.isnan(storage[-16:]).all()
+
+
 def test_exact_dot_product_oracle():
     groups, m, k, n = 4, 128, 256, 65
     # Bounded dyadic products/sums are exactly representable in FP32. This

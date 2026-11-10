@@ -422,7 +422,8 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         #pragma unroll
                         for (uint32_t pair = 0; pair < 2; ++pair) {
                             const uint32_t row = pair == 0 ? row0 : row1;
-                            if (row < valid_end) {
+                            if (row < valid_end and col < shape_n) {
+                                alignas(4) cd_dtype_t values[2];
                                 #pragma unroll
                                 for (uint32_t j = 0; j < 2; ++j) {
                                     if (col + j < shape_n) {
@@ -432,8 +433,20 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                         const float gate = __bfloat162float(__float2bfloat16_rn(accum[index]));
                                         const float up = __bfloat162float(__float2bfloat16_rn(accum_up[index]));
                                         const float hidden = (gate / (1.f + expf(-gate))) * up;
-                                        gmem_d[static_cast<int64_t>(row) * cd_m_stride + col + j] = cd_dtype_t(hidden);
+                                        values[j] = cd_dtype_t(hidden);
                                     }
+                                }
+                                auto* output = gmem_d + static_cast<int64_t>(row) * cd_m_stride + col;
+                                // Adjacent MMA accumulators belong to the same lane. Pack
+                                // their BF16 results without changing projection rounding.
+                                // Odd strides and offset output views can be only 2-byte aligned.
+                                if (col + 1 < shape_n and (reinterpret_cast<uintptr_t>(output) & 3u) == 0) {
+                                    *reinterpret_cast<uint32_t*>(output) =
+                                        *reinterpret_cast<const uint32_t*>(values);
+                                } else {
+                                    output[0] = values[0];
+                                    if (col + 1 < shape_n)
+                                        output[1] = values[1];
                                 }
                             }
                         }
