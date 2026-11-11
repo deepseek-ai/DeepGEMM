@@ -454,7 +454,7 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
                     CUTE_TIE_DECL(io_pipeline.advance(), io_stage_idx, io_phase);
                     smem.full_io_barriers[io_stage_idx].wait(io_phase);
 
-                    #pragma unroll
+                    #pragma unroll 2
                     for (uint32_t umma_k_idx = kPostWorkerIdx; umma_k_idx < BLOCK_K / UMMA_K;
                          umma_k_idx += kNumPostWGs) {
                         const uint32_t hidden_pair_idx = umma_k_idx * (UMMA_K / 2) +
