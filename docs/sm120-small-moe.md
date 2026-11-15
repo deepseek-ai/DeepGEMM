@@ -117,11 +117,33 @@ is not used as an independent accuracy oracle.
 Build the extension from this revision and use a fresh or revision-matched JIT
 cache. The validation runner records source and extension hashes, GPU identity,
 commands, exit codes, and full logs. It rejects a skipped GPU run as evidence.
+Run from the repository root in an environment with CUDA 13+, PyTorch, Triton,
+pytest and Compute Sanitizer installed. Force the extension rebuild so changed
+C++ headers cannot reuse stale objects:
 
 ```bash
+python setup.py build_ext --inplace --force
 python -m tests.run_sm120_small_moe_validation --output results/small-moe-validation
-python -m tests.bench_sm120_small_moe --jobs jobs.json --output results/chain.json --seeds 277 281
+python -m tests.bench_sm120_small_moe \
+  --jobs docs/validation/sm120-small-moe-calibration-jobs-20261115.json \
+  --output results/small-moe-calibration.json --seeds 269 --repeats 20 --batches 7
+python -m tests.bench_sm120_small_moe \
+  --jobs docs/validation/sm120-small-moe-holdout-jobs-20261115.json \
+  --output results/small-moe-holdout.json --seeds 277 281 --repeats 20 --batches 7
+python -m tests.bench_sm120_small_moe \
+  --jobs docs/validation/sm120-small-moe-final-boundary-jobs-20261115.json \
+  --output results/small-moe-final-boundary.json --seeds 283 --repeats 20 --batches 7
 ```
+
+The committed job lists preserve the archived execution order: 144 calibration
+jobs, 102 holdout jobs per seed, and 19 final boundary jobs. Together the commands
+produce 367 scenes. Each JSON array entry specifies `d`, `i`, `t`, `k`, `e`, and
+`distribution`; seeds control operands and route generation. `concentrated`
+routes every token to the same set of k experts in a shuffled order. `skew75`
+draws three quarters of each token's experts from the first half of the expert
+IDs when k >= 4; for k=1/2 it uses the same generator as `uniform`. These are
+synthetic routing cases, not sampled model router traces. The support policy
+is fixed; running calibration does not rewrite it or tune on the holdouts.
 
 The four sanitizers exercise every tile/barrier configuration using a compact
 E=8 fixture plus odd-shape fallback, custom capacity, and a nondefault stream.
