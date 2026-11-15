@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstddef>
+#include <list>
 #include <memory>
 #include <unordered_map>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <cublasLt.h>
 #include <torch/python.h>
 
@@ -24,8 +26,19 @@ public:
     // cuBLASLt utils
     // cuBLAS will select worse heuristics when workspace > 16 MiB with shape, e.g. m=128, n=7168, k=16384
     static constexpr size_t kCublasLtWorkspaceSize = 16 * 1024 * 1024;
-    // cuBLASLt may use the workspace asynchronously, so concurrent streams cannot share it.
-    std::unordered_map<c10::cuda::CUDAStream, torch::Tensor> cublaslt_workspaces;
+    // Bound the per-stream cache. cuBLASLt may use the workspace asynchronously, so concurrent
+    // streams cannot share one tensor, but an unbounded map pins a caching-allocator block for
+    // every stream that ever called into cuBLASLt.
+    static constexpr size_t kMaxCachedCublasLtWorkspaces = 16;
+    // `c10::cuda::CUDAStream` is a non-owning {device, id} value; storing it as a map key does not
+    // keep the underlying `cudaStream_t` alive, and destroyed streams cannot be queried safely.
+    // Key by the raw stream handle and evict LRU entries so dropped/ephemeral streams can release.
+    struct CachedCublasLtWorkspace {
+        torch::Tensor tensor;
+        std::list<cudaStream_t>::iterator lru_it;
+    };
+    std::list<cudaStream_t> cublaslt_workspace_lru;
+    std::unordered_map<cudaStream_t, CachedCublasLtWorkspace> cublaslt_workspaces;
 
     // Create the cuBLASLt handle ourselves
     cublasLtHandle_t cublaslt_handle;
@@ -69,10 +82,31 @@ public:
         if (use_temp_cublaslt_workspace)
             return torch::empty({kCublasLtWorkspaceSize}, options);
 
-        auto& workspace = cublaslt_workspaces[stream];
-        if (not workspace.defined())
-            workspace = torch::empty({kCublasLtWorkspaceSize}, options);
+        // Capture streams are often created per graph and discarded. A cached tensor would also be
+        // captured by pointer, so put scratch in the graph mempool instead of inserting a cache entry.
+        if (c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None)
+            return torch::empty({kCublasLtWorkspaceSize}, options);
+
+        const cudaStream_t raw = stream.stream();
+        if (const auto cached = cublaslt_workspaces.find(raw); cached != cublaslt_workspaces.end()) {
+            cublaslt_workspace_lru.splice(
+                cublaslt_workspace_lru.begin(), cublaslt_workspace_lru, cached->second.lru_it);
+            return cached->second.tensor;
+        }
+
+        if (cublaslt_workspaces.size() >= kMaxCachedCublasLtWorkspaces) {
+            cublaslt_workspaces.erase(cublaslt_workspace_lru.back());
+            cublaslt_workspace_lru.pop_back();
+        }
+
+        auto workspace = torch::empty({kCublasLtWorkspaceSize}, options);
+        cublaslt_workspace_lru.push_front(raw);
+        cublaslt_workspaces.emplace(raw, CachedCublasLtWorkspace{workspace, cublaslt_workspace_lru.begin()});
         return workspace;
+    }
+
+    size_t num_cached_cublaslt_workspaces() const {
+        return cublaslt_workspaces.size();
     }
 
     void set_num_sms(const int& new_num_sms) {
