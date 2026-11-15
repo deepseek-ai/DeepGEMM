@@ -4,8 +4,10 @@
 #include <list>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <cublasLt.h>
 #include <torch/python.h>
@@ -33,9 +35,15 @@ public:
     // `c10::cuda::CUDAStream` is a non-owning {device, id} value; storing it as a map key does not
     // keep the underlying `cudaStream_t` alive, and destroyed streams cannot be queried safely.
     // Key by the raw stream handle and evict LRU entries so dropped/ephemeral streams can release.
+    // Each entry holds a CUDA event recorded after the last cuBLASLt launch. Eviction waits on that
+    // event (valid after stream teardown) rather than synchronizing the raw `cudaStream_t`.
     struct CachedCublasLtWorkspace {
         torch::Tensor tensor;
         std::list<cudaStream_t>::iterator lru_it;
+        c10::cuda::CUDAEvent last_use;
+
+        CachedCublasLtWorkspace(torch::Tensor tensor, std::list<cudaStream_t>::iterator lru_it):
+            tensor(std::move(tensor)), lru_it(lru_it) {}
     };
     std::list<cudaStream_t> cublaslt_workspace_lru;
     std::unordered_map<cudaStream_t, CachedCublasLtWorkspace> cublaslt_workspaces;
@@ -65,6 +73,8 @@ public:
     }
 
     ~Runtime() noexcept(false) {
+        while (not cublaslt_workspace_lru.empty())
+            evict_lru_cublaslt_workspace();
         if (not use_pytorch_managed_cublaslt_handle)
             DG_CUBLASLT_CHECK(cublasLtDestroy(cublaslt_handle));
     }
@@ -94,19 +104,39 @@ public:
             return cached->second.tensor;
         }
 
-        if (cublaslt_workspaces.size() >= kMaxCachedCublasLtWorkspaces) {
-            cublaslt_workspaces.erase(cublaslt_workspace_lru.back());
-            cublaslt_workspace_lru.pop_back();
-        }
+        if (cublaslt_workspaces.size() >= kMaxCachedCublasLtWorkspaces)
+            evict_lru_cublaslt_workspace();
 
         auto workspace = torch::empty({kCublasLtWorkspaceSize}, options);
         cublaslt_workspace_lru.push_front(raw);
-        cublaslt_workspaces.emplace(raw, CachedCublasLtWorkspace{workspace, cublaslt_workspace_lru.begin()});
+        cublaslt_workspaces.try_emplace(raw, workspace, cublaslt_workspace_lru.begin());
         return workspace;
+    }
+
+    // Record after cuBLASLt has been queued so eviction can wait for in-flight workspace writes.
+    void record_cublaslt_workspace_use(const c10::cuda::CUDAStream& stream) {
+        if (use_temp_cublaslt_workspace)
+            return;
+        if (c10::cuda::currentStreamCaptureStatusMayInitCtx() != c10::cuda::CaptureStatus::None)
+            return;
+        const auto cached = cublaslt_workspaces.find(stream.stream());
+        if (cached == cublaslt_workspaces.end())
+            return;
+        cached->second.last_use.record(stream);
     }
 
     size_t num_cached_cublaslt_workspaces() const {
         return cublaslt_workspaces.size();
+    }
+
+    void evict_lru_cublaslt_workspace() {
+        const auto raw = cublaslt_workspace_lru.back();
+        cublaslt_workspace_lru.pop_back();
+        auto entry = cublaslt_workspaces.extract(raw);
+        if (not entry)
+            return;
+        // Wait on the last-use event, not the stream handle: the stream may already be gone.
+        entry.mapped().last_use.synchronize();
     }
 
     void set_num_sms(const int& new_num_sms) {
