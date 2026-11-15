@@ -771,7 +771,11 @@ static void m_grouped_bf16_gemm_nn_contiguous(const torch::Tensor& a, const torc
 
 static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::Tensor& b,
                                           const torch::Tensor& d, const torch::Tensor& masked_m,
-                                          const int& expected_m, const std::string& compiled_dims) {
+                                          const int& expected_m, const std::string& compiled_dims,
+                                          const int sm120_m_tile = 0) {
+    DG_HOST_ASSERT(sm120_m_tile == 0 or sm120_m_tile == 32 or sm120_m_tile == 64 or sm120_m_tile == 128);
+    DG_HOST_ASSERT(sm120_m_tile == 0 or
+                   (a.is_cuda() and at::cuda::getDeviceProperties(a.get_device())->major == 12));
     c10::cuda::OptionalCUDAGuard sm120_guard;
     if (a.is_cuda() and at::cuda::getDeviceProperties(a.get_device())->major == 12) {
         sm120_guard.set_device(a.device());
@@ -803,7 +807,7 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
 
     if (at::cuda::getDeviceProperties(a.get_device())->major == 12) {
         sm120_m_grouped_bf16_gemm_masked(a, b, d, masked_m, num_groups, m, n, k,
-                                  expected_m, major_a, major_b, compiled_dims);
+                                  expected_m, major_a, major_b, compiled_dims, sm120_m_tile);
         return;
     }
 
@@ -1141,7 +1145,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("ensure_zero_padding") = true);
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
-          py::arg("expected_m"), py::arg("compiled_dims") = "nk");
+          py::arg("expected_m"), py::arg("compiled_dims") = "nk", py::kw_only(),
+          py::arg("sm120_m_tile") = 0);
     m.def("m_grouped_bf16_swiglu_nt_masked", &m_grouped_bf16_swiglu_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"));

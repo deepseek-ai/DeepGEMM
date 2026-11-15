@@ -35,7 +35,11 @@ struct SM120ArchSpec {
         std::vector<int> block_m_candidates;
         const bool is_m_grouped = is_m_grouped_contiguous(desc.gemm_type)
                                   or desc.gemm_type == GemmType::MGroupedMasked;
-        if (runtime_align == 32 and is_m_grouped) {
+        if (desc.block_m_override != 0) {
+            DG_HOST_ASSERT(desc.block_m_override != 32 or not is_small_n);
+            block_m_candidates.push_back(desc.block_m_override);
+        }
+        else if (runtime_align == 32 and is_m_grouped) {
             // Decode alignment: BLOCK_M=32 via the kNWarps=4 warp layout. No valid warp
             // layout exists for BLOCK_M=32 with N <= 32 tiles — reject explicitly.
             DG_HOST_ASSERT(not is_small_n and "m-grouped with N <= 32 requires alignment >= 64");
@@ -64,7 +68,8 @@ struct SM120ArchSpec {
         // but only beneficial for large M (>= 2048) and non-mixed dtypes.
         const bool is_mixed = (desc.a_dtype != desc.b_dtype);
         std::vector<int> block_k_candidates;
-        if (!is_mixed and expected_m >= 2048 and not (is_m_grouped and runtime_align == 32))
+        const bool uses_bm32 = block_m_candidates.size() == 1 and block_m_candidates[0] == 32;
+        if (!is_mixed and expected_m >= 2048 and not uses_bm32)
             block_k_candidates.push_back(64 / elem_size);
         block_k_candidates.push_back(128 / elem_size);
 

@@ -18,6 +18,8 @@ struct SM120GemmDesc {
     bool cd_n_contiguous = true;
     bool ensure_zero_padding = true;
     int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
+    // Per-call masked BF16 tuning; zero preserves the original heuristic.
+    int block_m_override = 0;
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
     int get_expected_n() const { return expected_n > 0 ? expected_n : n; }
     int get_expected_k() const { return expected_k > 0 ? expected_k : k; }
@@ -34,6 +36,13 @@ struct SM120GemmDesc {
     }
 
     void check_validity() const {
+        DG_HOST_ASSERT(block_m_override == 0 or block_m_override == 32 or
+                       block_m_override == 64 or block_m_override == 128);
+        if (block_m_override != 0) {
+            DG_HOST_ASSERT(gemm_type == GemmType::MGroupedMasked and
+                           kernel_type == KernelType::KernelNoSF and
+                           a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
+        }
         if (get_mma_kind() == MmaKind::BF16) {
             DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
         } else {
@@ -63,7 +72,8 @@ struct SM120GemmDesc {
            << ", ensure_zero_padding=" << static_cast<int>(desc.ensure_zero_padding)
            << ", expected_m=" << desc.expected_m << ", expected_n=" << desc.expected_n
            << ", expected_k=" << desc.expected_k
-           << ", expected_num_groups=" << desc.expected_num_groups << ")";
+           << ", expected_num_groups=" << desc.expected_num_groups
+           << ", block_m_override=" << desc.block_m_override << ")";
         return os;
     }
 };

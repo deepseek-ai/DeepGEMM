@@ -9,6 +9,7 @@
 #include "apis/einsum.hpp"
 #include "apis/hyperconnection.hpp"
 #include "apis/gemm.hpp"
+#include "apis/sm120_moe_small.hpp"
 #include "apis/layout.hpp"
 #include "apis/mega_moe.hpp"
 #include "apis/sm90_mega.hpp"
@@ -35,6 +36,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     deep_gemm::einsum::register_apis(m);
     deep_gemm::hyperconnection::register_apis(m);
     deep_gemm::gemm::register_apis(m);
+    deep_gemm::sm120_moe_small::register_apis(m);
     deep_gemm::layout::register_apis(m);
     deep_gemm::mega::register_apis(m);
     deep_gemm::mega::register_sm90_apis(m);

@@ -245,7 +245,8 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                              const int& num_groups, const int& m, const int& n, const int& k,
                                              const int& expected_m,
                                              const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                             const std::string& compiled_dims) {
+                                             const std::string& compiled_dims,
+                                             const int block_m_override = 0) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
 
     const auto desc = SM120GemmDesc {
@@ -259,7 +260,8 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
         .num_sms = deep_gemm::runtime->get_num_sms(),
         .tc_util = deep_gemm::runtime->get_tc_util(),
         .compiled_dims = compiled_dims,
-        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
+        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups,
+        .block_m_override = block_m_override
     };
     auto config = get_best_sm120_config<SM120ArchSpec>(desc);
     if (m % config.layout.block_m != 0)
