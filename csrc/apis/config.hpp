@@ -45,6 +45,12 @@ static void register_apis(pybind11::module_& m) {
             heuristics_runtime->set_block_size_multiple_of(x, y);
         }
     });
+    m.def("num_cached_cublaslt_workspaces", []() {
+        return runtime->num_cached_cublaslt_workspaces();
+    });
+    m.def("max_cached_cublaslt_workspaces", []() {
+        return Runtime::kMaxCachedCublasLtWorkspaces;
+    });
 }
 
 } // namespace deep_gemm::config
