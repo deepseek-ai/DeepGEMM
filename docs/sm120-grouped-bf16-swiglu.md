@@ -34,11 +34,13 @@ The explicit BF16 rounding of the projections preserves the materialized BF16
 pipeline's semantics. This does not promise bitwise equality to every GEMM
 specialization or a real-number matrix product. Tests compare to the materialized
 pipeline and include an independently computed, exactly representable dot-product
-fixture. The random-input FP64 test currently fails for both ordinary and fused
-paths on RTX 5090. Independent exact-dot diagnostics locate projection differences
-near BF16 rounding boundaries. This failure is retained; no test threshold has
-been relaxed. See the [validation results](sm120-grouped-bf16-swiglu-validation.md)
-for the evidence and the remaining numerical-contract question.
+fixture. The historical random-input FP64 failure affected both ordinary and
+fused paths near BF16 rounding boundaries. The current short-dot accumulation
+and midpoint refinement pass the unchanged original checks and expanded
+seed/expert checks; no test threshold has been relaxed. This measured safeguard
+does not guarantee correct rounding for arbitrary GEMMs. See the
+[validation results](sm120-grouped-bf16-swiglu-validation.md) for current receipts
+and the retained historical failures.
 
 ## Validation
 
@@ -67,7 +69,10 @@ are identical in these branches.
 
 Status: the original 42 tests, expanded midpoint/seed tests, all-expert
 seed-0/1 FP64 checks and four sanitizers pass after the accuracy repair.
-The original failures remain recorded as historical evidence. The repair has
+The rare refinement body is shared through a warp-uniform device call.
+The outlined version also passes all 50 native BF16 regression cases;
+22-scene Graph measurements and losing cases are recorded in the current
+validation report. The original failures remain recorded as historical evidence. The repair has
 a material performance cost, so earlier speedups do not validate this revision.
 Current receipts, timing and retained BK32 spill limitations are in the
 [validation results](sm120-grouped-bf16-swiglu-validation.md); the accumulation

@@ -46,6 +46,13 @@ range. Retaining each addition's residual substantially reduces summation
 error without using FP64 in production. Normal outputs keep the tensor-core
 result.
 
+The midpoint test stays inline, while the rare recomputation body is a
+`__noinline__` device helper shared by its call sites. Its call is guarded by
+the full-warp ballot: either all 32 lanes call with the same nonzero pending
+mask, or all lanes skip it. The TwoSum operations, reduction order, midpoint
+window and projection conversion are unchanged. This reduces repeated code
+in the epilogue without adding a kernel launch or synchronization protocol.
+
 The refinement is part of the same kernel and uses no scratch allocation,
 host readback, extra launch, CTA barrier, ready counter, or global queue. Every
 math lane participates in the ballots and shuffles, including lanes whose

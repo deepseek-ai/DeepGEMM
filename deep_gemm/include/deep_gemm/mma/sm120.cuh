@@ -163,17 +163,11 @@ __device__ __forceinline__ void bf16_mma(
 // Rare BF16 midpoint refinement. FP32 accumulation can select the opposite
 // BF16 neighbor from the FP64 reference. Keep this
 // slow path outside the MMA loop; ordinary values retain the tensor-core path.
-__device__ __forceinline__ float bf16_refine_midpoint(
-    float value, const __nv_bfloat16* a, const __nv_bfloat16* b, uint32_t k, bool valid = true
+__device__ __noinline__ float bf16_refine_pending(
+    float value, const __nv_bfloat16* a, const __nv_bfloat16* b, uint32_t k, uint32_t pending
 ) {
-    const uint32_t bits = __float_as_uint(value);
-    const int distance = static_cast<int>(bits & 0xffffu) - 0x8000;
-    // This guard is a practical refinement window, not a proof of correctly
-    // rounded arbitrary GEMMs. Infinities and NaNs keep their normal behavior.
     constexpr uint32_t mask = 0xffffffffu;
     const uint32_t lane = threadIdx.x % 32;
-    uint32_t pending = __ballot_sync(mask, valid and (bits & 0x7f800000u) != 0x7f800000u
-                                    and distance >= -32 and distance <= 32);
     // All lanes in a full math warp must call this helper, even for invalid
     // output positions. Cooperate on each rare dot to keep K loads coalesced
     // and avoid a long scalar tail on the decode critical path.
@@ -207,6 +201,21 @@ __device__ __forceinline__ float bf16_refine_midpoint(
         if (lane == owner) value = refined;
         pending &= pending - 1;
     }
+    return value;
+}
+
+__device__ __forceinline__ float bf16_refine_midpoint(
+    float value, const __nv_bfloat16* a, const __nv_bfloat16* b, uint32_t k, bool valid = true
+) {
+    const uint32_t bits = __float_as_uint(value);
+    const int distance = static_cast<int>(bits & 0xffffu) - 0x8000;
+    // This guard is a practical refinement window, not a proof of correctly
+    // rounded arbitrary GEMMs. Infinities and NaNs keep their normal behavior.
+    constexpr uint32_t mask = 0xffffffffu;
+    const uint32_t lane = threadIdx.x % 32;
+    uint32_t pending = __ballot_sync(mask, valid and (bits & 0x7f800000u) != 0x7f800000u
+                                    and distance >= -32 and distance <= 32);
+    if (pending) return bf16_refine_pending(value, a, b, k, pending);
     return value;
 }
 

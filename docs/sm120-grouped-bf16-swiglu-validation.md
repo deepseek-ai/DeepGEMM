@@ -1,6 +1,85 @@
 # RTX 5090 validation: grouped BF16 SwiGLU
 
-## Accuracy repair revalidation (2026-11-15)
+## Outlined midpoint refinement revalidation (2026-11-15)
+
+This increment outlines the rare recomputation body from the accuracy repair
+at `b0eebef0d0ad04f6d1b96a9db1b31f561a20f7c3`. The ballot stays inline;
+the whole warp calls a shared device function only when its pending mask is
+nonzero. The short-dot accumulation, TwoSum arithmetic, reduction order,
+32-step window, FP64 oracle and tolerances are unchanged.
+
+The final device header passed the complete native BF16 regression (**50 passed,
+5 historical deselections**), the unchanged original **42 tests**, five expanded
+unittest methods (including seeds 2 through 31 and all 48 experts for original
+seeds 0/1), and all four sanitizers on three compact methods each. Sanitizers
+reported zero errors; racecheck also reported zero hazards and warnings.
+The host ABI did not change, so the extension from the preceding forced rebuild
+was reused, with its hash recorded. JIT kernels use the measured device header.
+
+### Same-card performance boundary
+
+22 scenes cover E=4/16/48, valid rows 1/16/32/33/64/65/128/256, K/N=896/4864
+and 4096/1024, plus empty and skewed experts with seed 23. Both revisions
+ran in opposite process orders, with 12 alternating Graph samples per path
+per scene. All valid projection, separate and fused output hashes matched
+across revisions and sweeps. Independent FP64 checks passed for all E=4
+experts and three selected experts at E=16/48; the separate original-seed
+regression checks all 48 experts. Fused invalid-row sentinels were preserved.
+An initial benchmark attempt incorrectly required ordinary GEMM padding rows
+to remain untouched and stopped before timing. That assertion was corrected
+to match the fused API's contract; its failed log is retained separately.
+Valid-row FP64 checks and tolerances were unchanged.
+
+The published control is the numerically accepted accuracy repair, not the
+older numerically failing implementation. Times below are medians in
+microseconds, on the same RTX 5090, PyTorch 2.13.0+cu132 and CUDA 13.2:
+
+| E / rows / K / N | Published fused us | Outlined fused us | Reduction | Outlined separate / fused |
+|---|---:|---:|---:|---:|
+| 4 / 1 / 896 / 4864 | 35.270 | 29.858 | 15.35% | 1.0758x |
+| 4 / 16 / 896 / 4864 | 37.678 | 36.948 | 1.94% | 1.0347x |
+| 4 / 128 / 896 / 4864 | 78.678 | 66.721 | 15.20% | 1.0500x |
+| 4 / 128 / 4096 / 1024 | 73.504 | 72.997 | 0.69% | 0.9668x |
+| 4 / 256 / 4096 / 1024 | 137.134 | 132.660 | 3.26% | 0.9990x |
+| 48 / 128 / 896 / 4864 | 1001.601 | 779.696 | 22.15% | 1.0173x |
+
+These are gate/up GEMM plus SwiGLU measurements with reused weights and
+unlocked clocks; they exclude dispatch, down projection, combine and serving.
+Sub-percent differences are not evidence of stable improvement. Sparse scenes
+are not total-row-matched to uniform scenes. The public receipt retains all
+22 scenes, raw samples, commands, hashes and losing cases.
+
+Fusion still loses by more than 1% against its own separate path in these
+measured four-expert scenes:
+
+| K / N | Valid rows by expert | Separate / fused |
+|---|---|---:|
+| 4096 / 1024 | 65, 65, 65, 65 | 0.9417x |
+| 4096 / 1024 | 128, 128, 128, 128 | 0.9668x |
+| 896 / 4864 | 0, 16, 33, 8 | 0.9568x |
+| 896 / 4864 | 0, 64, 128, 32 | 0.9698x |
+
+No outlined fused regression exceeded 1% versus the published fused control
+in this sweep.
+This sweep does not establish a universal speedup or an automatic fallback
+boundary. Callers retain explicit fused/separate API selection. Earlier
+speedups from before the accuracy repair remain historical. This PR remains
+Draft while the accuracy/performance tradeoff is reviewed. No NCU counters
+were collected on this rental GPU; instruction-cache or occupancy causes
+are not established by these timings.
+
+See [the outlined-refinement receipts](validation/sm120-bf16-noinline-20261115.json).
+The benchmark can be repeated for either source revision with a revision-matched
+JIT cache; `--variant` labels the report and does not select an implementation:
+
+```bash
+python experiments/sm120_bf16_refinement_boundary.py \
+  --variant outlined --sweep 0 --output boundary-0.json
+python experiments/sm120_bf16_refinement_boundary.py \
+  --variant outlined --sweep 1 --output boundary-1.json
+```
+
+## Earlier accuracy repair revalidation (2026-11-15; b0eebef)
 
 The unchanged original strict test now passes for both seeds. This section
 describes the accuracy increment on top of PR #501's paired-store HEAD
@@ -33,7 +112,7 @@ The midpoint window is a measured accuracy safeguard, not a proof of correct
 rounding for arbitrary input distributions, K or exponent ranges. See
 [the accuracy design](sm120-bf16-accuracy.md).
 
-### Current timing and performance cost
+### Timing and performance cost at b0eebef
 
 GPU: `GPU-a7236a53-2726-62c6-41b5-0e53713a0063, NVIDIA GeForce RTX 5090, 610.57.04`. PyTorch `2.13.0+cu132`, CUDA `13.2`.
 K=896, N=4864, seed 0, capacity 128, 12 alternating CUDA Graph timing samples
