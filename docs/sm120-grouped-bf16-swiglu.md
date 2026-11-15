@@ -65,9 +65,11 @@ output address is four-byte aligned and both columns are valid. Odd-N tails and
 two-byte-offset output views use scalar stores. Projection rounding and activation
 are identical in these branches.
 
-Status: compiled and measured on RTX 5090, with a retained random-input FP64
-failure. This is still a draft, not an all-tests-passing contribution. Detailed
-test counts, measured speedups, regressions and known BK32 spilling are recorded
-in the [validation results](sm120-grouped-bf16-swiglu-validation.md). Measurements
-from RTX PRO 6000 or the broader research prototype are not used as validation
-of this patch.
+Status: the original 42 tests, expanded midpoint/seed tests, all-expert
+seed-0/1 FP64 checks and four sanitizers pass after the accuracy repair.
+The original failures remain recorded as historical evidence. The repair has
+a material performance cost, so earlier speedups do not validate this revision.
+Current receipts, timing and retained BK32 spill limitations are in the
+[validation results](sm120-grouped-bf16-swiglu-validation.md); the accumulation
+change and its measured scope are in the [accuracy design](sm120-bf16-accuracy.md).
+This remains a Draft for review of the accuracy/performance tradeoff.

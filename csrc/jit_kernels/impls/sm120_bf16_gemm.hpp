@@ -24,6 +24,8 @@ public:
         int stride_d_m = 0;
         int stride_c_m = 0;
         int stride_d_batch = 0;
+        int stride_a_m = 0;
+        int stride_b_n = 0;
         bool fused_swiglu = false;
 
         void* gmem_d;
@@ -92,6 +94,7 @@ static void __instantiate_kernel() {{
             args.tensor_map_buffer,
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.epilogue_args, args.stride_d_m, args.stride_c_m, args.stride_d_batch,
+            args.stride_a_m, args.stride_b_n,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_cd);
     }
@@ -285,10 +288,12 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                   1),
         .epilogue_type = std::nullopt,
         .stride_d_m = static_cast<int>(d.stride(-2)),
+        .stride_a_m = static_cast<int>(a.stride(-2)),
+        .stride_b_n = static_cast<int>(b.stride(-2)),
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
-        .gmem_a_ptr = nullptr,
-        .gmem_b_ptr = nullptr,
+        .gmem_a_ptr = a.data_ptr(),
+        .gmem_b_ptr = b.data_ptr(),
         .grouped_layout = masked_m.data_ptr(),
         .tensor_map_buffer = nullptr,
         .tensor_map_a = tensor_map_a,
@@ -347,11 +352,13 @@ static void sm120_m_grouped_bf16_swiglu_masked(const torch::Tensor& a,
                                        config.pipeline_config.smem_size, 1),
         .epilogue_type = std::nullopt,
         .stride_d_m = static_cast<int>(d.stride(-2)),
+        .stride_a_m = static_cast<int>(a.stride(-2)),
+        .stride_b_n = static_cast<int>(b.stride(-2)),
         .fused_swiglu = true,
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
-        .gmem_a_ptr = nullptr,
-        .gmem_b_ptr = nullptr,
+        .gmem_a_ptr = a.data_ptr(),
+        .gmem_b_ptr = b.data_ptr(),
         .grouped_layout = masked_m.data_ptr(),
         .tensor_map_buffer = nullptr,
         .tensor_map_a = tensor_map_a,

@@ -1,0 +1,424 @@
+{
+  "gpu": "GPU-a7236a53-2726-62c6-41b5-0e53713a0063, NVIDIA GeForce RTX 5090, 610.57.04",
+  "validation_steps": 9,
+  "all_experts_passed": true,
+  "expert_path_comparisons": 192,
+  "original_contract_test_unchanged": true,
+  "parent_source_hashes": {
+    "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "8ee492ea4d4e0c4045fe77fd1fcfe5f0314f877168fd25c88f32070a43255928",
+    "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "bcc75a436bb6af663a24c02668693759b988b2b7395706c607d26d0931c93ac9",
+    "deep_gemm/include/deep_gemm/mma/sm120.cuh": "5199232b50c8b9518a60f377cb3b1286c8fb14e6129369e2e1c2415073b3217c"
+  },
+  "source_hashes": {
+    "csrc/python_api.cpp": "da4d9eca87514b21f706ff7ce69fd1f3257691ea28675b4f5cd09b6b895cf181",
+    "csrc/apis/gemm.hpp": "e18c73ec0e1e9bee3cd972f2056ee4b1136263ab560ee41262645a86136f4a71",
+    "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "2a86246243126f3d6cfb39ad2acc51fde692824a5f0ac8e938a2c83756371860",
+    "deep_gemm/include/deep_gemm/mma/sm120.cuh": "9984abb5a6c4c3903b7c49c8b06a3e6a867502225a4f016d3729e30a20483c0a",
+    "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "b605f7d081d735c89b4d351a8417475086585842ec59ce0c27b0179b9ef46bcc",
+    "tests/test_sm120_grouped_swiglu.py": "b973900a08daae91a07d60f6c66ed1ddbb1483604911ef54062e12141fed13d0",
+    "tests/test_sm120_bf16_accumulation.py": "1012ff58a4e6c36036c8bb2ea765d58abbc7c27059cff5daa9d0e2be7cc35a68",
+    "tests/run_sm120_bf16_accuracy_validation.py": "107f843db2f12b6580ab323713a853e9e47be5d72bfc501c573540459135de4f",
+    "tests/fixtures/sm120_moe/midpoint-inputs.pt": "fd2d91443621016e3186c3303d7742ac9f7cd95d704969f67c36d6d3270c2a9b",
+    "tests/fixtures/sm120_moe/midpoint-seed2-inputs.pt": "2cd1e3b4a769c577631cfbc0a90957824a202c4abd1bfa6507771c9877d31c7d",
+    "experiments/sm120_grouped_swiglu_native.py": "d55312285db1646d504173a81eb9f6e0d30184f8403336dac2df7ab8be8cae73"
+  },
+  "timing": [
+    {
+      "rows": 16,
+      "before": {
+        "grouped_plus_swiglu": 27.45111684960644,
+        "grouped_fused": 26.294312443615333
+      },
+      "after": {
+        "grouped_plus_swiglu": 40.07470681589014,
+        "grouped_fused": 37.82036531904541
+      },
+      "before_samples_us": {
+        "grouped_plus_swiglu": [
+          27.211204685576973,
+          27.435191806993988,
+          27.45282267624477,
+          27.459821701049805,
+          27.44259165422949,
+          27.445884744850503,
+          27.449490796674436,
+          27.452742902538443,
+          27.458499045599073,
+          27.506092547157035,
+          27.49481429870752,
+          27.42142701886364
+        ],
+        "grouped_fused": [
+          26.170197095106158,
+          26.311218543130842,
+          26.291782939776827,
+          26.2835073937034,
+          26.296679076657803,
+          26.292912419230795,
+          26.29172989998706,
+          26.286760360475572,
+          26.295712467999866,
+          26.29665105207358,
+          26.31854299981165,
+          26.305660765253783
+        ]
+      },
+      "after_samples_us": {
+        "grouped_plus_swiglu": [
+          39.862093519657215,
+          40.11442703751813,
+          40.11454494606478,
+          40.05232949744068,
+          40.04829789316931,
+          40.04348261689762,
+          40.043515388411706,
+          40.08230654721333,
+          40.09942268942766,
+          40.10383094229349,
+          40.119170669290625,
+          40.067107084566956
+        ],
+        "grouped_fused": [
+          37.652290499940214,
+          37.82155070684652,
+          37.81917993124429,
+          37.81182364566331,
+          37.81529215515637,
+          37.81646343699673,
+          37.822764557186915,
+          37.82415701418507,
+          37.835953015239305,
+          37.83841373539772,
+          37.81328895235755,
+          37.83568729226205
+        ]
+      },
+      "before_speedup": 1.0439944725108032,
+      "after_speedup": 1.059606550011549,
+      "fused_after_over_before": 1.4383477567685472,
+      "separate_after_over_before": 1.4598570628453202
+    },
+    {
+      "rows": 128,
+      "before": {
+        "grouped_plus_swiglu": 49.891816150574456,
+        "grouped_fused": 49.828234651958056
+      },
+      "after": {
+        "grouped_plus_swiglu": 78.02505045095265,
+        "grouped_fused": 77.98096659014588
+      },
+      "before_samples_us": {
+        "grouped_plus_swiglu": [
+          49.56433744315641,
+          49.63064219997606,
+          49.59967867351193,
+          49.855081882317414,
+          49.926102520668344,
+          49.89056587219238,
+          49.92882161900617,
+          49.912057036445255,
+          49.894938948591786,
+          49.89306642895653,
+          49.921867804612944,
+          49.83131164728209
+        ],
+        "grouped_fused": [
+          49.66020609402847,
+          49.66248118082682,
+          49.79581935431367,
+          49.79486061782433,
+          49.8296905966366,
+          49.83917064767666,
+          49.82761852244005,
+          49.817448066025186,
+          49.855881344418314,
+          49.840797964982166,
+          49.84374979816417,
+          49.828850781476056
+        ]
+      },
+      "after_samples_us": {
+        "grouped_plus_swiglu": [
+          77.751097785102,
+          77.7460106417664,
+          77.78889721837537,
+          78.043370390143,
+          78.05861431619395,
+          78.02771457786724,
+          77.99934635991636,
+          78.03706620868883,
+          78.07333716030779,
+          78.02238632403805,
+          78.09500929486056,
+          78.01029320919152
+        ],
+        "grouped_fused": [
+          77.84514200119744,
+          77.87189863592506,
+          77.99613967774407,
+          77.98870908535594,
+          78.02804388651035,
+          78.00687955120416,
+          77.93767232013994,
+          77.96979805387824,
+          78.04201275522259,
+          77.97322409493583,
+          78.0362190738801,
+          77.9704132387715
+        ]
+      },
+      "before_speedup": 1.0012760134702845,
+      "after_speedup": 1.0005653156498875,
+      "fused_after_over_before": 1.56499557198504,
+      "separate_after_over_before": 1.56388475046632
+    }
+  ],
+  "clocks_locked": false,
+  "torch": "2.13.0+cu132",
+  "cuda": "13.2",
+  "extension_sha256": "684be765f48614e87251119d2ff009fb6c6e46d007c4bb4f4652aa91290264fe",
+  "native_summary": "50 passed, 5 deselected",
+  "validation_receipts": [
+    {
+      "name": "midpoint-regression",
+      "command": [
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_bf16_accumulation",
+        "-v"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "midpoint-regression.log",
+      "log_sha256": "42950d3fc2162188ddf4ea53500543c34019698d45e40a134fb7bdbbe5c7fe01",
+      "elapsed_seconds": 61.634318579919636
+    },
+    {
+      "name": "original-contract",
+      "command": [
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "pytest",
+        "tests/test_sm120_grouped_swiglu.py",
+        "-vv"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "original-contract.log",
+      "log_sha256": "b76bb5a6a2de95595d16f4415f8e53399ab5dfb295ddf50c3a6e730410edd5a5",
+      "elapsed_seconds": 104.79421873856336
+    },
+    {
+      "name": "native-regression",
+      "command": [
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "pytest",
+        "tests/test_sm120_bf16_gemm.py",
+        "tests/test_sm120_bf16_odd_n.py",
+        "tests/test_sm120_native_rejections.py",
+        "-k",
+        "not k_grouped_small_stride and not test_filter",
+        "-vv"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "native-regression.log",
+      "log_sha256": "75b4e5350018bb6df54b76f9b0bd09a3184c33a6491f692aa2b4934933af121c",
+      "elapsed_seconds": 590.235987951979
+    },
+    {
+      "name": "memcheck",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--error-exitcode",
+        "99",
+        "--print-limit",
+        "32",
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_saved_midpoint_projections_and_fp32_output",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_saved_double_rounding_projection",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_odd_shape_graph_on_nondefault_stream",
+        "-v"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "memcheck.log",
+      "log_sha256": "0838e05a771d0d7429d292da3500ce7a7660903502024fb4a6d21f3e171175de",
+      "elapsed_seconds": 9.8590779742226
+    },
+    {
+      "name": "synccheck",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "synccheck",
+        "--error-exitcode",
+        "99",
+        "--print-limit",
+        "32",
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_saved_midpoint_projections_and_fp32_output",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_saved_double_rounding_projection",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_odd_shape_graph_on_nondefault_stream",
+        "-v"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "synccheck.log",
+      "log_sha256": "4476bf3789c2864ac8b4d4364c45270b91278e4950087b61ff9a2a1f5233119e",
+      "elapsed_seconds": 4.935092422179878
+    },
+    {
+      "name": "racecheck",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "racecheck",
+        "--error-exitcode",
+        "99",
+        "--print-limit",
+        "32",
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_saved_midpoint_projections_and_fp32_output",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_saved_double_rounding_projection",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_odd_shape_graph_on_nondefault_stream",
+        "-v"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "racecheck.log",
+      "log_sha256": "eb869fd1b3b771fe8ef880445ae8f92768882fcfc2a2c1aa2abb020f92c83490",
+      "elapsed_seconds": 12.077920144423842
+    },
+    {
+      "name": "initcheck",
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "initcheck",
+        "--error-exitcode",
+        "99",
+        "--print-limit",
+        "32",
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_saved_midpoint_projections_and_fp32_output",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_saved_double_rounding_projection",
+        "tests.test_sm120_bf16_accumulation.Bf16AccumulationTest.test_odd_shape_graph_on_nondefault_stream",
+        "-v"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "initcheck.log",
+      "log_sha256": "4f95535684c26a8a0fd7c0eccb442d2b7fa4be1bc72c0021e2fa0a235829b974",
+      "elapsed_seconds": 4.630789211951196
+    },
+    {
+      "name": "timing-m16",
+      "command": [
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "experiments/sm120_grouped_swiglu_native.py",
+        "--rows",
+        "16",
+        "16",
+        "16",
+        "16",
+        "--max-m",
+        "128",
+        "--repeats",
+        "12",
+        "--output",
+        "/root/sm120-work/pr501-accuracy1/results/timing-m16.json"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "timing-m16.log",
+      "log_sha256": "0fac5b651be8abdc3bca6ecf49bc07aa43e5e920ab770c601622a1b6fbe4215c",
+      "elapsed_seconds": 9.339338664896786
+    },
+    {
+      "name": "timing-m128",
+      "command": [
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "experiments/sm120_grouped_swiglu_native.py",
+        "--rows",
+        "128",
+        "128",
+        "128",
+        "128",
+        "--max-m",
+        "128",
+        "--repeats",
+        "12",
+        "--output",
+        "/root/sm120-work/pr501-accuracy1/results/timing-m128.json"
+      ],
+      "passed": true,
+      "exit_code": 0,
+      "log": "timing-m128.log",
+      "log_sha256": "99aa0e0028c7ab0a937d6ac92b0a256925327e0964c80ca7bca9a14cf1ab1ec6",
+      "elapsed_seconds": 8.533246994949877
+    }
+  ],
+  "all_experts_receipt": {
+    "passed": true,
+    "command": [
+      "/usr/local/miniconda3/envs/py312/bin/python",
+      "-u",
+      "-m",
+      "unittest",
+      "tests.test_sm120_bf16_all_experts",
+      "-v"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 4.317972080782056,
+    "source_hashes": {
+      "csrc/python_api.cpp": "da4d9eca87514b21f706ff7ce69fd1f3257691ea28675b4f5cd09b6b895cf181",
+      "csrc/apis/gemm.hpp": "e18c73ec0e1e9bee3cd972f2056ee4b1136263ab560ee41262645a86136f4a71",
+      "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "2a86246243126f3d6cfb39ad2acc51fde692824a5f0ac8e938a2c83756371860",
+      "deep_gemm/include/deep_gemm/mma/sm120.cuh": "9984abb5a6c4c3903b7c49c8b06a3e6a867502225a4f016d3729e30a20483c0a",
+      "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "b605f7d081d735c89b4d351a8417475086585842ec59ce0c27b0179b9ef46bcc",
+      "tests/test_sm120_grouped_swiglu.py": "b973900a08daae91a07d60f6c66ed1ddbb1483604911ef54062e12141fed13d0",
+      "tests/test_sm120_bf16_accumulation.py": "1012ff58a4e6c36036c8bb2ea765d58abbc7c27059cff5daa9d0e2be7cc35a68",
+      "tests/run_sm120_bf16_accuracy_validation.py": "107f843db2f12b6580ab323713a853e9e47be5d72bfc501c573540459135de4f",
+      "tests/fixtures/sm120_moe/midpoint-inputs.pt": "fd2d91443621016e3186c3303d7742ac9f7cd95d704969f67c36d6d3270c2a9b",
+      "tests/fixtures/sm120_moe/midpoint-seed2-inputs.pt": "2cd1e3b4a769c577631cfbc0a90957824a202c4abd1bfa6507771c9877d31c7d",
+      "experiments/sm120_grouped_swiglu_native.py": "d55312285db1646d504173a81eb9f6e0d30184f8403336dac2df7ab8be8cae73"
+    },
+    "test_sha256": "807ad935d290e9933098b729c697a29064fc4c53cb0e0d95e71e696eb992fa82",
+    "seeds": [
+      0,
+      1
+    ],
+    "experts_per_seed": 48,
+    "paths": [
+      "ordinary",
+      "fused"
+    ],
+    "rtol": 0.01,
+    "atol": 0.002
+  },
+  "parent_original_fp64_exit_code": 1,
+  "parent_original_fp64_log_sha256": "008858f59d73fc209f44c6830f20f89f9864fab4ea89e0f766b035ab339468ef"
+}

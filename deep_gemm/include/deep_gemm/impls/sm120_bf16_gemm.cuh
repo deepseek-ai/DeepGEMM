@@ -50,6 +50,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                      const epilogue_type_t epilogue,
                      uint32_t stride_d_m, uint32_t stride_c_m, uint32_t stride_d_batch,
+                     uint32_t stride_a_m, uint32_t stride_b_n,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
@@ -385,6 +386,33 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             }
 
             // Epilogue
+            if constexpr (kGemmType == GemmType::MGroupedMasked and kBKMajor) {
+                const uint32_t group = scheduler.current_group_idx;
+                const uint32_t row_base = m_block_idx * BLOCK_M;
+                const uint32_t n_base = n_block_idx * BLOCK_N;
+                const uint32_t weight_n = shape_n * (kFusedSwiGLU ? 2 : 1);
+                #pragma unroll
+                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                    #pragma unroll
+                    for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 4; ++j) {
+                            const uint32_t row = row_base + (m_tile_base + mt) * MMA_M + group_id + (j / 2) * 8;
+                            const uint32_t col = n_base + (n_tile_base + nt) * MMA_N + thread_id * 2 + j % 2;
+                            const uint32_t index = (mt * kNTilesPerWarp + nt) * MMA_ACCUM + j;
+                            const bool valid = row < static_cast<uint32_t>(grouped_layout[group]) and row < shape_m and col < shape_n;
+                            const auto* a = reinterpret_cast<const __nv_bfloat16*>(gmem_a_ptr) +
+                                (static_cast<int64_t>(group) * shape_m + (valid ? row : 0)) * stride_a_m;
+                            const auto* b = reinterpret_cast<const __nv_bfloat16*>(gmem_b_ptr) +
+                                (static_cast<int64_t>(group) * weight_n + (valid ? col : 0)) * stride_b_n;
+                            accum[index] = sm120_mma::bf16_refine_midpoint(accum[index], a, b, shape_k, valid);
+                            if constexpr (kFusedSwiGLU)
+                                accum_up[index] = sm120_mma::bf16_refine_midpoint(accum_up[index], a,
+                                    b + static_cast<int64_t>(shape_n) * stride_b_n, shape_k, valid);
+                        }
+                    }
+                }
+            }
             if constexpr (not kFusedSwiGLU)
                 epilogue.apply_values(*reinterpret_cast<uint32_t(*)[kAccumPerWarp]>(accum));
             constexpr bool kEpilogueGroupOffset = not is_m_grouped_contiguous(kGemmType);

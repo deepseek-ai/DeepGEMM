@@ -1,5 +1,69 @@
 # RTX 5090 validation: grouped BF16 SwiGLU
 
+## Accuracy repair revalidation (2026-11-15)
+
+The unchanged original strict test now passes for both seeds. This section
+describes the accuracy increment on top of PR #501's paired-store HEAD
+`a2c6ef10f475282a7df1a78c6a6b92d875a1cb58`. It does not include later
+dispatch, down/combine or small-decode research kernels.
+
+- Original grouped SwiGLU contract: **42 passed**, including unchanged seed-0/1
+  independent FP64 checks. The original test file is unchanged.
+- Added midpoint/boundary regression: four unittest methods passed, including
+  the original strict comparison extended to seeds 2 through 31, saved rational
+  midpoint cases, double-rounding behavior, odd shape/output guards and changed
+  input/count Graph replay on a nondefault stream.
+- All-expert extension: the original two seeds passed for **all 48 experts**
+  in both ordinary and fused paths (192 expert/path comparisons). Seeds,
+  dimensions and `rtol=1e-2, atol=2e-3` are unchanged.
+- Native BF16 regression: **50 passed, 5 deselected**. The historical small-stride rejection
+  exclusions and pytest's imported `test_filter` helper exclusions are retained
+  and are explicit in the recorded command; no numerical test was deselected.
+- Memcheck, synccheck, racecheck and initcheck each passed the three compact
+  midpoint/Graph/boundary methods with zero errors. Racecheck also reported
+  zero hazards and zero warnings.
+- The extension was rebuilt with `--force`; kernel/test hashes remained stable
+  during the validation. Commands, GPU identity, hashes and timing samples are
+  retained in [the machine-readable receipts](validation/sm120-bf16-accuracy-20261115.json).
+
+The repair uses short zero-C BF16 MMA partial dots, explicit FP32 additions,
+and warp-cooperative two-FP32 midpoint refinement. It preserves BF16 projection
+rounding and the existing reference conversion; production uses no FP64.
+The midpoint window is a measured accuracy safeguard, not a proof of correct
+rounding for arbitrary input distributions, K or exponent ranges. See
+[the accuracy design](sm120-bf16-accuracy.md).
+
+### Current timing and performance cost
+
+GPU: `GPU-a7236a53-2726-62c6-41b5-0e53713a0063, NVIDIA GeForce RTX 5090, 610.57.04`. PyTorch `2.13.0+cu132`, CUDA `13.2`.
+K=896, N=4864, seed 0, capacity 128, 12 alternating CUDA Graph timing samples
+per path. The parent numerical failure is retained separately; its timing
+is diagnostic and is not a numerically accepted alternative. Current timings
+are measured from the same sources as the successful validation above.
+
+| E / valid rows per expert | Parent separate µs | Parent fused µs | Current separate µs | Current fused µs | Current speedup |
+|---|---:|---:|---:|---:|---:|
+| 4 / 16 | 27.451 | 26.294 | 40.075 | 37.820 | 1.0596x |
+| 4 / 128 | 49.892 | 49.828 | 78.025 | 77.981 | 1.0006x |
+
+Against the parent fused kernel, repaired fused latency increases by 43.8%
+and 56.5% in these two scenes. The repaired fused kernel is about 6.0% faster
+than the repaired separate path at 16 rows; the 128-row difference is parity
+within measurement noise. These results do not establish a general speedup.
+
+The parent and repaired processes ran sequentially on the same physical GPU
+with unlocked clocks and reused weights. These two scenes measure L1 GEMM plus
+SwiGLU only, excluding down projection, routing, communication and serving.
+They do not repeat or supersede the earlier 413-scene performance sweep.
+The accuracy change has a real cost; historical speedups below must not be
+advertised as measurements of this revision. Known BK32 spilling remains.
+PR Draft status is retained while the accuracy/performance tradeoff is reviewed.
+
+## Historical validation before the accuracy repair
+
+The following results describe the previous implementation. Their original
+failures and timings are preserved verbatim as historical evidence.
+
 Measured on NVIDIA GeForce RTX 5090, PyTorch `2.13.0+cu130` (PyTorch reports CUDA
 13.0). The measured source is commit
 `6cfdc45ac28d7a4ed9347f5ae9dd62eb6c6a2419` plus the paired-output-store change
