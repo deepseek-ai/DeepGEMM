@@ -70,7 +70,8 @@ struct alignas(128) MegaMoESignals {
     uint32_t shared_l2_task_count[kNumDeviceLocalityDomains];
 
     // Combine readiness: `combine_ready_grid_idx[peer] == own grid index` means the peer's L2 writes into this
-    // rank are done; grid indices are unique per launch, so no reset is needed. Peers push theirs during dispatch.
+    // rank are done. Peers push their grid indices during dispatch; dispatch clears the previous launch's tags,
+    // as CUDA graph replays reuse grid indices.
     alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
     alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
 
