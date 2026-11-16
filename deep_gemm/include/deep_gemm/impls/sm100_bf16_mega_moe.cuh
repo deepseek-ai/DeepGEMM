@@ -354,8 +354,12 @@ sm100_bf16_mega_moe_impl(void* y,
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
-            if (thread_idx < kNumRanks)
+            if (thread_idx < kNumRanks) {
                 *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+                // Clear the previous launch's tag, as CUDA graph replays reuse the grid index;
+                // peer `thread_idx` writes this launch's tag only after the pull barrier below
+                *workspace.get_combine_ready_grid_idx_ptr(thread_idx) = 0;
+            }
             __syncwarp();
 
             #pragma unroll

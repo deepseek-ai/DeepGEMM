@@ -350,6 +350,30 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     else:
         create_inputs()
 
+    # CUDA graph replays reuse the kernel's grid index; alternating two routings exposes any read of the
+    # previous replay's results
+    num_graph_replays = 100
+    perm = torch.randperm(num_tokens, device='cuda')
+    routings = [(topk_idx.clone(), topk_weights.clone()), (topk_idx[perm], topk_weights[perm])]
+
+    def set_routing(i: int):
+        topk_idx.copy_(routings[i][0])
+        topk_weights.copy_(routings[i][1])
+
+    ref_ys = []
+    for i in range(2):
+        set_routing(i)
+        ref_ys.append(run_fused()[0])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_y, _ = run_fused()
+    for i in range(num_graph_replays):
+        set_routing(i % 2)
+        graph.replay()
+        assert torch.equal(graph_y, ref_ys[i % 2]), f'CUDA graph replay #{i + 1} mismatched'
+    dist_print(f'CUDA graph replay test: {num_graph_replays} replays passed', once_in_node=True)
+    dist_print(once_in_node=True)
+
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
     gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
