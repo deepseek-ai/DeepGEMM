@@ -45,7 +45,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
           uint32_t kSplitKFactor = 1,
-          uint32_t kKAlignment = 128>
+          uint32_t kKAlignment = 128,
+          uint32_t kNumEmulatedSplits = 1>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
@@ -76,6 +77,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     // Hosts instantiate `epilogue::operators::Identity` or `ScaleByAlpha` only: SM120 epilogues scale or store
     // the accumulators, with no FP8 output and no stochastic rounding
     const epilogue_operator_t epilogue(epilogue_args);
+    // Emulated split-K computes each tile's K in `kNumEmulatedSplits` ranges, exactly as `kSplitKFactor` splits them,
+    // and sums the partials in the order `sm120_split_k_reduce` does: bitwise the same result without the workspace
+    DG_STATIC_ASSERT(kNumEmulatedSplits == 1 or (kSplitKFactor == 1 and kGemmType == GemmType::Normal),
+                     "Emulated split-K is for unsplit normal GEMMs");
     DG_STATIC_ASSERT(!(kIsFP4 && kBIsFP4), "Use kIsFP4 for symmetric FP4x4, not kBIsFP4");
     // kAIsFP4 = mixed FP4_A x FP8_B (swapAB of the FP8xFP4 mixed path): A fp4-unpacked at k32, B fp8.
     DG_STATIC_ASSERT(!(kAIsFP4 && (kIsFP4 || kBIsFP4)), "kAIsFP4 (fp4_A x fp8_B) is exclusive");
@@ -378,6 +383,17 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 const uint32_t k_per_split = num_k_blocks_total / kSplitKFactor;
                 num_k_blocks_start = scheduler.split_k_idx * k_per_split;
                 num_k_blocks = ((scheduler.split_k_idx == kSplitKFactor - 1) ? num_k_blocks_total : num_k_blocks_start + k_per_split) - num_k_blocks_start;
+            }
+
+            float split_sum[kNumEmulatedSplits > 1 ? kAccumPerWarp : 1];
+            #pragma unroll 1
+            for (uint32_t emulated_split_idx = 0; emulated_split_idx < kNumEmulatedSplits; ++ emulated_split_idx) {
+            if constexpr (kNumEmulatedSplits > 1) {
+                // The K blocks of split `emulated_split_idx`, as `kSplitKFactor` computes them; the producer loads all
+                // K blocks in order, so the consumed stages are unchanged
+                const uint32_t k_per_split = num_k_blocks_total / kNumEmulatedSplits;
+                const uint32_t split_start = emulated_split_idx * k_per_split;
+                num_k_blocks = (emulated_split_idx == kNumEmulatedSplits - 1 ? num_k_blocks_total : split_start + k_per_split) - split_start;
             }
 
             #pragma unroll
@@ -1329,6 +1345,19 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     empty_barriers[stage]->arrive();
             }
             } // else (!kUseSFMajorLoop) — original path
+
+            if constexpr (kNumEmulatedSplits > 1) {
+                // `sm120_split_k_reduce`'s order: the first partial, then each later one added in turn
+                #pragma unroll
+                for (uint32_t i = 0; i < kAccumPerWarp; ++i)
+                    split_sum[i] = emulated_split_idx == 0 ? accum[i] : __fadd_rn(split_sum[i], accum[i]);
+            }
+            } // emulated splits
+            if constexpr (kNumEmulatedSplits > 1) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kAccumPerWarp; ++i)
+                    accum[i] = split_sum[i];
+            }
 
             // Epilogue
             if constexpr (kSplitKFactor > 1) {
