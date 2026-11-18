@@ -34,7 +34,8 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
-          typename epilogue_operator_t>
+          typename epilogue_operator_t,
+          uint32_t kNumLocalityDomains = 1>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -43,7 +44,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                             const int* cluster_locality) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
@@ -193,8 +195,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4>(
-        shape_m, shape_n, shape_k, grouped_layout);
+    auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4, kNumLocalityDomains>(
+        shape_m, shape_n, shape_k, grouped_layout, cluster_locality);
     epilogue_operator_t epilogue_operator(epilogue_args);
 
     // Pipeline and TMA phases
@@ -281,10 +283,20 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                 if constexpr (kMajorA == cute::UMMA::Major::MN)
                     tma::copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
                         &tensor_map_a, &smem.full_barriers[stage_idx], smem.a[stage_idx], m_idx, k_a_idx, kNumMulticast, batch_idx);
-                if constexpr (kMajorB == cute::UMMA::Major::K)
+                if constexpr (kNumLocalityDomains > 1) {
+                    // Localized B `(domains, groups, N / domains, K)` has the 4D tensor map `(K, N / domains, domains, groups)`.
+                    // Clusters multicast on A, so `n_idx` has no CTA offset and a block never straddles two domains
+                    DG_STATIC_ASSERT(kMajorB == cute::UMMA::Major::K and kIsMulticastOnA, "Localized B must be K-major and multicast on A");
+                    const auto num_local_n = shape_n / kNumLocalityDomains;
+                    const auto domain_idx = n_block_idx * BLOCK_N / num_local_n;
+                    const auto group_idx = static_cast<uint32_t>(cute::max(0, grouped_layout[m_block_idx * BLOCK_M]));
+                    tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 4>(
+                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], kNumMulticast,
+                        k_b_idx, n_block_idx * BLOCK_N - domain_idx * num_local_n, domain_idx, group_idx);
+                } else if constexpr (kMajorB == cute::UMMA::Major::K)
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
                         &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], k_b_idx, n_idx, kNumMulticast, batch_idx);
-                if constexpr (kMajorB == cute::UMMA::Major::MN)
+                if constexpr (kNumLocalityDomains == 1 and kMajorB == cute::UMMA::Major::MN)
                     tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
                         &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], n_idx, k_b_idx, kNumMulticast, batch_idx);
 

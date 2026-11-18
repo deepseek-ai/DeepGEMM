@@ -30,6 +30,11 @@ public:
         CUtensorMap tensor_map_sfa;
         CUtensorMap tensor_map_sfb;
         CUtensorMap tensor_map_cd;
+
+        // Localized B: the number of locality domains B is split into along N (1 if not localized), and the
+        // cluster table of the locality-aware schedule (`nullptr` for the original schedule), see `sched::Scheduler`
+        int num_b_locality_domains = 1;
+        const void* cluster_locality = nullptr;
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -57,7 +62,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -76,7 +81,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.layout.swap_ab, args.gemm_desc.ensure_zero_padding,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         a_dtype, b_dtype, to_string(args.gemm_desc.cd_dtype),
-        args.epilogue_class->get_epilogue_operator_type()), args.epilogue_class->compiler_options());
+        args.epilogue_class->get_epilogue_operator_type(),
+        args.cluster_locality != nullptr ? args.num_b_locality_domains : 1), args.epilogue_class->compiler_options());
 
         // Launch
         jit->launch(
@@ -85,7 +91,8 @@ static void __instantiate_kernel() {{
             args.epilogue_class->make_epilogue_operator_args(args.gemm_desc.m, args.gemm_desc.n),
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
-            args.tensor_map_cd
+            args.tensor_map_cd,
+            args.cluster_locality
         );
     }
 };
@@ -177,7 +184,8 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                                          const bool& use_psum_layout,
                                                          const bool& ensure_zero_padding,
                                                          const std::optional<int>& expected_m_for_psum_layout,
-                                                         const std::shared_ptr<EpilogueClass>& epilogue_class) {
+                                                         const std::shared_ptr<EpilogueClass>& epilogue_class,
+                                                         const std::optional<torch::Tensor>& cluster_locality = std::nullopt) {
     const auto gemm_type = use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
 
@@ -211,11 +219,28 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
                                               config.layout.block_k,
                                               static_cast<int>(a.stride(get_non_contiguous_dim(major_a))), 1,
                                               config.storage_config.swizzle_a_mode, 0, false, not desc.is_mxf4_mma());
-    const auto tensor_map_b = make_tma_b_desc(major_b, b, n, k,
-                                              config.storage_config.load_block_n,
-                                              config.layout.block_k,
-                                              static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
-                                              config.storage_config.swizzle_b_mode, 0, false, not desc.is_mxf4_mma());
+    // Localized B `(num_domains, G, N / num_domains, K)` (K-major) uses the 4D tensor map `(K, N / num_domains, num_domains, G)`
+    // and the locality-aware schedule (`cluster_locality`), where the clusters of a domain only take the blocks of its N half
+    const bool is_b_localized = cluster_locality.has_value();
+    const int num_b_locality_domains = is_b_localized ? static_cast<int>(b.size(0)) : 1;
+    if (is_b_localized) {
+        DG_HOST_ASSERT(b.dim() == 4 and num_b_locality_domains == 2 and major_b == cute::UMMA::Major::K and not use_psum_layout);
+        DG_HOST_ASSERT(config.layout.swap_ab and config.layout.get_cluster_size() == 2 and config.layout.cluster_n == 2);
+        // Each domain takes whole N blocks, and an even number of them so that the two CTAs of a cluster share an M block
+        DG_HOST_ASSERT(n % (num_b_locality_domains * config.layout.block_n * config.layout.cluster_n) == 0 and
+                       "Localized B needs N to be a multiple of 512");
+        DG_HOST_ASSERT(config.launch_config.num_sms == runtime->get_num_sms());
+    }
+    const auto tensor_map_b = is_b_localized ?
+        make_tma_4d_desc(b, k, n / num_b_locality_domains, num_b_locality_domains, num_groups,
+                         config.layout.block_k, config.storage_config.load_block_n, 1, 1,
+                         b.stride(-2), b.stride(0), b.stride(1),
+                         config.storage_config.swizzle_b_mode, 0, false, not desc.is_mxf4_mma()) :
+        make_tma_b_desc(major_b, b, n, k,
+                        config.storage_config.load_block_n,
+                        config.layout.block_k,
+                        static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
+                        config.storage_config.swizzle_b_mode, 0, false, not desc.is_mxf4_mma());
     const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
                                                 config.storage_config.store_block_m,
                                                 config.storage_config.store_block_n,
@@ -247,7 +272,9 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd = tensor_map_cd
+        .tensor_map_cd = tensor_map_cd,
+        .num_b_locality_domains = num_b_locality_domains,
+        .cluster_locality = is_b_localized ? cluster_locality->data_ptr() : nullptr
     });
 }
 

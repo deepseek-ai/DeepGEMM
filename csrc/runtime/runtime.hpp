@@ -36,6 +36,8 @@ public:
     torch::Tensor sm_locality_domains;
     // We need to balance the SMs across locality domains to provide simpler load balancing
     torch::Tensor balanced_sm_locality_domains;
+    // The locality domain and rank of every 2-CTA cluster of a persistent GEMM launch, per launched SM count
+    std::unordered_map<int, torch::Tensor> cluster_locality_domains;
 
     explicit Runtime() {
         // Whether to use PyTorch cuBLASLt

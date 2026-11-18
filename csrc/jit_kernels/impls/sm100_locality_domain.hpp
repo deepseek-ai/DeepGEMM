@@ -38,4 +38,26 @@ static void __instantiate_kernel() {{
     );
 }
 
+// `sm_idx[block_idx]`: the SM of every block of a `num_sms`-block launch with 2-CTA clusters and one CTA per SM, as the GEMMs do
+static void sm100_locality_domain_probe_cluster_placement(const torch::Tensor& sm_idx) {
+    const auto kernel = jit->compile("sm100_probe_cluster_placement", R"(
+#include <deep_gemm/impls/sm100_cluster_placement.cuh>
+
+using namespace deep_gemm;
+
+static void __instantiate_kernel() {
+    auto ptr = reinterpret_cast<void*>(&probe_cluster_placement);
+};
+)");
+    jit->launch(
+        kernel, {
+            .num_smem_bytes = SM100ArchSpec::smem_capacity,
+            .grid_dim = dim3(static_cast<unsigned>(sm_idx.numel()), 1, 1),
+            .block_dim = dim3(32, 1, 1),
+            .cluster_dim = dim3(2, 1, 1),
+        },
+        sm_idx.data_ptr()
+    );
+}
+
 }  // namespace deep_gemm

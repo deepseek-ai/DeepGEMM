@@ -35,8 +35,19 @@ template <GemmType kGemmType,
           bool kEnsureZeroPadding = true,
           uint32_t kKAlignment = 128u,     // psum k-group start alignment
           uint32_t kSFKSpan = 128u,        // K covered by one k-grouped SF row
+          uint32_t kNumLocalityDomains = 1u,
           uint32_t kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, kIsMulticastOnA>()>
 struct Scheduler {
+    // With 2 locality domains, B is localized (N half `d` of every group in domain `d`), and the clusters of domain `d`
+    // only take the blocks of N half `d`. `cluster_locality` (from the host): `[d]` is the number of clusters of domain `d`,
+    // `[kNumLocalityDomains + cluster_idx]` is `(domain << 16) | rank` of cluster `blockIdx.x / 2` within its domain.
+    // The table partitions the clusters, so every block is computed exactly once wherever the CTAs actually run;
+    // the host builds it from the probed cluster placement, so that usually each cluster takes its own domain's blocks.
+    DG_STATIC_ASSERT(kNumLocalityDomains == 1 or kNumLocalityDomains == 2, "Invalid locality domain count");
+    DG_STATIC_ASSERT(kNumLocalityDomains == 1 or (kGemmType == GemmType::MGroupedContiguous and kNumMulticast == 2 and kIsMulticastOnA),
+                     "Locality domains need m-grouped contiguous GEMMs with 2-CTA clusters on N");
+    uint32_t num_local_clusters = 0, local_cluster_rank = 0, locality_domain_idx = 0;
+
     // A/B group starts must be aligned to whole K blocks. SF rows are packed
     // independently per group and tracked by `current_sf_k_cumsum`.
     DG_STATIC_ASSERT(not is_k_grouped_contiguous(kGemmType) or kKAlignment % 128 == 0,
@@ -83,7 +94,13 @@ struct Scheduler {
 
     // ReSharper disable once CppPossiblyUninitializedMember
     CUTLASS_DEVICE explicit Scheduler(const uint32_t& shape_m, const uint32_t& shape_n,
-                                       const uint32_t& shape_k, int* grouped_layout = nullptr) {
+                                       const uint32_t& shape_k, int* grouped_layout = nullptr,
+                                       const int* cluster_locality = nullptr) {
+        if constexpr (kNumLocalityDomains > 1) {
+            const auto entry = static_cast<uint32_t>(cluster_locality[kNumLocalityDomains + blockIdx.x / kNumMulticast]);
+            locality_domain_idx = entry >> 16, local_cluster_rank = entry & 0xffff;
+            num_local_clusters = static_cast<uint32_t>(cluster_locality[locality_domain_idx]);
+        }
         num_m_blocks = math::ceil_div(shape_m, BLOCK_M);
         num_n_blocks = math::ceil_div(shape_n, BLOCK_N);
         current_shape_k = is_k_grouped_contiguous(kGemmType) ? 0 : shape_k;
@@ -106,11 +123,17 @@ struct Scheduler {
     }
 
     CUTLASS_DEVICE void get_swizzled_block_idx(const uint32_t& block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        get_swizzled_block_idx(block_idx, num_m_blocks, num_n_blocks, m_block_idx, n_block_idx);
+    }
+
+    // The same swizzle over a `num_m_blocks_ x num_n_blocks_` sub-problem
+    CUTLASS_DEVICE void get_swizzled_block_idx(const uint32_t& block_idx, const uint32_t& num_m_blocks_, const uint32_t& num_n_blocks_,
+                                               uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNum1DBlocksPerGroup % kNumMulticast == 0, "Invalid group size");
 
         // Swizzle for better L2 usages
-        const auto primary_num_blocks = kIsMulticastOnA ? num_n_blocks : num_m_blocks;
-        const auto secondary_num_blocks = kIsMulticastOnA ? num_m_blocks : num_n_blocks;
+        const auto primary_num_blocks = kIsMulticastOnA ? num_n_blocks_ : num_m_blocks_;
+        const auto secondary_num_blocks = kIsMulticastOnA ? num_m_blocks_ : num_n_blocks_;
         const auto num_blocks_per_group = secondary_num_blocks * kNum1DBlocksPerGroup;
         const auto group_idx = block_idx / num_blocks_per_group;
         auto first_block_idx = group_idx * kNum1DBlocksPerGroup;
@@ -183,6 +206,18 @@ struct Scheduler {
     }
 
     CUTLASS_DEVICE bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        if constexpr (kNumLocalityDomains > 1) {
+            // Each domain walks the blocks of its N half with its own clusters; the two CTAs of a cluster keep adjacent N blocks
+            const auto num_local_n_blocks = num_n_blocks / kNumLocalityDomains;
+            const auto local_block_idx = (++ current_iter) * num_local_clusters * kNumMulticast +
+                                         local_cluster_rank * kNumMulticast + cute::block_rank_in_cluster();
+            if (local_block_idx >= num_m_blocks * num_local_n_blocks)
+                return false;
+            get_swizzled_block_idx(local_block_idx, num_m_blocks, num_local_n_blocks, m_block_idx, n_block_idx);
+            n_block_idx += locality_domain_idx * num_local_n_blocks;
+            return true;
+        }
+
         const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
 
         if constexpr (kGemmType == GemmType::MGroupedMasked) {
