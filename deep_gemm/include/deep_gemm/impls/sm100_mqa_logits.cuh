@@ -48,16 +48,16 @@ CUTLASS_DEVICE void visit_tmem_head_chunks(const uint32_t& tmem_col, float* accu
     }
 }
 
-// Shared BF16-output device core parameterized by Q/K dtype and scheduler geometry/addressing
+// Shared device core parameterized by Q/K, logits and weights dtypes and scheduler geometry/addressing
 template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t BLOCK_Q, uint32_t SPLIT_KV,
           uint32_t UMMA_N,
           uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
-          typename qk_dtype_t, typename MakeScheduler,
+          typename qk_dtype_t, typename logits_dtype_t, typename weights_dtype_t, typename MakeScheduler,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
 CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
-                                               nv_bfloat16* logits,
+                                               logits_dtype_t* logits,
                                                const cute::TmaDescriptor& tensor_map_q,
                                                const cute::TmaDescriptor& tensor_map_sf_q,
                                                const cute::TmaDescriptor& tensor_map_kv,
@@ -82,7 +82,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
     }
 
     using SharedStorage = layout::MQALogitsSharedStorage<kNumHeads, kHeadDim, BLOCK_Q, SPLIT_KV, UMMA_N,
-                                                         kNumQStages, kNumKVStages, kNumTmemStages, qk_dtype_t>;
+                                                         kNumQStages, kNumKVStages, kNumTmemStages, qk_dtype_t, weights_dtype_t>;
     extern __shared__ __align__(SharedStorage::kSwizzleAlignment) uint8_t smem_buffer[];
     auto& smem = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
@@ -440,7 +440,15 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
         DG_STATIC_ASSERT(kNumHeads % 4 == 0, "Head count must be a multiple of 4");
         DG_STATIC_ASSERT(8 <= UMMA_N and UMMA_N <= 256, "Invalid UMMA_N for MMA");
-        // Every token's weights stay in registers, so one TMEM chunk buffer is all that fits
+        // The weights dtype picks the reduction: FP32 weights reduce in FP32 straight from shared memory,
+        // BF16 weights reduce in packed BF16 from registers and only produce BF16 logits
+        constexpr bool kIsFP32Reduce = cute::is_same_v<weights_dtype_t, float>;
+        constexpr bool kIsFP32Logits = cute::is_same_v<logits_dtype_t, float>;
+        DG_STATIC_ASSERT(kIsFP32Reduce or not kIsFP32Logits, "BF16 weights require BF16 logits");
+        DG_STATIC_ASSERT(kIsFP32Logits or sizeof(logits_dtype_t) == sizeof(nv_bfloat16), "Invalid logits dtype");
+        using output_dtype_t = cute::conditional_t<kIsFP32Logits, float, nv_bfloat16>;
+        using sum_dtype_t = cute::conditional_t<kIsFP32Reduce, float2, nv_bfloat162>;
+        // Every token's BF16 weights stay in registers, so one TMEM chunk buffer is all that fits
         nv_bfloat162 weights[BLOCK_Q][kNumHeads / 2];
         float accum[kNumHeads < 16 ? kNumHeads : 16];
 
@@ -452,40 +460,71 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
             const auto process_q_block = [&](auto num_valid_tokens_t) {
                 constexpr uint32_t kNumValidTokens = decltype(num_valid_tokens_t)::value;
                 // Offset warp-uniform output bases by -seq_k_start[i] for shared KV indexing
-                nv_bfloat16* output_bases[BLOCK_Q];
+                output_dtype_t* output_bases[BLOCK_Q];
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i)
-                    output_bases[i] = logits + (task.q_token_base + i) * static_cast<uint64_t>(logits_stride) - seq_k_start[i];
+                    output_bases[i] = reinterpret_cast<output_dtype_t*>(logits) +
+                                      (task.q_token_base + i) * static_cast<uint64_t>(logits_stride) - seq_k_start[i];
 
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
-                    const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
-                    // Load two bf16 weights at a time as one packed shared u32
-                    const auto packed_row = reinterpret_cast<const uint32_t*>(smem_weights_row);
+                if constexpr (not kIsFP32Reduce) {
                     #pragma unroll
-                    for (uint32_t j = 0; j < kNumHeads / 2; ++ j) {
-                        const auto packed = ptx::ld_shared(packed_row + j);
-                        weights[i][j] = *reinterpret_cast<const nv_bfloat162*>(&packed);
+                    for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
+                        const auto smem_weights_row = smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow;
+                        // Load two bf16 weights at a time as one packed shared u32
+                        const auto packed_row = reinterpret_cast<const uint32_t*>(smem_weights_row);
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumHeads / 2; ++ j) {
+                            const auto packed = ptx::ld_shared(packed_row + j);
+                            weights[i][j] = *reinterpret_cast<const nv_bfloat162*>(&packed);
+                        }
                     }
                 }
 
-                // Reduce both bf16x2 halves and store the low half only for valid KV columns
+                // Reduce both x2 halves and store the result only for valid KV columns
                 const auto store_token = [&](const uint32_t& i, const uint32_t& kv_offset,
-                                             const nv_bfloat162& sum_0, const nv_bfloat162& sum_1) {
-                    const auto sum = __hadd2_rn(sum_0, sum_1);
-                    const auto result = __hadd2_rn(__low2bfloat162(sum), __high2bfloat162(sum));
-                    if (seq_k_start[i] <= kv_offset and kv_offset < seq_k_end[i])
-                        ptx::st_global_low_bf16(output_bases[i] + kv_offset, result);
+                                             const sum_dtype_t& sum_0, const sum_dtype_t& sum_1) {
+                    if constexpr (kIsFP32Reduce) {
+                        // The FP32 sums hold `2 * ReLU(x) * w`
+                        const auto sum = __fadd2_rn(sum_0, sum_1);
+                        const auto result = (sum.x + sum.y) * 0.5f;
+                        if (seq_k_start[i] <= kv_offset and kv_offset < seq_k_end[i]) {
+                            if constexpr (kIsFP32Logits)
+                                output_bases[i][kv_offset] = result;
+                            else
+                                output_bases[i][kv_offset] = __float2bfloat16_rn(result);
+                        }
+                    } else {
+                        const auto sum = __hadd2_rn(sum_0, sum_1);
+                        const auto result = __hadd2_rn(__low2bfloat162(sum), __high2bfloat162(sum));
+                        if (seq_k_start[i] <= kv_offset and kv_offset < seq_k_end[i])
+                            ptx::st_global_low_bf16(output_bases[i] + kv_offset, result);
+                    }
                 };
-                const auto reduce_pairs = [&](const float* chunk, const nv_bfloat162* chunk_weights, const uint32_t& num_heads,
-                                              nv_bfloat162& sum_0, nv_bfloat162& sum_1) {
+                const auto reduce_pairs = [&](const float* chunk, const nv_bfloat162* chunk_weights,
+                                              const weights_dtype_t* smem_chunk_weights, const uint32_t& num_heads,
+                                              sum_dtype_t& sum_0, sum_dtype_t& sum_1) {
                     #pragma unroll
                     for (uint32_t head_offset = 0; head_offset < num_heads; head_offset += 4) {
                         const auto accum_pair_0 = make_float2(chunk[head_offset], chunk[head_offset + 1]);
                         const auto accum_pair_1 = make_float2(chunk[head_offset + 2], chunk[head_offset + 3]);
-                        sum_0 = __hfma2(ptx::cvt_relu_bf16x2_f32(accum_pair_0), chunk_weights[head_offset / 2], sum_0);
-                        sum_1 = __hfma2(ptx::cvt_relu_bf16x2_f32(accum_pair_1), chunk_weights[head_offset / 2 + 1], sum_1);
+                        if constexpr (kIsFP32Reduce) {
+                            // One warp-uniform shared load feeds both pairs; `x + |x|` is `2 * ReLU(x)`, halved once in `store_token`
+                            const auto w = ptx::ld_shared(reinterpret_cast<const float4*>(smem_chunk_weights + head_offset));
+                            const auto relu_pair_0 = __fadd2_rn(accum_pair_0, make_float2(fabsf(accum_pair_0.x), fabsf(accum_pair_0.y)));
+                            const auto relu_pair_1 = __fadd2_rn(accum_pair_1, make_float2(fabsf(accum_pair_1.x), fabsf(accum_pair_1.y)));
+                            sum_0 = __ffma2_rn(relu_pair_0, make_float2(w.x, w.y), sum_0);
+                            sum_1 = __ffma2_rn(relu_pair_1, make_float2(w.z, w.w), sum_1);
+                        } else {
+                            sum_0 = __hfma2(ptx::cvt_relu_bf16x2_f32(accum_pair_0), chunk_weights[head_offset / 2], sum_0);
+                            sum_1 = __hfma2(ptx::cvt_relu_bf16x2_f32(accum_pair_1), chunk_weights[head_offset / 2 + 1], sum_1);
+                        }
                     }
+                };
+                const auto make_zero_sum = []() {
+                    if constexpr (kIsFP32Reduce)
+                        return make_float2(0.0f, 0.0f);
+                    else
+                        return __floats2bfloat162_rn(0.0f, 0.0f);
                 };
 
                 // Overlap loads and reduction by unrolling two splits, except in paged mode
@@ -498,8 +537,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
-                        auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
-                        auto sum_1 = __floats2bfloat162_rn(0.0f, 0.0f);
+                        auto sum_0 = make_zero_sum();
+                        auto sum_1 = make_zero_sum();
                         const auto reduce_head_chunk = [&](auto head_base_t, auto num_chunk_heads_t) {
                             constexpr uint32_t kHeadBase = decltype(head_base_t)::value;
                             constexpr uint32_t kNumChunkHeads = decltype(num_chunk_heads_t)::value;
@@ -510,7 +549,9 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                     smem.empty_tmem_barriers[tmem_stage_idx].arrive();
                                 }
                             }
-                            reduce_pairs(accum, weights[i] + kHeadBase / 2, kNumChunkHeads, sum_0, sum_1);
+                            reduce_pairs(accum, weights[i] + kHeadBase / 2,
+                                         smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow + kHeadBase,
+                                         kNumChunkHeads, sum_0, sum_1);
                         };
                         visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
                         store_token(i, kv_offset, sum_0, sum_1);
@@ -541,7 +582,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages,
           uint32_t kNumSMs,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
-          typename qk_dtype_t,
+          typename qk_dtype_t, typename logits_dtype_t, typename weights_dtype_t,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
 CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
 void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
@@ -549,7 +590,7 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
                       const uint32_t* cu_seq_len_k_start,
                       const uint32_t* cu_seq_len_k_end,
                       const uint32_t* schedule_meta,
-                      nv_bfloat16* logits,
+                      logits_dtype_t* logits,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
@@ -563,7 +604,7 @@ void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
     sm100_mqa_logits_core_impl<kNumHeads, kHeadDim,
                                BLOCK_Q, SPLIT_KV,
                                UMMA_N, kNumQStages, kNumKVStages, kNumTmemStages,
-                               kNumSpecializedThreads, kNumMathThreads, qk_dtype_t,
+                               kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t, weights_dtype_t,
                                decltype(make_scheduler), kNumMathWarpGroups>(
         logits_stride, logits,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
@@ -576,12 +617,12 @@ template <uint32_t kNumHeads, uint32_t kHeadDim, uint32_t PAGE_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages, uint32_t kNumTmemStages,
           uint32_t SPLIT_KV, uint32_t kSplitsPerChunk,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
-          typename qk_dtype_t,
+          typename qk_dtype_t, typename logits_dtype_t, typename weights_dtype_t,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
 CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
 void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
                             const uint32_t logits_stride, const uint32_t block_table_stride,
-                            const uint32_t* context_lens, nv_bfloat16* logits,
+                            const uint32_t* context_lens, logits_dtype_t* logits,
                             const uint32_t* block_table, const uint32_t* indices,
                             const uint32_t* schedule_meta,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_q,
@@ -599,7 +640,7 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
     sm100_mqa_logits_core_impl<kNumHeads, kHeadDim,
                                BLOCK_Q, SPLIT_KV,
                                UMMA_N, kNumQStages, kNumKVStages, kNumTmemStages,
-                               kNumSpecializedThreads, kNumMathThreads, qk_dtype_t,
+                               kNumSpecializedThreads, kNumMathThreads, qk_dtype_t, logits_dtype_t, weights_dtype_t,
                                decltype(make_scheduler), kNumMathWarpGroups>(
         logits_stride, logits,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,

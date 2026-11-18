@@ -316,10 +316,10 @@ Sources: `csrc/apis/attention.hpp` (host checks), `tests/test_attention.py` (SF 
 deep_gemm.fp8_fp4_mqa_logits(
     q,                       # (q_fp, q_sf): q_fp [seq_len, num_heads, head_dim]
     kv,                      # (kv_fp, kv_sf):       kv_fp [seq_len_kv, head_dim]
-    weights,                 # [seq_len, num_heads]; BF16 (or FP16, below) on SM100, FP32 on SM90/SM120
+    weights,                 # [seq_len, num_heads]; FP32, or BF16/FP16 (below) on SM100
     cu_seq_len_k_start, cu_seq_len_k_end,
     max_seqlen_k=max_seqlen_k,
-    logits_dtype=None,       # FP32 or BF16; defaults to BF16 on SM100, FP32 on SM90/SM120
+    logits_dtype=None,       # FP32 or BF16; defaults to BF16 for BF16 weights, FP32 otherwise
 )
 ```
 
@@ -342,7 +342,7 @@ Additional rules:
 - SF shapes: `q_sf` is `[seq_len, num_heads]` (non-paged) or `[batch_size, next_n, num_heads]` (paged); `kv_sf` is 1-D `[seq_len_kv]`. Both contiguous.
 - MX SF granularity is per-32-element blocks along `head_dim` — with `head_dim <= 128` all (up to 4) UE8M0 exponents of one token/head fit in exactly **one `int32`**, hence the shapes above have no trailing K dimension.
 - The non-paged API returns compressed logits and requires a positive `max_seqlen_k`. Neither API cleans entries beyond each row's valid KV span; callers must mask them.
-- `logits_dtype` selects FP32 or BF16 logits and defaults to BF16 on SM100, FP32 on SM90/SM120. BF16 weights require BF16 logits, and the SM100 BF16-weight kernels write BF16 only.
+- `logits_dtype` selects FP32 or BF16 logits. It defaults to the weights' precision: BF16 for BF16 weights, which reduce in BF16 and require BF16 logits, and FP32 for FP32 or FP16 weights.
 - Paged variant: the KV SF is **fused into the byte cache**, not a separate tensor. `kv_cache` is `uint8` of shape `[num_kv_blocks, block_kv, 1, kv_head_dim + 4]`, where `kv_head_dim` is `head_dim` for FP8 or `head_dim/2` for FP4. Within each page, all `block_kv * kv_head_dim` value bytes come first, followed by `block_kv` scales interpreted as `int32` (MX) or `float32` (non-MX). Despite the tensor shape, values and scales are not interleaved token by token; see the cache views in `csrc/apis/attention.hpp`.
 
 ```python

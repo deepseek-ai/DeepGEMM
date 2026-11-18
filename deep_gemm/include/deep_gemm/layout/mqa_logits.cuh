@@ -12,7 +12,7 @@ template <uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t UMMA_N,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumTmemStages,
-          typename qk_dtype_t>
+          typename qk_dtype_t, typename weights_dtype_t = nv_bfloat16>
 struct MQALogitsSharedStorage {
     static constexpr bool kIsFP4 = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t>;
 
@@ -32,13 +32,13 @@ struct MQALogitsSharedStorage {
     // TMA destinations in shared memory must be 128-byte aligned.
     static constexpr uint32_t kTmaAlignment = 128;
     static constexpr uint32_t kNumWeightBytesPerRow = math::constexpr_align(
-        kNumHeads * static_cast<uint32_t>(sizeof(nv_bfloat16)), 16u);
+        kNumHeads * static_cast<uint32_t>(sizeof(weights_dtype_t)), 16u);
     static constexpr uint32_t kNumWeightElementsPerRow =
-        kNumWeightBytesPerRow / static_cast<uint32_t>(sizeof(nv_bfloat16));
+        kNumWeightBytesPerRow / static_cast<uint32_t>(sizeof(weights_dtype_t));
     static constexpr uint32_t kNumWeightBytesPerStage = math::constexpr_align(
         BLOCK_Q * kNumWeightBytesPerRow, kTmaAlignment);
     static constexpr uint32_t kNumWeightElementsPerStage =
-        kNumWeightBytesPerStage / static_cast<uint32_t>(sizeof(nv_bfloat16));
+        kNumWeightBytesPerStage / static_cast<uint32_t>(sizeof(weights_dtype_t));
 
     DG_STATIC_ASSERT(UMMA_N == math::constexpr_align(BLOCK_QH, 8u), "Invalid Q tile shape");
     DG_STATIC_ASSERT(kNumQBytesPerStage % kSwizzleAlignment == 0, "Unaligned TMA swizzling");
@@ -51,7 +51,7 @@ struct MQALogitsSharedStorage {
     alignas(kSwizzleAlignment) qk_dtype_t smem_kv[kNumKVStages][kNumKVElementsPerStage];
     alignas(kTmaAlignment) uint32_t smem_sf_q[kNumQStages][kNumSFQ];
     alignas(kTmaAlignment) uint32_t smem_sf_kv[kNumKVStages][kNumSFKV];
-    alignas(kTmaAlignment) nv_bfloat16 smem_weights[kNumQStages][kNumWeightElementsPerStage];
+    alignas(kTmaAlignment) weights_dtype_t smem_weights[kNumQStages][kNumWeightElementsPerStage];
     // Barriers require 8-byte alignment, already guaranteed by the preceding TMA-aligned arrays.
     Barrier full_q_barriers[kNumQStages];
     Barrier full_sf_q_barriers[kNumQStages];

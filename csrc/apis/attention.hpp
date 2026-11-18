@@ -42,18 +42,21 @@ static void check_mqa_logits_q_and_weights(const torch::Tensor& q_fp, const std:
         DG_HOST_ASSERT(q_sf->scalar_type() == torch::kInt32);
     }
 
-    // Check weights: rows are loaded by TMA, so the row stride must be 16-byte aligned (pad `num_heads` up)
+    // Check weights: rows are loaded by TMA, so the row stride must be 16-byte aligned (pad `num_heads` up).
+    // FP32 everywhere; SM100 also takes BF16, which reduces in BF16
     const auto [_num_q_tokens, _num_heads] = get_shape<2>(weights);
     DG_HOST_ASSERT(num_q_tokens == _num_q_tokens and num_heads == _num_heads);
     DG_HOST_ASSERT(weights.stride(1) == 1 and (weights.stride(0) * weights.element_size()) % 16 == 0);
-    DG_HOST_ASSERT(is_f16_weights or weights.scalar_type() == (arch_major == 10 ? torch::kBFloat16 : torch::kFloat32));
+    DG_HOST_ASSERT(is_f16_weights or weights.scalar_type() == torch::kFloat32 or
+                   (arch_major == 10 and weights.scalar_type() == torch::kBFloat16));
 }
 
-// `logits_dtype` defaults to the architecture's native output: BF16 on SM100, FP32 elsewhere.
-// BF16 weights reduce in BF16 and so require BF16 logits; the SM100 BF16-weight kernel only writes BF16.
+// `logits_dtype` defaults to the weights' precision: BF16 weights reduce in BF16 and so require (and default to)
+// BF16 logits; FP32 and FP16 weights default to FP32 logits.
 static at::ScalarType resolve_mqa_logits_dtype(const std::optional<at::ScalarType>& logits_dtype,
-                                               const torch::Tensor& weights, const int& arch_major) {
-    const auto resolved_logits_dtype = logits_dtype.value_or(arch_major == 10 ? torch::kBFloat16 : torch::kFloat32);
+                                               const torch::Tensor& weights) {
+    const auto resolved_logits_dtype = logits_dtype.value_or(
+        weights.scalar_type() == torch::kBFloat16 ? torch::kBFloat16 : torch::kFloat32);
     DG_HOST_ASSERT(resolved_logits_dtype == torch::kFloat32 or resolved_logits_dtype == torch::kBFloat16);
     DG_HOST_ASSERT(weights.scalar_type() != torch::kBFloat16 or resolved_logits_dtype == torch::kBFloat16);
     return resolved_logits_dtype;
@@ -94,7 +97,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     const bool is_fp4 = qk_dtype == kPackedFP4;
     const bool is_mx_sf = q_sf.has_value();
     const auto arch_major = jit->device.get_arch_major();
-    const auto out_dtype = resolve_mqa_logits_dtype(logits_dtype, weights, arch_major);
+    const auto out_dtype = resolve_mqa_logits_dtype(logits_dtype, weights);
     const bool is_f16_weights = arch_major == 10 and weights.scalar_type() == torch::kFloat16;
 
     // Check Q, SF Q and weights
@@ -144,8 +147,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
                                      seq_len, seq_len_kv, max_seqlen_k, stride_logits,
                                      num_heads, head_dim, block_q, block_kv, false);
     } else if (arch_major == 10) {
-        DG_HOST_ASSERT(out_dtype == torch::kBFloat16 and "SM100 BF16-weight MQA logits are BF16 only");
-        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, false);
+        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, weights.scalar_type(), false);
         sm100_mqa_logits(config, q_fp, q_sf.value(), kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end,
                          logits, seq_len, seq_len_kv, stride_logits, schedule_meta);
     } else if (arch_major == 9) {
@@ -241,7 +243,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     int block_table_stride = block_table.stride(0);
     int num_sms = runtime->get_num_sms();
     const auto arch_major = jit->device.get_arch_major();
-    const auto out_dtype = resolve_mqa_logits_dtype(logits_dtype, weights, arch_major);
+    const auto out_dtype = resolve_mqa_logits_dtype(logits_dtype, weights);
 
     // Check Q, SF Q and weights
     const auto [batch_size, next_n, num_heads, head_dim] = get_logical_shape<4>(q_fp);
@@ -329,8 +331,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
 
     // Dispatch implementation
     if (arch_major == 10) {
-        DG_HOST_ASSERT(out_dtype == torch::kBFloat16 and "SM100 BF16-weight MQA logits are BF16 only");
-        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, true);
+        const MQALogitsConfig config(num_heads, head_dim, qk_dtype, weights.scalar_type(), true);
         sm100_paged_mqa_logits(config, q_fp, q_sf.value(), kv_cache, kv_cache_sf, weights, context_lens, logits,
                                block_table, indices_tensor, schedule_meta, batch_size, num_kv_blocks, block_kv,
                                aligned_max_context_len, block_table_stride);
@@ -485,6 +486,7 @@ static torch::Tensor fp8_fp4_sparse_mqa_logits(const std::tuple<torch::Tensor, s
     DG_HOST_ASSERT(num_heads > 0 and static_cast<uint32_t>(num_heads) <= kNumMaxHeads and num_heads % 4 == 0);
     DG_HOST_ASSERT(arch_major == 10 or static_cast<uint32_t>(num_heads) == kNumMaxHeads);
     check_mqa_logits_q_and_weights(q_fp, q_sf_optional, weights, num_q_tokens, num_heads, head_dim, 10);
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16);
 
     const auto [num_kv_tokens, kv_head_dim] = get_logical_shape<2>(kv_fp);
     DG_HOST_ASSERT(num_kv_tokens > 0 and kv_head_dim == head_dim and kv_fp.scalar_type() == qk_dtype and kv_fp.is_contiguous());
@@ -536,6 +538,7 @@ static torch::Tensor fp8_fp4_paged_sparse_mqa_logits(const std::tuple<torch::Ten
     DG_HOST_ASSERT(num_heads > 0 and static_cast<uint32_t>(num_heads) <= kNumMaxHeads and num_heads % 4 == 0);
     DG_HOST_ASSERT(arch_major == 10 or static_cast<uint32_t>(num_heads) == kNumMaxHeads);
     check_mqa_logits_q_and_weights(q_fp, q_sf_optional, weights, num_q_tokens, num_heads, head_dim, 10);
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16);
 
     const auto [num_kv_pages, page_kv, num_kv_heads, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
     DG_HOST_ASSERT(num_kv_pages > 0 and page_kv > 0 and page_kv % sparse_block_kv == 0 and num_kv_heads == 1 and

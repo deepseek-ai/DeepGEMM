@@ -9,7 +9,7 @@ import deep_gemm
 from deep_gemm.testing import assert_bitwise_equal, calc_diff, get_arch_major
 from deep_gemm.utils import per_custom_dims_cast_to_fp8
 from deep_gemm.utils import ceil_div
-from test_attention import ref_mqa_logits as ref_fp8_mqa_logits
+from test_attention import quantize_mqa_q, ref_mqa_logits as ref_fp8_mqa_logits
 
 
 def ref_diff_tol(has_bf16: bool) -> float:
@@ -145,6 +145,29 @@ def test_sm100_fp16_dense_rejections(seq_len, num_heads, with_metadata):
     meta = torch.empty(1, device='cuda', dtype=torch.int32) if with_metadata else None
     with pytest.raises((RuntimeError, AssertionError)):
         deep_gemm.fp8_fp4_mqa_logits((q, None), (kv, sf), weights, ks, ke, max_seqlen_k=256, schedule_meta=meta)
+
+
+@pytest.mark.parametrize('weights_dtype,logits_dtype', [
+    (torch.float32, torch.float32), (torch.float32, torch.bfloat16), (torch.bfloat16, torch.bfloat16)])
+def test_sm100_unified_dense_scheduled_preserved(weights_dtype, logits_dtype):
+    require_arch(10)
+    torch.manual_seed(789)
+    seq_len, num_heads, head_dim, seq_len_kv = 13, 32, 128, 512
+    q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
+    q_in, q_simulated = quantize_mqa_q(q, 'mxfp8')
+    kv_in, kv_simulated = quantize_mqa_q(kv, 'mxfp8')
+    weights = to_mqa_weights(torch.randn(seq_len, num_heads, device='cuda'), weights_dtype)
+    ks = torch.zeros(seq_len, device='cuda', dtype=torch.int32)
+    ke = torch.full_like(ks, seq_len_kv)
+    meta = deep_gemm.get_mqa_logits_metadata(ks, ke, seq_len_kv, num_heads)
+    eager = deep_gemm.fp8_fp4_mqa_logits(q_in, kv_in, weights, ks, ke, max_seqlen_k=seq_len_kv, logits_dtype=logits_dtype)
+    scheduled = deep_gemm.fp8_fp4_mqa_logits(
+        q_in, kv_in, weights, ks, ke, max_seqlen_k=seq_len_kv, logits_dtype=logits_dtype, schedule_meta=meta)
+    assert eager.dtype == logits_dtype
+    reference, _ = ref_fp8_mqa_logits(q_simulated, kv_simulated, weights.float(), ks, ke)
+    assert calc_diff(scheduled, reference) < ref_diff_tol(logits_dtype == torch.bfloat16)
+    assert_bitwise_equal(eager, scheduled, 'unified dense scheduled path')
 
 
 @pytest.mark.parametrize('page_kv', [32, 64])

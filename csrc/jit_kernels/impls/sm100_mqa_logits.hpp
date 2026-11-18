@@ -117,7 +117,7 @@ static void __instantiate_kernel() {{
 // Kernel geometry shared by the contiguous and paged runtimes: every math warpgroup consumes one UMMA_M = 128 KV
 // tile, the Q tile always covers 128 (token, head) rows, and the FP4 pipelines are deeper (half-size stages)
 struct MQALogitsConfig {
-    bool is_fp4, is_paged;
+    bool is_fp4, is_paged, is_fp32_weights;
     int num_heads, head_dim, block_q, umma_n;
     int num_q_stages, num_kv_stages;
     static constexpr int split_kv = kMQALogitsSplitKV;
@@ -125,10 +125,12 @@ struct MQALogitsConfig {
     static constexpr int num_specialized_threads = kMQALogitsNumSpecializedThreads;
     static constexpr int num_math_threads = (kMQALogitsSplitKV / 128) * 128;
 
-    MQALogitsConfig(const int& num_heads, const int& head_dim, const at::ScalarType& qk_dtype, const bool& is_paged):
-            is_fp4(qk_dtype == kPackedFP4), is_paged(is_paged), num_heads(num_heads), head_dim(head_dim),
-            block_q(get_mqa_logits_block_q(num_heads)) {
+    MQALogitsConfig(const int& num_heads, const int& head_dim, const at::ScalarType& qk_dtype,
+                    const at::ScalarType& weights_dtype, const bool& is_paged):
+            is_fp4(qk_dtype == kPackedFP4), is_paged(is_paged), is_fp32_weights(weights_dtype == torch::kFloat),
+            num_heads(num_heads), head_dim(head_dim), block_q(get_mqa_logits_block_q(num_heads)) {
         DG_HOST_ASSERT(qk_dtype == kPackedFP4 or qk_dtype == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(is_fp32_weights or weights_dtype == torch::kBFloat16);
         if (is_fp4)
             DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
         else
@@ -140,6 +142,15 @@ struct MQALogitsConfig {
 
     const char* qk_dtype_name() const {
         return is_fp4 ? "cutlass::float_e2m1_t" : "cutlass::float_e4m3_t";
+    }
+
+    // FP32 weights select the FP32 reduction
+    const char* weights_dtype_name() const {
+        return is_fp32_weights ? "float" : "nv_bfloat16";
+    }
+
+    uint32_t weight_element_size() const {
+        return is_fp32_weights ? sizeof(float) : sizeof(nv_bfloat16);
     }
 
     static auto compile(const std::string& name, const std::string& source) {
@@ -154,14 +165,14 @@ struct MQALogitsConfig {
 
     // Weights rows are padded to 16 bytes for TMA
     int num_weight_elements_per_row() const {
-        return static_cast<int>(align(num_heads * static_cast<uint32_t>(sizeof(nv_bfloat16)), 16u) / sizeof(nv_bfloat16));
+        return static_cast<int>(align(num_heads * weight_element_size(), 16u) / weight_element_size());
     }
 
     // Template arguments of `layout::MQALogitsSharedStorage`; the generated source asserts `sizeof` == `smem_size()`
     std::string shared_storage_args() const {
-        return std::format("{}, {}, {}, {}, {}, {}, {}, {}, {}",
+        return std::format("{}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
                            num_heads, head_dim, block_q, split_kv, umma_n, num_q_stages, num_kv_stages, num_tmem_stages,
-                           qk_dtype_name());
+                           qk_dtype_name(), weights_dtype_name());
     }
 
     // Mirrors `layout::MQALogitsSharedStorage`
@@ -174,7 +185,7 @@ struct MQALogitsConfig {
         const uint32_t num_sf_q = align(static_cast<uint32_t>(umma_n), kNumUTCCPAlignedElems);
         const uint32_t num_sf_kv = align(static_cast<uint32_t>(split_kv), kNumUTCCPAlignedElems);
         const uint32_t num_weight_bytes_per_stage = align(
-            static_cast<uint32_t>(block_q * num_weight_elements_per_row() * sizeof(nv_bfloat16)), kTmaAlignment);
+            static_cast<uint32_t>(block_q * num_weight_elements_per_row() * weight_element_size()), kTmaAlignment);
 
         uint32_t num_smem_bytes = 0;
         const auto add_region = [&](const uint32_t& num_region_bytes, const uint32_t& alignment) {
@@ -193,7 +204,7 @@ struct MQALogitsConfig {
         return smem_size;
     }
 
-    // `weights` is `[num_q_tokens, num_heads]` BF16 with an arbitrary row stride
+    // `weights` is `[num_q_tokens, num_heads]` FP32 or BF16 with an arbitrary row stride
     CUtensorMap make_tensor_map_weights(const torch::Tensor& weights, const int& num_q_tokens) const {
         return make_tma_2d_desc(weights, num_heads, num_q_tokens,
                                 num_weight_elements_per_row(), block_q,
@@ -263,7 +274,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {},
         {}, {},
-        {}
+        {}, {}, {}
     >);
 }};
 )",
@@ -274,7 +285,7 @@ static void __instantiate_kernel() {{
     config.num_q_stages, config.num_kv_stages, config.num_tmem_stages,
     num_sms,
     config.num_specialized_threads, config.num_math_threads,
-    config.qk_dtype_name()));
+    config.qk_dtype_name(), to_string(logits.scalar_type()), config.weights_dtype_name()));
 
     // Launch
     jit->launch(
@@ -350,7 +361,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {}, {},
-        {}
+        {}, {}, {}
     >);
 }};
 )",
@@ -361,7 +372,7 @@ static void __instantiate_kernel() {{
     config.num_q_stages, config.num_kv_stages, config.num_tmem_stages,
     config.split_kv, kMQALogitsSplitsPerChunk,
     config.num_specialized_threads, config.num_math_threads,
-    config.qk_dtype_name()));
+    config.qk_dtype_name(), to_string(logits.scalar_type()), config.weights_dtype_name()));
 
     // Launch
     jit->launch(
