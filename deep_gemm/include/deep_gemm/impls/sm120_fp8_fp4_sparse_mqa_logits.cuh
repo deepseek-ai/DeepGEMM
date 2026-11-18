@@ -13,6 +13,9 @@ namespace deep_gemm::sm120_sparse_mqa_detail {
 
 using namespace layout::sparse_mqa_logits;
 
+// The vendored SM120 kernel is written for the fixed 32-head layout
+static constexpr uint32_t kNumHeads = kNumMaxHeads;
+
 template <bool kIsFP4, uint32_t SPARSE_BLOCK_KV, bool kPipeline>
 struct SharedStorage {
     static constexpr uint32_t kRowBytes = kIsFP4 ? 64 : 128;

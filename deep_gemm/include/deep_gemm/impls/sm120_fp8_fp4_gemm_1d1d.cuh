@@ -17,7 +17,7 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/mma/sm120.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -37,7 +37,7 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumSMs,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t,
-          typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
+          typename epilogue_operator_t = epilogue::operators::Identity,
           bool kIsFP4 = false,
           bool kBIsFP4 = false,
           bool kAIsFP4 = false,
@@ -55,7 +55,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
                              uint32_t shape_cd_m,
-                             const epilogue_type_t epilogue,
+                             const __grid_constant__ EpilogueOperatorArgs epilogue_args,
                              uint32_t stride_c_m,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
@@ -73,6 +73,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
                      "Only float or bfloat16 output supported");
+    // Hosts instantiate `epilogue::operators::Identity` or `ScaleByAlpha` only: SM120 epilogues scale or store
+    // the accumulators, with no FP8 output and no stochastic rounding
+    const epilogue_operator_t epilogue(epilogue_args);
     DG_STATIC_ASSERT(!(kIsFP4 && kBIsFP4), "Use kIsFP4 for symmetric FP4x4, not kBIsFP4");
     // kAIsFP4 = mixed FP4_A x FP8_B (swapAB of the FP8xFP4 mixed path): A fp4-unpacked at k32, B fp8.
     DG_STATIC_ASSERT(!(kAIsFP4 && (kIsFP4 || kBIsFP4)), "kAIsFP4 (fp4_A x fp8_B) is exclusive");
@@ -1415,7 +1418,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                                 // becomes a plain STORE, this skip would drop the accumulation.
                                 if constexpr (kWithAccumulation and not kIsBatchedEpilogue) {
                                     const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
-                                    const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
+                                    const uint32_t gc = (
                                         n_base + (n_tile_base + nt) * MMA_N) + thread_id * 2;
                                     if (gr0 < total_shape_m and gc + 1 < shape_n) {
                                         const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
@@ -1459,7 +1462,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         #pragma unroll
                         for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
                             auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * kEpiSubM;
-                            const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
+                            const uint32_t n_store = (
                                 n_base + ts * kTMAStoreInnerDim);
                             if constexpr (kIsBatchedEpilogue) {
                                 if constexpr (kWithAccumulation)
@@ -1510,7 +1513,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
                         const uint32_t nt_global = n_tile_base + nt;
                         const uint32_t logical_col = n_base + nt_global * MMA_N + thread_id * 2;
-                        const uint32_t col = epilogue_type_t::template apply_index_n<MMA_N>(n_base + nt_global * MMA_N) + thread_id * 2;
+                        const uint32_t col = (n_base + nt_global * MMA_N) + thread_id * 2;
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 

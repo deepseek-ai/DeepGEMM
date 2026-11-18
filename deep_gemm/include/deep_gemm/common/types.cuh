@@ -42,14 +42,18 @@ enum class KernelType {
     KernelNoSF = 2
 };
 
-// Host-visible runtime state of the `epilogue::transform` operators, which derive from
-// this struct without adding members, so the host fully determines the operator on launch.
-// Only the fields consumed by the selected epilogue type are meaningful
-struct EpilogueArgs {
+// Host-provided epilogue parameters. Operators keep their per-thread state separately;
+// only the fields consumed by the selected operator are meaningful.
+struct EpilogueOperatorArgs {
     uint32_t* sfd = nullptr;
     uint32_t sfd_stride = 0;
     uint32_t shape_m = 0, shape_n = 0;
     float alpha = 1.0f;
+    float clamp_value = 0.0f;  // Zero disables clamping
+    uint32_t* clamped_count = nullptr;
+    uint32_t* clamp_count_ready = nullptr;  // Per-stream GPU launch tag for in-kernel initialization
 };
+
+static constexpr uint32_t kNumDeviceLocalityDomains = 2;
 
 } // namespace deep_gemm

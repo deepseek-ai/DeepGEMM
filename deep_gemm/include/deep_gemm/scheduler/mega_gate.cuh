@@ -6,31 +6,16 @@
 
 namespace deep_gemm::sched::mega_gate {
 
-template <uint32_t kNumSMs, uint32_t kNumLogicalCtas, uint32_t kBlockTokens>
-struct Scheduler {
-    static constexpr uint32_t kNumWorkerGroups = kNumSMs / kNumLogicalCtas;
-    uint32_t worker_group_idx;
-    uint32_t num_token_blocks;
+using namespace layout::mega_gate;
 
-    CUTLASS_DEVICE Scheduler(const uint32_t& num_tokens):
-        worker_group_idx(blockIdx.x / kNumLogicalCtas),
-        num_token_blocks(math::ceil_div(num_tokens, kBlockTokens)) {}
-
-    template <typename Task>
-    CUTLASS_DEVICE void run(const Task& run_task) const {
-        uint32_t iter_idx = 0;
-        for (auto token_block_idx = worker_group_idx; token_block_idx < num_token_blocks;
-             token_block_idx += kNumWorkerGroups, ++ iter_idx)
-            run_task(token_block_idx, iter_idx);
-    }
-};
-
+// Every logical CTA of a token block arrives once; wait observes all their score slices through the
+// terminal release sequence. wait_init prevents an arrival from racing the grid tag.
 template <uint32_t kNumLogicalCtas>
 struct ScoreBarrier {
+    DG_STATIC_ASSERT(kNumLogicalCtas < kNumMaxLogicalCtas, "Too many logical CTAs for the score barrier");
+
     static CUTLASS_DEVICE uint64_t encode_state(const uint64_t grid_idx, const uint32_t num_arrived_ctas = 0) {
-        DG_STATIC_ASSERT(kNumLogicalCtas < layout::mega_gate::kNumMaxLogicalCtas,
-                         "Too many logical CTAs for the score barrier");
-        return (grid_idx + 1) * layout::mega_gate::kNumMaxLogicalCtas + num_arrived_ctas;
+        return (grid_idx + 1) * kNumMaxLogicalCtas + num_arrived_ctas;
     }
 
     static CUTLASS_DEVICE void init(uint64_t* state_ptr) {
@@ -38,8 +23,9 @@ struct ScoreBarrier {
     }
 
     static CUTLASS_DEVICE void wait_init(uint64_t* state_ptr) {
-        const auto state_base = encode_state(ptx::get_grid_idx());
-        while (ptx::ld_acq_gpu(state_ptr) - state_base >= kNumLogicalCtas);
+        const auto current_grid_barrier_base = encode_state(ptx::get_grid_idx());
+        // NOTES: unsigned distance rejects stale grid tags but accepts any current-grid arrival count.
+        while (ptx::ld_acq_gpu(state_ptr) - current_grid_barrier_base >= kNumLogicalCtas);
     }
 
     static CUTLASS_DEVICE void arrive(uint64_t* state_ptr) {

@@ -1,6 +1,3 @@
-import os
-import sys
-
 import torch
 
 import deep_gemm
@@ -12,10 +9,7 @@ from deep_gemm.testing import (
     get_arch_major,
     test_filter,
 )
-from deep_gemm.utils import align
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'third-party'))
-from tilelang_ops import ref_mhc  # noqa: E402
+from deep_gemm.utils import align, per_token_cast_to_fp8
 
 
 def enumerate_cases():
@@ -99,6 +93,123 @@ def run_mega_mhc(inputs, outputs, **overrides):
     deep_gemm.mega_mhc(**kwargs)
 
 
+def extra_sf_rows(x: torch.Tensor, block_m: int) -> torch.Tensor:
+    token_idx = torch.arange(x.size(0), device=x.device)
+    index_in_block = token_idx % block_m
+    return (
+        token_idx // block_m * align(block_m, 128)
+        + index_in_block // 128 * 128
+        + index_in_block % 32 * 4
+        + index_in_block % 128 // 32
+    )
+
+
+def _allocate_extra_sf(x: torch.Tensor, block_m: int) -> torch.Tensor:
+    num_tokens, hidden = x.shape
+    num_rows = (num_tokens + block_m - 1) // block_m * align(block_m, 128)
+    return torch.empty_strided(
+        (num_rows, hidden // 128), (1, num_rows), dtype=torch.int32, device=x.device)
+
+
+def _sinkhorn_reference(value: torch.Tensor, repeat: int, eps: float) -> torch.Tensor:
+    value = value.softmax(dim=-1) + eps
+    value = value / (value.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(repeat - 1):
+        value = value / (value.sum(dim=-1, keepdim=True) + eps)
+        value = value / (value.sum(dim=-2, keepdim=True) + eps)
+    return value
+
+
+@torch.no_grad()
+def mhc_reference(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    mix_scales: torch.Tensor,
+    mix_bases: torch.Tensor,
+    rmsnorm_weight: torch.Tensor,
+    hc_mult: int,
+    hc_norm_eps: float,
+    hc_pre_eps: float,
+    hc_post_scale: float,
+    sinkhorn_eps: float,
+    num_sinkhorn_iters: int,
+    rmsnorm_eps: float,
+    rmsnorm_scale: float,
+    sf_layout: str = 'bf16',
+    shared_sf_block_m: int = 0,
+    shifted_prev_mix: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    new_residual = x.float().unsqueeze(1) * post_mix
+    new_residual += torch.einsum(
+        'tij,tih->tjh', comb_res_mix, residual.float())
+    new_residual = new_residual.bfloat16()
+    norm_input = None if shifted_prev_mix is None else (
+        new_residual.float() * shifted_prev_mix).sum(dim=1).bfloat16()
+
+    old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        mixes = new_residual.flatten(1).float() @ fn.mT
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+    hc_sqr_sum = new_residual.float().square().sum((1, 2))
+    mixes *= torch.rsqrt(
+        hc_sqr_sum / (hc_mult * x.size(1)) + hc_norm_eps).unsqueeze(1)
+    scales = torch.cat((
+        mix_scales[0].expand(hc_mult),
+        mix_scales[1].expand(hc_mult),
+        mix_scales[2].expand(hc_mult * hc_mult),
+    ))
+    mixes = mixes * scales + mix_bases
+    new_prev_mix = mixes[:, :hc_mult].sigmoid().unsqueeze(2) + hc_pre_eps
+    new_post_mix = (
+        mixes[:, hc_mult:2 * hc_mult].sigmoid() * hc_post_scale
+    ).unsqueeze(2)
+    new_comb_res_mix = _sinkhorn_reference(
+        mixes[:, 2 * hc_mult:].view(-1, hc_mult, hc_mult),
+        num_sinkhorn_iters,
+        sinkhorn_eps,
+    )
+    if norm_input is None:
+        norm_input = (new_residual.float() * new_prev_mix).sum(dim=1).bfloat16()
+
+    norm_input_float = norm_input.float()
+    y_bf16 = (
+        norm_input_float
+        * torch.rsqrt(norm_input_float.square().mean(1) + rmsnorm_eps).unsqueeze(1)
+        * (rmsnorm_weight.float() * rmsnorm_scale)
+    ).bfloat16()
+    result = {
+        'new_residual': new_residual,
+        'new_post_mix': new_post_mix,
+        'new_comb_res_mix': new_comb_res_mix,
+        'y_bf16': y_bf16,
+    }
+    if shifted_prev_mix is not None:
+        result['new_prev_mix'] = new_prev_mix
+    if sf_layout == 'bf16':
+        return result
+
+    y_fp8, y_fp8_sf = per_token_cast_to_fp8(
+        y_bf16, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    if sf_layout == 'col':
+        col_major_sf = torch.empty_strided(
+            y_fp8_sf.shape, (1, align(x.size(0), 4)),
+            dtype=torch.int32, device=x.device)
+        col_major_sf.copy_(y_fp8_sf)
+        y_fp8_sf = col_major_sf
+    sf_name = 'y_gemm_sf' if sf_layout == 'col' else 'y_routed_sf'
+    result.update(y_fp8=y_fp8, **{sf_name: y_fp8_sf})
+    if sf_layout == 'extra':
+        storage = _allocate_extra_sf(x, shared_sf_block_m)
+        storage[extra_sf_rows(x, shared_sf_block_m)] = y_fp8_sf
+        result['y_shared_sf_storage'] = storage
+    return result
+
+
 def logical_outputs(result, shared_sf_block_m=None):
     names = ('new_residual', 'new_post_mix', 'new_comb_res_mix', 'y_bf16')
     names += ('new_prev_mix',) if result.get('new_prev_mix') is not None else ()
@@ -106,7 +217,7 @@ def logical_outputs(result, shared_sf_block_m=None):
     values = {name: result[name] for name in names}
     if 'y_shared_sf_storage' in result:
         y_bf16 = result['y_bf16']
-        rows = ref_mhc.extra_sf_rows(y_bf16, result.get('shared_sf_block_m', shared_sf_block_m))
+        rows = extra_sf_rows(y_bf16, result.get('shared_sf_block_m', shared_sf_block_m))
         values['y_shared_sf'] = result['y_shared_sf_storage'][rows]
     return values
 
@@ -115,17 +226,15 @@ def comparable(tensor: torch.Tensor):
     return tensor.contiguous().view(torch.uint8) if tensor.dtype == torch.int32 else tensor
 
 
-def check_correctness(actual, pytorch_ref, baseline_ref, case):
-    max_diffs = [0.0, 0.0, 0.0]
+def check_correctness(actual, reference, case):
+    max_diffs = []
     for name in actual:
-        tensors = tuple(comparable(result[name]) for result in (actual, pytorch_ref, baseline_ref))
-        diffs = tuple(float(calc_diff(tensors[i], tensors[j])) for i, j in ((0, 1), (0, 2), (2, 1)))
-        pytorch_limit = 2e-4 if name == 'y_fp8' else 5e-5
-        baseline_limit = 1e-5 if case[0] == 'normal' and name == 'y_fp8' else 1e-6
-        limits = (pytorch_limit, baseline_limit, pytorch_limit)
-        assert all(diff < limit for diff, limit in zip(diffs, limits)), \
-            f'{case}, {name=}, {diffs=}'
-        max_diffs = [max(old, new) for old, new in zip(max_diffs, diffs)]
+        actual_tensor = comparable(actual[name])
+        reference_tensor = comparable(reference[name])
+        diff = float(calc_diff(actual_tensor, reference_tensor))
+        limit = 2e-4 if name == 'y_fp8' else 5e-5
+        assert diff < limit, f'{case}, {name=}, {diff=}'
+        max_diffs.append(diff)
     return max_diffs
 
 
@@ -209,11 +318,8 @@ def test_mega_mhc_api_contract() -> None:
 @test_filter(lambda: get_arch_major() == 10)
 @torch.no_grad()
 def test_mega_mhc() -> None:
-    if not ref_mhc.has_baseline():
-        return
     for is_shifted in (True, False):
         mode = 'shifted' if is_shifted else 'normal'
-        baseline_kernels = ref_mhc.SHIFTED_KERNELS if is_shifted else ref_mhc.NORMAL_KERNELS
         print(f'Testing Mega {mode} mHC:')
         for case_idx, (sf_layout, num_tokens, hidden) in enumerate(enumerate_cases()):
             inputs, duplicates = make_inputs(
@@ -222,16 +328,11 @@ def test_mega_mhc() -> None:
             ref_kwargs = dict(
                 **inputs, sf_layout=sf_layout,
                 shared_sf_block_m=outputs.get('shared_sf_block_m', 0))
-
-            def run_baseline():
-                return ref_mhc.mhc_baseline(**ref_kwargs)
-
-            pytorch_ref, baseline_ref = ref_mhc.mhc_reference(**ref_kwargs), run_baseline()
+            reference = mhc_reference(**ref_kwargs)
             run_mega_mhc(inputs, outputs)
             actual = logical_outputs(outputs)
-            refs = tuple(logical_outputs(ref, outputs.get('shared_sf_block_m'))
-                         for ref in (pytorch_ref, baseline_ref))
-            diffs = check_correctness(actual, *refs, (mode, sf_layout, num_tokens, hidden))
+            ref = logical_outputs(reference, outputs.get('shared_sf_block_m'))
+            diffs = check_correctness(actual, ref, (mode, sf_layout, num_tokens, hidden))
 
             expected = {name: tensor.clone() for name, tensor in actual.items()}
             for _ in range(30):
@@ -245,19 +346,15 @@ def test_mega_mhc() -> None:
 
             kernel_t = bench_kineto(lambda: run_mega_mhc(inputs, outputs),
                                     'sm100_mega_mhc', suppress_kineto_output=True)
-            baseline_times = bench_kineto(run_baseline, baseline_kernels, suppress_kineto_output=True)
-            baseline_t = sum(baseline_times)
             logical_inputs = [tensor for tensor in inputs.values() if isinstance(tensor, torch.Tensor)]
             logical_bytes = count_bytes(*logical_inputs, *actual.values())
-            # Materialized Norm/Cast boundary, plus the normal-only Res reread
             intermediate_io_bytes = 2 * count_bytes(outputs['y_bf16'])
             if not is_shifted:
                 intermediate_io_bytes += count_bytes(outputs['new_residual'])
             print(f' > {sf_layout:5} T={num_tokens:5}, H={hidden:4}: {kernel_t * 1e6:6.1f} us, '
                   f'{logical_bytes / kernel_t / 1e9:4.0f} GB/s '
                   f'({(logical_bytes + intermediate_io_bytes) / kernel_t / 1e9:4.0f} incl. Scratch I/O) | '
-                  f'baseline {baseline_t * 1e6:6.1f} us, {baseline_t / kernel_t:5.2f}x | '
-                  f'diff K/P={diffs[0]:.1e}, K/B={diffs[1]:.1e}, B/P={diffs[2]:.1e}')
+                  f'diff {max(diffs):.1e}')
     print()
 
 

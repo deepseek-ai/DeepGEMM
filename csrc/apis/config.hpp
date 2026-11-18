@@ -9,6 +9,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("init", [&](const std::string& library_root_path) {
         init_jit(library_root_path);
     });
+    m.def("shutdown", []() {
+        runtime = deep_jit::LazyInit<Runtime>(nullptr);
+    });
     m.def("set_num_sms", [&](const int& new_num_sms) {
         runtime->set_num_sms(new_num_sms);
     });

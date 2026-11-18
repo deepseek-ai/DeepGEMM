@@ -314,16 +314,16 @@ Sources: `csrc/apis/attention.hpp` (host checks), `tests/test_attention.py` (SF 
 
 ```python
 deep_gemm.fp8_fp4_mqa_logits(
-    q,                       # (q_fp, q_sf or None): q_fp [seq_len, num_heads, head_dim]
+    q,                       # (q_fp, q_sf): q_fp [seq_len, num_heads, head_dim]
     kv,                      # (kv_fp, kv_sf):       kv_fp [seq_len_kv, head_dim]
-    weights,                 # [seq_len, num_heads]; FP32, or SM100 BF16/FP16 (restrictions below)
+    weights,                 # [seq_len, num_heads]; BF16 (or FP16, below) on SM100, FP32 on SM90/SM120
     cu_seq_len_k_start, cu_seq_len_k_end,
-    clean_logits=True, max_seqlen_k=0, logits_dtype=torch.float32,
-    schedule_meta=None,
+    max_seqlen_k=max_seqlen_k,
+    logits_dtype=None,       # FP32 or BF16; defaults to BF16 on SM100, FP32 on SM90/SM120
 )
 ```
 
-SM100 dense **FP16 weights** select a non-MX FP8-only path: `q_sf=None`, contiguous FP32 `kv_sf[seq_len_kv]`, positive `seq_len % 4 == 0`, positive `seq_len_kv`, `num_heads` in 4/8/16/32/64/128, and `head_dim` in 32/64/128. Weights require `stride(1)==1`; the launcher materializes a contiguous FP16 copy as needed. The runtime SM count must be even. `schedule_meta` is unsupported, logits may be FP32 or BF16, and `max_seqlen_k >= 0`. Full-output cleaning uses a separate pass; compressed logits (`max_seqlen_k > 0`) require `clean_logits=False`. Paged MQA does not accept FP16 weights. SM100 BF16 weights still require BF16 logits.
+SM100 dense **FP16 weights** select a non-MX FP8-only path: `q_sf=None`, contiguous FP32 `kv_sf[seq_len_kv]`, positive `seq_len % 4 == 0`, positive `seq_len_kv`, `num_heads` in 4/8/16/32/64/128, and `head_dim` in 32/64/128. Weights require `stride(1)==1`; the launcher materializes a contiguous FP16 copy as needed. The runtime SM count must be even. `schedule_meta` is unsupported and logits may be FP32 or BF16. Paged MQA does not accept FP16 weights. SM100 BF16 weights still require BF16 logits.
 
 **The dtype of `q_sf` and `kv_sf` is COUPLED.** Passing `q_sf` selects "MX mode", which flips the required `kv_sf` dtype (`kv_sf.scalar_type() == (is_mx_sf ? kInt32 : kFloat)` in `csrc/apis/attention.hpp`). There is no mixed mode:
 
@@ -332,7 +332,7 @@ SM100 dense **FP16 weights** select a non-MX FP8-only path: `q_sf=None`, contigu
 | MX (`q_sf` provided) | `int32` packed UE8M0, contiguous | `int32` packed UE8M0, contiguous | FP8 (MXFP8) or packed FP4 (MXFP4) | SM100; SM120 supports MXFP4 only |
 | non-MX (`q_sf=None`) | — | `float32` (one plain scale per token), contiguous | FP8 only | SM90 / SM100 / SM120 |
 
-SM120 dense/paged MQA supports 16, 32 or 64 heads, with FP8 head dimensions 32, 64 or 128 and MXFP4 head dimension 128. Weights must be FP32; logits may be BF16 or FP32. Dense `schedule_meta` and `get_mqa_logits_metadata` remain SM100-only. SM120 paged MQA uses `get_paged_mqa_logits_metadata`; supported page sizes are 64/128/256 for FP8 and 32/64/128/256 for MXFP4. Paged cleaning is unsupported; non-paged cleaning uses a separate pass and requires `max_seqlen_k=0`.
+SM120 dense/paged MQA supports 16, 32 or 64 heads, with FP8 head dimensions 32, 64 or 128 and MXFP4 head dimension 128. Weights must be FP32; logits may be BF16 or FP32. Dense `schedule_meta` and `get_mqa_logits_metadata` remain SM100-only. SM120 paged MQA uses `get_paged_mqa_logits_metadata`; supported page sizes are 64/128/256 for FP8 and 32/64/128/256 for MXFP4.
 
 SM90 paged MQA accepts physical page sizes `block_kv=32/64`, `next_n=1/2/4`, 32 or 64 heads, and head dimension 32/64/128. It uses FP8 Q/KV with `q_sf=None`, FP32 weights and plain FP32 cache SFs; neither `indices` nor paged cleaning is supported. `context_lens` is contiguous int32 `[batch_size, next_n]`. For `next_n=4`, the runtime SM count must be even and the metadata helper's `num_sms` argument must be `deep_gemm.get_num_sms() // 2`; for `next_n=1/2`, pass the full runtime count. `get_paged_mqa_logits_metadata(context_lens, block_kv, num_sms)` takes scheduler slots and returns int32 `[num_sms + 1, 2]`. The `next_n=4` path schedules two CTAs per work item with independent KV copies; it does not promise literal KV multicast.
 
@@ -341,7 +341,8 @@ Additional rules:
 - **FP4 Q/KV data requires MX mode** — `q_sf` must be provided.
 - SF shapes: `q_sf` is `[seq_len, num_heads]` (non-paged) or `[batch_size, next_n, num_heads]` (paged); `kv_sf` is 1-D `[seq_len_kv]`. Both contiguous.
 - MX SF granularity is per-32-element blocks along `head_dim` — with `head_dim <= 128` all (up to 4) UE8M0 exponents of one token/head fit in exactly **one `int32`**, hence the shapes above have no trailing K dimension.
-- The legacy aliases `fp8_mqa_logits` / `fp8_paged_mqa_logits` hardwire `q_sf=None`, i.e., always the non-MX `float32` mode.
+- The non-paged API returns compressed logits and requires a positive `max_seqlen_k`. Neither API cleans entries beyond each row's valid KV span; callers must mask them.
+- `logits_dtype` selects FP32 or BF16 logits and defaults to BF16 on SM100, FP32 on SM90/SM120. BF16 weights require BF16 logits, and the SM100 BF16-weight kernels write BF16 only.
 - Paged variant: the KV SF is **fused into the byte cache**, not a separate tensor. `kv_cache` is `uint8` of shape `[num_kv_blocks, block_kv, 1, kv_head_dim + 4]`, where `kv_head_dim` is `head_dim` for FP8 or `head_dim/2` for FP4. Within each page, all `block_kv * kv_head_dim` value bytes come first, followed by `block_kv` scales interpreted as `int32` (MX) or `float32` (non-MX). Despite the tensor shape, values and scales are not interleaved token by token; see the cache views in `csrc/apis/attention.hpp`.
 
 ```python
@@ -353,14 +354,16 @@ kv_fp8, kv_sf = per_token_cast_to_fp8(kv, use_ue8m0=True, gran_k=32, use_packed_
 logits = deep_gemm.fp8_fp4_mqa_logits(
     q=(q_fp8_2d.view(seq_len, num_heads, head_dim), q_sf.view(seq_len, num_heads)),  # int32
     kv=(kv_fp8, kv_sf.view(seq_len_kv)),                                             # int32
-    weights=weights, cu_seq_len_k_start=ks, cu_seq_len_k_end=ke)
+    weights=weights, cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
+    max_seqlen_k=int((ke - ks).max().item()))
 
 # non-MX mode: q_sf=None forces kv_sf to be plain float32 per-token
 kv_fp8, kv_sf = per_custom_dims_cast_to_fp8(kv, (0,), False)   # kv_sf: [seq_len_kv], float32
 logits = deep_gemm.fp8_fp4_mqa_logits(
     q=(q.to(torch.float8_e4m3fn), None),
     kv=(kv_fp8, kv_sf),
-    weights=weights, cu_seq_len_k_start=ks, cu_seq_len_k_end=ke)
+    weights=weights, cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
+    max_seqlen_k=int((ke - ks).max().item()))
 ```
 
 ### 6.2 `fp8_einsum`: SFs Are Permuted Internally
