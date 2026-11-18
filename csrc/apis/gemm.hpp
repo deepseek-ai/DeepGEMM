@@ -11,6 +11,7 @@
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
 
 #include "layout.hpp"
+#include "locality_domain.hpp"
 
 namespace deep_gemm::gemm {
 
@@ -191,18 +192,22 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
                                                  const bool& ensure_zero_padding,
                                                  const std::optional<int>& expected_m_for_psum_layout,
                                                  const std::shared_ptr<EpilogueClass>& epilogue_class) {
-    // Shape must be `[M, K] @ [G, N, K].mT`
+    // Shape must be `[M, K] @ [G, N, K].mT`, B may also be localized `(num_domains, G, N / num_domains, K)`, see `deep_gemm.localize`
+    const bool is_b_localized = b.first.dim() == 4 and is_localized(b.first);
+    const auto b_logical = is_b_localized ? b.first.select(0, 0) : b.first;
     const auto major_a = get_major_type_ab(a.first);
-    const auto major_b = get_major_type_ab(b.first);
+    const auto major_b = get_major_type_ab(b_logical);
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
-    if (fp8_fp4_requires_k_major(a.first, b.first))
+    if (fp8_fp4_requires_k_major(a.first, b.first) or is_b_localized)
         DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
     DG_HOST_ASSERT(grouped_layout.is_contiguous());
 
     // Type and shape checks
     const auto arch_major = jit->device.get_arch_major();
     const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
-    const auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b.first, major_b, arch_major);
+    auto [num_groups, n, k_] = check_grouped_ab_fp8_fp4(b_logical, major_b, arch_major);
+    n *= is_b_localized ? static_cast<int>(b.first.size(0)) : 1;
+    DG_HOST_ASSERT(not is_b_localized or arch_major == 10);
     const auto [m_, n_] = get_shape<2>(d);
     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
     DG_HOST_ASSERT(n > 0 and k > 0 and num_groups > 0);
@@ -243,7 +248,8 @@ static void m_grouped_fp8_fp4_gemm_nt_contiguous(const std::pair<torch::Tensor, 
         sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(a.first, sfa, b.first, sfb, d, grouped_layout,
                                                      num_groups, m, n, k, gran_k_a, gran_k_b, major_a, major_b,
                                                      compiled_dims, use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
-                                                     resolve_epilogue_class(epilogue_class, std::nullopt, d));
+                                                     resolve_epilogue_class(epilogue_class, std::nullopt, d),
+                                                     is_b_localized ? std::make_optional(locality_domain::get_cluster_locality_domains(runtime->get_num_sms())) : std::nullopt);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
     }

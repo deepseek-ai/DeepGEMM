@@ -141,6 +141,42 @@ static torch::Tensor get_balanced_sm_locality_domains() {
     return runtime->balanced_sm_locality_domains;
 }
 
+// For persistent GEMMs with 2-CTA clusters on `num_sms` SMs: an `int` table with `[d]` the number of clusters of
+// domain `d`, and `[num_domains + cluster_idx]` the `(domain << 16) | rank` of cluster `cluster_idx` (blocks
+// `2 * cluster_idx` and `2 * cluster_idx + 1`). The domain is that of the SM the cluster ran on in a probe launch of
+// the same size, which the hardware keeps for later launches. The table only decides which blocks a cluster takes,
+// so every block is computed exactly once even if a cluster later runs elsewhere, just with more cross-domain traffic.
+static torch::Tensor get_cluster_locality_domains(const int& num_sms) {
+    if (const auto it = runtime->cluster_locality_domains.find(num_sms); it != runtime->cluster_locality_domains.end())
+        return it->second;
+
+    const auto num_domains = get_num_locality_domains();
+    DG_HOST_ASSERT(num_domains == 2 and
+                   num_sms >= num_domains * kNumSMsPerTPC and
+                   num_sms % kNumSMsPerTPC == 0 and
+                   num_sms <= jit->device.get_num_sms());
+    const auto sm_idx = torch::full({num_sms}, -1, torch::dtype(torch::kInt).device(torch::kCUDA));
+    sm100_locality_domain_probe_cluster_placement(sm_idx);
+    const auto sm_domain = get_balanced_sm_locality_domains().to(torch::kInt).index({sm_idx.to(torch::kLong)}).cpu();
+
+    // A cluster takes the domain of its first CTA (both CTAs run on one TPC, and the balanced table moves whole TPCs)
+    const auto num_clusters = num_sms / kNumSMsPerTPC;
+    const auto cluster_domain = sm_domain.view({num_clusters, kNumSMsPerTPC}).select(1, 0).contiguous();
+    // Both domains have the same work, so balance the cluster counts as closely as possible. With fewer SMs than the
+    // device, surplus clusters of the larger domain take the other domain's blocks.
+    std::vector<int> domains(cluster_domain.data_ptr<int>(), cluster_domain.data_ptr<int>() + num_clusters);
+    for (int i = num_clusters - 1, surplus = static_cast<int>(std::count(domains.begin(), domains.end(), 1)) * 2 - num_clusters;
+         i >= 0 and std::abs(surplus) > 1; -- i) {
+        if (domains[i] == (surplus > 0 ? 1 : 0))
+            domains[i] ^= 1, surplus += surplus > 0 ? -2 : 2;
+    }
+    const auto table = torch::zeros({num_domains + num_clusters}, torch::dtype(torch::kInt));
+    const auto table_ptr = table.data_ptr<int>();
+    for (int i = 0; i < num_clusters; ++ i)
+        table_ptr[num_domains + i] = (domains[i] << 16) | (table_ptr[domains[i]] ++);
+    return runtime->cluster_locality_domains[num_sms] = table.cuda();
+}
+
 static void release_mlopart() {
     get_balanced_sm_locality_domains();
     mlopart::release();
