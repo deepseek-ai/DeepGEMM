@@ -322,6 +322,10 @@ struct SM120ArchSpec {
     }
 
     static int get_split_k_factor(const SM120GemmDesc& desc, const Layout& layout) {
+        // NOTES: deterministic mode is also batch invariant. Whether K is split depends on M, and a split K is
+        // summed in a different order, so a row's result would depend on the batch it is computed in.
+        if (heuristics_runtime->get_deterministic_algorithms())
+            return 1;
         if (desc.gemm_type != GemmType::Normal or desc.kernel_type == KernelType::KernelNoSF)
             return 1;
 
