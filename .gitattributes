@@ -1,0 +1,2 @@
+# These reproduction launchers execute on Linux, including after a Windows checkout.
+/scripts/*single_token*.sh text eol=lf

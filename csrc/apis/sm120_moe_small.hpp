@@ -36,7 +36,9 @@ static void launch(const torch::Tensor& input, const torch::Tensor& b,
     DG_HOST_ASSERT((l1 ? output.size(0) : input.size(0)) == e);
     DG_HOST_ASSERT(int64_t(e) * capacity <= INT_MAX and int64_t(e) * b.size(1) <= INT_MAX);
     DG_HOST_ASSERT((d == (l1 ? 768 : 2048) and k == (l1 ? 2048 : 768)) or
-                   (d == (l1 ? 1536 : 4096) and k == (l1 ? 4096 : 1536)));
+                   (d == (l1 ? 1536 : 4096) and k == (l1 ? 4096 : 1536)) or
+                   (d == (l1 ? 1408 : 2048) and k == (l1 ? 2048 : 1408)) or
+                   (d == (l1 ? 2560 : 3584) and k == (l1 ? 3584 : 2560)));
     DG_HOST_ASSERT(bn == 8 or bn == 16 or bn == 32);
     DG_HOST_ASSERT(stages >= 2 and stages <= 4 and bundle >= 1 and bundle <= topk and topk % bundle == 0);
     DG_HOST_ASSERT(l1 or bundle == topk);

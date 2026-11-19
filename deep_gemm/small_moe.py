@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 from . import _C
-from .small_moe_policy import select_config
+from .small_moe_policy import select_config, select_single_token_config
 
 
 @triton.jit
@@ -58,7 +58,7 @@ class SmallMoE:
     """
 
     def __init__(self, tokens, gate_up, down, topk, *, capacity=None,
-                 enable_fusion=True, fallback_m_tile=None):
+                 enable_fusion=True, fallback_m_tile=None, fusion_policy='validated'):
         if gate_up.ndim != 3 or down.ndim != 3:
             raise ValueError('Expected rank-three gate_up and down weights')
         self.e, twice_i, self.d = gate_up.shape
@@ -81,7 +81,16 @@ class SmallMoE:
         if self.e * self.capacity > 2**31 - 1 or self.e * max(self.d, 2*self.i) > 2**31 - 1:
             raise ValueError('Packed dimensions exceed int32 descriptor range')
         self.gate_up, self.down = gate_up, down
-        self.config = select_config(tokens, self.e, topk, self.d, self.i) if enable_fusion else None
+        if fusion_policy not in ('validated', 'single_token'):
+            raise ValueError("fusion_policy must be 'validated' or 'single_token'")
+        self.fusion_policy = fusion_policy
+        selector = select_single_token_config if fusion_policy == 'single_token' else select_config
+        self.config = selector(tokens, self.e, topk, self.d, self.i) if enable_fusion else None
+        if fusion_policy == 'single_token' and self.config is not None:
+            device = torch.cuda.get_device_properties(self.device)
+            if 'RTX 5090' not in device.name or device.multi_processor_count != 170:
+                from .small_moe_policy import SmallMoEConfig
+                self.config = SmallMoEConfig(reason='single-token evidence requires RTX 5090 with 170 SMs')
         self.fallback_m_tile = (32 if tokens <= 4 else 0) if fallback_m_tile is None else fallback_m_tile
         if self.fallback_m_tile not in (0, 32, 64, 128):
             raise ValueError('Invalid ordinary M tile')

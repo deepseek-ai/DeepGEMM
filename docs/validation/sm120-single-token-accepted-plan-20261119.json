@@ -1,0 +1,499 @@
+{
+  "complete": true,
+  "plans": {
+    "deepseek": {
+      "key": [
+        2048,
+        1408,
+        64,
+        6
+      ],
+      "selected": "candidate",
+      "fusion_accepted": true,
+      "controls": [
+        "split-32-32",
+        "public-32"
+      ],
+      "checks": [
+        {
+          "seed": 25011,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.568613790950759,
+          "bootstrap_one_sided_95_upper": 0.5789056888199232,
+          "passed": true
+        },
+        {
+          "seed": 25011,
+          "condition": "pressure512",
+          "baseline": "split-32-32",
+          "ratio": 0.8297871813420922,
+          "bootstrap_one_sided_95_upper": 0.8297871813420922,
+          "passed": true
+        },
+        {
+          "seed": 25029,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5940312106406413,
+          "bootstrap_one_sided_95_upper": 0.6022699270172153,
+          "passed": true
+        },
+        {
+          "seed": 25029,
+          "condition": "pressure512",
+          "baseline": "split-0-0",
+          "ratio": 0.8124999431565831,
+          "bootstrap_one_sided_95_upper": 0.8124999431565831,
+          "passed": true
+        }
+      ],
+      "config": [
+        [
+          16,
+          3,
+          2
+        ],
+        [
+          16,
+          4,
+          6
+        ]
+      ],
+      "independent_checks": [
+        {
+          "seed": 25107,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5833857981821855,
+          "upper": 0.5874003622433883,
+          "passed": true
+        },
+        {
+          "seed": 25107,
+          "condition": "pressure512",
+          "baseline": "split-32-0",
+          "ratio": 0.8124999431565831,
+          "upper": 0.8124999431565831,
+          "passed": true
+        },
+        {
+          "seed": 25223,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5950519536069557,
+          "upper": 0.5982825497621489,
+          "passed": true
+        },
+        {
+          "seed": 25223,
+          "condition": "pressure512",
+          "baseline": "split-0-0",
+          "ratio": 0.8124999431565831,
+          "upper": 0.8124999431565831,
+          "passed": true
+        }
+      ],
+      "independent_accepted": true
+    },
+    "qwen15": {
+      "key": [
+        2048,
+        1408,
+        60,
+        4
+      ],
+      "selected": "candidate",
+      "fusion_accepted": true,
+      "controls": [
+        "split-32-32",
+        "public-32"
+      ],
+      "checks": [
+        {
+          "seed": 25011,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5053229187169326,
+          "bootstrap_one_sided_95_upper": 0.5061932765786229,
+          "passed": true
+        },
+        {
+          "seed": 25011,
+          "condition": "pressure512",
+          "baseline": "split-0-32",
+          "ratio": 0.8235294086176654,
+          "bootstrap_one_sided_95_upper": 0.8235294086176654,
+          "passed": true
+        },
+        {
+          "seed": 25029,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5247254679023082,
+          "bootstrap_one_sided_95_upper": 0.5261199560432722,
+          "passed": true
+        },
+        {
+          "seed": 25029,
+          "condition": "pressure512",
+          "baseline": "split-0-32",
+          "ratio": 0.8285714270865393,
+          "bootstrap_one_sided_95_upper": 0.8285714270865393,
+          "passed": true
+        }
+      ],
+      "config": [
+        [
+          16,
+          3,
+          4
+        ],
+        [
+          16,
+          4,
+          4
+        ]
+      ],
+      "independent_checks": [
+        {
+          "seed": 25107,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5054789918098143,
+          "upper": 0.5065768638974769,
+          "passed": true
+        },
+        {
+          "seed": 25107,
+          "condition": "pressure512",
+          "baseline": "split-0-32",
+          "ratio": 0.7999999896057751,
+          "upper": 0.8235294086176654,
+          "passed": true
+        },
+        {
+          "seed": 25223,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.527810449013766,
+          "upper": 0.5283288498690973,
+          "passed": true
+        },
+        {
+          "seed": 25223,
+          "condition": "pressure512",
+          "baseline": "split-0-32",
+          "ratio": 0.8235294086176654,
+          "upper": 0.8235294086176654,
+          "passed": true
+        }
+      ],
+      "independent_accepted": true
+    },
+    "qwen2": {
+      "key": [
+        3584,
+        2560,
+        64,
+        8
+      ],
+      "selected": "split-32-32",
+      "fusion_accepted": false,
+      "controls": [
+        "split-32-32",
+        "public-32"
+      ],
+      "checks": [
+        {
+          "seed": 25011,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.9538152921833281,
+          "bootstrap_one_sided_95_upper": 0.9545411354856084,
+          "passed": true
+        },
+        {
+          "seed": 25011,
+          "condition": "pressure512",
+          "baseline": "public-32",
+          "ratio": 1.025316465022859,
+          "bootstrap_one_sided_95_upper": 1.025316465022859,
+          "passed": false
+        },
+        {
+          "seed": 25029,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.9962296428121105,
+          "bootstrap_one_sided_95_upper": 0.9971331813977824,
+          "passed": false
+        },
+        {
+          "seed": 25029,
+          "condition": "pressure512",
+          "baseline": "split-32-32",
+          "ratio": 1.0377358611443461,
+          "bootstrap_one_sided_95_upper": 1.0377358611443461,
+          "passed": false
+        }
+      ],
+      "config": [
+        [
+          32,
+          3,
+          4
+        ],
+        [
+          32,
+          2,
+          8
+        ]
+      ],
+      "independent_checks": [
+        {
+          "seed": 25107,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.9605533812834658,
+          "upper": 0.9610702757140264,
+          "passed": true
+        },
+        {
+          "seed": 25107,
+          "condition": "pressure512",
+          "baseline": "split-32-32",
+          "ratio": 1.0191082401099347,
+          "upper": 1.025477715271484,
+          "passed": false
+        },
+        {
+          "seed": 25223,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.9781844346463908,
+          "upper": 0.9785612269692376,
+          "passed": false
+        },
+        {
+          "seed": 25223,
+          "condition": "pressure512",
+          "baseline": "split-32-32",
+          "ratio": 1.0381132326576974,
+          "upper": 1.0382165729072261,
+          "passed": false
+        }
+      ],
+      "independent_accepted": false
+    },
+    "qwen235": {
+      "key": [
+        4096,
+        1536,
+        128,
+        8
+      ],
+      "selected": "candidate",
+      "fusion_accepted": true,
+      "controls": [
+        "split-32-32",
+        "public-32"
+      ],
+      "checks": [
+        {
+          "seed": 25011,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.8743728573054798,
+          "bootstrap_one_sided_95_upper": 0.8751191261987339,
+          "passed": true
+        },
+        {
+          "seed": 25011,
+          "condition": "pressure512",
+          "baseline": "split-32-32",
+          "ratio": 0.92500003334814,
+          "bootstrap_one_sided_95_upper": 0.9327731457236781,
+          "passed": true
+        },
+        {
+          "seed": 25029,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.880261774218858,
+          "bootstrap_one_sided_95_upper": 0.8810408476683,
+          "passed": true
+        },
+        {
+          "seed": 25029,
+          "condition": "pressure512",
+          "baseline": "split-32-32",
+          "ratio": 0.9327731457236781,
+          "bootstrap_one_sided_95_upper": 0.9329044186769557,
+          "passed": true
+        }
+      ],
+      "config": [
+        [
+          16,
+          2,
+          8
+        ],
+        [
+          32,
+          2,
+          8
+        ]
+      ],
+      "independent_checks": [
+        {
+          "seed": 25107,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.862152710668214,
+          "upper": 0.8629622414338227,
+          "passed": true
+        },
+        {
+          "seed": 25107,
+          "condition": "pressure512",
+          "baseline": "split-32-32",
+          "ratio": 0.9000000242531927,
+          "upper": 0.9075630524416188,
+          "passed": true
+        },
+        {
+          "seed": 25223,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.8766701905564354,
+          "upper": 0.8772834375821467,
+          "passed": true
+        },
+        {
+          "seed": 25223,
+          "condition": "pressure512",
+          "baseline": "split-32-32",
+          "ratio": 0.9327731457236781,
+          "upper": 0.9327731457236781,
+          "passed": true
+        }
+      ],
+      "independent_accepted": true
+    },
+    "qwen30": {
+      "key": [
+        2048,
+        768,
+        128,
+        8
+      ],
+      "selected": "candidate",
+      "fusion_accepted": true,
+      "controls": [
+        "split-32-32",
+        "public-32"
+      ],
+      "checks": [
+        {
+          "seed": 25011,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5113977945246306,
+          "bootstrap_one_sided_95_upper": 0.5140906861329876,
+          "passed": true
+        },
+        {
+          "seed": 25011,
+          "condition": "pressure512",
+          "baseline": "split-0-0",
+          "ratio": 0.6904762131619996,
+          "bootstrap_one_sided_95_upper": 0.7139136752663867,
+          "passed": true
+        },
+        {
+          "seed": 25029,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5519404792118384,
+          "bootstrap_one_sided_95_upper": 0.5527813803441183,
+          "passed": true
+        },
+        {
+          "seed": 25029,
+          "condition": "pressure512",
+          "baseline": "split-0-0",
+          "ratio": 0.6976744008968041,
+          "bootstrap_one_sided_95_upper": 0.6976744008968041,
+          "passed": true
+        }
+      ],
+      "config": [
+        [
+          32,
+          3,
+          2
+        ],
+        [
+          16,
+          4,
+          8
+        ]
+      ],
+      "independent_checks": [
+        {
+          "seed": 25107,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.516325138916304,
+          "upper": 0.5169927249618869,
+          "passed": true
+        },
+        {
+          "seed": 25107,
+          "condition": "pressure512",
+          "baseline": "split-0-64",
+          "ratio": 0.6902194331418015,
+          "upper": 0.6904762131619996,
+          "passed": true
+        },
+        {
+          "seed": 25223,
+          "condition": "warm",
+          "baseline": "split-32-32",
+          "ratio": 0.5173728740562225,
+          "upper": 0.5193653183589455,
+          "passed": true
+        },
+        {
+          "seed": 25223,
+          "condition": "pressure512",
+          "baseline": "split-0-0",
+          "ratio": 0.6744186213752406,
+          "upper": 0.6744186213752406,
+          "passed": true
+        }
+      ],
+      "independent_accepted": true
+    }
+  },
+  "source_hashes": {
+    "deep_gemm/small_moe.py": "da166c20fa3f20de982b125f44d8c8f85ac5883aed2f44e36fe93aa93313761f",
+    "deep_gemm/small_moe_policy.py": "675185d61c4ac95650a7be3c78ff019ac4f074411b0e3533368e84dc29bcd634",
+    "csrc/apis/sm120_moe_small.hpp": "e9fa80ff0962974a97c50a680c17273336bec50ea105dc3bcdd1226026151be1",
+    "deep_gemm/include/deep_gemm/mma/sm120.cuh": "e1d207c47b38b964ae97d08a62d7392dd742e21256d7dd616082675b478f2cdf",
+    "deep_gemm/include/deep_gemm/impls/sm120_bf16_moe_small.cuh": "272f7136710247f96d62f0176acff5fc1278add597aee8a4756e22d7425dc3e8",
+    "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "b605f7d081d735c89b4d351a8417475086585842ec59ce0c27b0179b9ef46bcc",
+    "tests/bench_sm120_single_token.py": "213bfc8b86390ac7146f4fc3e6e3ace0d3f339ad9b7891525a1e141fff90a967"
+  },
+  "calibration_seeds": [
+    25011,
+    25029
+  ],
+  "boundary": "X + existing GPU routes -> Y, allocation/JIT/router excluded",
+  "repaired_arithmetic": true,
+  "acceptance": "candidate beats fastest measured ordinary/public control in all calibration states by 3%, one-sided bootstrap upper < .97; new-seed acceptance still required; independent audit may remove but never add support",
+  "calibration_sha256": "b43af1bc88a3abd5742d85752655135c63ef314c56084190bcb6212f357ee6fe",
+  "plan_sha256": "fa5b23f140f0e339bf0b13d1665effe7e16d82523ea80d241be5a020c5e879e0",
+  "holdout_sha256": "8e6e95737257c3dd0bb25c1ae3638e41bf52711948125591f00d385ff2c72ec9"
+}

@@ -1,0 +1,1358 @@
+{
+  "complete": true,
+  "final_entry": [
+    {
+      "model": "qwen30",
+      "seed": 25301,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 26.230400800704956,
+      "baseline_us": 50.88000297546387,
+      "ratio": 0.5155345767836174,
+      "upper": 0.515978837838788,
+      "legacy_us": 23.001599311828613,
+      "legacy_ratio": 1.1403729125572553
+    },
+    {
+      "model": "qwen30",
+      "seed": 25301,
+      "condition": "pressure512",
+      "baseline": "split-0-0",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 88.06400001049042,
+      "ratio": 0.6744186213752406,
+      "upper": 0.6904762131619996,
+      "legacy_us": 67.58400052785873,
+      "legacy_ratio": 0.878787893820849
+    },
+    {
+      "model": "qwen235",
+      "seed": 25301,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 196.00319862365723,
+      "baseline_us": 225.04959106445312,
+      "ratio": 0.8709333693813416,
+      "upper": 0.871334716821888,
+      "legacy_us": 196.1087942123413,
+      "legacy_ratio": 0.9994615458775921
+    },
+    {
+      "model": "qwen235",
+      "seed": 25301,
+      "condition": "pressure512",
+      "baseline": "split-32-32",
+      "entry_us": 225.2800017595291,
+      "baseline_us": 243.71199309825897,
+      "ratio": 0.924369781296325,
+      "upper": 0.924369781296325,
+      "legacy_us": 225.2800017595291,
+      "legacy_ratio": 1.0
+    },
+    {
+      "model": "qwen15",
+      "seed": 25301,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 20.345599949359894,
+      "baseline_us": 40.28159976005554,
+      "ratio": 0.5050842089329135,
+      "upper": 0.5056018848755065,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "qwen15",
+      "seed": 25301,
+      "condition": "pressure512",
+      "baseline": "split-0-32",
+      "entry_us": 57.34400078654289,
+      "baseline_us": 71.68000191450119,
+      "ratio": 0.7999999896057751,
+      "upper": 0.7999999896057751,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "qwen2",
+      "seed": 25301,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 295.1296091079712,
+      "baseline_us": 295.15841007232666,
+      "ratio": 0.9999024220101049,
+      "upper": 1.0009336378649807,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "qwen2",
+      "seed": 25301,
+      "condition": "pressure512",
+      "baseline": "split-32-32",
+      "entry_us": 323.5839903354645,
+      "baseline_us": 323.5839903354645,
+      "ratio": 1.0,
+      "upper": 1.0063693824741926,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "deepseek",
+      "seed": 25301,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 39.09760117530823,
+      "baseline_us": 66.36160016059875,
+      "ratio": 0.5891600124272148,
+      "upper": 0.5922424080673888,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "deepseek",
+      "seed": 25301,
+      "condition": "pressure512",
+      "baseline": "split-32-64",
+      "entry_us": 81.91999793052673,
+      "baseline_us": 98.30400347709656,
+      "ratio": 0.8333332828058517,
+      "upper": 0.8333332828058517,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "qwen30",
+      "seed": 25309,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 26.48960053920746,
+      "baseline_us": 50.21439790725708,
+      "ratio": 0.5275299842912012,
+      "upper": 0.5284884990904853,
+      "legacy_us": 23.8304004073143,
+      "legacy_ratio": 1.1115885627787003
+    },
+    {
+      "model": "qwen30",
+      "seed": 25309,
+      "condition": "pressure512",
+      "baseline": "split-32-0",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 86.01599931716919,
+      "ratio": 0.6904762131619996,
+      "upper": 0.6904762131619996,
+      "legacy_us": 67.58400052785873,
+      "legacy_ratio": 0.878787893820849
+    },
+    {
+      "model": "qwen235",
+      "seed": 25309,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 193.27679872512817,
+      "baseline_us": 222.11201190948486,
+      "ratio": 0.8701771554970759,
+      "upper": 0.8708738091384578,
+      "legacy_us": 193.23519468307495,
+      "legacy_ratio": 1.000215302611522
+    },
+    {
+      "model": "qwen235",
+      "seed": 25309,
+      "condition": "pressure512",
+      "baseline": "public-32",
+      "entry_us": 223.23200106620789,
+      "baseline_us": 241.66400730609894,
+      "ratio": 0.9237287900446651,
+      "upper": 0.9237287900446651,
+      "legacy_us": 223.23200106620789,
+      "legacy_ratio": 1.0
+    },
+    {
+      "model": "qwen15",
+      "seed": 25309,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 19.974400103092194,
+      "baseline_us": 38.790398836135864,
+      "ratio": 0.5149315475582246,
+      "upper": 0.5172329588186644,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "qwen15",
+      "seed": 25309,
+      "condition": "pressure512",
+      "baseline": "split-0-32",
+      "entry_us": 57.34400078654289,
+      "baseline_us": 69.63200122117996,
+      "ratio": 0.8235294086176654,
+      "upper": 0.8235294086176654,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "qwen2",
+      "seed": 25309,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 297.7344036102295,
+      "baseline_us": 297.6799964904785,
+      "ratio": 1.0001827704931214,
+      "upper": 1.001000469017439,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "qwen2",
+      "seed": 25309,
+      "condition": "pressure512",
+      "baseline": "public-32",
+      "entry_us": 323.5839903354645,
+      "baseline_us": 323.5839903354645,
+      "ratio": 1.0,
+      "upper": 1.0127388576357421,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "deepseek",
+      "seed": 25309,
+      "condition": "warm",
+      "baseline": "split-32-32",
+      "entry_us": 37.92960047721863,
+      "baseline_us": 64.79039788246155,
+      "ratio": 0.5854200887302468,
+      "upper": 0.5890173994188164,
+      "legacy_us": null,
+      "legacy_ratio": null
+    },
+    {
+      "model": "deepseek",
+      "seed": 25309,
+      "condition": "pressure512",
+      "baseline": "split-0-0",
+      "entry_us": 79.8719972372055,
+      "baseline_us": 98.30400347709656,
+      "ratio": 0.8124999431565831,
+      "upper": 0.8124999431565831,
+      "legacy_us": null,
+      "legacy_ratio": null
+    }
+  ],
+  "real_replay": [
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 27.884799242019653,
+      "baseline_us": 60.70399880409241,
+      "ratio": 0.459356875846205
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 77.79199630022049,
+      "ratio": 0.7897984544680069
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 26.879999041557312,
+      "baseline_us": 57.551997900009155,
+      "ratio": 0.4670558802886152
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 81.91999793052673,
+      "ratio": 0.7250000363797889
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 28.188800811767578,
+      "baseline_us": 59.93279814720154,
+      "ratio": 0.4703401423463124
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 79.8719972372055,
+      "ratio": 0.7692307764062701
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 42.55029857158661,
+      "baseline_us": 69.81459856033325,
+      "ratio": 0.6094756605212728
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 45.05600035190582,
+      "baseline_us": 70.97599655389786,
+      "ratio": 0.6348061674300146
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 1,
+      "condition": "warm",
+      "entry_us": 52.74699926376343,
+      "baseline_us": 75.27120113372803,
+      "ratio": 0.7007593670526429
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 1,
+      "condition": "pressure512",
+      "entry_us": 53.69599908590317,
+      "baseline_us": 75.83999633789062,
+      "ratio": 0.7080168997723958
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 2,
+      "condition": "warm",
+      "entry_us": 53.15999984741211,
+      "baseline_us": 75.82190036773682,
+      "ratio": 0.7011166904230267
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 2,
+      "condition": "pressure512",
+      "entry_us": 54.016001522541046,
+      "baseline_us": 76.1599987745285,
+      "ratio": 0.7092437288826027
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 26.46079957485199,
+      "baseline_us": 60.53119897842407,
+      "ratio": 0.43714315958426264
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 77.82399654388428,
+      "ratio": 0.7631579476437385
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 27.113598585128784,
+      "baseline_us": 59.699201583862305,
+      "ratio": 0.45417020438775924
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 73.7600028514862,
+      "ratio": 0.8329717471893655
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 26.659199595451355,
+      "baseline_us": 58.05119872093201,
+      "ratio": 0.4592359879355708
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 75.77600330114365,
+      "ratio": 0.7837837691680917
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 52.53180265426636,
+      "baseline_us": 74.81380105018616,
+      "ratio": 0.7021672728408396
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 53.568001836538315,
+      "baseline_us": 75.52000135183334,
+      "ratio": 0.7093220455197712
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 4,
+      "condition": "warm",
+      "entry_us": 52.313101291656494,
+      "baseline_us": 74.87390041351318,
+      "ratio": 0.6986827319365223
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 4,
+      "condition": "pressure512",
+      "entry_us": 53.247999399900436,
+      "baseline_us": 75.32799988985062,
+      "ratio": 0.7068818962107456
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 5,
+      "condition": "warm",
+      "entry_us": 42.80099868774414,
+      "baseline_us": 69.48959827423096,
+      "ratio": 0.6159338915564888
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 5,
+      "condition": "pressure512",
+      "entry_us": 45.441001653671265,
+      "baseline_us": 70.65600156784058,
+      "ratio": 0.6431301042423261
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 6,
+      "condition": "warm",
+      "entry_us": 52.283698320388794,
+      "baseline_us": 75.00699758529663,
+      "ratio": 0.6970509419595511
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 6,
+      "condition": "pressure512",
+      "entry_us": 52.86400020122528,
+      "baseline_us": 75.29599964618683,
+      "ratio": 0.702082453910318
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 27.04319953918457,
+      "baseline_us": 59.84960198402405,
+      "ratio": 0.45185262128231607
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 79.8719972372055,
+      "ratio": 0.7435897878386655
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 27.939200401306152,
+      "baseline_us": 55.59359788894653,
+      "ratio": 0.5025614722241462
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 75.77600330114365,
+      "ratio": 0.8108107550054408
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 28.150400519371033,
+      "baseline_us": 57.42400288581848,
+      "ratio": 0.49022010143293404
+    },
+    {
+      "kind": "steady",
+      "layer": 0,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 77.79199630022049,
+      "ratio": 0.7897984544680069
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 54.84359860420227,
+      "baseline_us": 76.50219798088074,
+      "ratio": 0.7168891881761184
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 0,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 55.424001067876816,
+      "baseline_us": 76.80000364780426,
+      "ratio": 0.7216666462939864
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 27.327999472618103,
+      "baseline_us": 59.833598136901855,
+      "ratio": 0.4567333458718371
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 79.8719972372055,
+      "ratio": 0.7692307764062701
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 28.42879891395569,
+      "baseline_us": 60.44800281524658,
+      "ratio": 0.47030170708609736
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 77.82399654388428,
+      "ratio": 0.7631579476437385
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 26.495999097824097,
+      "baseline_us": 60.48640012741089,
+      "ratio": 0.43804886787793457
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 81.91999793052673,
+      "ratio": 0.75
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 39.32560086250305,
+      "baseline_us": 67.5786018371582,
+      "ratio": 0.581923860414641
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 41.728001087903976,
+      "baseline_us": 68.41599941253662,
+      "ratio": 0.6099158303058815
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 1,
+      "condition": "warm",
+      "entry_us": 42.79760122299194,
+      "baseline_us": 69.24840211868286,
+      "ratio": 0.6180301626258806
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 1,
+      "condition": "pressure512",
+      "entry_us": 45.24900019168854,
+      "baseline_us": 70.17599791288376,
+      "ratio": 0.6447931135637072
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 2,
+      "condition": "warm",
+      "entry_us": 43.17930042743683,
+      "baseline_us": 71.117502450943,
+      "ratio": 0.6071543423114726
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 2,
+      "condition": "pressure512",
+      "entry_us": 44.47999969124794,
+      "baseline_us": 71.68000191450119,
+      "ratio": 0.6205356934044589
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 27.103999257087708,
+      "baseline_us": 59.1264009475708,
+      "ratio": 0.4584077302645507
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 83.96799862384796,
+      "ratio": 0.7073171023870998
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 28.441599011421204,
+      "baseline_us": 60.48960089683533,
+      "ratio": 0.47018989363028185
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 83.96799862384796,
+      "ratio": 0.7317073105806445
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 26.46079957485199,
+      "baseline_us": 59.836798906326294,
+      "ratio": 0.4422161622695762
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 77.82399654388428,
+      "ratio": 0.7631579476437385
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 40.525299310684204,
+      "baseline_us": 68.68129968643188,
+      "ratio": 0.5900485211506569
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 42.55999997258186,
+      "baseline_us": 69.50400024652481,
+      "ratio": 0.6123388556288147
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 4,
+      "condition": "warm",
+      "entry_us": 44.59820091724396,
+      "baseline_us": 71.00449800491333,
+      "ratio": 0.6281038831393171
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 4,
+      "condition": "pressure512",
+      "entry_us": 46.592000871896744,
+      "baseline_us": 71.8730017542839,
+      "ratio": 0.6482545564352985
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 5,
+      "condition": "warm",
+      "entry_us": 41.73620045185089,
+      "baseline_us": 69.15879845619202,
+      "ratio": 0.6034835969321863
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 5,
+      "condition": "pressure512",
+      "entry_us": 44.28799822926521,
+      "baseline_us": 70.52800059318542,
+      "ratio": 0.6279491529147988
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 6,
+      "condition": "warm",
+      "entry_us": 42.91059970855713,
+      "baseline_us": 70.0747013092041,
+      "ratio": 0.612355085456796
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 6,
+      "condition": "pressure512",
+      "entry_us": 44.16000097990036,
+      "baseline_us": 70.65600156784058,
+      "ratio": 0.625
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 26.82879865169525,
+      "baseline_us": 59.913599491119385,
+      "ratio": 0.4477914677062912
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 73.72800260782242,
+      "ratio": 0.8055555471343087
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 26.72640085220337,
+      "baseline_us": 62.13120222091675,
+      "ratio": 0.4301606905524485
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 79.8719972372055,
+      "ratio": 0.7435897878386655
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 28.307199478149414,
+      "baseline_us": 58.68480205535889,
+      "ratio": 0.48235997203239267
+    },
+    {
+      "kind": "steady",
+      "layer": 4,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 75.77600330114365,
+      "ratio": 0.8108107550054408
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 39.36359882354736,
+      "baseline_us": 67.5885021686554,
+      "ratio": 0.5824008161228713
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 4,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 41.4079986512661,
+      "baseline_us": 68.80000233650208,
+      "ratio": 0.6018604250729356
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 28.2943993806839,
+      "baseline_us": 57.46240019798279,
+      "ratio": 0.49239849507151584
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 73.72800260782242,
+      "ratio": 0.8333332828058517
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 28.358399868011475,
+      "baseline_us": 60.65279841423035,
+      "ratio": 0.4675530331566372
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 77.82399654388428,
+      "ratio": 0.7894736993267825
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 26.473599672317505,
+      "baseline_us": 58.65280032157898,
+      "ratio": 0.4513612227748586
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 75.77600330114365,
+      "ratio": 0.7837837691680917
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 0,
+      "condition": "warm",
+      "entry_us": 40.86570143699646,
+      "baseline_us": 68.25199723243713,
+      "ratio": 0.5987473347897109
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 0,
+      "condition": "pressure512",
+      "entry_us": 43.20000112056732,
+      "baseline_us": 67.84000247716904,
+      "ratio": 0.6367924460955895
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 1,
+      "condition": "warm",
+      "entry_us": 38.70159983634949,
+      "baseline_us": 67.10039973258972,
+      "ratio": 0.576771524321526
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 1,
+      "condition": "pressure512",
+      "entry_us": 41.280001401901245,
+      "baseline_us": 68.15999746322632,
+      "ratio": 0.6056338459251357
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 2,
+      "condition": "warm",
+      "entry_us": 36.72820031642914,
+      "baseline_us": 65.65229892730713,
+      "ratio": 0.5594350984890275
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 2,
+      "condition": "pressure512",
+      "entry_us": 38.40000182390213,
+      "baseline_us": 65.0240033864975,
+      "ratio": 0.5905511783957007
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 25.724801421165466,
+      "baseline_us": 55.60640096664429,
+      "ratio": 0.46262302493909985
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 83.96799862384796,
+      "ratio": 0.7073171023870998
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 25.910401344299316,
+      "baseline_us": 58.86399745941162,
+      "ratio": 0.4401740021507249
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 73.72800260782242,
+      "ratio": 0.8333332828058517
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 28.572800755500793,
+      "baseline_us": 58.476799726486206,
+      "ratio": 0.488617723424409
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 63.48799914121628,
+      "baseline_us": 83.96799862384796,
+      "ratio": 0.7560975631397852
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 3,
+      "condition": "warm",
+      "entry_us": 35.35400032997131,
+      "baseline_us": 64.8356020450592,
+      "ratio": 0.5452868364729786
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 3,
+      "condition": "pressure512",
+      "entry_us": 37.50399872660637,
+      "baseline_us": 65.92000275850296,
+      "ratio": 0.568931995710039
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 4,
+      "condition": "warm",
+      "entry_us": 37.515801191329956,
+      "baseline_us": 65.90480208396912,
+      "ratio": 0.5692423010925848
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 4,
+      "condition": "pressure512",
+      "entry_us": 39.872001856565475,
+      "baseline_us": 67.00800359249115,
+      "ratio": 0.595033424649492
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 5,
+      "condition": "warm",
+      "entry_us": 41.876599192619324,
+      "baseline_us": 69.55389976501465,
+      "ratio": 0.6020740653521645
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 5,
+      "condition": "pressure512",
+      "entry_us": 44.415999203920364,
+      "baseline_us": 70.65600156784058,
+      "ratio": 0.6286231631898135
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 6,
+      "condition": "warm",
+      "entry_us": 38.40290009975433,
+      "baseline_us": 66.44700169563293,
+      "ratio": 0.5779478248794824
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 6,
+      "condition": "pressure512",
+      "entry_us": 39.872001856565475,
+      "baseline_us": 67.1359971165657,
+      "ratio": 0.5938990045435271
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 27.449598908424377,
+      "baseline_us": 60.27200222015381,
+      "ratio": 0.4554286882350451
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "baseline_us": 77.82399654388428,
+      "ratio": 0.7894736993267825
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 26.345598697662354,
+      "baseline_us": 59.20000076293945,
+      "ratio": 0.44502699929279893
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 79.8719972372055,
+      "ratio": 0.7435897878386655
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 26.681599020957947,
+      "baseline_us": 57.59360194206238,
+      "ratio": 0.4632736644566687
+    },
+    {
+      "kind": "steady",
+      "layer": 7,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "baseline_us": 77.82399654388428,
+      "ratio": 0.7631579476437385
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 7,
+      "condition": "warm",
+      "entry_us": 34.015101194381714,
+      "baseline_us": 63.80850076675415,
+      "ratio": 0.5330810281645804
+    },
+    {
+      "kind": "sequence_average",
+      "layer": 7,
+      "prompt": 7,
+      "condition": "pressure512",
+      "entry_us": 36.73600032925606,
+      "baseline_us": 64.96000289916992,
+      "ratio": 0.5655172212088291
+    }
+  ],
+  "validation_steps": [
+    {
+      "name": "public-correctness",
+      "passed": true,
+      "command": [
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_small_moe_policy",
+        "tests.test_sm120_single_token_policy",
+        "tests.test_sm120_small_moe_gpu",
+        "tests.test_sm120_single_token_gpu",
+        "-v"
+      ],
+      "exit_code": 0,
+      "seconds": 128.4867979818955,
+      "log": "public-correctness.log",
+      "sha256": "f6e863e861b75577ce01d4086f2981f962b24dc3308f89576e3ae116b7c71161"
+    },
+    {
+      "name": "original-contract",
+      "passed": true,
+      "command": [
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "pytest",
+        "tests/test_sm120_grouped_swiglu.py",
+        "-vv"
+      ],
+      "exit_code": 0,
+      "seconds": 77.0543949753046,
+      "log": "original-contract.log",
+      "sha256": "d384919f0b25d554fbb5460a88b8a85ad8ad6f5156c62714a9008a1abf2c314a"
+    },
+    {
+      "name": "accuracy-regression",
+      "passed": true,
+      "command": [
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_bf16_accumulation",
+        "-v"
+      ],
+      "exit_code": 0,
+      "seconds": 22.202619643881917,
+      "log": "accuracy-regression.log",
+      "sha256": "f09856911ce14d90fa33a90b2eb6a4381ac8b1996a44fdc51abd497c595e21d5"
+    },
+    {
+      "name": "memcheck",
+      "passed": true,
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "memcheck",
+        "--error-exitcode",
+        "99",
+        "--print-limit",
+        "32",
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+        "tests.test_sm120_single_token_gpu.SingleTokenGpuTest.test_candidate_templates_graph_guards_and_high_slots",
+        "tests.test_sm120_single_token_gpu.SingleTokenGpuTest.test_candidates_preserve_midpoint_and_cancellation",
+        "-v"
+      ],
+      "exit_code": 0,
+      "seconds": 11.039633475709707,
+      "log": "memcheck.log",
+      "sha256": "8f568aea37af8a30ddf06347e7b04fde431199d73f6dde17bc2636b9aa36d08e"
+    },
+    {
+      "name": "synccheck",
+      "passed": true,
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "synccheck",
+        "--error-exitcode",
+        "99",
+        "--print-limit",
+        "32",
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+        "tests.test_sm120_single_token_gpu.SingleTokenGpuTest.test_candidate_templates_graph_guards_and_high_slots",
+        "tests.test_sm120_single_token_gpu.SingleTokenGpuTest.test_candidates_preserve_midpoint_and_cancellation",
+        "-v"
+      ],
+      "exit_code": 0,
+      "seconds": 7.681713796686381,
+      "log": "synccheck.log",
+      "sha256": "d6fe5fd939b06a73bb53890933133c16da13cdcfcfbba3e8f61d2fcb0f2cbadc"
+    },
+    {
+      "name": "racecheck",
+      "passed": true,
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "racecheck",
+        "--error-exitcode",
+        "99",
+        "--print-limit",
+        "32",
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+        "tests.test_sm120_single_token_gpu.SingleTokenGpuTest.test_candidate_templates_graph_guards_and_high_slots",
+        "tests.test_sm120_single_token_gpu.SingleTokenGpuTest.test_candidates_preserve_midpoint_and_cancellation",
+        "-v"
+      ],
+      "exit_code": 0,
+      "seconds": 400.5394876319915,
+      "log": "racecheck.log",
+      "sha256": "47c322efc974d2abc6219f5fdb27f28d66ecf8b0bf396737ffa9de2311b9add6"
+    },
+    {
+      "name": "initcheck",
+      "passed": true,
+      "command": [
+        "compute-sanitizer",
+        "--tool",
+        "initcheck",
+        "--error-exitcode",
+        "99",
+        "--print-limit",
+        "32",
+        "/usr/local/miniconda3/envs/py312/bin/python",
+        "-u",
+        "-m",
+        "unittest",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+        "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+        "tests.test_sm120_single_token_gpu.SingleTokenGpuTest.test_candidate_templates_graph_guards_and_high_slots",
+        "tests.test_sm120_single_token_gpu.SingleTokenGpuTest.test_candidates_preserve_midpoint_and_cancellation",
+        "-v"
+      ],
+      "exit_code": 0,
+      "seconds": 6.822577768005431,
+      "log": "initcheck.log",
+      "sha256": "8323250ff4f6bddf97fbd5bdc4d5e22538133d6184a297c517d7d2eb3d023f1d"
+    }
+  ],
+  "real_check_rows": 3072,
+  "real_oracle_rows": 108,
+  "source_hashes": {
+    "deep_gemm/small_moe.py": "962fe8fefc5ef0168855f5e97d11902353f91c121e1344e27dd88c23e28da88c",
+    "deep_gemm/small_moe_policy.py": "9483eb12e3cbe08a35fb6ad962d815044db3cc9a5c1b6d4dd8be8b6fd2635a80",
+    "csrc/apis/sm120_moe_small.hpp": "e9fa80ff0962974a97c50a680c17273336bec50ea105dc3bcdd1226026151be1",
+    "deep_gemm/include/deep_gemm/mma/sm120.cuh": "e1d207c47b38b964ae97d08a62d7392dd742e21256d7dd616082675b478f2cdf",
+    "deep_gemm/include/deep_gemm/impls/sm120_bf16_moe_small.cuh": "272f7136710247f96d62f0176acff5fc1278add597aee8a4756e22d7425dc3e8",
+    "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "b605f7d081d735c89b4d351a8417475086585842ec59ce0c27b0179b9ef46bcc",
+    "tests/bench_sm120_single_token.py": "213bfc8b86390ac7146f4fc3e6e3ace0d3f339ad9b7891525a1e141fff90a967"
+  },
+  "evidence_sha256": {
+    "final-entry.json": "3bf1a4e3d62b59691a01a55371074e070064bd508512d95f0331546bb4e4d62f",
+    "validation/completion.json": "31b56fd8048a0ee6088655fc79ef68cb5e05e97e7484531c60d7e0783cb71d92",
+    "real-replay.json": "00271bddf74dc874ca2b8585881f28ff0ce6e218b6c45bb8a039fcb7f3c28f87"
+  },
+  "real_entry_inputs": 768,
+  "all_entry_H_Y_bitwise": true,
+  "historical_HF_outside_tolerance_inputs": 0,
+  "historical_HF_outside_tolerance_elements": 0
+}
