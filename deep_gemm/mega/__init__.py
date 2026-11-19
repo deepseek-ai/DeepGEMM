@@ -13,6 +13,8 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+from .sm90_fused import SM90FusedSymmBuffer, fp8_mxfp4_mega_moe
+from .mxfp4 import transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90
 
 
 class SymmBuffer:
@@ -418,15 +420,24 @@ def get_symm_buffer_for_sm90_mega_moe(group: dist.ProcessGroup,
                                       num_max_tokens_per_rank: int, num_topk: int,
                                       hidden: int, intermediate_hidden: int,
                                       use_fp8_dispatch: bool = True,
-                                      activation: str = 'swiglu') -> SM90SymmBuffer:
+                                      activation: str = 'swiglu',
+                                      fused: bool = False,
+                                      num_experts_per_wave: Optional[int] = None,
+                                      l2_act_sf_gran_k: Optional[int] = None) -> Union[SM90SymmBuffer, SM90FusedSymmBuffer]:
+    if fused:
+        num_max_tokens_per_rank = align(
+            num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_fused_mega_moe())
+        return SM90FusedSymmBuffer(
+            group, num_experts, num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden, use_fp8_dispatch, activation,
+            num_experts_per_wave, l2_act_sf_gran_k)
+    if num_experts_per_wave is not None or l2_act_sf_gran_k is not None:
+        raise ValueError('Wave and L2 SF options require fused=True')
     num_max_tokens_per_rank = align(
         num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_mega_moe())
     return SM90SymmBuffer(
-        group, num_experts,
-        num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden,
-        use_fp8_dispatch, activation,
-    )
+        group, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, use_fp8_dispatch, activation)
 
 
 def transform_weights_for_mega_moe_sm90(
@@ -486,19 +497,44 @@ def transform_weights_for_mega_moe_sm90(
 def fp8_mega_moe(y: torch.Tensor,
                  l1_weights: Tuple[torch.Tensor, torch.Tensor],
                  l2_weights: Tuple[torch.Tensor, torch.Tensor],
-                 sym_buffer: SM90SymmBuffer,
+                 sym_buffer: Union[SM90SymmBuffer, SM90FusedSymmBuffer],
                  cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                  recipe: Tuple[int, int, int] = (128, 128, 128),
                  activation: str = 'swiglu',
                  activation_clamp: Optional[float] = None,
-                 fast_math: bool = True):
+                 fast_math: bool = True,
+                 *,
+                 num_tokens_bound: Optional[int] = None):
     """SM90 (Hopper) MegaMoE entry point.
 
     Expects FP8 e4m3 weights and block-(128, 128) float scale factors. The
     weight SF layout matches the convention used by ``DeepSeekV4FlashFp8`` /
     DeepEP, so the same SF tensors can be physically shared between the
     DeepEP path and this kernel.
+
+    An ``SM90FusedSymmBuffer`` selects the single-kernel implementation.
+    ``num_tokens_bound`` (fused only) is an upper bound on this call's
+    per-rank token count on every rank; ``None`` uses the buffer capacity.
     """
+    if isinstance(sym_buffer, SM90FusedSymmBuffer):
+        _C.sm90_fused_fp8_mega_moe(
+            y,
+            l1_weights, l2_weights,
+            cumulative_local_expert_recv_stats,
+            sym_buffer.buffer,
+            sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank,
+            sym_buffer.num_experts, sym_buffer.num_topk,
+            recipe,
+            activation, activation_clamp,
+            fast_math,
+            sym_buffer.num_ring_tokens,
+            0 if num_tokens_bound is None else num_tokens_bound,
+            sym_buffer.l2_lag_encoded, sym_buffer.l2_act_sf_gran_k
+        )
+        return
+    if num_tokens_bound is not None:
+        raise ValueError('`num_tokens_bound` applies to the fused buffer only')
     if not isinstance(sym_buffer, SM90SymmBuffer):
         raise ValueError('SM90 FP8 MegaMoE requires an SM90SymmBuffer')
     _C.fp8_mega_moe(
