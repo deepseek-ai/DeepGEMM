@@ -321,7 +321,38 @@ struct SM120ArchSpec {
         return a.num_cycles < b.num_cycles;
     }
 
+    // NOTES: deterministic mode is also batch invariant, so the K splits must not depend on M. They depend on the
+    // weight's N (`desc.m` under swap-AB) and K only, as the split-K heuristic picks them for one block row; every
+    // split is a multiple of both BLOCK_K candidates and of the packed SF tile, so any layout splits K identically.
+    static int get_batch_invariant_num_splits(const SM120GemmDesc& desc, const int& weight_n) {
+        if (desc.gemm_type != GemmType::Normal or desc.kernel_type == KernelType::KernelNoSF)
+            return 1;
+        const int num_n_blocks = ceil_div(weight_n, 64);
+        if (num_n_blocks >= desc.num_sms / 2)
+            return 1;
+        const int split_unit = std::lcm(128, 4 * desc.max_gran_k);
+        if (desc.k % split_unit != 0)
+            return 1;
+        const int num_units = desc.k / split_unit;
+        int num_splits = std::min(ceil_div(desc.num_sms * 3 / 4, num_n_blocks), num_units / 2);
+        while (num_splits > 1 and num_units % num_splits != 0)
+            -- num_splits;
+        return std::max(num_splits, 1);
+    }
+
+    // Whether the batch-invariant splits run as real split-K (few MN blocks, bounded workspace) or emulated
+    static bool uses_real_split_k(const SM120GemmDesc& desc, const Layout& layout, const int& num_splits) {
+        constexpr int64_t kMaxWorkspaceBytes = 32 * 1024 * 1024;
+        const int num_mn_blocks = ceil_div(desc.m, layout.block_m) * ceil_div(desc.n, layout.block_n);
+        return num_splits > 1 and num_mn_blocks < desc.num_sms / 2 and
+               static_cast<int64_t>(num_splits) * desc.m * desc.n * sizeof(float) <= kMaxWorkspaceBytes;
+    }
+
     static int get_split_k_factor(const SM120GemmDesc& desc, const Layout& layout) {
+        // NOTES: deterministic mode is also batch invariant. Whether K is split depends on M, and a split K is
+        // summed in a different order, so a row's result would depend on the batch it is computed in.
+        if (heuristics_runtime->get_deterministic_algorithms())
+            return 1;
         if (desc.gemm_type != GemmType::Normal or desc.kernel_type == KernelType::KernelNoSF)
             return 1;
 

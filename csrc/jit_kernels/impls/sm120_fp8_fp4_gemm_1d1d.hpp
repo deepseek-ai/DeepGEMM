@@ -44,6 +44,7 @@ public:
         bool a_is_fp4;
         bool k_grouped_constant_stride;
         int k_alignment = 128;
+        int num_emulated_splits = 1;
         int stride_cd_m;
         int stride_cd_n;
         int stride_cd_batch;
@@ -90,6 +91,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -115,7 +117,8 @@ static void __instantiate_kernel() {{
         args.k_grouped_constant_stride ? "true" : "false",
         args.gemm_config.storage_config.store_block_m,
         args.gemm_config.split_k_factor,
-        args.k_alignment);
+        args.k_alignment,
+        args.num_emulated_splits);
     }
 
     template <typename Kernel>
@@ -258,6 +261,16 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
 
     auto config = get_best_sm120_config<SM120ArchSpec>(desc);
     config.split_k_factor = SM120ArchSpec::get_split_k_factor(desc, config.layout);
+    int num_emulated_splits = 1;
+    if (heuristics_runtime->get_deterministic_algorithms()) {
+        // Batch invariant: K is split into the same ranges for any M, for real when there are few MN blocks
+        // (e.g. decode) and emulated inside the kernel otherwise, which gives bitwise the same result
+        const int num_splits = SM120ArchSpec::get_batch_invariant_num_splits(desc, swap_ab ? m : n);
+        if (SM120ArchSpec::uses_real_split_k(desc, config.layout, num_splits))
+            config.split_k_factor = num_splits;
+        else
+            num_emulated_splits = num_splits;
+    }
 
     const auto cd = c.value_or(d);
     const bool fp4_unpacked = !is_fp4;
@@ -307,6 +320,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
         .b_is_fp4 = b_is_fp4,
         .a_is_fp4 = a_is_fp4,
         .k_grouped_constant_stride = false,
+        .num_emulated_splits = num_emulated_splits,
         .stride_cd_m = swap_ab ? static_cast<int>(d.stride(-1)) : d_stride,
         .stride_cd_n = swap_ab ? static_cast<int>(d.stride(-2)) : 0,
         .stride_cd_batch = 0,

@@ -26,13 +26,14 @@ __global__ void sm120_split_k_reduce_impl(
     const uint32_t col = (idx % shape_n);
     const uint32_t ws_stride = shape_m * shape_n;
 
+    // NOTES: the GEMM kernel's emulated split-K sums in this order, and scales without contracting into the C add
     float sum = workspace[idx];
     #pragma unroll
     for (uint32_t s = 1; s < kSplitKFactor; ++s)
-        sum += workspace[s * ws_stride + idx];
+        sum = __fadd_rn(sum, workspace[s * ws_stride + idx]);
 
     if (with_alpha)
-        sum *= alpha;
+        sum = __fmul_rn(sum, alpha);
     if (gmem_c != nullptr)
         sum += static_cast<float>(gmem_c[static_cast<int64_t>(row) * stride_c_m + static_cast<int64_t>(col) * stride_c_n]);
     gmem_d[static_cast<int64_t>(row) * stride_cd_m + static_cast<int64_t>(col) * stride_cd_n] = cd_dtype_t(sum);
