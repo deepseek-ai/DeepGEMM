@@ -1,12 +1,13 @@
 #pragma once
 
 #include <cutlass/bfloat16.h>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 
 namespace deep_gemm {
 
+// NOTES: `epilogue_operator_t` only keys the instantiation; the reduction applies `alpha` itself
 template <typename cd_dtype_t, uint32_t kSplitKFactor,
-          typename epilogue_type_t = epilogue::transform::EpilogueIdentity>
+          typename epilogue_operator_t = epilogue::operators::Identity>
 __global__ void sm120_split_k_reduce_impl(
     cd_dtype_t* gmem_d,
     const float* __restrict__ workspace,
@@ -22,7 +23,7 @@ __global__ void sm120_split_k_reduce_impl(
         return;
 
     const uint32_t row = idx / shape_n;
-    const uint32_t col = epilogue_type_t::template apply_index_n<1>(idx % shape_n);
+    const uint32_t col = (idx % shape_n);
     const uint32_t ws_stride = shape_m * shape_n;
 
     float sum = workspace[idx];

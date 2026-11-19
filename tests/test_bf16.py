@@ -9,6 +9,7 @@ from deep_gemm.testing import (
 )
 from utils import (
     assert_direct_output_matches_fp32_accumulation,
+    assert_stochastic_bf16_matches_fp32_accumulation,
     assert_psum_zero_padding,
 )
 from generators import (
@@ -45,6 +46,12 @@ def test_gemm() -> None:
                 assert diff < 1e-5, (f'{m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=}, '
                                        f'{use_alpha=}, {alpha=}, {diff:.5f}, alias={test_alias}')
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
+        if get_arch_major() == 10 and not accumulate and out_dtype == torch.bfloat16:
+            deep_gemm.bf16_gemm_nt(a, b, d, epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+            assert_stochastic_bf16_matches_fp32_accumulation(
+                d,
+                lambda output, accumulator: deep_gemm.bf16_gemm_nt(a, b, output, c=accumulator),
+                f'BF16 GEMM stochastic rounding, {m=}, {n=}, {k=}, {major_opt=}')
 
         t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), 'bf16_gemm', suppress_kineto_output=True)
         deep_gemm.use_deterministic_algorithms(False)
@@ -175,12 +182,15 @@ def test_k_grouped_gemm_contiguous() -> None:
                     case_label = (f'BF16 K-grouped direct output, {m=}, {n=}, {total_k=}, '
                                   f'{test_real_ks_cpu=}, {test_host_ks_cpu=}, {use_psum_layout=}, '
                                   f'{out_dtype=}')
-                    assert_direct_output_matches_fp32_accumulation(
-                        d,
-                        lambda output, accumulator: deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
-                            a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
-                            use_psum_layout=use_psum_layout),
-                        case_label)
+                    launch = lambda output, accumulator: deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
+                        a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
+                        use_psum_layout=use_psum_layout)
+                    assert_direct_output_matches_fp32_accumulation(d, launch, case_label)
+                    if out_dtype == torch.bfloat16:
+                        deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
+                            a, b, d, test_host_ks_cpu, grouped_layout, None, use_psum_layout=use_psum_layout,
+                            epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                        assert_stochastic_bf16_matches_fp32_accumulation(d, launch, f'stochastic rounding, {case_label}')
 
         # Test performance
         _, a, b, c, d, _, grouped_layout, host_ks_cpu = generate_k_grouped_contiguous(

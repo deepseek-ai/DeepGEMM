@@ -694,6 +694,9 @@ CUTLASS_GLOBAL void __launch_bounds__(kNumThreads, 1)
     __syncthreads();
     if (warp_idx == 3)
         Allocator().free(tmem_base, kNumTmemCols);
+    // Every barrier use of this CTA is complete; the last CTA advances the epoch.
+    if (threadIdx.x == 0)
+        sched::mega_mhc::Epoch::retire(gmem_split_barriers, gridDim.x);
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only supports sm_100f");

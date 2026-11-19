@@ -8,7 +8,22 @@ import torch
 import deep_gemm
 from deep_gemm.testing import assert_bitwise_equal, calc_diff, get_arch_major
 from deep_gemm.utils import per_custom_dims_cast_to_fp8
-from test_attention import ref_diff_tol, ref_fp8_mqa_logits, to_mqa_weights
+from deep_gemm.utils import ceil_div
+from test_attention import quantize_mqa_q, ref_mqa_logits as ref_fp8_mqa_logits
+
+
+def ref_diff_tol(has_bf16: bool) -> float:
+    return 3e-5 if has_bf16 else 5e-6
+
+
+def to_mqa_weights(weights: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # Rows are padded to 16 bytes for the TMA loads
+    element_size = torch.empty((), dtype=dtype).element_size()
+    stride = ceil_div(weights.size(1) * element_size, 16) * 16 // element_size
+    storage = torch.empty((weights.size(0), stride), device=weights.device, dtype=dtype)
+    result = storage[:, :weights.size(1)]
+    result.copy_(weights)
+    return result
 
 
 def require_arch(major):
@@ -33,8 +48,7 @@ def graph_replay(call):
 @pytest.mark.parametrize('seq_len,num_heads', [(4, 8), (12, 16), (516, 32), (512, 64)])
 @pytest.mark.parametrize('head_dim', [32, 64, 128])
 @pytest.mark.parametrize('logits_dtype', [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize('compressed', [False, True])
-def test_sm100_fp16_dense_tail_graph(seq_len, num_heads, head_dim, logits_dtype, compressed):
+def test_sm100_fp16_dense_tail_graph(seq_len, num_heads, head_dim, logits_dtype):
     require_arch(10)
     torch.manual_seed(123)
     seq_len_kv, window = 769, 127
@@ -49,8 +63,7 @@ def test_sm100_fp16_dense_tail_graph(seq_len, num_heads, head_dim, logits_dtype,
     ks[::4], ke[::4] = 0, 0
     kwargs = dict(q=(q_fp8, None), kv=(kv_fp8, kv_sf), weights=weights,
                   cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
-                  clean_logits=not compressed, max_seqlen_k=window if compressed else 0,
-                  logits_dtype=logits_dtype)
+                  max_seqlen_k=window, logits_dtype=logits_dtype)
     call = lambda: deep_gemm.fp8_fp4_mqa_logits(**kwargs)
     eager = call()
     graph, captured = graph_replay(call)
@@ -59,16 +72,11 @@ def test_sm100_fp16_dense_tail_graph(seq_len, num_heads, head_dim, logits_dtype,
         reference, _ = ref_fp8_mqa_logits(q, kv, weights.float(), ks, ke)
         simulated_kv = (kv_fp8.float() * kv_sf[:, None]).bfloat16()
         simulated, _ = ref_fp8_mqa_logits(q_fp8.bfloat16(), simulated_kv, weights.float(), ks, ke)
-        if compressed:
-            positions = ks[:, None] + torch.arange(window, device='cuda')[None, :]
-            mask = positions < ke[:, None]
-            reference = reference.gather(1, positions.long())
-            simulated = simulated.gather(1, positions.long())
-            assert actual.shape == (seq_len, window)
-        else:
-            mask = reference != float('-inf')
-            assert torch.equal(actual == float('-inf'), ~mask)
-            assert actual.shape == (seq_len, seq_len_kv)
+        positions = ks[:, None] + torch.arange(window, device='cuda')[None, :]
+        mask = positions < ke[:, None]
+        reference = reference.gather(1, positions.clamp(max=seq_len_kv - 1).long())
+        simulated = simulated.gather(1, positions.clamp(max=seq_len_kv - 1).long())
+        assert actual.shape == (seq_len, window)
         assert actual.dtype == logits_dtype
         actual = actual.float().masked_fill(~mask, 0)
         assert calc_diff(actual, reference.masked_fill(~mask, 0)) < 1e-3
@@ -92,8 +100,7 @@ def test_sm100_fp16_dense_tail_graph(seq_len, num_heads, head_dim, logits_dtype,
 @pytest.mark.parametrize('num_heads', [32, 64])
 @pytest.mark.parametrize('head_dim', [32, 64, 128])
 @pytest.mark.parametrize('logits_dtype', [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize('compressed', [False, True])
-def test_sm100_fp16_dense_large(seq_len, seq_len_kv, num_heads, head_dim, logits_dtype, compressed):
+def test_sm100_fp16_dense_large(seq_len, seq_len_kv, num_heads, head_dim, logits_dtype):
     from test_sm120_attention import check_mqa_logits_chunked
 
     require_arch(10)
@@ -111,23 +118,19 @@ def test_sm100_fp16_dense_large(seq_len, seq_len_kv, num_heads, head_dim, logits
     window = int((ke - ks).max())
     kwargs = dict(q=(q_fp8, None), kv=(kv_fp8, kv_sf), weights=weights,
                   cu_seq_len_k_start=ks, cu_seq_len_k_end=ke,
-                  clean_logits=not compressed, max_seqlen_k=window if compressed else 0,
-                  logits_dtype=logits_dtype)
+                  max_seqlen_k=window, logits_dtype=logits_dtype)
     actual = deep_gemm.fp8_fp4_mqa_logits(**kwargs)
-    assert actual.shape == (seq_len, window if compressed else seq_len_kv)
+    assert actual.shape == (seq_len, window)
     assert actual.dtype == logits_dtype
-    assert check_mqa_logits_chunked(actual, q, kv, weights, ks, ke, compressed) < 1e-3
+    assert check_mqa_logits_chunked(actual, q, kv, weights, ks, ke, True) < 1e-3
     simulated_kv = (kv_fp8.float() * kv_sf[:, None]).bfloat16()
     assert check_mqa_logits_chunked(
-        actual, q_fp8.bfloat16(), simulated_kv, weights, ks, ke, compressed) < ref_diff_tol(True)
+        actual, q_fp8.bfloat16(), simulated_kv, weights, ks, ke, True) < ref_diff_tol(True)
     repeated = deep_gemm.fp8_fp4_mqa_logits(**kwargs)
     for m0 in range(0, seq_len, 256):
         m1 = min(m0 + 256, seq_len)
-        if compressed:
-            mask = torch.arange(window, device='cuda')[None, :] < (ke[m0:m1] - ks[m0:m1])[:, None]
-            assert_bitwise_equal(actual[m0:m1][mask], repeated[m0:m1][mask], 'large FP16 dense repeat')
-        else:
-            assert_bitwise_equal(actual[m0:m1], repeated[m0:m1], 'large FP16 dense repeat')
+        mask = torch.arange(window, device='cuda')[None, :] < (ke[m0:m1] - ks[m0:m1])[:, None]
+        assert_bitwise_equal(actual[m0:m1][mask], repeated[m0:m1][mask], 'large FP16 dense repeat')
 
 
 @pytest.mark.parametrize('seq_len,num_heads,with_metadata', [(510, 32, False), (512, 12, False), (512, 32, True)])
@@ -141,7 +144,7 @@ def test_sm100_fp16_dense_rejections(seq_len, num_heads, with_metadata):
     ke = torch.full_like(ks, 256)
     meta = torch.empty(1, device='cuda', dtype=torch.int32) if with_metadata else None
     with pytest.raises((RuntimeError, AssertionError)):
-        deep_gemm.fp8_fp4_mqa_logits((q, None), (kv, sf), weights, ks, ke, schedule_meta=meta)
+        deep_gemm.fp8_fp4_mqa_logits((q, None), (kv, sf), weights, ks, ke, max_seqlen_k=256, schedule_meta=meta)
 
 
 @pytest.mark.parametrize('weights_dtype,logits_dtype', [
@@ -149,18 +152,20 @@ def test_sm100_fp16_dense_rejections(seq_len, num_heads, with_metadata):
 def test_sm100_unified_dense_scheduled_preserved(weights_dtype, logits_dtype):
     require_arch(10)
     torch.manual_seed(789)
-    seq_len, num_heads, head_dim, seq_len_kv = 13, 12, 64, 512
-    q = torch.randn(seq_len, num_heads, head_dim, device='cuda').to(torch.float8_e4m3fn)
-    kv = torch.randn(seq_len_kv, head_dim, device='cuda').to(torch.float8_e4m3fn)
-    sf = torch.ones(seq_len_kv, device='cuda')
+    seq_len, num_heads, head_dim, seq_len_kv = 13, 32, 128, 512
+    q = torch.randn(seq_len, num_heads, head_dim, device='cuda', dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device='cuda', dtype=torch.bfloat16)
+    q_in, q_simulated = quantize_mqa_q(q, 'mxfp8')
+    kv_in, kv_simulated = quantize_mqa_q(kv, 'mxfp8')
     weights = to_mqa_weights(torch.randn(seq_len, num_heads, device='cuda'), weights_dtype)
     ks = torch.zeros(seq_len, device='cuda', dtype=torch.int32)
     ke = torch.full_like(ks, seq_len_kv)
     meta = deep_gemm.get_mqa_logits_metadata(ks, ke, seq_len_kv, num_heads)
-    eager = deep_gemm.fp8_fp4_mqa_logits((q, None), (kv, sf), weights, ks, ke, logits_dtype=logits_dtype)
+    eager = deep_gemm.fp8_fp4_mqa_logits(q_in, kv_in, weights, ks, ke, max_seqlen_k=seq_len_kv, logits_dtype=logits_dtype)
     scheduled = deep_gemm.fp8_fp4_mqa_logits(
-        (q, None), (kv, sf), weights, ks, ke, logits_dtype=logits_dtype, schedule_meta=meta)
-    reference, _ = ref_fp8_mqa_logits(q.float(), kv.float(), weights.float(), ks, ke)
+        q_in, kv_in, weights, ks, ke, max_seqlen_k=seq_len_kv, logits_dtype=logits_dtype, schedule_meta=meta)
+    assert eager.dtype == logits_dtype
+    reference, _ = ref_fp8_mqa_logits(q_simulated, kv_simulated, weights.float(), ks, ke)
     assert calc_diff(scheduled, reference) < ref_diff_tol(logits_dtype == torch.bfloat16)
     assert_bitwise_equal(eager, scheduled, 'unified dense scheduled path')
 
