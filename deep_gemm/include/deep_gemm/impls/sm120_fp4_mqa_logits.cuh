@@ -326,12 +326,20 @@ void sm120_fp4_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 }
 
                 // Order shared-memory reads before the producer reuses this stage.
+#if (__CUDACC_VER_MAJOR__ > 13) or (__CUDACC_VER_MAJOR__ == 13 and __CUDACC_VER_MINOR__ >= 4)
+                asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::: "memory");
+#else
                 cutlass::arch::fence_view_async_shared();
+#endif
                 empty_kv_barriers[kv_stage_idx]->arrive();
             }
             num_total_kv_blocks += num_kv_blocks;
 
+#if (__CUDACC_VER_MAJOR__ > 13) or (__CUDACC_VER_MAJOR__ == 13 and __CUDACC_VER_MINOR__ >= 4)
+            asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::: "memory");
+#else
             cutlass::arch::fence_view_async_shared();
+#endif
             empty_q_barriers[q_stage_idx]->arrive();
             CUTE_TIE(get_next_block_q_idx(), block_q_idx, q_iter_idx);
         }
