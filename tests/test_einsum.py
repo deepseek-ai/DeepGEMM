@@ -12,6 +12,11 @@ from deep_gemm.utils.math import (
     per_block_cast_to_fp8, per_channel_cast_to_fp8, per_token_cast_to_fp8
 )
 
+from utils import (
+    assert_direct_output_matches_fp32_accumulation,
+    assert_stochastic_bf16_matches_fp32_accumulation,
+)
+
 
 def test_bmk_bnk_mn() -> None:
     print('Testing "bmk, bnk -> mn":')
@@ -51,6 +56,11 @@ def test_bhr_hdr_bhd():
                 z = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
                 deep_gemm.einsum('bhr,hdr->bhd', x, y, z)
                 assert calc_diff(z, ref_z) < 1e-10
+                launch = lambda output, accumulator: deep_gemm.einsum('bhr,hdr->bhd', x, y, output, c=accumulator)
+                assert_direct_output_matches_fp32_accumulation(z, launch, f'{b=}, {h=}, {r=}, {d=}')
+                if not use_cublaslt and get_arch_major() == 10:
+                    deep_gemm.einsum('bhr,hdr->bhd', x, y, z, epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                    assert_stochastic_bf16_matches_fp32_accumulation(z, launch, f'{b=}, {h=}, {r=}, {d=}')
                 kernel_name = 'nvjet' if use_cublaslt else 'gemm'
                 times.append(bench_kineto(lambda: deep_gemm.einsum('bhr,hdr->bhd', x, y, z), kernel_name, suppress_kineto_output=True))
             t, t_cublaslt = times
@@ -77,6 +87,11 @@ def test_bhd_hdr_bhr():
                 z = torch.empty((b, h, r), device='cuda', dtype=torch.bfloat16)
                 deep_gemm.einsum('bhd,hdr->bhr', x, y, z)
                 assert calc_diff(z, ref_z) < 1e-10
+                launch = lambda output, accumulator: deep_gemm.einsum('bhd,hdr->bhr', x, y, output, c=accumulator)
+                assert_direct_output_matches_fp32_accumulation(z, launch, f'{b=}, {h=}, {r=}, {d=}')
+                if not use_cublaslt and get_arch_major() == 10:
+                    deep_gemm.einsum('bhd,hdr->bhr', x, y, z, epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                    assert_stochastic_bf16_matches_fp32_accumulation(z, launch, f'{b=}, {h=}, {r=}, {d=}')
                 kernel_name = 'nvjet' if use_cublaslt else 'gemm'
                 times.append(bench_kineto(lambda: deep_gemm.einsum('bhd,hdr->bhr', x, y, z), kernel_name, suppress_kineto_output=True))
 
@@ -132,25 +147,50 @@ def test_fp8_bhr_hdr_bhd(use_ue8m0: bool = True):
                     output = torch.empty_like(z, dtype=output_dtype)
                     sfd = torch.empty_strided(
                         (b, ceil_div(h * d, 32 * 4)), (1, align(b, 4)), dtype=torch.int32, device='cuda')
-                    deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, (output, sfd))
-                    restored_output = cast_back_from_fp8(
-                        output.view(b, h * d), sfd.contiguous(), gran_k=32, use_packed_ue8m0=True)
-                    diff = calc_diff(restored_output, ref_z.reshape(b, h * d))
-
-                    # The fused output must align with the production pipeline (a BF16 D
-                    # followed by a per-token cast): the epilogue rounds the accumulator into
-                    # BF16 before the same amax/scale/rounding steps, so both the FP8 data
-                    # and the packed SF words must match bitwise
-                    d_bf16 = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
+                    count_cuda = torch.empty(1, device='cuda', dtype=torch.uint32)
+                    d_bf16 = torch.empty_like(z)
                     deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, d_bf16)
-                    ref_fp8, ref_sfd = per_token_cast_to_fp8(d_bf16.view(b, h * d), use_ue8m0=True,
-                                                             gran_k=32, use_packed_ue8m0=True)
-                    assert torch.equal(output.view(b, h * d), ref_fp8), f'{b=}, {h=}, {r=}, {d=}'
-                    assert torch.equal(sfd.contiguous(), ref_sfd), f'{b=}, {h=}, {r=}, {d=}'
+
+                    # Random dot products have variance r; 2.576 sigma clips about 1%.
+                    for clamp_value in (None, 2.576 * r ** 0.5):
+                        expected = d_bf16 if clamp_value is None else d_bf16.clamp(-clamp_value, clamp_value)
+                        ref_fp8, ref_sfd = per_token_cast_to_fp8(
+                            expected.view(b, h * d), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+                        ref_count = 0 if clamp_value is None else (d_bf16.abs() > clamp_value).sum().item()
+                        # The scalar output must overwrite its previous contents.
+                        for clamped_count in (None, count_cuda):
+                            epilogue = deep_gemm.epilogue.FP8CastWithClamp(
+                                sfd=sfd, clamp_value=clamp_value, clamped_count=clamped_count)
+                            if clamped_count is not None:
+                                clamped_count.fill_(0xffffffff)
+                            if clamp_value is None and clamped_count is None:
+                                deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, (output, sfd))
+                            else:
+                                deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, output, epilogue=epilogue)
+                            if clamped_count is not None:
+                                assert clamped_count.item() == ref_count, f'{b=}, {clamp_value=}: count'
+                            assert torch.equal(output.view(b, h * d), ref_fp8), f'{b=}, {clamp_value=}: FP8'
+                            assert torch.equal(sfd.contiguous(), ref_sfd), f'{b=}, {clamp_value=}: SF'
+                        if clamp_value is None:
+                            restored_output = cast_back_from_fp8(
+                                output.view(b, h * d), sfd.contiguous(), gran_k=32, use_packed_ue8m0=True)
+                            diff = calc_diff(restored_output, ref_z.reshape(b, h * d))
                 else:
                     output = z
                     deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, output)
                     diff = calc_diff(output, ref_z)
+
+                    if get_arch_major() == 10:
+                        def launch_accumulated(out, acc):
+                            assert out is acc
+                            tmp = torch.zeros((h, b, d), device='cuda', dtype=torch.float).permute(1, 0, 2)
+                            deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, tmp, c=tmp)
+                            out.copy_(tmp)
+                        z_sr = torch.empty_like(z)
+                        deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, z_sr,
+                                             epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                        assert_stochastic_bf16_matches_fp32_accumulation(
+                            z_sr, launch_accumulated, f'{b=}, {h=}, {r=}, {d=}')
                 assert diff < (2e-3 if output_dtype == torch.float8_e4m3fn else 1e-3), \
                     f'{b=}, {h=}, {r=}, {d=}, {output_dtype=}, {diff=:.5f}'
 
@@ -184,6 +224,17 @@ def test_fp8_bhd_hdr_bhr(use_ue8m0: bool = True):
 
             deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z)
             assert calc_diff(z, ref_z) < 1e-3
+
+            def launch_accumulated(out, acc):
+                assert out is acc
+                tmp = torch.zeros((h, b, r), device='cuda', dtype=torch.float).permute(1, 0, 2)
+                deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, tmp, c=tmp)
+                out.copy_(tmp)
+            z_sr = torch.empty_like(z)
+            deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z_sr,
+                                 epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+            assert_stochastic_bf16_matches_fp32_accumulation(
+                z_sr, launch_accumulated, f'{b=}, {h=}, {r=}, {d=}')
 
             t = bench_kineto(lambda: deep_gemm.fp8_einsum('bhd,hdr->bhr', x_fp8, y_fp8, z), 'gemm_', suppress_kineto_output=True)
             t_cublaslt = bench_kineto(lambda: deep_gemm.einsum('bhd,hdr->bhr', x, y, z), 'nvjet', suppress_kineto_output=True)

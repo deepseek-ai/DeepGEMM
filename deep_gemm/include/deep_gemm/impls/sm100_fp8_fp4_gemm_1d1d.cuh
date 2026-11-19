@@ -9,7 +9,7 @@
 #include <deep_gemm/common/packing.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
 #include <deep_gemm/layout/gemm.cuh>
@@ -34,11 +34,11 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
-          typename epilogue_op_t>
+          typename epilogue_operator_t>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                             const __grid_constant__ epilogue_op_t epilogue_op,
+                             const __grid_constant__ EpilogueOperatorArgs epilogue_args,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
@@ -53,16 +53,12 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     constexpr bool kIsMXF4 = cute::is_same_v<a_dtype_t, cutlass::float_e2m1_t> and
                              cute::is_same_v<b_dtype_t, cutlass::float_e2m1_t>;
 
-    // The host launches the epilogue operator directly as a kernel argument
-    DG_STATIC_ASSERT(sizeof(epilogue_op_t) == sizeof(EpilogueArgs),
-                     "Epilogue operators must not add state to `EpilogueArgs`");
-
     // C/D type: BF16 and FP32 are supported, with or without accumulation; FP8 C/D requires the
     // dynamically-scaled epilogue with per-32 UE8M0 SFD output, batched only, without accumulation
-    constexpr bool kWithOutputSF = cute::is_same_v<epilogue_op_t, epilogue::transform::EpilogueDynamicScaledFP8>;
-    DG_STATIC_ASSERT(kWithOutputSF ? (cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t> and
-                                      kGemmType == GemmType::Batched and not kWithAccumulation) :
-                                     (cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
+    constexpr bool kIsFP8CastWithClamp = epilogue_operator_t::kIsFP8CastWithClamp;
+    DG_STATIC_ASSERT(kIsFP8CastWithClamp ? (cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t> and
+                                            kGemmType == GemmType::Batched and not kWithAccumulation) :
+                                           (cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
                      "Invalid C/D data dtype");
 
     // MMA Configs
@@ -138,6 +134,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto lane_idx = ptx::get_lane_idx();
+    const auto epilogue_warp_idx = warp_idx - kNumNonEpilogueThreads / 32;
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
@@ -198,6 +195,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4>(
         shape_m, shape_n, shape_k, grouped_layout);
+    epilogue_operator_t epilogue_operator(epilogue_args);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -372,7 +370,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                     // Do SF copy at certain stages
                     // TODO: process shared memory descriptor by addition
                     using cute_utccp_t = cute::conditional_t<kNumMulticast == 1,
-                        cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
+                                                             cute::SM100_UTCCP_4x32dp128bit_1cta, cute::SM100_UTCCP_4x32dp128bit_2cta>;
                     if (sfa_stage_in_group_idx == 0) {
                         #pragma unroll
                         for (uint32_t i = 0; i < SF_BLOCK_K * SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
@@ -410,8 +408,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                 if (cute::elect_one_sync()) {
                     // Issue UMMA
                     using mma_t = cute::conditional_t<kIsMXF4,
-                        cute::conditional_t<kNumMulticast == 1, ptx::SM100_MMA_MXF4_SS, ptx::SM100_MMA_MXF4_2x1SM_SS>,
-                        cute::conditional_t<kNumMulticast == 1, ptx::SM100_MMA_MXF8F6F4_SS, ptx::SM100_MMA_MXF8F6F4_2x1SM_SS>>;
+                                                      cute::conditional_t<kNumMulticast == 1, ptx::SM100_MMA_MXF4_SS, ptx::SM100_MMA_MXF4_2x1SM_SS>,
+                                                      cute::conditional_t<kNumMulticast == 1, ptx::SM100_MMA_MXF8F6F4_SS, ptx::SM100_MMA_MXF8F6F4_2x1SM_SS>>;
                     #pragma unroll
                     for (uint32_t umma_k_idx = 0; umma_k_idx < BLOCK_K / UMMA_K; ++ umma_k_idx) {
                         const uint32_t offset = umma_k_idx * UMMA_K;
@@ -494,9 +492,9 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                 smem.full_barriers[stage_idx].arrive(0u);
             }
         }
-    } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
+    } else if (epilogue_warp_idx < kNumUMMAStoreThreads / 32) {
         // Epilogue warp groups
-        const auto epilogue_warp_idx = warp_idx - (kNumNonEpilogueThreads / 32);
+        epilogue_operator.init(scheduler.num_blocks * kNumGroups, epilogue_warp_idx * 32 + lane_idx);
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
@@ -537,7 +535,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                  is_empty_group,
                  effective_m,
                  epilogue_warp_idx, lane_idx,
-                 epilogue_op,
+                 epilogue_operator,
                  reverse_store_order,
                  &smem.tmem_overlap_barriers[accum_stage_idx],
                  &smem.tmem_empty_barriers[accum_stage_idx],
@@ -552,7 +550,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                  base_m_idx, base_n_idx, scheduler.current_group_idx,
                  is_empty_group,
                  epilogue_warp_idx, lane_idx,
-                 epilogue_op,
+                 epilogue_operator,
                  reverse_store_order,
                  &smem.tmem_overlap_barriers[accum_stage_idx],
                  &smem.tmem_empty_barriers[accum_stage_idx],
@@ -567,6 +565,10 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     // Deallocate tensor memory
     if (warp_idx == 0)
         Allocator().free(0, kNumTmemCols);
+
+    // Finalize the epilogue while the other warp deallocates tensor memory.
+    if (epilogue_warp_idx < kNumUMMAStoreThreads / 32)
+        epilogue_operator.finalize();
 
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

@@ -127,15 +127,26 @@ def test_sm120_bf16_einsum_empty(expr):
 
 @test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('expr', EXPRESSIONS)
-def test_sm120_bf16_einsum_c_rejection(expr):
+def test_sm120_bf16_einsum_c(expr):
     a = torch.ones((2, 2, 128), dtype=torch.bfloat16, device='cuda')
     b = torch.ones((2, 8, 128) if expr == EXPRESSIONS[0] else (2, 128, 8), dtype=torch.bfloat16, device='cuda')
-    d = torch.full((2, 2, 8), 19, dtype=torch.bfloat16, device='cuda')
+    # The default (cuBLASLt) policy accumulates C as on the other architectures: D = A @ B + C
     for same in (False, True):
-        c = d if same else torch.zeros_like(d)
-        with pytest.raises(RuntimeError, match='not c.has_value'):
-            deep_gemm.einsum(expr, a, b, d, c=c)
-        assert (d == 19).all()
+        d = torch.full((2, 2, 8), 19, dtype=torch.bfloat16, device='cuda')
+        c = d if same else torch.full_like(d, 3)
+        deep_gemm.einsum(expr, a, b, d, c=c)
+        assert (d == 128 + (19 if same else 3)).all()
+    # The deterministic policy runs the native SM120 kernel, which stores only
+    try:
+        deep_gemm.use_deterministic_algorithms(True)
+        for same in (False, True):
+            d = torch.full((2, 2, 8), 19, dtype=torch.bfloat16, device='cuda')
+            c = d if same else torch.zeros_like(d)
+            with pytest.raises(RuntimeError, match='plain BF16 store only'):
+                deep_gemm.einsum(expr, a, b, d, c=c)
+            assert (d == 19).all()
+    finally:
+        deep_gemm.use_deterministic_algorithms(False)
 
 
 @test_filter(lambda: get_arch_major() == 12)
@@ -160,6 +171,6 @@ if __name__ == '__main__':
     for expr in EXPRESSIONS:
         test_sm120_bf16_einsum_empty(expr=expr)
     for expr in EXPRESSIONS:
-        test_sm120_bf16_einsum_c_rejection(expr=expr)
+        test_sm120_bf16_einsum_c(expr=expr)
     for expr in EXPRESSIONS:
         test_sm120_bf16_einsum_default_policy(expr=expr)

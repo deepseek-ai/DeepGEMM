@@ -38,6 +38,47 @@ def assert_direct_output_matches_fp32_accumulation(
     assert_bitwise_equal(direct_output, expected, label)
 
 
+def add_sf_k_padding(sf: torch.Tensor, padding: int, k_grouped: bool = False) -> torch.Tensor:
+    # Poison padding with UE8M0 NaN to expose reads using a compact pitch.
+    assert padding > 0 and padding % 4 == 0
+    mn = sf.size(-1 if k_grouped else -2)
+    pitch = align(mn, 4) + padding
+    storage = sf.new_full((sf.numel() // mn, pitch), -1)
+    strides = (pitch, 1) if k_grouped else (1, pitch)
+    if sf.dim() == 3:
+        strides = (sf.size(-1) * pitch, *strides)
+    return storage.as_strided(sf.shape, strides).copy_(sf)
+
+
+def assert_stochastic_bf16_matches_fp32_accumulation(
+        direct_output: torch.Tensor,
+        launch: Callable[[torch.Tensor, torch.Tensor | None], None],
+        label: str) -> None:
+    assert direct_output.dtype == torch.bfloat16
+    # Reference-only restriction (the quartet view below): the kernel itself handles any N,
+    # as quartets align to absolute tensor coordinates and OOB columns hash deterministic zeros
+    assert direct_output.size(-1) % 4 == 0
+
+    fp32 = torch.zeros_like(direct_output, dtype=torch.float)
+    launch(fp32, fp32)
+    shape = fp32.shape
+    values = (fp32.view(torch.int32).to(torch.int64) & 0xffffffff).view(*shape[:-1], -1, 4)
+    quartet_n_idx = torch.arange(shape[-1] // 4, device=fp32.device, dtype=torch.int64)
+    h = (values[..., 0] * 0x5671d42b + values[..., 1] * 0x9995e499 +
+         values[..., 2] * 0xace1b8a5 + values[..., 3] * 0xe153538d + quartet_n_idx) & 0xffffffff
+    h = (h ^ (h >> 23)) * 0x7feb352d & 0xffffffff
+    h ^= h >> 16
+    h1 = h * 0x846ca68b & 0xffffffff
+    h2 = h * 0xd35a2d97 & 0xffffffff
+    h1 ^= h1 >> 11
+    h2 ^= h2 >> 11
+    random_bits = torch.stack((h1 & 0xffff, h1 >> 16, h2 & 0xffff, h2 >> 16), dim=-1)
+
+    rounded = (values >> 16) + (((values & 0xffff) + random_bits) >> 16)
+    expected = rounded.to(torch.uint16).view(torch.bfloat16).view(shape)
+    assert_bitwise_equal(direct_output, expected, label)
+
+
 def convert_to_fp8(x: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
     # E4M3 exactly represents every finite E2M1 value. Convert the encoding without requantizing.
     data, sf = x

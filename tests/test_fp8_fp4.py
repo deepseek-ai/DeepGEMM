@@ -10,7 +10,8 @@ from deep_gemm.testing import (
     get_arch_major
 )
 from utils import (
-    assert_direct_output_matches_fp32_accumulation,
+    add_sf_k_padding, assert_direct_output_matches_fp32_accumulation,
+    assert_stochastic_bf16_matches_fp32_accumulation,
     assert_psum_zero_padding, convert_to_fp8, make_cublas_gemm,
 )
 
@@ -25,6 +26,7 @@ from generators import (
 def test_gemm() -> None:
     print('Testing GEMM:')
     use_alpha_options = (False, True) if get_arch_major() == 10 else (False,)
+    test_sf_k_padding = get_arch_major() == 10
     for kernel_type, quant_config, m, n, k, major_a, major_b, accumulate, out_dtype, scores in \
             enumerate_normal(torch.float8_e4m3fn, collect_cublas_scores=True):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
@@ -55,6 +57,17 @@ def test_gemm() -> None:
                                                         f'{diff:.5f}, alias={test_alias}')
 
         a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0, quant_config=quant_config)
+        if get_arch_major() == 10 and not accumulate and out_dtype == torch.bfloat16:
+            d_sr = torch.empty_like(d)
+            deep_gemm.fp8_fp4_gemm_nt(a, b, d_sr, disable_ue8m0_cast=disable_ue8m0_cast,
+                                      recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+                                      epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+            assert_stochastic_bf16_matches_fp32_accumulation(
+                d_sr,
+                lambda output, accumulator: deep_gemm.fp8_fp4_gemm_nt(
+                    a, b, output, c=accumulator, disable_ue8m0_cast=disable_ue8m0_cast,
+                    recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
+                f'FP8/FP4 GEMM stochastic rounding, {m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}')
         initial_d = d.clone()
         def test_func(a_=a, b_=b, d_=d):
             deep_gemm.fp8_fp4_gemm_nt(a_, b_, d_, c=d_ if accumulate else None,
@@ -67,6 +80,18 @@ def test_gemm() -> None:
             d.copy_(initial_d)
             test_func()
             assert torch.equal(d, equivalent_d), f'{m=}, {n=}, {k=}, {accumulate=}'
+        if test_sf_k_padding and use_ue8m0 and not accumulate:
+            packed_a = deep_gemm.transform_sf_into_required_layout(a[1], m, k, (1, quant_config.gran_k_a))
+            gran_mn_b = 1 if quant_config.is_fp4_b else quant_config.gran_k_b
+            packed_b = deep_gemm.transform_sf_into_required_layout(b[1], n, k, (gran_mn_b, quant_config.gran_k_b))
+            strided_a = a[0], add_sf_k_padding(packed_a, padding=4)
+            strided_b = b[0], add_sf_k_padding(packed_b, padding=4)
+            strided_d = initial_d.clone()
+            deep_gemm.fp8_fp4_gemm_nt(
+                strided_a, strided_b, strided_d,
+                recipe_a=(1, quant_config.gran_k_a), recipe_b=(1, quant_config.gran_k_b))
+            assert_bitwise_equal(strided_d, equivalent_d, 'packed SF K-stride')
+            test_sf_k_padding = False
         if quant_config.is_fp4_a or quant_config.is_fp4_b:
             equivalent_fp8_d = initial_d.clone()
             test_func(convert_to_fp8(a), convert_to_fp8(b), equivalent_fp8_d)
@@ -217,6 +242,7 @@ def test_k_grouped_gemm_contiguous() -> None:
     print('Testing k-grouped GEMM:')
 
     arch_major = get_arch_major()
+    test_sf_k_padding = arch_major == 10
     test_options = [(torch.float8_e4m3fn, QuantConfig(),
                      deep_gemm.k_grouped_fp8_gemm_nt_contiguous if arch_major == 9 else
                      deep_gemm.k_grouped_fp8_gemm_tn_contiguous)]
@@ -274,12 +300,15 @@ def test_k_grouped_gemm_contiguous() -> None:
                         case_label = (f'{dtype_opt} K-grouped direct output, {m=}, {n=}, {total_k=}, '
                                       f'{test_real_ks_cpu=}, {test_host_ks_cpu=}, {use_psum_layout=}, '
                                       f'{out_dtype=}')
-                        assert_direct_output_matches_fp32_accumulation(
-                            d,
-                            lambda output, accumulator: gemm(
-                                a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
-                                recipe=recipe, use_psum_layout=use_psum_layout),
-                            case_label)
+                        launch = lambda output, accumulator: gemm(
+                            a, b, output, test_host_ks_cpu, grouped_layout, accumulator,
+                            recipe=recipe, use_psum_layout=use_psum_layout)
+                        assert_direct_output_matches_fp32_accumulation(d, launch, case_label)
+                        if out_dtype == torch.bfloat16:
+                            gemm(a, b, d, test_host_ks_cpu, grouped_layout, None,
+                                 recipe=recipe, use_psum_layout=use_psum_layout,
+                                 epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                            assert_stochastic_bf16_matches_fp32_accumulation(d, launch, f'stochastic rounding, {case_label}')
 
                 if accumulate:
                     diff = calc_diff(d, ref_d)
@@ -313,6 +342,14 @@ def test_k_grouped_gemm_contiguous() -> None:
                     packed_d = initial_d.clone()
                     gemm(packed_a, packed_b, packed_d, host_ks_cpu, grouped_layout, packed_d if accumulate else None,
                          recipe=recipe, use_psum_layout=use_psum_layout)
+                    if test_sf_k_padding:
+                        strided_a = packed_a[0], add_sf_k_padding(packed_a[1], padding=4, k_grouped=True)
+                        strided_b = packed_b[0], add_sf_k_padding(packed_b[1], padding=4, k_grouped=True)
+                        strided_d = initial_d.clone()
+                        gemm(strided_a, strided_b, strided_d, host_ks_cpu, grouped_layout,
+                             strided_d if accumulate else None, recipe=recipe, use_psum_layout=use_psum_layout)
+                        assert_bitwise_equal(strided_d, packed_d, 'K-grouped packed SF K-stride')
+                        test_sf_k_padding = False
                     if accumulate:
                         packed_diff = calc_diff(packed_d, ref_d)
                         assert packed_diff < quant_config.max_diff(), (
@@ -323,12 +360,15 @@ def test_k_grouped_gemm_contiguous() -> None:
                         case_label = (f'pre-packed INT32 SF direct output: {dtype_opt}, {m=}, {n=}, '
                                       f'{total_k=}, {test_real_ks_cpu=}, {host_ks_cpu=}, '
                                       f'{use_psum_layout=}, {out_dtype=}')
-                        assert_direct_output_matches_fp32_accumulation(
-                            packed_d,
-                            lambda output, accumulator: gemm(
-                                packed_a, packed_b, output, host_ks_cpu, grouped_layout, accumulator,
-                                recipe=recipe, use_psum_layout=use_psum_layout),
-                            case_label)
+                        launch = lambda output, accumulator: gemm(
+                            packed_a, packed_b, output, host_ks_cpu, grouped_layout, accumulator,
+                            recipe=recipe, use_psum_layout=use_psum_layout)
+                        assert_direct_output_matches_fp32_accumulation(packed_d, launch, case_label)
+                        if out_dtype == torch.bfloat16:
+                            gemm(packed_a, packed_b, packed_d, host_ks_cpu, grouped_layout, None,
+                                 recipe=recipe, use_psum_layout=use_psum_layout,
+                                 epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                            assert_stochastic_bf16_matches_fp32_accumulation(packed_d, launch, f'stochastic rounding, {case_label}')
 
             _, a, b, c, d, _, grouped_layout, host_ks_cpu = generate_k_grouped_contiguous(
                 num_groups, m, n, major_a, major_b, real_ks_cpu,

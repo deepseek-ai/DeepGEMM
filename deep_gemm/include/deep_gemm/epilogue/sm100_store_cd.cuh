@@ -4,7 +4,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
 
@@ -17,7 +17,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N,
           uint32_t kNumUMMAStoreThreads,
           uint32_t kNumOverlappedTmemCols,
           GemmType kGemmType, bool kWithAccumulation,
-          typename epilogue_op_t,
+          typename epilogue_operator_t,
           typename smem_t>
 CUTLASS_DEVICE void
 sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
@@ -25,15 +25,15 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
                const uint32_t& base_m_idx, const uint32_t& base_n_idx, const uint32_t& batch_idx,
                const bool& is_empty_group,
                const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
-               const epilogue_op_t& epilogue_op,
+               epilogue_operator_t& epilogue_operator,
                const bool& reverse_store_order,
                const cutlass::arch::ClusterTransactionBarrier* tmem_overlap_barrier,
                const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
                const cute::TmaDescriptor& tensor_map_cd) {
     using cd_dtype_t = typename smem_t::cd_dtype;
-    // Whether to cast D into FP8 with dynamic per-`kSFGranN` UE8M0 SFs (see `EpilogueDynamicScaledFP8`)
-    constexpr bool kWithOutputSF = cute::is_same_v<epilogue_op_t, transform::EpilogueDynamicScaledFP8>;
-    constexpr uint32_t kSFGranN = transform::EpilogueDynamicScaledFP8::kSFGranN;
+    // Whether to cast D into FP8 with dynamic per-`kSFGranN` UE8M0 SFs (see `CastToFP8WithClamp`)
+    constexpr bool kIsFP8CastWithClamp = epilogue_operator_t::kIsFP8CastWithClamp;
+    constexpr uint32_t kSFGranN = operators::CastToFP8WithClamp::kSFGranN;
     // TMA checks
     constexpr uint32_t kNumBankGroupBytes = 16;
     constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
@@ -41,13 +41,10 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
     DG_STATIC_ASSERT(STORE_BLOCK_N % kNumElemsPerBankGroup == 0, "Invalid swizzling");
     DG_STATIC_ASSERT(BLOCK_M % STORE_BLOCK_M == 0, "Invalid block sizes");
     DG_STATIC_ASSERT(BLOCK_N % STORE_BLOCK_N == 0, "Invalid block sizes");
-    DG_STATIC_ASSERT(not kWithOutputSF or cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t>, "FP8 output requires an E4M3 D");
-    DG_STATIC_ASSERT(not kWithOutputSF or STORE_BLOCK_N % kSFGranN == 0, "A store must cover complete SF groups");
-
-    // Share store pipeline between blocks
-    auto advance_store_pipeline = [&]() {
-        tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
-    };
+    DG_STATIC_ASSERT(not kIsFP8CastWithClamp or STORE_BLOCK_N % kSFGranN == 0, "A store must cover complete SF groups");
+    DG_STATIC_ASSERT(not epilogue_operator_t::kWithStochasticRounding or
+                     (cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> and not kWithAccumulation),
+                     "Stochastic rounding only supports direct BF16 output");
 
     // Iterate over M waves
     constexpr auto kNumMWaves = BLOCK_M / STORE_BLOCK_M;
@@ -56,7 +53,7 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
         // Issue every swizzled atom and pipeline STSM and TMA store
         constexpr uint32_t kNumStores = BLOCK_N / STORE_BLOCK_N;
         #pragma unroll
-        for (uint32_t s = 0; s < kNumStores; ++ s, advance_store_pipeline()) {
+        for (uint32_t s = 0; s < kNumStores; ++ s) {
             const auto store_idx = reverse_store_order ? kNumStores - 1 - s : s;
             auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem.cd[tma_stage_idx]);
 
@@ -83,18 +80,17 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
 
             // The pipeline stage
             const auto m_idx = base_m_idx + w * STORE_BLOCK_M;
-            const auto n_idx = epilogue_op_t::apply_index_n<STORE_BLOCK_N>(base_n_idx + store_idx * STORE_BLOCK_N);
+            const auto n_idx = base_n_idx + store_idx * STORE_BLOCK_N;
 
             // Iterate over TMEM loads: each covers one swizzled bank group per lane, or one
             // complete SF group per lane (one row, `kSFGranN` columns) with FP8 output
-            constexpr uint32_t kNumElemsPerLoad = kWithOutputSF ? kSFGranN : kNumElemsPerBankGroup;
+            constexpr uint32_t kNumElemsPerLoad = kIsFP8CastWithClamp ? kSFGranN : kNumElemsPerBankGroup;
             constexpr uint32_t kNumLoads = STORE_BLOCK_N / kNumElemsPerLoad;
             constexpr auto kNumOverlapLoads = math::constexpr_ceil_div(kNumOverlappedTmemCols, kNumElemsPerLoad);
             DG_STATIC_ASSERT(kNumOverlapLoads <= kNumLoads, "The first store block must cover all overlapped columns");
 
-            // A store covering a whole packed word (with word-aligned batches) writes all 4 SF bytes at once
+            // FP8 output N is 128-aligned, so four SF groups always form a complete word.
             const auto row_idx = m_idx + epilogue_warp_idx * 32 + lane_idx;
-            const bool store_whole_sf_word = kWithOutputSF and kNumLoads == 4 and epilogue_op.shape_n % (4 * kSFGranN) == 0;
             uint32_t sf_word = 0;
 
             #pragma unroll
@@ -110,13 +106,13 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
                 uint32_t values[kNumElemsPerLoad];
                 DG_STATIC_ASSERT(kNumElemsPerLoad == 4 or kNumElemsPerLoad == 8 or kNumElemsPerLoad == 32, "Invalid load width");
                 using tmem_load_t = cute::conditional_t<kNumElemsPerLoad == 32, cute::SM100_TMEM_LOAD_32dp32b32x,
-                                    cute::conditional_t<kNumElemsPerLoad ==  8, cute::SM100_TMEM_LOAD_32dp32b8x,
-                                                                                cute::SM100_TMEM_LOAD_32dp32b4x>>;
+                                                        cute::conditional_t<kNumElemsPerLoad ==  8, cute::SM100_TMEM_LOAD_32dp32b8x,
+                                                                            cute::SM100_TMEM_LOAD_32dp32b4x>>;
                 [&]<size_t... Is>(cute::index_sequence<Is...>) {
                     tmem_load_t::copy(tmem_addr, values[Is]...);
                 }(cute::make_index_sequence<kNumElemsPerLoad>{});
                 cutlass::arch::fence_view_async_tmem_load();
-                epilogue_op.apply_values(values);
+                epilogue_operator.apply_values(values);
                 #pragma unroll
                 for (uint32_t value_idx = 0; value_idx < kNumElemsPerLoad; ++ value_idx)
                     values[value_idx] = is_empty_group ? 0u : values[value_idx];
@@ -136,53 +132,38 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
                 }
 
                 // Store into shared memory
-                if constexpr (kWithOutputSF) {
-                    // Round the accumulator into BF16 pairs first, so the output bitwise matches
-                    // a BF16 D followed by the standalone cast (power-of-two scaling of BF16 is exact)
+                if constexpr (kIsFP8CastWithClamp) {
                     nv_bfloat162 values_bf16x2[kNumElemsPerLoad / 2];
-                    #pragma unroll
-                    for (uint32_t pair_idx = 0; pair_idx < kNumElemsPerLoad / 2; ++ pair_idx)
-                        values_bf16x2[pair_idx] = math::cast_into_bf16x2(values[pair_idx * 2], values[pair_idx * 2 + 1]);
+                    uint32_t packed[kNumElemsPerLoad / 4];
+                    uint2 sf_exp;
+                    epilogue_operator.template prepare_fp8<false>(values, values_bf16x2, sf_exp, row_idx,
+                                                                  n_idx + load_idx * kNumElemsPerLoad);
+                    epilogue_operator.cast_fp8(values_bf16x2, packed, sf_exp);
 
-                    // Reduce the group amax and compute the SF (the SF exponent floor covers the amax clamp),
-                    // then splat the BF16 sf_inv into both packed halves
-                    const auto sf_exp = math::get_ue8m0_sf_exp<cd_dtype_t>(math::get_packed_bf16_amax(values_bf16x2));
-                    const auto sf_inv = __bfloat162bfloat162(math::get_ue8m0_sf_inv<nv_bfloat16>(sf_exp));
-
-                    // Cast into FP8 and store into shared memory
                     constexpr uint32_t kNumBankGroupsPerLoad = kNumElemsPerLoad / kNumElemsPerBankGroup;
                     #pragma unroll
                     for (uint32_t bank_group_iter_idx = 0; bank_group_iter_idx < kNumBankGroupsPerLoad; ++ bank_group_iter_idx) {
                         const auto smem_ptr = get_swizzled_smem_ptr(load_idx * kNumBankGroupsPerLoad + bank_group_iter_idx);
-                        const auto pair_idx = bank_group_iter_idx * (kNumElemsPerBankGroup / 2);
-                        ptx::st_shared(smem_ptr,
-                                       math::scale_bf16x2_into_fp8x4(values_bf16x2[pair_idx + 0], values_bf16x2[pair_idx + 1], sf_inv, sf_inv),
-                                       math::scale_bf16x2_into_fp8x4(values_bf16x2[pair_idx + 2], values_bf16x2[pair_idx + 3], sf_inv, sf_inv),
-                                       math::scale_bf16x2_into_fp8x4(values_bf16x2[pair_idx + 4], values_bf16x2[pair_idx + 5], sf_inv, sf_inv),
-                                       math::scale_bf16x2_into_fp8x4(values_bf16x2[pair_idx + 6], values_bf16x2[pair_idx + 7], sf_inv, sf_inv));
+                        const auto packed_idx = bank_group_iter_idx * 4;
+                        ptx::st_shared(smem_ptr, packed[packed_idx], packed[packed_idx + 1],
+                                                 packed[packed_idx + 2], packed[packed_idx + 3]);
                     }
 
                     // Accumulate the SF byte into the packed word, or store it directly
-                    if (store_whole_sf_word)
-                        sf_word |= sf_exp << (load_idx * 8);
+                    if constexpr (kNumLoads == 4)
+                        sf_word |= sf_exp.x << (load_idx * 8);
                     else
-                        epilogue_op.store_sf(row_idx, n_idx + load_idx * kSFGranN, batch_idx, static_cast<uint8_t>(sf_exp));
+                        epilogue_operator.store_sf(row_idx, n_idx + load_idx * kSFGranN, batch_idx, static_cast<uint8_t>(sf_exp.x));
                 } else if constexpr (cute::is_same_v<cd_dtype_t, float>) {
                     ptx::st_shared(get_swizzled_smem_ptr(load_idx), values[0], values[1], values[2], values[3]);
                 } else {
-                    ptx::st_shared(
-                        get_swizzled_smem_ptr(load_idx),
-                        math::cast_into_bf16_and_pack(values[0], values[1]),
-                        math::cast_into_bf16_and_pack(values[2], values[3]),
-                        math::cast_into_bf16_and_pack(values[4], values[5]),
-                        math::cast_into_bf16_and_pack(values[6], values[7])
-                    );
+                    uint32_t packed[4];
+                    epilogue_operator.template cast_bf16<false>(values, packed, n_idx + load_idx * kNumElemsPerLoad, lane_idx);
+                    ptx::st_shared(get_swizzled_smem_ptr(load_idx), packed[0], packed[1], packed[2], packed[3]);
                 }
             }
-            if constexpr (kWithOutputSF) {
-                if (store_whole_sf_word)
-                    epilogue_op.store_sf(row_idx, n_idx, batch_idx, sf_word);
-            }
+            if constexpr (kIsFP8CastWithClamp and kNumLoads == 4)
+                epilogue_operator.store_sf(row_idx, n_idx, batch_idx, sf_word);
 
             // Synchronize all threads and issue TMA
             cute::tma_store_fence();
@@ -190,16 +171,17 @@ sm100_store_cd(smem_t& smem, uint32_t& tma_stage_idx,
             if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
                 if constexpr (kGemmType == GemmType::Batched or is_k_grouped_contiguous(kGemmType)) {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
-                                            cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
+                                                           cute::SM90_TMA_REDUCE_ADD_3D, cute::SM90_TMA_STORE_3D>;
                     cute_tma_t::copy(&tensor_map_cd, smem_base_ptr, n_idx, m_idx, batch_idx);
                 } else {
                     using cute_tma_t = cute::conditional_t<kWithAccumulation,
-                                            cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
+                                                           cute::SM90_TMA_REDUCE_ADD_2D, cute::SM90_TMA_STORE_2D>;
                     cute_tma_t::copy(&tensor_map_cd, smem_base_ptr, n_idx, m_idx);
                 }
                 cute::tma_store_arrive();
             }
             __syncwarp();
+            tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
         }
     }
 }
