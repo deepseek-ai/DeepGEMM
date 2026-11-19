@@ -8,6 +8,7 @@
 #include "../../utils/math.hpp"
 #include "../heuristics/sm120.hpp"
 
+#include "epilogue.hpp"
 #include "runtime_utils.hpp"
 #include "sm120_padding.hpp"
 
@@ -35,7 +36,7 @@ public:
         SM120GemmConfig gemm_config;
         SM120LaunchArgs launch_args;
         const std::optional<std::string> epilogue_type;
-        EpilogueOperatorArgs epilogue_args{};
+        EpilogueArgs epilogue_args{};
         int stride_c_m = 0;
 
         int gran_k_a, gran_k_b;
@@ -107,7 +108,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_sms,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
-        get_sm120_epilogue_type(args.epilogue_type),
+        get_default_epilogue_type(args.epilogue_type),
         args.is_fp4 ? "true" : "false",
         args.b_is_fp4 ? "true" : "false",
         args.a_is_fp4 ? "true" : "false",
@@ -165,7 +166,7 @@ static void __instantiate_kernel() {{
 )",
         to_string(args.gemm_desc.cd_dtype),
         args.gemm_config.split_k_factor,
-        get_sm120_epilogue_type(args.epilogue_type));
+        get_default_epilogue_type(args.epilogue_type));
     }
 
     template <typename Kernel>
@@ -287,7 +288,7 @@ static void sm120_fp8_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor&
                                                 config.storage_config.swizzle_cd_mode);
 
     const int split_k = config.split_k_factor;
-    const auto epilogue = make_sm120_epilogue_input(m, n, epilogue_type, split_k > 1 ? std::nullopt : alpha);
+    const auto epilogue = make_epilogue_input(m, n, epilogue_type, split_k > 1 ? std::nullopt : alpha);
     torch::Tensor workspace;
     if (split_k > 1)
         workspace = torch::empty({split_k, m, n}, d.options().dtype(torch::kFloat));

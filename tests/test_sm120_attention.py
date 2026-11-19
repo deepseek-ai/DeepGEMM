@@ -70,7 +70,7 @@ def check_logits(actual, expected, dtype):
 @pytest.mark.parametrize('fp4,dim', ((False, 32), (False, 64), (False, 128), (True, 128)))
 @pytest.mark.parametrize('heads', (16, 32, 64))
 def test_sm120_dense_mqa_contract(fp4, dim, heads):
-    for dtype in (torch.float32, torch.bfloat16):
+    for dtype, compressed in ((torch.float32, False), (torch.bfloat16, False), (torch.float32, True)):
         seq, tokens = (3, 8192) if not fp4 and heads == 16 else (9, 257)
         q, qsf, qr = mqa_operand((seq, heads, dim), fp4, 1)
         kv, kvsf, kr = mqa_operand((tokens, dim), fp4, 2)
@@ -83,21 +83,27 @@ def test_sm120_dense_mqa_contract(fp4, dim, heads):
         ends = torch.tensor([tokens, 1, tokens - 1] * ((seq + 2) // 3), dtype=torch.int32)[:seq]
         ks, ke = starts.cuda(), ends.cuda()
         expected = mqa_reference(qr, kr, weights_cpu)
-        width = int((ends - starts).max())
+        width = int((ends - starts).max()) if compressed else 0
         call = lambda: deep_gemm.fp8_fp4_mqa_logits((q, qsf), (kv, kvsf), weights, ks, ke,
-                                                   max_seqlen_k=width, logits_dtype=dtype)
+                                                   clean_logits=not compressed, max_seqlen_k=width, logits_dtype=dtype)
         if heads == 16:
             eager, result, mutated = graph_mqa_call(call, weights)
             for row, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
-                columns = slice(0, end - start)
+                columns = slice(0, end - start) if compressed else slice(start, end)
                 check_logits(mutated[row, columns].cpu(), expected[row, start:end] * 0.5, dtype)
                 torch.testing.assert_close(eager[row, columns], result[row, columns], rtol=0, atol=0)
         else:
             result = call()
         actual = result.cpu()
         for row, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
-            check_logits(actual[row, :end - start], expected[row, start:end], dtype)
-        print(f' > SM120 dense MQA: {fp4=}, {dim=}, {heads=}, {dtype=}')
+            values = actual[row, :end - start] if compressed else actual[row, start:end]
+            check_logits(values, expected[row, start:end], dtype)
+            if not compressed:
+                assert torch.isneginf(actual[row, :start]).all() and torch.isneginf(actual[row, end:]).all()
+        if not fp4 and dtype == torch.float32 and not compressed:
+            legacy = deep_gemm.fp8_mqa_logits(q, (kv, kvsf), weights, ks, ke)
+            torch.testing.assert_close(legacy, result, rtol=0, atol=0)
+        print(f' > SM120 dense MQA: {fp4=}, {dim=}, {heads=}, {dtype=}, {compressed=}')
 
 
 @test_filter(lambda: get_arch_major() == 12)
@@ -151,6 +157,13 @@ def test_sm120_paged_mqa_contract(fp4, page, dtype):
                     check_logits(mutated[row * next_n + token, :end].cpu(), ref[token, :end] * 0.5, dtype)
                     torch.testing.assert_close(eager[row * next_n + token, :end], out[row * next_n + token, :end], rtol=0, atol=0)
         assert torch.equal(backing, before)
+        if not fp4 and next_n == 1 and dtype == torch.float32:
+            legacy = deep_gemm.fp8_paged_mqa_logits(q, cache, weights, contexts, table, meta, 2 * page, indices=indices)
+            for row in range(batch):
+                end = contexts_cpu[row, 0].item()
+                torch.testing.assert_close(legacy[row, :end], out[row, :end], rtol=0, atol=0)
+        with pytest.raises(RuntimeError, match='clean_logits'):
+            deep_gemm.fp8_fp4_paged_mqa_logits((q, qsf), cache, weights, contexts, table, meta, 2 * page, clean_logits=True)
         print(f' > SM120 paged MQA: {fp4=}, {page=}, {next_n=}')
 
 
@@ -197,6 +210,55 @@ def test_sm120_paged_mqa_page32_smem_edge(varlen):
             end = contexts_cpu[row, token].item()
             check_logits(out[row * next_n + token, :end].cpu(), ref[token, :end], torch.bfloat16)
     print(f' > SM120 paged MQA page32 smem edge: {varlen=}')
+
+
+@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
+def test_sm120_skip_head_mid(dtype):
+    m, n, k = 1024, 512, 128
+    aa, sa, ar = fp8_operand(1, m, k, 1, 128, 1)
+    bb, sb, br = fp8_operand(1, n, k, 1, 128, 2)
+    a, b = (aa[0].cuda(), sa[0].cuda()), (bb[0].cuda(), sb[0].cuda())
+    d, storage = native_matrix(torch.full((m, 640), 19, dtype=dtype), True, 1)
+    deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, (128, 64, 128), recipe=(1, 1, 128))
+    actual = d.cpu().float().reshape(m, 2, 320)
+    expected = (ar[0] @ br[0].T).reshape(m, 2, 256)
+    check_logits(actual[..., :128], expected[..., :128], dtype)
+    check_logits(actual[..., 192:], expected[..., 128:], dtype)
+    assert (actual[..., 128:192] == 19).all()
+    valid = torch.zeros_like(storage, dtype=torch.bool)
+    valid.as_strided(d.shape, d.stride(), d.storage_offset()).fill_(True)
+    assert (storage[~valid] == 19).all()
+
+
+@test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
+@pytest.mark.parametrize('packed_a,packed_b', ((False, False), (False, True), (True, False)))
+def test_sm120_skip_head_mid_reject_fp32_scale_without_cast(dtype, packed_a, packed_b):
+    a = torch.ones((1, 512), dtype=torch.float8_e4m3fn, device='cuda')
+    b = torch.ones((256, 512), dtype=torch.float8_e4m3fn, device='cuda')
+    sa, sb = torch.ones((1, 4), device='cuda'), torch.ones((256, 4), device='cuda')
+    packed_sa = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sa)
+    packed_sb = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(sb)
+    sfa, sfb = packed_sa if packed_a else sa, packed_sb if packed_b else sb
+    d, storage = native_matrix(torch.full((1, 320), 19, dtype=dtype), True, 1)
+    before = storage.clone()
+    match = 'sfb.scalar_type' if packed_a else 'Unsupported architecture or scaling factor types'
+    with pytest.raises(RuntimeError, match=match):
+        deep_gemm.fp8_gemm_nt_skip_head_mid((a, sfa), (b, sfb), d, (128, 64, 128),
+                                          recipe=(1, 1, 128), disable_ue8m0_cast=True)
+    assert torch.equal(storage, before)
+    for scale_a, scale_b, disable_cast in ((sfa, sfb, False), (packed_sa, packed_sb, True)):
+        d.fill_(19)
+        deep_gemm.fp8_gemm_nt_skip_head_mid((a, scale_a), (b, scale_b), d, (128, 64, 128),
+                                          recipe=(1, 1, 128), disable_ue8m0_cast=disable_cast)
+        actual = d.cpu()
+        torch.testing.assert_close(actual[:, :128], torch.full((1, 128), 512, dtype=dtype), rtol=0, atol=0)
+        torch.testing.assert_close(actual[:, 192:], torch.full((1, 128), 512, dtype=dtype), rtol=0, atol=0)
+        assert (actual[:, 128:192] == 19).all()
+        valid = torch.zeros_like(storage, dtype=torch.bool)
+        valid.as_strided(d.shape, d.stride(), d.storage_offset()).fill_(True)
+        assert (storage[~valid] == 19).all()
 
 
 @test_filter(lambda: get_arch_major() == 12)
@@ -263,7 +325,6 @@ def test_sm120_mqa_host_rejections():
     starts = torch.zeros(3, dtype=torch.int32, device='cuda')
     ends = torch.full((3,), 128, dtype=torch.int32, device='cuda')
     def call(qvalue=(None, None), kvvalue=None, w=None, **kwargs):
-        kwargs.setdefault('max_seqlen_k', 128)
         return deep_gemm.fp8_fp4_mqa_logits((q, None) if qvalue[0] is None else qvalue,
                                            (kv, sf) if kvvalue is None else kvvalue,
                                            weights if w is None else w, starts, ends, **kwargs)
@@ -279,38 +340,46 @@ def test_sm120_mqa_host_rejections():
     with pytest.raises(RuntimeError, match='schedule_meta'):
         call(schedule_meta=torch.zeros(1, dtype=torch.int32, device='cuda'))
     with pytest.raises(RuntimeError, match='max_seqlen_k'):
-        call(max_seqlen_k=0)
+        call(max_seqlen_k=-1)
+    with pytest.raises(RuntimeError, match='clean_logits'):
+        call(max_seqlen_k=128, clean_logits=True)
     with pytest.raises(RuntimeError, match='arch_major'):
         deep_gemm.get_mqa_logits_metadata(starts, ends, 128, 16)
-
-
-SM120_DENSE_STORE_CASES = (
-    ((128, 16, 128), 2, 'scalar'),
-    ((65, 16, 128), 2, 'scalar'),
-    ((129, 16, 128), 2, 'scalar'),
-    ((1, 16, 128), 2, 'scalar'),
-    ((32, 256, 16384), 32, 'split'),
-    ((32, 512, 16384), 32, 'split'),
-    ((32, 128, 16384), 32, 'split'),
-    ((128, 256, 2048), 2, 'tma'),
-    ((1024, 512, 128), 32, 'tma'),
-)
 
 
 @test_filter(lambda: get_arch_major() == 12)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float32))
 @pytest.mark.parametrize('padded', (False, True))
 @pytest.mark.parametrize('pdl', (False, True))
-@pytest.mark.parametrize('shape,sms,branch', SM120_DENSE_STORE_CASES)
-def test_sm120_dense_fp8_stores(dtype, padded, pdl, shape, sms, branch):
+@pytest.mark.parametrize('shape,splits,sms,branch', (
+    ((128, 16, 128), (8, 8, 8), 2, 'scalar'),
+    ((65, 16, 128), (8, 8, 8), 2, 'scalar'),
+    ((129, 16, 128), (0, 8, 8), 2, 'scalar'),
+    ((1, 16, 128), (8, 8, 0), 2, 'scalar'),
+    ((65, 16, 128), (8, 0, 8), 2, 'scalar'),
+    ((32, 256, 16384), (128, 64, 128), 32, 'split'),
+    ((32, 512, 16384), (128, 64, 128), 32, 'split'),
+    ((32, 128, 16384), (0, 64, 128), 32, 'split'),
+    ((32, 128, 16384), (128, 64, 0), 32, 'split'),
+    ((32, 256, 16384), (128, 0, 128), 32, 'split'),
+    ((128, 256, 2048), (128, 64, 128), 2, 'tma'),
+    ((1024, 512, 128), (128, 64, 128), 32, 'tma'),
+))
+def test_sm120_skip_head_stores(dtype, padded, pdl, shape, splits, sms, branch):
     from sm120_reference_heuristic import predict_dense_fp8
 
     m, n, k = shape
+    left, mid, right = splits
+    width = n + n // (left + right) * mid
     aa, sa, ar = fp8_operand(1, m, k, 1, 128, 1)
     bb, sb, br = fp8_operand(1, n, k, 1, 128, 2)
     a, b = (aa[0].cuda(), sa[0].cuda()), (bb[0].cuda(), sb[0].cuda())
-    d, storage = native_matrix(torch.full((m, n), 19, dtype=dtype), padded, int(padded))
+    d, storage = native_matrix(torch.full((m, width), 19, dtype=dtype), padded, int(padded))
+    logical = torch.arange(n)
+    physical = logical + (logical + right) // (left + right) * mid
     expected = ar[0] @ br[0].T
+    untouched = torch.ones(width, dtype=torch.bool)
+    untouched[physical] = False
     valid = torch.zeros_like(storage, dtype=torch.bool)
     valid.as_strided(d.shape, d.stride(), d.storage_offset()).fill_(True)
     old_sms = deep_gemm.get_num_sms()
@@ -326,10 +395,12 @@ def test_sm120_dense_fp8_stores(dtype, padded, pdl, shape, sms, branch):
             assert (prediction['swizzle_cd'] > 0) == (branch == 'tma'), prediction
 
         def call():
-            deep_gemm.fp8_gemm_nt(a, b, d, recipe=(1, 1, 128))
+            deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, splits, recipe=(1, 1, 128))
 
         def check():
-            check_logits(d.cpu().float(), expected, dtype)
+            actual = d.cpu()
+            check_logits(actual[:, physical], expected, dtype)
+            assert (actual[:, untouched] == 19).all()
             assert (storage[~valid] == 19).all()
 
         call()
@@ -351,10 +422,6 @@ def test_sm120_dense_fp8_stores(dtype, padded, pdl, shape, sms, branch):
         deep_gemm.set_pdl(old_pdl)
         deep_gemm.set_num_sms(old_sms)
         deep_gemm.set_mk_alignment_for_contiguous_layout(old_alignment)
-
-
-# `KVSplitHeader::get_num_kv_blocks`: clear the contiguous (bit 31) and partial-tail (bit 30) flags
-SPARSE_KV_COUNT_MASK = 0x3fffffff
 
 
 def check_mqa_logits_chunked(actual, q, kv, weights, ks, ke, compressed):
@@ -420,7 +487,7 @@ def check_sm120_sparse_metadata(metadata, candidates, sizes, starts, block, fmt,
     for split in range(splits):
         offset = 16 + split * split_bytes
         query, packed_count, base0, base1 = struct.unpack_from('<IIII', raw, offset)
-        size = packed_count & SPARSE_KV_COUNT_MASK
+        size = packed_count & 0x7fffffff
         assert 0 < size <= capacity and query < len(sizes)
         split_queries.append(query)
         physical_blocks = []
@@ -648,14 +715,14 @@ def test_sm120_sparse_metadata_wave_histogram_reuse():
 
 def check_sm120_sparse_entry_partition_mapping(split_headers, q_token_base):
     chunks = [(index, chunk) for index, (base, packed, *_) in enumerate(split_headers)
-              if base == q_token_base and (packed & SPARSE_KV_COUNT_MASK) <= 80
-              for chunk in range(ceil_div(packed & SPARSE_KV_COUNT_MASK, 8))]
+              if base == q_token_base and (packed & 0x7fffffff) <= 80
+              for chunk in range(ceil_div(packed & 0x7fffffff, 8))]
     assignments = []
     for partition in range(4):
         begin, end = len(chunks) * partition // 4, len(chunks) * (partition + 1) // 4
         prefix, assigned = 0, []
         for index, (base, packed, *_) in enumerate(split_headers):
-            blocks = packed & SPARSE_KV_COUNT_MASK
+            blocks = packed & 0x7fffffff
             count = ceil_div(blocks, 8) if base == q_token_base and blocks <= 80 else 0
             local_begin = min(count, max(0, begin - prefix))
             local_end = min(count, max(0, end - prefix))
@@ -1008,14 +1075,19 @@ if __name__ == '__main__':
     for fp4, page in ((False, 64), (False, 128), (False, 256), (True, 32), (True, 64), (True, 128), (True, 256)):
         for dtype in (torch.float32, torch.bfloat16):
             test_sm120_paged_mqa_contract(fp4=fp4, page=page, dtype=dtype)
+    for dtype in (torch.bfloat16, torch.float32):
+        test_sm120_skip_head_mid(dtype=dtype)
+    for dtype in (torch.bfloat16, torch.float32):
+        for packed_a, packed_b in ((False, False), (False, True), (True, False)):
+            test_sm120_skip_head_mid_reject_fp32_scale_without_cast(dtype=dtype, packed_a=packed_a, packed_b=packed_b)
     for dim, heads, page in ((32, 32, 64), (64, 64, 128)):
         test_sm120_paged_mqa_metadata_graph(dim=dim, heads=heads, page=page)
     test_sm120_mqa_host_rejections()
     for dtype in (torch.bfloat16, torch.float32):
         for padded in (False, True):
             for pdl in (False, True):
-                for shape, sms, branch in SM120_DENSE_STORE_CASES:
-                    test_sm120_dense_fp8_stores(dtype=dtype, padded=padded, pdl=pdl, shape=shape, sms=sms, branch=branch)
+                for shape, splits, sms, branch in (((128, 16, 128), (8, 8, 8), 2, 'scalar'), ((65, 16, 128), (8, 8, 8), 2, 'scalar'), ((129, 16, 128), (0, 8, 8), 2, 'scalar'), ((1, 16, 128), (8, 8, 0), 2, 'scalar'), ((65, 16, 128), (8, 0, 8), 2, 'scalar'), ((32, 256, 16384), (128, 64, 128), 32, 'split'), ((32, 512, 16384), (128, 64, 128), 32, 'split'), ((32, 128, 16384), (0, 64, 128), 32, 'split'), ((32, 128, 16384), (128, 64, 0), 32, 'split'), ((32, 256, 16384), (128, 0, 128), 32, 'split'), ((128, 256, 2048), (128, 64, 128), 2, 'tma'), ((1024, 512, 128), (128, 64, 128), 32, 'tma')):
+                    test_sm120_skip_head_stores(dtype=dtype, padded=padded, pdl=pdl, shape=shape, splits=splits, sms=sms, branch=branch)
     test_sm120_sparse_metadata()
     test_sm120_sparse_metadata_wave_histogram_reuse()
     test_sm120_sparse_entry_partition_mapping()

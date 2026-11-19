@@ -13,30 +13,6 @@ namespace deep_gemm::sm120_sparse_mqa_detail {
 
 using namespace layout::sparse_mqa_logits;
 
-// The vendored SM120 kernel is written for the fixed 32-head layout
-static constexpr uint32_t kNumHeads = kNumMaxHeads;
-
-// The metadata layout comes from the base tree's `layout/sparse_mqa_logits.cuh`, which this repo does not vendor.
-// Pin every part of it this kernel reads, so a base-side format change fails to compile here instead of producing
-// wrong logits. Both KV split flags are hints this kernel may ignore: every KV token is bounds-checked when copied.
-// When one of these fires, review the new format against this kernel before updating the assertion.
-DG_STATIC_ASSERT(kNumSparseSlotBits == 16 and kInvalidSparseSlot == 0xffffu, "Unexpected sparse slot packing");
-DG_STATIC_ASSERT(KVSplitHeader::kFlagMask == 0xc0000000u, "Unknown KV split flag");
-DG_STATIC_ASSERT(KVSplitHeader::get_num_kv_blocks(0xffffffffu) == 0x3fffffffu, "Unexpected KV split block count");
-DG_STATIC_ASSERT(sizeof(MetadataHeader) == 16 and offsetof(MetadataHeader, num_kv_splits) == 0 and
-                 offsetof(MetadataHeader, num_waves) == 4 and offsetof(MetadataHeader, use_unaligned_ks) == 8,
-                 "Unexpected metadata header layout");
-DG_STATIC_ASSERT(sizeof(KVSplitHeader) == 16 and offsetof(KVSplitHeader, q_token_base) == 0 and
-                 offsetof(KVSplitHeader, packed_num_kv_blocks) == 4 and offsetof(KVSplitHeader, q0_slot_base) == 8 and
-                 offsetof(KVSplitHeader, q1_slot_base) == 12, "Unexpected KV split header layout");
-DG_STATIC_ASSERT(sizeof(KVBlockInfo) == 8 and offsetof(KVBlockInfo, physical_kv_block_idx) == 0 and
-                 offsetof(KVBlockInfo, packed_slot_offsets) == 4, "Unexpected KV block info layout");
-DG_STATIC_ASSERT(sizeof(KVSplit<4>) == 16 + 4 * 8 and offsetof(KVSplit<4>, kv_block_infos) == 16,
-                 "Unexpected KV split layout");
-DG_STATIC_ASSERT(sizeof(ScheduleEntry) == 16 and offsetof(ScheduleEntry, kv_split_begin) == 0 and
-                 offsetof(ScheduleEntry, kv_split_end) == 4 and offsetof(ScheduleEntry, q_token_base) == 8 and
-                 offsetof(ScheduleEntry, num_q_tokens) == 12, "Unexpected schedule entry layout");
-
 template <bool kIsFP4, uint32_t SPARSE_BLOCK_KV, bool kPipeline>
 struct SharedStorage {
     static constexpr uint32_t kRowBytes = kIsFP4 ? 64 : 128;

@@ -331,7 +331,6 @@ static void sm90_bf16_k_grouped_gemm(const torch::Tensor& a,
 
 static void sm90_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
                                   const torch::Tensor& tensor_b,
-                                  const std::optional<torch::Tensor>& tensor_c,
                                   const torch::Tensor& tensor_d,
                                   const int& b, const int& h, const int& r, const int& d,
                                   const std::string& compiled_dims = "nk") {
@@ -342,7 +341,7 @@ static void sm90_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
         .a_dtype = tensor_a.scalar_type(), .b_dtype = tensor_b.scalar_type(),
         .cd_dtype = tensor_d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
-        .with_accumulation = tensor_c.has_value(),
+        .with_accumulation = false,
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims
@@ -385,7 +384,6 @@ static void sm90_bf16_bhr_hdr_bhd(const torch::Tensor& tensor_a,
 
 static void sm90_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
                                   const torch::Tensor& tensor_b,
-                                  const std::optional<torch::Tensor>& tensor_c,
                                   const torch::Tensor& tensor_d,
                                   const int& b, const int& h, const int& r, const int& d,
                                   const std::string& compiled_dims = "nk") {
@@ -396,7 +394,7 @@ static void sm90_bf16_bhd_hdr_bhr(const torch::Tensor& tensor_a,
         .a_dtype = tensor_a.scalar_type(), .b_dtype = tensor_b.scalar_type(),
         .cd_dtype = tensor_d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::MN,
-        .with_accumulation = tensor_c.has_value(),
+        .with_accumulation = false,
         .num_sms = runtime->get_num_sms(),
         .tc_util = runtime->get_tc_util(),
         .compiled_dims = compiled_dims

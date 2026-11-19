@@ -18,7 +18,7 @@ public:
         SM120GemmConfig gemm_config;
         SM120LaunchArgs launch_args;
         const std::optional<std::string> epilogue_type;
-        EpilogueOperatorArgs epilogue_args{};
+        EpilogueArgs epilogue_args{};
         bool k_grouped_constant_stride = false;
         int k_alignment = 128;
         int stride_d_m = 0;
@@ -76,7 +76,7 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_sms,
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
-        get_sm120_epilogue_type(args.epilogue_type),
+        get_default_epilogue_type(args.epilogue_type),
         args.gemm_desc.major_b == cute::UMMA::Major::K ? "true" : "false",
         k_n_warps, args.k_grouped_constant_stride, args.k_alignment);
     }
@@ -104,7 +104,7 @@ static void sm120_bf16_gemm(const torch::Tensor& a,
                             const std::string& compiled_dims,
                             const std::optional<float>& alpha = std::nullopt) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
-    const auto epilogue = make_sm120_epilogue_input(m, n, std::nullopt, alpha);
+    const auto epilogue = make_epilogue_input(m, n, std::nullopt, alpha);
 
     const auto desc = SM120GemmDesc {
         .gemm_type = GemmType::Normal,

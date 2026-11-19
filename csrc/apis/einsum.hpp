@@ -152,21 +152,7 @@ static void sm120_bf16_einsum(const torch::Tensor& A, const torch::Tensor& B,
         D.copy_(native_d.narrow(2, 0, n));
 }
 
-// The native SM120 BF16 einsum (deterministic, or without cuBLASLt) only stores a plain BF16 D.
-// Check before anything writes D: resolving the epilogue already copies a separate C into D.
-static void check_sm120_native_bf16_einsum(const torch::Tensor& D, const std::optional<torch::Tensor>& C,
-                                           const std::shared_ptr<EpilogueClass>& epilogue_class) {
-    const bool uses_cublaslt = not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()
-        and (epilogue_class == nullptr or epilogue_class->get_alpha().has_value());
-    if (jit->device.get_arch_major() == 12 and not uses_cublaslt) {
-        DG_HOST_ASSERT(epilogue_class == nullptr and not C.has_value() and D.scalar_type() == torch::kBFloat16
-                       and "SM120 BF16 einsum supports a plain BF16 store only");
-    }
-}
-
-static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D,
-                        const std::optional<torch::Tensor>& C,
-                        const std::shared_ptr<EpilogueClass>& epilogue_class) {
+static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D) {
     const auto [b , h  , r ] = get_shape<3>(A);
     const auto [h_, d  , r_] = get_shape<3>(B);
     const auto [b_, h__, d_] = get_shape<3>(D);
@@ -174,7 +160,7 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
 
     DG_HOST_ASSERT(A.scalar_type() == torch::kBFloat16 and A.stride(2) == 1);
     DG_HOST_ASSERT(B.scalar_type() == torch::kBFloat16 and B.stride(2) == 1);
-    DG_HOST_ASSERT(D.stride(2) == 1);
+    DG_HOST_ASSERT(D.scalar_type() == torch::kBFloat16 and D.stride(2) == 1);
     DG_HOST_ASSERT(B.device() == A.device() and D.device() == A.device());
     const c10::cuda::CUDAGuard device_guard(A.device());
     const auto& device_prop = *at::cuda::getDeviceProperties(A.get_device());
@@ -184,37 +170,22 @@ static void bhr_hdr_bhd(const torch::Tensor& A, const torch::Tensor& B, const to
                    and cached_prop.sharedMemPerBlockOptin == device_prop.sharedMemPerBlockOptin
                    and cached_prop.l2CacheSize == device_prop.l2CacheSize);
 
-    check_sm120_native_bf16_einsum(D, C, epilogue_class);
-
-    // Early return for trivial cases
-    if (h == 0 or gemm::early_return(b, d, r, D, C))
-        return;
-
-    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, C, D);
-    const auto epilogue_alpha = resolved_epilogue_class->get_alpha();
-
-    // Dispatch implementation; cuBLASLt only covers a plain store, optionally alpha-scaled
+    // Dispatch implementation
     const auto arch_major = jit->device.get_arch_major();
-    if (not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()
-        and epilogue_alpha.has_value()) {
-        cublaslt_bhr_hdr_bhd(A, B, D, b, h, r, d, C.has_value(), epilogue_alpha.value());
+    if (not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()) {
+        cublaslt_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 9) {
-        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
-        sm90_bf16_bhr_hdr_bhd(A, B, C, D, b, h, r, d);
+        sm90_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
-        sm100_bf16_bhr_hdr_bhd(A, B, C, D, b, h, r, d, "nk", resolved_epilogue_class);
+        sm100_bf16_bhr_hdr_bhd(A, B, D, b, h, r, d);
     } else if (arch_major == 12) {
-        DG_HOST_ASSERT(epilogue_class == nullptr and not C.has_value() and D.scalar_type() == torch::kBFloat16
-                       and "SM120 BF16 einsum supports a plain BF16 store only");
         sm120_bf16_einsum(A, B, D, true);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 }
 
-static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D,
-                        const std::optional<torch::Tensor>& C,
-                        const std::shared_ptr<EpilogueClass>& epilogue_class) {
+static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const torch::Tensor& D) {
     const auto [b , h  , d ] = get_shape<3>(A);
     const auto [h_, d_ , r ] = get_shape<3>(B);
     const auto [b_, h__, r_] = get_shape<3>(D);
@@ -222,7 +193,7 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
 
     DG_HOST_ASSERT(A.scalar_type() == torch::kBFloat16 and A.stride(2) == 1);
     DG_HOST_ASSERT(B.scalar_type() == torch::kBFloat16 and B.stride(2) == 1);
-    DG_HOST_ASSERT(D.stride(2) == 1);
+    DG_HOST_ASSERT(D.scalar_type() == torch::kBFloat16 and D.stride(2) == 1);
     DG_HOST_ASSERT(B.device() == A.device() and D.device() == A.device());
     const c10::cuda::CUDAGuard device_guard(A.device());
     const auto& device_prop = *at::cuda::getDeviceProperties(A.get_device());
@@ -232,28 +203,15 @@ static void bhd_hdr_bhr(const torch::Tensor& A, const torch::Tensor& B, const to
                    and cached_prop.sharedMemPerBlockOptin == device_prop.sharedMemPerBlockOptin
                    and cached_prop.l2CacheSize == device_prop.l2CacheSize);
 
-    check_sm120_native_bf16_einsum(D, C, epilogue_class);
-
-    // Early return for trivial cases
-    if (h == 0 or gemm::early_return(b, r, d, D, C))
-        return;
-
-    const auto resolved_epilogue_class = resolve_epilogue_class(epilogue_class, C, D);
-    const auto epilogue_alpha = resolved_epilogue_class->get_alpha();
-
-    // Dispatch implementation; cuBLASLt only covers a plain store, optionally alpha-scaled
+    // Dispatch implementation
     const auto arch_major = jit->device.get_arch_major();
-    if (not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()
-        and epilogue_alpha.has_value()) {
-        cublaslt_bhd_hdr_bhr(A, B, D, b, h, r, d, C.has_value(), epilogue_alpha.value());
+    if (not heuristics_runtime->get_deterministic_algorithms() and runtime->is_cublaslt_available()) {
+        cublaslt_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 9) {
-        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues require SM100");
-        sm90_bf16_bhd_hdr_bhr(A, B, C, D, b, h, r, d);
+        sm90_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 10) {
-        sm100_bf16_bhd_hdr_bhr(A, B, C, D, b, h, r, d, "nk", resolved_epilogue_class);
+        sm100_bf16_bhd_hdr_bhr(A, B, D, b, h, r, d);
     } else if (arch_major == 12) {
-        DG_HOST_ASSERT(epilogue_class == nullptr and not C.has_value() and D.scalar_type() == torch::kBFloat16
-                       and "SM120 BF16 einsum supports a plain BF16 store only");
         sm120_bf16_einsum(A, B, D, false);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
@@ -286,8 +244,7 @@ static void einsum(const std::string& expr,
                    const torch::Tensor& a,
                    const torch::Tensor& b,
                    const torch::Tensor& d,
-                   const std::optional<torch::Tensor>& c,
-                   const std::shared_ptr<EpilogueClass>& epilogue_class) {
+                   const std::optional<torch::Tensor>& c) {
     DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
@@ -299,14 +256,14 @@ static void einsum(const std::string& expr,
     // TODO: support any expression
     // TODO: canonicalize expression
     if (expr == "bmk,bnk->mn") {
-        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues are unsupported for this expression");
         bmk_bnk_mn(a, b, d, c);
     } else if (expr == "bhr,hdr->bhd") {
-        bhr_hdr_bhd(a, b, d, c, epilogue_class);
+        DG_HOST_ASSERT(not c.has_value());
+        bhr_hdr_bhd(a, b, d);
     } else if (expr == "bhd,hdr->bhr") {
-        bhd_hdr_bhr(a, b, d, c, epilogue_class);
+        DG_HOST_ASSERT(not c.has_value());
+        bhd_hdr_bhr(a, b, d);
     } else if (expr == "bhd,bhr->hdr") {
-        DG_HOST_ASSERT(epilogue_class == nullptr and "Custom epilogues are unsupported for this expression");
         bhd_bhr_hdr(a, b, d, c);
     } else {
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
@@ -320,20 +277,10 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
                     const std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>>& d,
                     const std::optional<torch::Tensor>& c,
                     std::optional<std::tuple<int, int, int>> recipe,
-                    const std::string& compiled_dims,
-                    const std::shared_ptr<EpilogueClass>& epilogue_class) {
-    // The FP8 output pair is shorthand for `FP8CastWithClamp` without clamping
+                    const std::string& compiled_dims) {
     const auto d_fp8 = std::get_if<std::pair<torch::Tensor, torch::Tensor>>(&d);
     const auto d_tensor = d_fp8 != nullptr ? d_fp8->first : std::get<torch::Tensor>(d);
-    auto merged_epilogue_class = epilogue_class;
-    std::optional<torch::Tensor> sfd;
-    if (d_fp8 != nullptr) {
-        DG_HOST_ASSERT(epilogue_class == nullptr and "The FP8 output pair supports no other epilogue");
-        sfd = d_fp8->second;
-        merged_epilogue_class = std::make_shared<FP8CastWithClampEpilogue>(d_fp8->second);
-    } else {
-        sfd = merged_epilogue_class != nullptr ? merged_epilogue_class->output_sfd() : std::nullopt;
-    }
+    const auto sfd = d_fp8 != nullptr ? std::make_optional(d_fp8->second) : std::nullopt;
     DG_HOST_ASSERT(a.is_cuda());
     for (const auto& t: {sfa, b, sfb, d_tensor})
         DG_HOST_ASSERT(t.is_cuda() and t.device() == a.device());
@@ -342,8 +289,7 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
     const c10::cuda::CUDAGuard device_guard(a.device());
     const auto arch_major = jit->device.get_arch_major();
     DG_HOST_ASSERT(arch_major == at::cuda::getDeviceProperties(a.get_device())->major);
-    DG_HOST_ASSERT((arch_major != 12 or merged_epilogue_class == nullptr) and
-                   "SM120 FP8 BMM supports a plain BF16/FP32 store only");
+    DG_HOST_ASSERT(arch_major != 12 or not sfd.has_value());
 
     // Shape must be `[B, M, K] @ [B, N, K].T`
     const auto major_a = a.stride(-1) == 1 ? cute::UMMA::Major::K : cute::UMMA::Major::MN;
@@ -366,9 +312,12 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
         //  - `d.stride(0) == n`: the batches are contiguous along the columns of the view
         //  - `n % 128 == 0`: each batch is quantized independently, so neither an SF group
         //    nor a packed 4-SF word may cross a batch boundary
-        DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+        DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and not c.has_value());
+        DG_HOST_ASSERT(d_tensor.scalar_type() == torch::kFloat8_e4m3fn);
         DG_HOST_ASSERT(d_tensor.stride(0) == n and n % 128 == 0);
         check_sf_layout(sfd.value(), m, batch_size * n, 1, 32, std::nullopt, true, false, torch::kInt);
+    } else {
+        DG_HOST_ASSERT(d_tensor.scalar_type() == torch::kBFloat16 or d_tensor.scalar_type() == torch::kFloat);
     }
 
     // Early return for trivial cases
@@ -446,11 +395,8 @@ static void fp8_bmm(const torch::Tensor& a, const torch::Tensor& sfa,
 
     // Dispatch implementation
     if (arch_major == 10) {
-        sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k,
-                      gran_k_a, gran_k_b, major_a, major_b, compiled_dims,
-                      resolve_epilogue_class(merged_epilogue_class, c, d_tensor));
+        sm100_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k, gran_k_a, gran_k_b, major_a, major_b, compiled_dims, sfd);
     } else {
-        DG_HOST_ASSERT(merged_epilogue_class == nullptr and "Custom epilogues require SM100");
         const auto major_sfb = get_major_type_ab(sfb);
         DG_HOST_ASSERT(gran_k_a == 128 and gran_k_b == 128);
         sm90_fp8_bmm(a, transformed_sfa, b, transformed_sfb, c, d_tensor, batch_size, m, n, k, major_a, major_b, major_sfb, compiled_dims);
@@ -462,8 +408,7 @@ static void fp8_einsum(const std::string& expr,
                        const std::pair<torch::Tensor, torch::Tensor>& b,
                        const std::variant<torch::Tensor, std::pair<torch::Tensor, torch::Tensor>>& d,
                        const std::optional<torch::Tensor>& c,
-                       const std::tuple<int, int, int>& recipe,
-                       const std::shared_ptr<EpilogueClass>& epilogue_class) {
+                       const std::tuple<int, int, int>& recipe) {
     DG_HOST_ASSERT(a.first.is_cuda());
     const auto& output = std::holds_alternative<torch::Tensor>(d) ? std::get<torch::Tensor>(d)
         : std::get<std::pair<torch::Tensor, torch::Tensor>>(d).first;
@@ -491,7 +436,7 @@ static void fp8_einsum(const std::string& expr,
         else
             std::get<torch::Tensor>(perm_d) = std::get<torch::Tensor>(perm_d).permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
-        fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk", epilogue_class);
+        fp8_bmm(perm_a, perm_sfa, b.first, b.second, perm_d, perm_c, recipe, "nk");
     } else if (expr == "bhd,hdr->bhr" and (arch_major == 10 or arch_major == 12)) {
         // (batch_size, m, n, k): (h, b, r, d)
         DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
@@ -503,7 +448,7 @@ static void fp8_einsum(const std::string& expr,
             perm_b = perm_b.contiguous();
         const auto perm_d = std::get<torch::Tensor>(d).permute({1, 0, 2});
         const auto perm_c = c.has_value() ? std::make_optional(c.value().permute({1, 0, 2})) : std::nullopt;
-        fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk", epilogue_class);
+        fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, perm_d, perm_c, recipe, "nk");
     } else if (expr == "bhd,bhr->hdr" and (arch_major == 10 or arch_major == 12)) {
         // (batch_size, m, n, k): (h, d, r, b)
         DG_HOST_ASSERT(std::holds_alternative<torch::Tensor>(d));
@@ -515,7 +460,7 @@ static void fp8_einsum(const std::string& expr,
             perm_a = perm_a.contiguous();
             perm_b = perm_b.contiguous();
         }
-        fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn", epilogue_class);
+        fp8_bmm(perm_a, perm_sfa, perm_b, perm_sfb, d, c, recipe, "mn");
     } else {
         DG_HOST_UNREACHABLE(std::format("Unsupported einsum expression: {}", expr));
     }
@@ -523,13 +468,11 @@ static void fp8_einsum(const std::string& expr,
 static void register_apis(pybind11::module_& m) {
     m.def("einsum", &einsum,
           py::arg("expr"), py::arg("a"), py::arg("b"),
-          py::arg("d"), py::arg("c") = std::nullopt,
-          py::arg("epilogue") = nullptr);
+          py::arg("d"), py::arg("c") = std::nullopt);
     m.def("fp8_einsum", &fp8_einsum,
           py::arg("expr"), py::arg("a"), py::arg("b"),
           py::arg("d"), py::arg("c") = std::nullopt,
-          py::arg("recipe") = std::make_tuple(1, 128, 128),
-          py::arg("epilogue") = nullptr);
+          py::arg("recipe") = std::make_tuple(1, 128, 128));
 }
 
 } // namespace deep_gemm::einsum
