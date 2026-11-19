@@ -252,6 +252,9 @@ static void mega_mhc(const torch::Tensor& x,
 }
 
 static void register_apis(pybind11::module_& m) {
+    m.def("prepare_mega_mhc_stream", []() {
+        get_split_barriers(torch::TensorOptions().device(at::cuda::getCurrentCUDAStream().device()));
+    }, "Initialize split barriers on the current CUDA stream before graph capture.");
     m.def(
         "mega_mhc",
         &mega_mhc,

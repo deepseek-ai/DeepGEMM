@@ -271,16 +271,17 @@ def test_mega_mhc_api_contract() -> None:
     else:
         raise AssertionError('Mega mHC must be warmed up before CUDA Graph capture')
 
+    # Only the barriers are stream-local. The kernel was warmed up above.
     with torch.cuda.stream(capture_stream):
-        run_mega_mhc(inputs, graph_outputs)
+        deep_gemm.prepare_mega_mhc_stream()
     capture_stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
         run_mega_mhc(inputs, graph_outputs)
-    graph.replay()
-    capture_stream.synchronize()
-    for name, tensor in logical_outputs(graph_outputs).items():
-        assert_bitwise_equal(tensor, expected_outputs[name], f'CUDA Graph: {name}')
+    for _ in range(2):
+        graph.replay()
+        for name, tensor in logical_outputs(graph_outputs).items():
+            assert_bitwise_equal(tensor, expected_outputs[name], f'CUDA Graph: {name}')
 
     # FP8-only calls remain bitwise stable after a different-sized invocation
     for is_shifted in (False, True):
