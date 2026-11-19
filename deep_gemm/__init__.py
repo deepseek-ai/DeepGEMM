@@ -77,7 +77,7 @@ from ._C import (
     fp8_fp4_sparse_mqa_logits,
     fp8_fp4_paged_sparse_mqa_logits,
     # Hyperconnection kernels
-    mega_mhc,
+    mega_mhc, prepare_mega_mhc_stream,
     tf32_hc_prenorm_gemm,
     # Layout kernels
     transform_sf_into_required_layout,
