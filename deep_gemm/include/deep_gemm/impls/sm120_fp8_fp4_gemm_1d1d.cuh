@@ -696,7 +696,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                 // Release stage
                 // Order shared-memory reads before the producer reuses this stage.
+#if (__CUDACC_VER_MAJOR__ > 13) or (__CUDACC_VER_MAJOR__ == 13 and __CUDACC_VER_MINOR__ >= 4)
+                asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::: "memory");
+#else
                 cutlass::arch::fence_view_async_shared();
+#endif
                 if (lane_idx == 0)
                     empty_barriers[stage]->arrive();
             }); // kb_inner (cute::for_each)
@@ -1009,7 +1013,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 }
 
                 // Order shared-memory reads before the producer reuses this stage.
+#if (__CUDACC_VER_MAJOR__ > 13) or (__CUDACC_VER_MAJOR__ == 13 and __CUDACC_VER_MINOR__ >= 4)
+                asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::: "memory");
+#else
                 cutlass::arch::fence_view_async_shared();
+#endif
                 if (lane_idx == 0)
                     empty_barriers[stage]->arrive();
             } // SF-major tail kb loop
@@ -1340,7 +1348,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 }
 
                 // Order shared-memory reads before the producer reuses this stage.
+#if (__CUDACC_VER_MAJOR__ > 13) or (__CUDACC_VER_MAJOR__ == 13 and __CUDACC_VER_MINOR__ >= 4)
+                asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;" ::: "memory");
+#else
                 cutlass::arch::fence_view_async_shared();
+#endif
                 if (lane_idx == 0)
                     empty_barriers[stage]->arrive();
             }
