@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deepgemm-sm120-vllm-experiment"
+version = "0.1.0"
+description = "Opt-in single-token SM120 MoE experiment for vLLM 0.32.0"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+deepgemm_sm120 = "sm120_vllm:register"
+
+[tool.setuptools]
+py-modules = ["sm120_vllm", "sm120_vllm_validation", "sm120_tp_policy"]
