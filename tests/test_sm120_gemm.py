@@ -317,6 +317,14 @@ def test_sm120_dense_fp8_fp4_tails_large():
 
 
 @test_filter(lambda: get_arch_major() == 12)
+@pytest.mark.parametrize('k', (2048, 2560, 3584, 4096))
+@pytest.mark.parametrize('sf_kind', ('float', 'packed'))
+def test_sm120_dense_split_k_sf_alignment(k, sf_kind):
+    exercise_sm120_dense_fp8_fp4((False, False), 'nt', (32, 64, k), torch.float32,
+                                None, 'none', sf_kind, (128, 128), common_recipe=True)
+
+
+@test_filter(lambda: get_arch_major() == 12)
 def test_sm120_dense_fp8_fp4_graph_pdl():
     for fi, fmt in enumerate(((False, False), (False, True), (True, False), (True, True))):
         for li, layout in enumerate(('nt', 'nn', 'tn', 'tt')):
@@ -570,6 +578,9 @@ if __name__ == '__main__':
     test_sm120_dense_fp8_fp4_formats_alpha()
     test_sm120_dense_fp8_fp4_swap_boundary()
     test_sm120_dense_fp8_fp4_tails_large()
+    for k in (2048, 2560, 3584, 4096):
+        for sf_kind in ('float', 'packed'):
+            test_sm120_dense_split_k_sf_alignment(k=k, sf_kind=sf_kind)
     test_sm120_dense_fp8_fp4_graph_pdl()
     test_sm120_dense_fp8_fp4_explicit_rejections()
     test_sm120_dense_scaling_defaults()
