@@ -1,0 +1,1373 @@
+{
+  "schema": "sm120-pr501-postmerge-validation-v1",
+  "validated_head": "643f4f3ce4991889b702e814210fe754b7f36ec6",
+  "tree": "1c557cbf5fb0e848a8d35d0428340a66241f58d8",
+  "upstream": "8c8a92076c4de39e5ed29459e55fea3eaca6256c",
+  "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+  "dependencies": {
+    "deep_jit_commit": "2efdab421e1cfb17fe8bc20e11ca72aa6d0e6c43",
+    "cutlass_commit": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+  },
+  "all_phases_passed": true,
+  "receipts": {
+    "complete": true,
+    "head": "643f4f3ce4991889b702e814210fe754b7f36ec6",
+    "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+    "public_correctness_tests": 30,
+    "original_contract_tests": 42,
+    "numerical_regression_tests": 4,
+    "layout_direct_id_tests": 4,
+    "sanitizer_clean": [
+      "memcheck",
+      "synccheck",
+      "racecheck",
+      "initcheck",
+      "tp-memcheck",
+      "tp-synccheck",
+      "tp-racecheck",
+      "tp-initcheck"
+    ],
+    "tp_verified_ranks": [
+      0,
+      1
+    ],
+    "tp_records_per_rank": 9,
+    "source_unchanged": true,
+    "abi_verified": true
+  },
+  "micro": [
+    {
+      "model": "qwen30",
+      "key": [
+        2048,
+        768,
+        128,
+        8
+      ],
+      "seed": 28001,
+      "condition": "warm",
+      "entry_us": 27.728000283241272,
+      "best_split_label": "split-32-32",
+      "best_split_us": 51.03679895401001,
+      "best_public_label": "public-32",
+      "best_public_us": 87.1999979019165,
+      "speedup_vs_best_split": 1.8406231402434208,
+      "speedup_vs_best_public": 3.144835437506106
+    },
+    {
+      "model": "qwen30",
+      "key": [
+        2048,
+        768,
+        128,
+        8
+      ],
+      "seed": 28001,
+      "condition": "pressure512",
+      "entry_us": 61.43999844789505,
+      "best_split_label": "split-0-0",
+      "best_split_us": 88.06400001049042,
+      "best_public_label": "public-32",
+      "best_public_us": 104.44799810647964,
+      "speedup_vs_best_split": 1.4333333697131223,
+      "speedup_vs_best_public": 1.7000000121265963
+    },
+    {
+      "model": "qwen235",
+      "key": [
+        4096,
+        1536,
+        128,
+        8
+      ],
+      "seed": 28001,
+      "condition": "warm",
+      "entry_us": 196.1087942123413,
+      "best_split_label": "split-32-32",
+      "best_split_us": 224.8863935470581,
+      "best_public_label": "public-32",
+      "best_public_us": 230.44159412384033,
+      "speedup_vs_best_split": 1.146743033377469,
+      "speedup_vs_best_public": 1.1750701698482955
+    },
+    {
+      "model": "qwen235",
+      "key": [
+        4096,
+        1536,
+        128,
+        8
+      ],
+      "seed": 28001,
+      "condition": "pressure512",
+      "entry_us": 225.2800017595291,
+      "best_split_label": "split-32-32",
+      "best_split_us": 243.68000030517578,
+      "best_public_label": "public-32",
+      "best_public_us": 245.7599937915802,
+      "speedup_vs_best_split": 1.0816761292699535,
+      "speedup_vs_best_public": 1.0909090548299625
+    },
+    {
+      "model": "qwen15",
+      "key": [
+        2048,
+        1408,
+        60,
+        4
+      ],
+      "seed": 28001,
+      "condition": "warm",
+      "entry_us": 20.348800718784332,
+      "best_split_label": "split-32-32",
+      "best_split_us": 40.63360095024109,
+      "best_public_label": "public-32",
+      "best_public_us": 76.4415979385376,
+      "speedup_vs_best_split": 1.9968548275541125,
+      "speedup_vs_best_public": 3.7565652637195974
+    },
+    {
+      "model": "qwen15",
+      "key": [
+        2048,
+        1408,
+        60,
+        4
+      ],
+      "seed": 28001,
+      "condition": "pressure512",
+      "entry_us": 57.34400078654289,
+      "best_split_label": "split-64-32",
+      "best_split_us": 71.6480016708374,
+      "best_public_label": "public-32",
+      "best_public_us": 94.2080020904541,
+      "speedup_vs_best_split": 1.2494419762851858,
+      "speedup_vs_best_public": 1.64285715677798
+    },
+    {
+      "model": "deepseek",
+      "key": [
+        2048,
+        1408,
+        64,
+        6
+      ],
+      "seed": 28001,
+      "condition": "warm",
+      "entry_us": 39.769598841667175,
+      "best_split_label": "split-32-32",
+      "best_split_us": 64.40960168838501,
+      "best_public_label": "public-32",
+      "best_public_us": 92.06079840660095,
+      "speedup_vs_best_split": 1.6195688054288884,
+      "speedup_vs_best_public": 2.3148535838422273
+    },
+    {
+      "model": "deepseek",
+      "key": [
+        2048,
+        1408,
+        64,
+        6
+      ],
+      "seed": 28001,
+      "condition": "pressure512",
+      "entry_us": 79.8719972372055,
+      "best_split_label": "split-0-32",
+      "best_split_us": 98.30400347709656,
+      "best_public_label": "public-32",
+      "best_public_us": 108.5439994931221,
+      "speedup_vs_best_split": 1.230769316875241,
+      "speedup_vs_best_public": 1.3589743996355306
+    },
+    {
+      "model": "qwen2",
+      "key": [
+        3584,
+        2560,
+        64,
+        8
+      ],
+      "seed": 28001,
+      "condition": "warm",
+      "entry_us": 295.9104061126709,
+      "best_split_label": "split-32-32",
+      "best_split_us": 296.1951971054077,
+      "best_public_label": "public-32",
+      "best_public_us": 301.32479667663574,
+      "speedup_vs_best_split": 1.0009624230403995,
+      "speedup_vs_best_public": 1.0182973983074568
+    },
+    {
+      "model": "qwen2",
+      "key": [
+        3584,
+        2560,
+        64,
+        8
+      ],
+      "seed": 28001,
+      "condition": "pressure512",
+      "entry_us": 321.5680122375488,
+      "best_split_label": "split-32-32",
+      "best_split_us": 323.5839903354645,
+      "best_public_label": "public-32",
+      "best_public_us": 323.5839903354645,
+      "speedup_vs_best_split": 1.006269212176572,
+      "speedup_vs_best_public": 1.006269212176572
+    },
+    {
+      "model": "qwen30",
+      "key": [
+        2048,
+        768,
+        128,
+        8
+      ],
+      "seed": 28007,
+      "condition": "warm",
+      "entry_us": 26.265600323677063,
+      "best_split_label": "split-32-32",
+      "best_split_us": 50.00640153884888,
+      "best_public_label": "public-32",
+      "best_public_us": 85.18400192260742,
+      "speedup_vs_best_split": 1.903874304131961,
+      "speedup_vs_best_public": 3.243177421146491
+    },
+    {
+      "model": "qwen30",
+      "key": [
+        2048,
+        768,
+        128,
+        8
+      ],
+      "seed": 28007,
+      "condition": "pressure512",
+      "entry_us": 59.39200147986412,
+      "best_split_label": "split-32-32",
+      "best_split_us": 86.01599931716919,
+      "best_public_label": "public-32",
+      "best_public_us": 102.39999741315842,
+      "speedup_vs_best_split": 1.448275814485415,
+      "speedup_vs_best_public": 1.7241378445189366
+    },
+    {
+      "model": "qwen235",
+      "key": [
+        4096,
+        1536,
+        128,
+        8
+      ],
+      "seed": 28007,
+      "condition": "warm",
+      "entry_us": 196.24639749526978,
+      "best_split_label": "split-32-32",
+      "best_split_us": 231.2959909439087,
+      "best_public_label": "public-32",
+      "best_public_us": 227.37600803375244,
+      "speedup_vs_best_split": 1.1785999330228916,
+      "speedup_vs_best_public": 1.1586251311402187
+    },
+    {
+      "model": "qwen235",
+      "key": [
+        4096,
+        1536,
+        128,
+        8
+      ],
+      "seed": 28007,
+      "condition": "pressure512",
+      "entry_us": 227.32800245285034,
+      "best_split_label": "split-32-32",
+      "best_split_us": 245.7599937915802,
+      "best_public_label": "public-32",
+      "best_public_us": 243.74400079250336,
+      "speedup_vs_best_split": 1.0810810421059007,
+      "speedup_vs_best_public": 1.072212829754917
+    },
+    {
+      "model": "qwen15",
+      "key": [
+        2048,
+        1408,
+        60,
+        4
+      ],
+      "seed": 28007,
+      "condition": "warm",
+      "entry_us": 20.37760019302368,
+      "best_split_label": "split-32-32",
+      "best_split_us": 39.05920088291168,
+      "best_public_label": "public-32",
+      "best_public_us": 76.31040215492249,
+      "speedup_vs_best_split": 1.9167713819551573,
+      "speedup_vs_best_public": 3.7448179094733405
+    },
+    {
+      "model": "qwen15",
+      "key": [
+        2048,
+        1408,
+        60,
+        4
+      ],
+      "seed": 28007,
+      "condition": "pressure512",
+      "entry_us": 57.34400078654289,
+      "best_split_label": "split-32-32",
+      "best_split_us": 69.63200122117996,
+      "best_public_label": "public-32",
+      "best_public_us": 94.2080020904541,
+      "speedup_vs_best_split": 1.2142857189259932,
+      "speedup_vs_best_public": 1.64285715677798
+    },
+    {
+      "model": "deepseek",
+      "key": [
+        2048,
+        1408,
+        64,
+        6
+      ],
+      "seed": 28007,
+      "condition": "warm",
+      "entry_us": 38.07680010795593,
+      "best_split_label": "split-32-32",
+      "best_split_us": 65.57120084762573,
+      "best_public_label": "public-32",
+      "best_public_us": 89.34400081634521,
+      "speedup_vs_best_split": 1.7220775028814725,
+      "speedup_vs_best_public": 2.3464156799687927
+    },
+    {
+      "model": "deepseek",
+      "key": [
+        2048,
+        1408,
+        64,
+        6
+      ],
+      "seed": 28007,
+      "condition": "pressure512",
+      "entry_us": 79.8719972372055,
+      "best_split_label": "split-0-0",
+      "best_split_us": 98.30400347709656,
+      "best_public_label": "public-0",
+      "best_public_us": 104.44799810647964,
+      "speedup_vs_best_split": 1.230769316875241,
+      "speedup_vs_best_public": 1.3076923292188103
+    },
+    {
+      "model": "qwen2",
+      "key": [
+        3584,
+        2560,
+        64,
+        8
+      ],
+      "seed": 28007,
+      "condition": "warm",
+      "entry_us": 300.13439655303955,
+      "best_split_label": "split-32-32",
+      "best_split_us": 300.18560886383057,
+      "best_public_label": "public-32",
+      "best_public_us": 302.63679027557373,
+      "speedup_vs_best_split": 1.000170631261792,
+      "speedup_vs_best_public": 1.0083375772696281
+    },
+    {
+      "model": "qwen2",
+      "key": [
+        3584,
+        2560,
+        64,
+        8
+      ],
+      "seed": 28007,
+      "condition": "pressure512",
+      "entry_us": 325.6320059299469,
+      "best_split_label": "split-32-32",
+      "best_split_us": 327.67999172210693,
+      "best_public_label": "public-32",
+      "best_public_us": 323.5839903354645,
+      "speedup_vs_best_split": 1.0062892644299855,
+      "speedup_vs_best_public": 0.9937106440485368
+    }
+  ],
+  "model": [
+    {
+      "parallel": "pp2",
+      "context": 32,
+      "decode_tokens": 32,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "pp2-0-N",
+            "pp2-3-N"
+          ],
+          "median_seconds": 0.3047312980052084,
+          "process_medians_seconds": {
+            "pp2-0-N": 0.30638124397955835,
+            "pp2-3-N": 0.29541583894751966
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.30638124397955835,
+            0.30966296698898077,
+            0.30712669994682074,
+            0.30629287497140467,
+            0.30508614308200777,
+            0.304376452928409,
+            0.29387454711832106,
+            0.29573586396873,
+            0.29393048002384603,
+            0.29541583894751966
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "pp2-1-S",
+            "pp2-2-S"
+          ],
+          "median_seconds": 0.2970603925641626,
+          "process_medians_seconds": {
+            "pp2-1-S": 0.2986072029452771,
+            "pp2-2-S": 0.28892762307077646
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.2986072029452771,
+            0.2986696281004697,
+            0.29642771114595234,
+            0.3012512060813606,
+            0.2976930739823729,
+            0.28892762307077646,
+            0.2992775528691709,
+            0.28809043602086604,
+            0.28715347894467413,
+            0.29024611809290946
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 2.5172686531577226,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 51.72622203826904,
+          "decode_window_ms": 252.37346556968987,
+          "tpot_ms": 8.141079534506126
+        },
+        "fused": {
+          "first_token_ms": 47.30534553527832,
+          "decode_window_ms": 247.10678937844932,
+          "tpot_ms": 7.971186754143527
+        }
+      }
+    },
+    {
+      "parallel": "pp2",
+      "context": 32,
+      "decode_tokens": 128,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "pp2-0-N",
+            "pp2-3-N"
+          ],
+          "median_seconds": 1.069605914526619,
+          "process_medians_seconds": {
+            "pp2-0-N": 1.0697110500186682,
+            "pp2-3-N": 1.06697911885567
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            1.0697110500186682,
+            1.0695007790345699,
+            1.0691104729194194,
+            1.0910025020129979,
+            1.0869015918578953,
+            1.064653243869543,
+            1.06697911885567,
+            1.0653727930039167,
+            1.0711098199244589,
+            1.0715347391087562
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "pp2-1-S",
+            "pp2-2-S"
+          ],
+          "median_seconds": 1.047529120463878,
+          "process_medians_seconds": {
+            "pp2-1-S": 1.047207301016897,
+            "pp2-2-S": 1.0478509399108589
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            1.0517750540748239,
+            1.0492455619387329,
+            1.0447799668181688,
+            1.0466714359354228,
+            1.047207301016897,
+            1.0532114380039275,
+            1.0484151630662382,
+            1.0449595681857318,
+            1.042832356877625,
+            1.0478509399108589
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 2.0640119658006717,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 52.96039581298828,
+          "decode_window_ms": 1017.4417165108025,
+          "tpot_ms": 8.011352098510256
+        },
+        "fused": {
+          "first_token_ms": 53.897857666015625,
+          "decode_window_ms": 992.8371499991044,
+          "tpot_ms": 7.817615354323657
+        }
+      }
+    },
+    {
+      "parallel": "pp2",
+      "context": 128,
+      "decode_tokens": 32,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "pp2-0-N",
+            "pp2-3-N"
+          ],
+          "median_seconds": 0.30369591957423836,
+          "process_medians_seconds": {
+            "pp2-0-N": 0.3056323940400034,
+            "pp2-3-N": 0.3016709079965949
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.3056323940400034,
+            0.3100877769757062,
+            0.30606293585151434,
+            0.3031200831755996,
+            0.2948034508153796,
+            0.30062618502415717,
+            0.29991799709387124,
+            0.30427175597287714,
+            0.3016709079965949,
+            0.307820140151307
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "pp2-1-S",
+            "pp2-2-S"
+          ],
+          "median_seconds": 0.2969077394809574,
+          "process_medians_seconds": {
+            "pp2-1-S": 0.2978845548350364,
+            "pp2-2-S": 0.29504707898013294
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.2978845548350364,
+            0.29738368606194854,
+            0.29947537602856755,
+            0.29705938906408846,
+            0.2980572269298136,
+            0.2967560898978263,
+            0.29504707898013294,
+            0.2965697969775647,
+            0.2945290580391884,
+            0.2936561470851302
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 2.235189759150391,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 52.21676826477051,
+          "decode_window_ms": 251.05538696516305,
+          "tpot_ms": 8.09856086984397
+        },
+        "fused": {
+          "first_token_ms": 50.218820571899414,
+          "decode_window_ms": 246.3960440363735,
+          "tpot_ms": 7.948259485044307
+        }
+      }
+    },
+    {
+      "parallel": "pp2",
+      "context": 128,
+      "decode_tokens": 128,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "pp2-0-N",
+            "pp2-3-N"
+          ],
+          "median_seconds": 1.0752632175572217,
+          "process_medians_seconds": {
+            "pp2-0-N": 1.0680953939445317,
+            "pp2-3-N": 1.0797693259082735
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            1.0892690119799227,
+            1.0901263400446624,
+            1.0680953939445317,
+            1.0547909799497575,
+            1.0586527229752392,
+            1.0707571092061698,
+            1.069858097936958,
+            1.0806962039787322,
+            1.0797693259082735,
+            1.0813104470726103
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "pp2-1-S",
+            "pp2-2-S"
+          ],
+          "median_seconds": 1.0419774104375392,
+          "process_medians_seconds": {
+            "pp2-1-S": 1.0412104618735611,
+            "pp2-2-S": 1.0442148330621421
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            1.0454854920972139,
+            1.0412104618735611,
+            1.0427443590015173,
+            1.0403981949202716,
+            1.0411494630388916,
+            1.0442148330621421,
+            1.0336073429789394,
+            1.0390668790787458,
+            1.0478760220576078,
+            1.0458262669853866
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 3.0955961829793655,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 53.6653995513916,
+          "decode_window_ms": 1022.1594565082341,
+          "tpot_ms": 8.04849965754515
+        },
+        "fused": {
+          "first_token_ms": 52.11138725280762,
+          "decode_window_ms": 990.1598516153172,
+          "tpot_ms": 7.796534264687537
+        }
+      }
+    },
+    {
+      "parallel": "pp2",
+      "context": 512,
+      "decode_tokens": 32,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "pp2-0-N",
+            "pp2-3-N"
+          ],
+          "median_seconds": 0.3239699724363163,
+          "process_medians_seconds": {
+            "pp2-0-N": 0.3195215710438788,
+            "pp2-3-N": 0.3326435689814389
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.3198397201485932,
+            0.3195215710438788,
+            0.3180467940401286,
+            0.3198874299414456,
+            0.3177031979430467,
+            0.32927235099487007,
+            0.3360305188689381,
+            0.3327223309315741,
+            0.3326435689814389,
+            0.32805251493118703
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "pp2-1-S",
+            "pp2-2-S"
+          ],
+          "median_seconds": 0.3212356094736606,
+          "process_medians_seconds": {
+            "pp2-1-S": 0.32091708900406957,
+            "pp2-2-S": 0.32188416295684874
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.3215541299432516,
+            0.3206397471949458,
+            0.3208933621644974,
+            0.3217978309839964,
+            0.32091708900406957,
+            0.3209121359977871,
+            0.3238010969944298,
+            0.32188416295684874,
+            0.32889509899541736,
+            0.3198412940837443
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 0.8440174075679874,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 75.20735263824463,
+          "decode_window_ms": 248.8725099246949,
+          "tpot_ms": 8.028145481441772
+        },
+        "fused": {
+          "first_token_ms": 74.65970516204834,
+          "decode_window_ms": 246.09835294540972,
+          "tpot_ms": 7.93865654662612
+        }
+      }
+    },
+    {
+      "parallel": "pp2",
+      "context": 512,
+      "decode_tokens": 128,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "pp2-0-N",
+            "pp2-3-N"
+          ],
+          "median_seconds": 1.1057806394528598,
+          "process_medians_seconds": {
+            "pp2-0-N": 1.0854859168175608,
+            "pp2-3-N": 1.1090072910301387
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            1.0817792960442603,
+            1.0840410229284316,
+            1.1046420228667557,
+            1.0854859168175608,
+            1.0875474400818348,
+            1.1164179318584502,
+            1.1072847368195653,
+            1.1090072910301387,
+            1.1069192560389638,
+            1.1101934479083866
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "pp2-1-S",
+            "pp2-2-S"
+          ],
+          "median_seconds": 1.0718387980014086,
+          "process_medians_seconds": {
+            "pp2-1-S": 1.0747991281095892,
+            "pp2-2-S": 1.0643274548929185
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            1.0753480719868094,
+            1.0730401631444693,
+            1.0747991281095892,
+            1.0785877839662135,
+            1.070637432858348,
+            1.0574982659891248,
+            1.0562126890290529,
+            1.0682566568721086,
+            1.074715306982398,
+            1.0643274548929185
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 3.069491383774414,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 81.17341995239258,
+          "decode_window_ms": 1020.2709869481623,
+          "tpot_ms": 8.033629818489466
+        },
+        "fused": {
+          "first_token_ms": 81.03525638580322,
+          "decode_window_ms": 990.8069765660912,
+          "tpot_ms": 7.801629736740876
+        }
+      }
+    },
+    {
+      "parallel": "tp2",
+      "context": 32,
+      "decode_tokens": 32,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "tp2-0-N",
+            "tp2-3-N"
+          ],
+          "median_seconds": 0.23895196348894387,
+          "process_medians_seconds": {
+            "tp2-0-N": 0.22834093705751002,
+            "tp2-3-N": 0.24848027294501662
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.23052247799932957,
+            0.22914519906044006,
+            0.22797911404632032,
+            0.22834093705751002,
+            0.22773505095392466,
+            0.24738144897855818,
+            0.24848027294501662,
+            0.2525255219079554,
+            0.2535109920427203,
+            0.24797910917550325
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "tp2-1-D",
+            "tp2-2-D"
+          ],
+          "median_seconds": 0.2401207205839455,
+          "process_medians_seconds": {
+            "tp2-1-D": 0.2394780518952757,
+            "tp2-2-D": 0.24061356205493212
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.24266223493032157,
+            0.23931972892023623,
+            0.23888416402041912,
+            0.242078143870458,
+            0.2394780518952757,
+            0.24118031398393214,
+            0.2396278791129589,
+            0.24085275596007705,
+            0.2388187451288104,
+            0.24061356205493212
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": -0.48911801264848176,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 56.95319175720215,
+          "decode_window_ms": 181.29091896116734,
+          "tpot_ms": 5.848094160037656
+        },
+        "fused": {
+          "first_token_ms": 62.57283687591553,
+          "decode_window_ms": 177.32046847231686,
+          "tpot_ms": 5.720015112010222
+        }
+      }
+    },
+    {
+      "parallel": "tp2",
+      "context": 32,
+      "decode_tokens": 128,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "tp2-0-N",
+            "tp2-3-N"
+          ],
+          "median_seconds": 0.8160967795411125,
+          "process_medians_seconds": {
+            "tp2-0-N": 0.8217602919321507,
+            "tp2-3-N": 0.8080955899786204
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.7975518531166017,
+            0.8217602919321507,
+            0.8213403411209583,
+            0.8248458879534155,
+            0.8265170799568295,
+            0.8108532179612666,
+            0.8239312449004501,
+            0.8054062849842012,
+            0.8080955899786204,
+            0.7990639731287956
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "tp2-1-D",
+            "tp2-2-D"
+          ],
+          "median_seconds": 0.7707773739239201,
+          "process_medians_seconds": {
+            "tp2-1-D": 0.7941504218615592,
+            "tp2-2-D": 0.7450128009077162
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.7964581770356745,
+            0.7893186479341239,
+            0.7941504218615592,
+            0.7953627600800246,
+            0.7919314878527075,
+            0.7522360999137163,
+            0.7435659251641482,
+            0.7440920770168304,
+            0.7450128009077162,
+            0.7498404961079359
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 5.5531901060405175,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 62.911152839660645,
+          "decode_window_ms": 758.1643098965287,
+          "tpot_ms": 5.9697977157206985
+        },
+        "fused": {
+          "first_token_ms": 57.21926689147949,
+          "decode_window_ms": 713.0814730189741,
+          "tpot_ms": 5.6148147481808985
+        }
+      }
+    },
+    {
+      "parallel": "tp2",
+      "context": 128,
+      "decode_tokens": 32,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "tp2-0-N",
+            "tp2-3-N"
+          ],
+          "median_seconds": 0.23557815712410957,
+          "process_medians_seconds": {
+            "tp2-0-N": 0.2275141030550003,
+            "tp2-3-N": 0.24664262984879315
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.22786684497259557,
+            0.2275141030550003,
+            0.22677409602329135,
+            0.22711476613767445,
+            0.22808208409696817,
+            0.24848024197854102,
+            0.24664262984879315,
+            0.24644760112278163,
+            0.24962146603502333,
+            0.24307423015125096
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "tp2-1-D",
+            "tp2-2-D"
+          ],
+          "median_seconds": 0.2413103700382635,
+          "process_medians_seconds": {
+            "tp2-1-D": 0.24040420004166663,
+            "tp2-2-D": 0.24258081708103418
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.24254552205093205,
+            0.24221654003486037,
+            0.24040420004166663,
+            0.24025175999850035,
+            0.23952171998098493,
+            0.24258081708103418,
+            0.23960025911219418,
+            0.243634499842301,
+            0.23982192017138004,
+            0.24360001902095973
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": -2.4332531437258886,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 55.799126625061035,
+          "decode_window_ms": 180.15855993144214,
+          "tpot_ms": 5.81156644940136
+        },
+        "fused": {
+          "first_token_ms": 62.69502639770508,
+          "decode_window_ms": 177.45444003958255,
+          "tpot_ms": 5.724336775470405
+        }
+      }
+    },
+    {
+      "parallel": "tp2",
+      "context": 128,
+      "decode_tokens": 128,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "tp2-0-N",
+            "tp2-3-N"
+          ],
+          "median_seconds": 0.8212804864160717,
+          "process_medians_seconds": {
+            "tp2-0-N": 0.8213827318977565,
+            "tp2-3-N": 0.8211782409343868
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.8219867239240557,
+            0.8213827318977565,
+            0.821818582015112,
+            0.8167304459493607,
+            0.8195472620427608,
+            0.8547161950264126,
+            0.8245851001702249,
+            0.8189070879016072,
+            0.7832243929151446,
+            0.8211782409343868
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "tp2-1-D",
+            "tp2-2-D"
+          ],
+          "median_seconds": 0.7855816135415807,
+          "process_medians_seconds": {
+            "tp2-1-D": 0.7926529089454561,
+            "tp2-2-D": 0.7560042389668524
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.7852172600105405,
+            0.7944883948657662,
+            0.7983514971565455,
+            0.7926529089454561,
+            0.7920446929056197,
+            0.7560042389668524,
+            0.7485464038327336,
+            0.7478391630575061,
+            0.7821046200115234,
+            0.785945967072621
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 4.346733359059185,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 63.100457191467285,
+          "decode_window_ms": 758.0378300044686,
+          "tpot_ms": 5.968801811058808
+        },
+        "fused": {
+          "first_token_ms": 63.46476078033447,
+          "decode_window_ms": 722.1702230162919,
+          "tpot_ms": 5.6863797087896994
+        }
+      }
+    },
+    {
+      "parallel": "tp2",
+      "context": 512,
+      "decode_tokens": 32,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "tp2-0-N",
+            "tp2-3-N"
+          ],
+          "median_seconds": 0.28041037544608116,
+          "process_medians_seconds": {
+            "tp2-0-N": 0.28070095204748213,
+            "tp2-3-N": 0.28020471800118685
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.28070095204748213,
+            0.27895946707576513,
+            0.278114456217736,
+            0.28168168500997126,
+            0.31052545201964676,
+            0.2829118990339339,
+            0.2792639520484954,
+            0.27818381506949663,
+            0.28020471800118685,
+            0.2806160328909755
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "tp2-1-D",
+            "tp2-2-D"
+          ],
+          "median_seconds": 0.3016513144830242,
+          "process_medians_seconds": {
+            "tp2-1-D": 0.30771675799041986,
+            "tp2-2-D": 0.2853841329924762
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.30074621411040425,
+            0.30142370401881635,
+            0.3216836331412196,
+            0.33239986398257315,
+            0.30771675799041986,
+            0.301878924947232,
+            0.3023471459746361,
+            0.2853841329924762,
+            0.272085984935984,
+            0.2720038900151849
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": -7.574947611390126,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 99.17926788330078,
+          "decode_window_ms": 179.66800252906978,
+          "tpot_ms": 5.795742017066767
+        },
+        "fused": {
+          "first_token_ms": 123.44217300415039,
+          "decode_window_ms": 177.4857755517587,
+          "tpot_ms": 5.725347598443829
+        }
+      }
+    },
+    {
+      "parallel": "tp2",
+      "context": 512,
+      "decode_tokens": 128,
+      "implementations": {
+        "native": {
+          "samples": 10,
+          "processes": [
+            "tp2-0-N",
+            "tp2-3-N"
+          ],
+          "median_seconds": 0.8647141640540212,
+          "process_medians_seconds": {
+            "tp2-0-N": 0.881374420132488,
+            "tp2-3-N": 0.841635880060494
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.8793709019664675,
+            0.8849335669074208,
+            0.8801614120602608,
+            0.8820453591179103,
+            0.881374420132488,
+            0.841635880060494,
+            0.850057426141575,
+            0.8400340341031551,
+            0.8422849162016064,
+            0.8410346370656043
+          ]
+        },
+        "fused": {
+          "samples": 10,
+          "processes": [
+            "tp2-1-D",
+            "tp2-2-D"
+          ],
+          "median_seconds": 0.8498189086094499,
+          "process_medians_seconds": {
+            "tp2-1-D": 0.8513118079863489,
+            "tp2-2-D": 0.8490375140681863
+          },
+          "within_implementation_output_equal": true,
+          "raw_seconds": [
+            0.8448183010332286,
+            0.8578271388541907,
+            0.8513118079863489,
+            0.8759224431123585,
+            0.8405286730267107,
+            0.8184514890890568,
+            0.8506080301012844,
+            0.847228097030893,
+            0.8506003031507134,
+            0.8490375140681863
+          ]
+        }
+      },
+      "same_prompt": true,
+      "equal_output": true,
+      "latency_reduction_percent": 1.7225640637986372,
+      "eligible_for_equal_output_speed_claim": true,
+      "latency_breakdown": {
+        "native": {
+          "first_token_ms": 113.51406574249268,
+          "decode_window_ms": 750.8483584970236,
+          "tpot_ms": 5.912191799189163
+        },
+        "fused": {
+          "first_token_ms": 124.69017505645752,
+          "decode_window_ms": 724.0331495413557,
+          "tpot_ms": 5.701048421585478
+        }
+      }
+    }
+  ],
+  "model_audits": [
+    {
+      "process": "pp2-0-N",
+      "layers": 48,
+      "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+      "native_backend": [
+        "UnquantizedMoeBackend.FLASHINFER_CUTLASS"
+      ],
+      "complete": true,
+      "fusion_enabled": false
+    },
+    {
+      "process": "pp2-1-S",
+      "layers": 48,
+      "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+      "native_backend": [
+        "UnquantizedMoeBackend.FLASHINFER_CUTLASS"
+      ],
+      "complete": true,
+      "fusion_enabled": true
+    },
+    {
+      "process": "pp2-2-S",
+      "layers": 48,
+      "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+      "native_backend": [
+        "UnquantizedMoeBackend.FLASHINFER_CUTLASS"
+      ],
+      "complete": true,
+      "fusion_enabled": true
+    },
+    {
+      "process": "pp2-3-N",
+      "layers": 48,
+      "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+      "native_backend": [
+        "UnquantizedMoeBackend.FLASHINFER_CUTLASS"
+      ],
+      "complete": true,
+      "fusion_enabled": false
+    },
+    {
+      "process": "tp2-0-N",
+      "layers": 96,
+      "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+      "native_backend": [
+        "UnquantizedMoeBackend.FLASHINFER_CUTLASS"
+      ],
+      "complete": true,
+      "fusion_enabled": false
+    },
+    {
+      "process": "tp2-1-D",
+      "layers": 96,
+      "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+      "native_backend": [
+        "UnquantizedMoeBackend.FLASHINFER_CUTLASS"
+      ],
+      "complete": true,
+      "fusion_enabled": true
+    },
+    {
+      "process": "tp2-2-D",
+      "layers": 96,
+      "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+      "native_backend": [
+        "UnquantizedMoeBackend.FLASHINFER_CUTLASS"
+      ],
+      "complete": true,
+      "fusion_enabled": true
+    },
+    {
+      "process": "tp2-3-N",
+      "layers": 96,
+      "extension_sha256": "a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9",
+      "native_backend": [
+        "UnquantizedMoeBackend.FLASHINFER_CUTLASS"
+      ],
+      "complete": true,
+      "fusion_enabled": false
+    }
+  ],
+  "historical_output_comparison": {
+    "schema": "sm120-postmerge-historical-output-comparison-v1",
+    "scenes": 48,
+    "same_prompt": 48,
+    "exact_tokens": 48,
+    "exact_recorded_top5_logprobs": 48,
+    "historical_nll_acceptance_transferred": false,
+    "scope": "Representative timed prompts only. Equality is not a broad quality or task-accuracy guarantee."
+  },
+  "historical_quality_gate_transferred": false,
+  "performance_acceptance": "Short TP2 requests regressed in this session; no blanket serving speed claim",
+  "performance_scope": "Same host session; two engine processes per implementation; descriptive statistics",
+  "evidence_archive_sha256": "0dd5bb1a33b287beecdd1c50607d05ea26479e6e8dad9400faa235608b0f2056"
+}

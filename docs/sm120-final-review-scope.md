@@ -1,6 +1,6 @@
 # PR501 最终候选范围与评审入口
 
-本候选沿用已经完成 GPU 验收的专用融合内核、舍入修复、配置、白名单和回退规则，补齐原集成工作区遗漏的 TP 本地 I=384 输入支持及示例打包文件。随后合并上游 `8c8a92076c4de39e5ed29459e55fea3eaca6256c`，适配新增 epilogue 接口。没有重调参数或改变数值容差；合并后的源码尚未重新构建 CUDA 扩展或运行 GPU 验证。
+本候选沿用已经完成 GPU 验收的专用融合内核、舍入修复、配置、白名单和回退规则，补齐原集成工作区遗漏的 TP 本地 I=384 输入支持及示例打包文件。随后合并上游 `8c8a92076c4de39e5ed29459e55fea3eaca6256c`，适配新增 epilogue 接口。没有重调参数或改变数值容差；合并后的 `643f4f3` 已完成独立干净构建、正确性/数值回归、core/TP 四种 sanitizer 和双卡完整模型复测；详见文末新增证据。
 
 ## 评审顺序
 
@@ -13,7 +13,7 @@
 
 补丁 01–04 基于 PR501 原 head `8fb87090aff4bfe6c8da6080cc4caa3525fd8979`，对应四个独立提交；之后以单独的 merge commit 集成上游。原集成工作区及其真实 Git index 保留，发布通过隔离候选分支完成。
 
-准确性修复已在原 PR501 中；补丁 01–04 是它之后的增量。冻结 review bundle 的 diff 与 CPU 回执描述合并上游之前的候选，不代表当前提交。当前 masked BF16 GEMM 保留上游 positional `epilogue=None`，并保留本 PR keyword-only `sm120_m_tile=0`。stub 生成器改用 pybind 声明的 Python 参数名，避免误导调用者使用 C++ 内部名 `epilogue_class`。合并后 9 项核心 CPU 检查与 4 项 TP 策略检查通过；stub AST 有效，示例打包和默认关闭导入检查通过。检查不包含 CUDA 编译、sanitizer 或 GPU 性能。
+准确性修复已在原 PR501 中；补丁 01–04 是它之后的增量。冻结 review bundle 的 diff 与 CPU 回执描述合并上游之前的候选，不代表当前提交。当前 masked BF16 GEMM 保留上游 positional `epilogue=None`，并保留本 PR keyword-only `sm120_m_tile=0`。stub 生成器改用 pybind 声明的 Python 参数名，避免误导调用者使用 C++ 内部名 `epilogue_class`。合并后 9 项核心 CPU 检查与 4 项 TP 策略检查通过；stub AST 有效，示例打包和默认关闭导入检查通过。上述为先前本地检查；后续新增 GPU 验证见文末，不能把两次检查混记为一次运行。
 
 ## 机制与正式范围
 
@@ -73,4 +73,20 @@ T>1、未知键、其他设备在该策略下回退。压力测试退化的 3584
 - 最终质量冻结协议：`56f4fc7643bd91babd5b3a44176b478e57c7bc1dcf2ebde5186bb03c92eba5b2`。
 - 最终质量原始归档：`89cd9b7ae7e8345e7de1a627ac39a6a33db8f321242cc4e97d06b3ae2a6e13d1`。
 
-候选对所选 242 个核心/测试/适配器文件核对 LF 归一化内容，逐文件记录 raw hash；原始实测字节保留在冻结包。本候选统一 Git diff 换行，不能声称生成的新扩展拥有旧 SHA 或已经重新在 GPU 编译。未初始化的 CUTLASS/DeepJIT 子模块及新构建身份亦需明确，详见本地 bundle README。
+候选对所选 242 个核心/测试/适配器文件核对 LF 归一化内容，逐文件记录 raw hash；原始实测字节保留在冻结包。本候选统一 Git diff 换行。新 GPU 构建使用 gitlink 固定的 CUTLASS/DeepJIT，拥有独立扩展 SHA；旧扩展与旧质量验收身份保留。
+
+## 上游合并后的 GPU 验证（2026-11-20）
+
+GPU 执行 head 为 `643f4f3ce4991889b702e814210fe754b7f36ec6`，tree 为 `1c557cbf5fb0e848a8d35d0428340a66241f58d8`。本次新增提交只更新本文与验证 JSON，内核、API、测试、适配器与配置相对 GPU 执行 head 的字节不变。
+
+新扩展 SHA256：`a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9`。证据归档 SHA256：`0dd5bb1a33b287beecdd1c50607d05ea26479e6e8dad9400faa235608b0f2056`。本地完整交付位于 `deliverables/sm120-pr501-gpu-20261120/`；机器可读摘要为 [合并后验证](validation/sm120-pr501-postmerge-20261120.json)。
+
+- 干净构建、9项 Linux CPU 合同、30项公开正确性、42项原始 SwiGLU 合同、4项原 FP64/中点/抵消回归通过；原容差未改。
+- core 与 TP 的 memcheck/synccheck/racecheck/initcheck 全部干净，racecheck 无 hazard、error 或 warning；布局/direct-ID 4项和实际 positional epilogue/keyword-only tile ABI 通过。
+- TP 两 rank 各9个 slot/int64/int32 记录的 BM32 局部结果、改变输入 Graph 与 NCCL 外层求和逐位一致；TP 本地 I=384 的回归通过。
+- 单层20行全部披露：四个支持尺寸、两个种子，相对每行实测最快分离组合，warm 为 1.147–1.997×，512 MiB 缓存干扰为 1.081–1.448×。Qwen2 尺寸继续回退，不计作融合收益。
+- 完整 BF16 Qwen3-Coder-30B、batch=1、上下文32/128/512、生成32/128，PP2/TP2共12场景均跨实现/重复等 token；请求墙钟延迟PP2 降低 0.84–3.10%；TP2 生成128 token时降低 1.72–5.55%，生成32 token时变慢 0.49–7.57%。每实现2个引擎进程，每场景每进程5轮，同一主机会话，不是吞吐、HTTP或跨会话稳定性结论。
+
+TP2 短请求回退保留。上下文512/生成32时，原生/融合首 token 中位延迟99.18/123.44ms，首末token间隔179.67/177.49ms；decode间隔的节省未抵消首token增加。不能由此断言CPU/prefill/通信/包装器中的具体根因。核心正确性通过不等于完整服务性能验收，TP适配器继续默认关闭。
+
+相对历史对应进程/提示的48项核对，token相同48项，已记录top-5 logprob完全相同48项。历史 `PASS_SCOPED_NLL` 仍属于旧扩展；本轮没有重跑其三领域完整语料，不能写成当前提交的自动质量通过。
