@@ -17,7 +17,7 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/utils.cuh>
-#include <deep_gemm/epilogue/transform.cuh>
+#include <deep_gemm/epilogue/operators.cuh>
 #include <deep_gemm/mma/sm120.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -36,7 +36,7 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           uint32_t kNumSMs,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t,
-          typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
+          typename epilogue_operator_t = epilogue::operators::Identity,
           bool kBKMajor = true,
           uint32_t kNWarps_ = 1,
           bool kKGroupedConstantStride = false,
@@ -48,7 +48,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                      int* grouped_layout,
                      cute::TmaDescriptor* tensor_map_buffer,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                     const epilogue_type_t epilogue,
+                     const __grid_constant__ EpilogueOperatorArgs epilogue_args,
                      uint32_t stride_d_m, uint32_t stride_c_m, uint32_t stride_d_batch,
                      uint32_t stride_a_m, uint32_t stride_b_n,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
@@ -65,6 +65,9 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>,
                      "Only float or bfloat16 output supported");
+    // Hosts instantiate `epilogue::operators::Identity` or `ScaleByAlpha` only: SM120 epilogues scale or store
+    // the accumulators, with no FP8 output and no stochastic rounding
+    const epilogue_operator_t epilogue(epilogue_args);
     DG_STATIC_ASSERT(kNumTMAThreads > 0, "SM120a always uses warp-specialized pipeline");
     DG_STATIC_ASSERT(not kFusedSwiGLU or (kGemmType == GemmType::MGroupedMasked and
                      cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> and kBKMajor and not kWithAccumulation),
@@ -498,7 +501,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
 
                         if constexpr (kWithAccumulation) {
                             const uint32_t gr0 = m_base + local_row0, gr1 = m_base + local_row1;
-                            const uint32_t gc = epilogue_type_t::template apply_index_n<MMA_N>(
+                            const uint32_t gc = (
                                 n_base + (n_tile_base + nt) * MMA_N) + thread_id * 2;
                             if (gr0 < total_shape_m and gc + 1 < shape_n) {
                                 const auto ci = cd_batch_offset + static_cast<int64_t>(gr0) * cd_m_stride + gc;
@@ -534,7 +537,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     #pragma unroll
                     for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
                         auto* smem_src = reinterpret_cast<char*>(smem_d_base) + ts * kSwizzleCDMode * BLOCK_M;
-                        const uint32_t n_store = epilogue_type_t::template apply_index_n<kTMAStoreInnerDim>(
+                        const uint32_t n_store = (
                             n_base + ts * kTMAStoreInnerDim);
                         if constexpr (kIsBatchedEpilogue) {
                             if constexpr (kWithAccumulation)
@@ -569,7 +572,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     for (uint32_t nt = 0; nt < kNTilesPerWarp; ++nt) {
                         const uint32_t ai = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
                         const uint32_t nt_global_base = n_base + (n_tile_base + nt) * MMA_N;
-                        const uint32_t col = epilogue_type_t::template apply_index_n<MMA_N>(nt_global_base) + thread_id * 2;
+                        const uint32_t col = (nt_global_base) + thread_id * 2;
                         const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
                         const uint32_t row1 = row0 + 8;
 

@@ -89,8 +89,8 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     if int(os.environ.get('DG_USE_NVIDIA_TOOLS', 0)):
         return (1, ) * len(kernel_names) if is_tuple else 1
 
-    # By default, flush L2 with an excessive 8 GB memset to give the GPU some (literal) chill time without full idle
-    flush_l2_size = int(8e9 // 4)
+    # Flush L2 cache with 256 MB data
+    flush_l2_size = int(256e6 // 4)
 
     # For some auto-tuning kernels with prints
     fn()

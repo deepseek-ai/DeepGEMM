@@ -185,32 +185,38 @@ static void cublaslt_nvfp4_gemm(const torch::Tensor& lhs, const torch::Tensor& l
 }
 
 static void cublaslt_bhr_hdr_bhd(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
-                                 const int& b, const int& h, const int& r, const int& d) {
+                                 const int& b, const int& h, const int& r, const int& d,
+                                 const bool& accumulate,
+                                 const float& alpha = 1.0f) {
     const auto m = d, n = b, k = r;
     const auto trans_a = CUBLAS_OP_T;
     const auto trans_b = CUBLAS_OP_N;
 
     // Matrix layouts
+    const auto cuda_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
     const auto layout_a = get_cublaslt_layout(CUDA_R_16BF, k, m, rhs.stride(1), h, rhs.stride(0));
     const auto layout_b = get_cublaslt_layout(CUDA_R_16BF, k, n, lhs.stride(0), h, lhs.stride(1));
-    const auto layout_d = get_cublaslt_layout(CUDA_R_16BF, m, n, out.stride(0), h, out.stride(1));
+    const auto layout_d = get_cublaslt_layout(cuda_type_d, m, n, out.stride(0), h, out.stride(1));
 
-    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, false);
+    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, accumulate, alpha);
 }
 
 
 static void cublaslt_bhd_hdr_bhr(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,
-                                 const int& b, const int& h, const int& r, const int& d) {
+                                 const int& b, const int& h, const int& r, const int& d,
+                                 const bool& accumulate,
+                                 const float& alpha = 1.0f) {
     const auto m = r, n = b, k = d;
     const auto trans_a = CUBLAS_OP_N;
     const auto trans_b = CUBLAS_OP_N;
 
     // Matrix layouts
+    const auto cuda_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
     const auto layout_a = get_cublaslt_layout(CUDA_R_16BF, m, k, rhs.stride(1), h, rhs.stride(0));
     const auto layout_b = get_cublaslt_layout(CUDA_R_16BF, k, n, lhs.stride(0), h, lhs.stride(1));
-    const auto layout_d = get_cublaslt_layout(CUDA_R_16BF, m, n, out.stride(0), h, out.stride(1));
+    const auto layout_d = get_cublaslt_layout(cuda_type_d, m, n, out.stride(0), h, out.stride(1));
 
-    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, false);
+    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, accumulate, alpha);
 }
 
 static void cublaslt_bhd_bhr_hdr(const torch::Tensor& lhs, const torch::Tensor& rhs, const torch::Tensor& out,

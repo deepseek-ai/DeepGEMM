@@ -6,12 +6,14 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cublasLt.h>
+#include <torch/python.h>
 
 #include <deep_jit/utils/env.hpp>
 #include <deep_jit/utils/lazy.hpp>
 
 #include "../utils/exception.hpp"
 #include "jit.hpp"
+#include "locality_domain.hpp"
 
 namespace deep_gemm {
 
@@ -29,6 +31,11 @@ public:
     cublasLtHandle_t cublaslt_handle;
     bool use_pytorch_managed_cublaslt_handle;
     bool use_temp_cublaslt_workspace;
+
+    // The locality domain of every SM, probed lazily
+    torch::Tensor sm_locality_domains;
+    // We need to balance the SMs across locality domains to provide simpler load balancing
+    torch::Tensor balanced_sm_locality_domains;
 
     explicit Runtime() {
         // Whether to use PyTorch cuBLASLt

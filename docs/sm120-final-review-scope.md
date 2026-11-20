@@ -1,6 +1,6 @@
 # PR501 最终候选范围与评审入口
 
-本候选沿用已经完成 GPU 验收的数学实现、配置、白名单和回退规则，补齐原集成工作区遗漏的 TP 本地 I=384 输入支持及示例打包文件。唯一源码整理为换行统一；没有重调参数或改变数值容差。本轮不使用 GPU。
+本候选沿用已经完成 GPU 验收的专用融合内核、舍入修复、配置、白名单和回退规则，补齐原集成工作区遗漏的 TP 本地 I=384 输入支持及示例打包文件。随后合并上游 `8c8a92076c4de39e5ed29459e55fea3eaca6256c`，适配新增 epilogue 接口。没有重调参数或改变数值容差；合并后的源码尚未重新构建 CUDA 扩展或运行 GPU 验证。
 
 ## 评审顺序
 
@@ -11,9 +11,9 @@
 | 框架示例 | vLLM 0.32.0 默认关闭适配器、独立 TP2 白名单 | 03 |
 | 说明材料 | 当前 PR 正文、支持边界、示例使用说明 | 04 |
 
-补丁基于 PR501 head `8fb87090aff4bfe6c8da6080cc4caa3525fd8979`。本地分支 `codex/pr501-final-review` 已准备候选 diff，无新 commit、push、评论或评审请求。原集成工作区及其真实 Git index 保留。
+补丁 01–04 基于 PR501 原 head `8fb87090aff4bfe6c8da6080cc4caa3525fd8979`，对应四个独立提交；之后以单独的 merge commit 集成上游。原集成工作区及其真实 Git index 保留，发布通过隔离候选分支完成。
 
-准确性修复已在现有 PR501 中；补丁 01–04 是它之后的增量。review bundle 的 `full-pr-diff.stat` 按 GitHub 比较的共同祖先给出完整范围，避免把增量误当成整个项目。上游当前 tip 已前进；本次未执行向该 tip 的 merge/rebase，不把补丁适用检查写成上游合并检查通过。
+准确性修复已在原 PR501 中；补丁 01–04 是它之后的增量。冻结 review bundle 的 diff 与 CPU 回执描述合并上游之前的候选，不代表当前提交。当前 masked BF16 GEMM 保留上游 positional `epilogue=None`，并保留本 PR keyword-only `sm120_m_tile=0`。stub 生成器改用 pybind 声明的 Python 参数名，避免误导调用者使用 C++ 内部名 `epilogue_class`。合并后 9 项核心 CPU 检查与 4 项 TP 策略检查通过；stub AST 有效，示例打包和默认关闭导入检查通过。检查不包含 CUDA 编译、sanitizer 或 GPU 性能。
 
 ## 机制与正式范围
 
@@ -64,6 +64,7 @@ T>1、未知键、其他设备在该策略下回退。压力测试退化的 3584
 | 质量结果、独立复算、定位 | `deliverables/sm120-final-acceptance-completed-20261120/` 中的 REPORT、analysis、secondary-metrics、localization-summary、local-remote-reanalysis-audit |
 | 中文论文 | 同上 `paper/main.pdf` 与 `paper/main.tex`（25 页、16 图） |
 | 当前候选与 CPU 回执 | `deliverables/sm120-pr501-review-ready-20261120/` |
+| 上游合并、发布身份与当前 CPU 回执 | `deliverables/sm120-pr501-publish-20261120/` |
 
 关键 SHA256：
 

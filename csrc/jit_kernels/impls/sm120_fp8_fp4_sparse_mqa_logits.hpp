@@ -47,7 +47,7 @@ static void launch_sm120_fp8_fp4_sparse_mqa_logits(
     DG_HOST_ASSERT(is_fp4 or q.scalar_type() == torch::kFloat8_e4m3fn);
     const int row_bytes = is_fp4 ? 64 : 128;
     DG_HOST_ASSERT(q.is_cuda() and q.is_contiguous() and q.dim() == (is_paged ? 4 : 3));
-    DG_HOST_ASSERT(q.size(-2) == kNumHeads and q.size(-1) == row_bytes);
+    DG_HOST_ASSERT(q.size(-2) == kNumMaxHeads and q.size(-1) == row_bytes);
     DG_HOST_ASSERT(not is_paged or q.size(1) == 1);
     const int64_t num_q_tokens = q.size(0);
     DG_HOST_ASSERT(num_q_tokens > 0 and num_q_tokens <= std::numeric_limits<uint32_t>::max());
@@ -60,9 +60,9 @@ static void launch_sm120_fp8_fp4_sparse_mqa_logits(
     check_device(metadata);
     check_device(logits);
     DG_HOST_ASSERT(sf_q.scalar_type() == torch::kInt32 and sf_q.is_contiguous());
-    DG_HOST_ASSERT(sf_q.dim() == (is_paged ? 3 : 2) and sf_q.size(0) == num_q_tokens and sf_q.size(-1) == kNumHeads);
+    DG_HOST_ASSERT(sf_q.dim() == (is_paged ? 3 : 2) and sf_q.size(0) == num_q_tokens and sf_q.size(-1) == kNumMaxHeads);
     DG_HOST_ASSERT(not is_paged or sf_q.size(1) == 1);
-    DG_HOST_ASSERT(weights.dim() == 2 and weights.size(0) == num_q_tokens and weights.size(1) == kNumHeads);
+    DG_HOST_ASSERT(weights.dim() == 2 and weights.size(0) == num_q_tokens and weights.size(1) == kNumMaxHeads);
     DG_HOST_ASSERT(weights.scalar_type() == torch::kBFloat16 and weights.stride(1) == 1);
     DG_HOST_ASSERT(metadata.dim() == 1 and metadata.scalar_type() == torch::kUInt8 and metadata.is_contiguous());
     DG_HOST_ASSERT(metadata.numel() >= static_cast<int64_t>(sizeof(MetadataHeader)));

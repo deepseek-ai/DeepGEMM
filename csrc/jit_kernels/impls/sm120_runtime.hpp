@@ -4,9 +4,31 @@
 #include <memory>
 
 #include "../../runtime/runtime.hpp"
-#include "epilogue.hpp"
+#include "epilogue_class.hpp"
 
 namespace deep_gemm {
+
+// SM120 GEMMs instantiate the identity or the alpha-scaling epilogue operator only
+static std::string get_sm120_epilogue_type(const std::optional<std::string>& epilogue_type) {
+    return epilogue_type.value_or(IdentityEpilogue().get_epilogue_operator_type());
+}
+
+// The operator type to instantiate the kernel with, and its runtime arguments to launch it with
+struct SM120EpilogueInput {
+    std::string type;
+    EpilogueOperatorArgs args;
+};
+
+static SM120EpilogueInput make_sm120_epilogue_input(const int& m, const int& n,
+                                                    const std::optional<std::string>& epilogue_type = std::nullopt,
+                                                    const std::optional<float>& alpha = std::nullopt) {
+    if (alpha.has_value()) {
+        DG_HOST_ASSERT(not epilogue_type.has_value());
+        const AlphaEpilogue epilogue(alpha.value());
+        return {epilogue.get_epilogue_operator_type(), epilogue.make_epilogue_operator_args(m, n)};
+    }
+    return {get_sm120_epilogue_type(epilogue_type), {}};
+}
 
 struct SM120LaunchArgs {
     int blocks, threads, smem, cluster;

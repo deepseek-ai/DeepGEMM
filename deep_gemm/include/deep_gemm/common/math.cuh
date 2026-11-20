@@ -73,12 +73,12 @@ CUTLASS_HOST_DEVICE float fast_rcp(const float& x) {
 
 /// Casting
 template <typename old_t>
-CUTLASS_DEVICE nv_bfloat162 cast_into_bf16x2(old_t& x, old_t& y) {
-    return __float22bfloat162_rn({*reinterpret_cast<float*>(&x), *reinterpret_cast<float*>(&y)});
+CUTLASS_DEVICE nv_bfloat162 cast_into_bf16x2(const old_t& x, const old_t& y) {
+    return __float22bfloat162_rn(make_float2(*reinterpret_cast<const float*>(&x), *reinterpret_cast<const float*>(&y)));
 }
 
 template <typename old_t>
-CUTLASS_DEVICE int cast_into_bf16_and_pack(old_t& x, old_t& y) {
+CUTLASS_DEVICE int cast_into_bf16_and_pack(const old_t& x, const old_t& y) {
     auto bf16x2 = cast_into_bf16x2(x, y);
     return *reinterpret_cast<int*>(&bf16x2);
 }
@@ -105,7 +105,13 @@ CUTLASS_DEVICE nv_bfloat16 get_packed_bf16_amax(const nv_bfloat162 (&values)[kNu
 // Scale two BF16 pairs by power-of-two BF16 sf_invs (exact) and pack into four FP8 bytes
 CUTLASS_DEVICE uint32_t scale_bf16x2_into_fp8x4(const nv_bfloat162& lower, const nv_bfloat162& upper,
                                                 const nv_bfloat162& sf_inv_lower, const nv_bfloat162& sf_inv_upper) {
-    return __nv_fp8x4_e4m3(__hmul2(lower, sf_inv_lower), __hmul2(upper, sf_inv_upper)).__x;
+    // The BF16 FP8 constructor converts each element separately; float2 uses packed conversion.
+    const auto scaled_lower = __bfloat1622float2(__hmul2(lower, sf_inv_lower));
+    const auto scaled_upper = __bfloat1622float2(__hmul2(upper, sf_inv_upper));
+    const uint32_t packed_lower = __nv_cvt_float2_to_fp8x2(scaled_lower, __NV_SATFINITE, __NV_E4M3);
+    const uint32_t packed_upper = __nv_cvt_float2_to_fp8x2(scaled_upper, __NV_SATFINITE, __NV_E4M3);
+    // Explicit packing also handles identical halves correctly with CUDA 12.9.
+    return packed_lower | (packed_upper << 16);
 }
 
 // Select a power-of-two UE8M0 SF mapping `amax` into the finite range of `quant_dtype_t`:

@@ -227,6 +227,7 @@ def parse_m_def_statement(m_def_str):
         'python_function_name': None,
         'num_args': 0,
         'default_args': {},
+        'arg_names': {},
         'is_lambda': False,
     }
 
@@ -311,6 +312,9 @@ def parse_m_def_statement(m_def_str):
 
     for idx, arg_expr in enumerate(py_args):
         expr = arg_expr.strip()
+        name_match = re.match(r'(?:py|pybind11)::arg\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\)', expr)
+        if name_match:
+            result['arg_names'][idx] = name_match.group(1)
         # Find top-level '='
         eq_pos = -1
         p_depth = b_depth = br_depth = angle_depth = 0
@@ -807,7 +811,7 @@ def generate_pyi_function(item_entry):
             param_lines.append('    *')
         param_info = params[i] if i < len(params) else {'type': 'Any', 'name': f'arg{i}'}
         param_type = cpp_type_to_python_type(param_info['type'])
-        param_name = param_info['name'] or f'arg{i}'
+        param_name = parsed.get('arg_names', {}).get(i) or param_info['name'] or f'arg{i}'
 
         # Replace invalid Python identifiers (e.g., keywords)
         if param_name in {'def', 'class', 'from', 'import', 'None', 'True', 'False'}:

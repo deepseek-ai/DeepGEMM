@@ -13,6 +13,7 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_jit/utils/env.hpp>
 
+#include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/math.hpp"
 #include "sm100.hpp"
@@ -23,7 +24,7 @@ struct MegaMoEConfig {
     // Block tiling
     int block_m, block_n, block_k;
     int load_block_m, load_block_n;
-    int store_block_m;
+    int store_block_m_l1, store_block_m_l2;
 
     // SF block sizes (UTCCP 128-aligned)
     int sf_block_m, sf_block_n;
@@ -48,7 +49,7 @@ struct MegaMoEConfig {
         os << "MegaMoEConfig("
            << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
            << ", load_block_m=" << config.load_block_m << ", load_block_n=" << config.load_block_n
-           << ", store_block_m=" << config.store_block_m
+           << ", store_block_m_l1=" << config.store_block_m_l1 << ", store_block_m_l2=" << config.store_block_m_l2
            << ", sf_block_m=" << config.sf_block_m << ", sf_block_n=" << config.sf_block_n
            << ", num_ring_tokens=" << config.num_ring_tokens
            << ", num_sf_ring_tokens=" << config.num_sf_ring_tokens
@@ -61,6 +62,13 @@ struct MegaMoEConfig {
         return os;
     }
 };
+
+// We need to distribute work across locality domains, so we must use the whole GPU
+static int get_num_sms_for_mega_moe() {
+    const auto num_sms = runtime->get_num_sms();
+    DG_HOST_ASSERT(num_sms == jit->device.get_num_sms());
+    return num_sms;
+}
 
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16")
@@ -77,7 +85,7 @@ static bool is_mma_with_sf(const MmaKind& mma_kind) {
     return mma_kind == MmaKind::MXFP8FP4;
 }
 
-static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
+static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& num_tokens,
@@ -100,7 +108,12 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
                 break;
         }
     }
-    const int store_block_m = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 : 40;
+
+    // Use smaller, asymmetric store blocks at FP8xFP4 prefill to save shared memory for sufficient TMA pipeline depth
+    const int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 :
+                                 mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;
+    const int store_block_m_l2 = (block_m == 240 and mma_kind == MmaKind::MXFP8FP4) ? 8 : store_block_m_l1;
+
     const int block_k = 128 / get_num_mma_elem_bytes(mma_kind);
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
@@ -110,14 +123,14 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
     );
 
     // Return configs: 2-CTA clusters and 2 epilogue warpgroups
-    return {2, block_m, store_block_m, block_k, 2 * 128};
+    return {2, block_m, store_block_m_l1, store_block_m_l2, block_k, 2 * 128};
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k, 
-    const int& num_bytes_per_pull, const int& store_block_m,
+    const int& num_bytes_per_pull, const int& store_block_m_l1, const int& store_block_m_l2,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const MmaKind& mma_kind) {
@@ -139,8 +152,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
-    const int smem_cd_l1 = num_epilogue_warpgroups * store_block_m * (block_n / 2) * kNumTMAStoreStages * get_num_mma_elem_bytes(mma_kind);
-    const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd_l1 = num_epilogue_warpgroups * store_block_m_l1 * (block_n / 2) * kNumTMAStoreStages * get_num_mma_elem_bytes(mma_kind);
+    const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m_l2 * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
     // Schedule task payloads
@@ -153,7 +166,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
-        store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
+        store_block_m_l1 * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
 
     // Tensor memory pointer
     const int smem_tmem_ptr = 4;
@@ -190,7 +203,7 @@ static MegaMoEConfig get_mega_moe_config(
     const MmaKind& mma_kind) {
 
     // Block config
-    const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
+    const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
     DG_HOST_ASSERT(num_ring_tokens % block_m == 0);
     const int block_n = 128;
@@ -219,14 +232,14 @@ static MegaMoEConfig get_mega_moe_config(
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
         SM100ArchSpec::smem_capacity,
         num_experts, hidden,
-        block_m, block_n, block_k, num_bytes_per_pull, store_block_m,
+        block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
         mma_kind);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
-        load_block_m, load_block_n, store_block_m,
+        load_block_m, load_block_n, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n,
         num_ring_tokens, is_mma_with_sf(mma_kind) ? num_sf_ring_tokens : 0,
         swizzle_acts_mode, swizzle_weights_mode,

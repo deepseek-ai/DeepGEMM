@@ -8,10 +8,26 @@ from scripts.generate_pyi import (
     build_cpp_function_index, extract_m_def_statements,
     parse_mdef_and_attach_cpp_signatures, extract_cpp_signature_details,
     generate_pyi_function,
+    parse_m_def_statement,
 )
 
 
 class KeywordOnlyStubTest(unittest.TestCase):
+    def test_binding_names_override_cpp_names(self):
+        parsed = parse_m_def_statement(
+            'm.def("example", &example, py::arg("epilogue") = nullptr, '
+            'py::kw_only(), pybind11::arg("tile") = 0);')
+        parsed['cpp_parsed_signature'] = {
+            'return_type': 'void',
+            'parameters': [{'type': 'int', 'name': 'epilogue_class'},
+                           {'type': 'int', 'name': 'cpp_tile'}],
+        }
+        function = ast.parse(generate_pyi_function({'parsed': parsed})).body[0]
+        self.assertEqual([p.arg for p in function.args.args], ['epilogue'])
+        self.assertEqual([p.arg for p in function.args.kwonlyargs], ['tile'])
+        self.assertIsNone(ast.literal_eval(function.args.defaults[0]))
+        self.assertEqual(ast.literal_eval(function.args.kw_defaults[0]), 0)
+
     def test_masked_bf16_bindings(self):
         root = Path(__file__).resolve().parents[1] / 'csrc'
         index = build_cpp_function_index(root)
@@ -26,7 +42,13 @@ class KeywordOnlyStubTest(unittest.TestCase):
                 function = ast.parse(generate_pyi_function(statement)).body[0]
                 self.assertEqual([p.arg for p in function.args.kwonlyargs], ['sm120_m_tile'])
                 self.assertEqual(ast.literal_eval(function.args.kw_defaults[0]), 0)
-                self.assertEqual(len(function.args.args), 6 if name.endswith('gemm_nt_masked') else 5)
+                if name.endswith('gemm_nt_masked'):
+                    self.assertEqual([p.arg for p in function.args.args],
+                                     ['a', 'b', 'd', 'masked_m', 'expected_m',
+                                      'compiled_dims', 'epilogue'])
+                    self.assertIsNone(ast.literal_eval(function.args.defaults[-1]))
+                else:
+                    self.assertEqual(len(function.args.args), 5)
                 found.add(name)
         self.assertEqual(found, names)
 
