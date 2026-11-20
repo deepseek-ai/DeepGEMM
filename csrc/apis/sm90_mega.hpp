@@ -32,8 +32,8 @@ get_symm_buffer_size_for_sm90_mega_moe(
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     if (not use_fp8_dispatch)
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE currently supports FP8 dispatch only");
-    if (activation != "swiglu")
-        DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE currently supports the swiglu activation only");
+    if (activation != "swiglu" and activation != "swigluoai")
+        DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE supports swiglu and swigluoai only");
     DG_HOST_ASSERT(num_max_tokens_per_rank > 0 and
                    num_max_tokens_per_rank % kSM90MegaMoETokenAlignment == 0);
     if (hidden <= 0 or hidden % 256 != 0)
@@ -159,6 +159,8 @@ static void fp8_mega_moe(
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
+    const float& activation_alpha,
+    const float& activation_up_bias,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
 ) {
@@ -194,8 +196,13 @@ static void fp8_mega_moe(
     const auto [rm, rn, rk] = recipe;
     if (rm != 128 or rn != 128 or rk != 128)
         DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE requires recipe=(128, 128, 128)");
-    if (activation != "swiglu")
-        DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE currently supports the swiglu activation only");
+    if (activation != "swiglu" and activation != "swigluoai")
+        DG_HOST_UNREACHABLE("SM90 FP8 MegaMoE supports swiglu and swigluoai only");
+    if (activation == "swiglu" and
+        (activation_alpha != 1.0f or activation_up_bias != 0.0f))
+        DG_HOST_UNREACHABLE(
+            "SM90 FP8 MegaMoE swiglu requires activation_alpha=1.0 and "
+            "activation_up_bias=0.0; use swigluoai for parameterized SwiGLU");
 
     // Activation checks
     const auto activation_clamp =
@@ -266,7 +273,8 @@ static void fp8_mega_moe(
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
-                     activation_clamp, fast_math);
+                     activation_clamp, activation_alpha, activation_up_bias,
+                     fast_math);
 
     if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG", 0))
         sym_buffer.zero_();
