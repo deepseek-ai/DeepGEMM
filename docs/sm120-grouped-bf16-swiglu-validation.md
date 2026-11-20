@@ -1,0 +1,275 @@
+# RTX 5090 validation: grouped BF16 SwiGLU
+
+## Outlined midpoint refinement revalidation (2026-11-15)
+
+This increment outlines the rare recomputation body from the accuracy repair
+at `b0eebef0d0ad04f6d1b96a9db1b31f561a20f7c3`. The ballot stays inline;
+the whole warp calls a shared device function only when its pending mask is
+nonzero. The short-dot accumulation, TwoSum arithmetic, reduction order,
+32-step window, FP64 oracle and tolerances are unchanged.
+
+The final device header passed the complete native BF16 regression (**50 passed,
+5 historical deselections**), the unchanged original **42 tests**, five expanded
+unittest methods (including seeds 2 through 31 and all 48 experts for original
+seeds 0/1), and all four sanitizers on three compact methods each. Sanitizers
+reported zero errors; racecheck also reported zero hazards and warnings.
+The host ABI did not change, so the extension from the preceding forced rebuild
+was reused, with its hash recorded. JIT kernels use the measured device header.
+
+### Same-card performance boundary
+
+22 scenes cover E=4/16/48, valid rows 1/16/32/33/64/65/128/256, K/N=896/4864
+and 4096/1024, plus empty and skewed experts with seed 23. Both revisions
+ran in opposite process orders, with 12 alternating Graph samples per path
+per scene. All valid projection, separate and fused output hashes matched
+across revisions and sweeps. Independent FP64 checks passed for all E=4
+experts and three selected experts at E=16/48; the separate original-seed
+regression checks all 48 experts. Fused invalid-row sentinels were preserved.
+An initial benchmark attempt incorrectly required ordinary GEMM padding rows
+to remain untouched and stopped before timing. That assertion was corrected
+to match the fused API's contract; its failed log is retained separately.
+Valid-row FP64 checks and tolerances were unchanged.
+
+The published control is the numerically accepted accuracy repair, not the
+older numerically failing implementation. Times below are medians in
+microseconds, on the same RTX 5090, PyTorch 2.13.0+cu132 and CUDA 13.2:
+
+| E / rows / K / N | Published fused us | Outlined fused us | Reduction | Outlined separate / fused |
+|---|---:|---:|---:|---:|
+| 4 / 1 / 896 / 4864 | 35.270 | 29.858 | 15.35% | 1.0758x |
+| 4 / 16 / 896 / 4864 | 37.678 | 36.948 | 1.94% | 1.0347x |
+| 4 / 128 / 896 / 4864 | 78.678 | 66.721 | 15.20% | 1.0500x |
+| 4 / 128 / 4096 / 1024 | 73.504 | 72.997 | 0.69% | 0.9668x |
+| 4 / 256 / 4096 / 1024 | 137.134 | 132.660 | 3.26% | 0.9990x |
+| 48 / 128 / 896 / 4864 | 1001.601 | 779.696 | 22.15% | 1.0173x |
+
+These are gate/up GEMM plus SwiGLU measurements with reused weights and
+unlocked clocks; they exclude dispatch, down projection, combine and serving.
+Sub-percent differences are not evidence of stable improvement. Sparse scenes
+are not total-row-matched to uniform scenes. The public receipt retains all
+22 scenes, raw samples, commands, hashes and losing cases.
+
+Fusion still loses by more than 1% against its own separate path in these
+measured four-expert scenes:
+
+| K / N | Valid rows by expert | Separate / fused |
+|---|---|---:|
+| 4096 / 1024 | 65, 65, 65, 65 | 0.9417x |
+| 4096 / 1024 | 128, 128, 128, 128 | 0.9668x |
+| 896 / 4864 | 0, 16, 33, 8 | 0.9568x |
+| 896 / 4864 | 0, 64, 128, 32 | 0.9698x |
+
+No outlined fused regression exceeded 1% versus the published fused control
+in this sweep.
+This sweep does not establish a universal speedup or an automatic fallback
+boundary. Callers retain explicit fused/separate API selection. Earlier
+speedups from before the accuracy repair remain historical. The PR was Draft
+at the time of this sweep; its current scope and subsequent validation are
+recorded in [the final review guide](sm120-final-review-scope.md). No NCU counters
+were collected on this rental GPU; instruction-cache or occupancy causes
+are not established by these timings.
+
+See [the outlined-refinement receipts](validation/sm120-bf16-noinline-20261115.json).
+The benchmark can be repeated for either source revision with a revision-matched
+JIT cache; `--variant` labels the report and does not select an implementation:
+
+```bash
+python experiments/sm120_bf16_refinement_boundary.py \
+  --variant outlined --sweep 0 --output boundary-0.json
+python experiments/sm120_bf16_refinement_boundary.py \
+  --variant outlined --sweep 1 --output boundary-1.json
+```
+
+## Earlier accuracy repair revalidation (2026-11-15; b0eebef)
+
+The unchanged original strict test now passes for both seeds. This section
+describes the accuracy increment on top of PR #501's paired-store HEAD
+`a2c6ef10f475282a7df1a78c6a6b92d875a1cb58`. It does not include later
+dispatch, down/combine or small-decode research kernels.
+
+- Original grouped SwiGLU contract: **42 passed**, including unchanged seed-0/1
+  independent FP64 checks. The original test file is unchanged.
+- Added midpoint/boundary regression: four unittest methods passed, including
+  the original strict comparison extended to seeds 2 through 31, saved rational
+  midpoint cases, double-rounding behavior, odd shape/output guards and changed
+  input/count Graph replay on a nondefault stream.
+- All-expert extension: the original two seeds passed for **all 48 experts**
+  in both ordinary and fused paths (192 expert/path comparisons). Seeds,
+  dimensions and `rtol=1e-2, atol=2e-3` are unchanged.
+- Native BF16 regression: **50 passed, 5 deselected**. The historical small-stride rejection
+  exclusions and pytest's imported `test_filter` helper exclusions are retained
+  and are explicit in the recorded command; no numerical test was deselected.
+- Memcheck, synccheck, racecheck and initcheck each passed the three compact
+  midpoint/Graph/boundary methods with zero errors. Racecheck also reported
+  zero hazards and zero warnings.
+- The extension was rebuilt with `--force`; kernel/test hashes remained stable
+  during the validation. Commands, GPU identity, hashes and timing samples are
+  retained in [the machine-readable receipts](validation/sm120-bf16-accuracy-20261115.json).
+
+The repair uses short zero-C BF16 MMA partial dots, explicit FP32 additions,
+and warp-cooperative two-FP32 midpoint refinement. It preserves BF16 projection
+rounding and the existing reference conversion; production uses no FP64.
+The midpoint window is a measured accuracy safeguard, not a proof of correct
+rounding for arbitrary input distributions, K or exponent ranges. See
+[the accuracy design](sm120-bf16-accuracy.md).
+
+### Timing and performance cost at b0eebef
+
+GPU: `GPU-a7236a53-2726-62c6-41b5-0e53713a0063, NVIDIA GeForce RTX 5090, 610.57.04`. PyTorch `2.13.0+cu132`, CUDA `13.2`.
+K=896, N=4864, seed 0, capacity 128, 12 alternating CUDA Graph timing samples
+per path. The parent numerical failure is retained separately; its timing
+is diagnostic and is not a numerically accepted alternative. Current timings
+are measured from the same sources as the successful validation above.
+
+| E / valid rows per expert | Parent separate µs | Parent fused µs | Current separate µs | Current fused µs | Current speedup |
+|---|---:|---:|---:|---:|---:|
+| 4 / 16 | 27.451 | 26.294 | 40.075 | 37.820 | 1.0596x |
+| 4 / 128 | 49.892 | 49.828 | 78.025 | 77.981 | 1.0006x |
+
+Against the parent fused kernel, repaired fused latency increases by 43.8%
+and 56.5% in these two scenes. The repaired fused kernel is about 6.0% faster
+than the repaired separate path at 16 rows; the 128-row difference is parity
+within measurement noise. These results do not establish a general speedup.
+
+The parent and repaired processes ran sequentially on the same physical GPU
+with unlocked clocks and reused weights. These two scenes measure L1 GEMM plus
+SwiGLU only, excluding down projection, routing, communication and serving.
+They do not repeat or supersede the earlier 413-scene performance sweep.
+The accuracy change has a real cost; historical speedups below must not be
+advertised as measurements of this revision. Known BK32 spilling remains.
+PR Draft status is retained while the accuracy/performance tradeoff is reviewed.
+
+## Historical validation before the accuracy repair
+
+The following results describe the previous implementation. Their original
+failures and timings are preserved verbatim as historical evidence.
+
+Measured on NVIDIA GeForce RTX 5090, PyTorch `2.13.0+cu130` (PyTorch reports CUDA
+13.0). The measured source is commit
+`6cfdc45ac28d7a4ed9347f5ae9dd62eb6c6a2419` plus the paired-output-store change
+and its four alignment/tail tests. The tested kernel and test-file SHA256 hashes
+are recorded below. Subsequent documentation changes do not change those files.
+
+This patch implements the gate/up projection and SwiGLU, with a separate down
+projection. Results exclude routing, communication, down GEMM and serving latency.
+
+## Validation results
+
+- The original scalar implementation passed 37/38 focused tests. The paired-store
+  version passed 41/42; both fail the same seed-0 random-input FP64 test. These are
+  retained failures, not passing or skipped tests.
+- Both versions passed 50 ordinary BF16 regression cases each. The paired version
+  passed 11 memcheck and 11 synccheck focused cases. Additional racecheck and
+  initialized 48-expert memcheck/initcheck runs passed.
+- 413 controlled scenarios, two seeds each, passed materialized-contract checks in
+  both versions. All 826 complete valid-output hashes matched across versions.
+  Scenarios cover E=4/8/16/32/48 and mean tokens=16/32/64/128/256/512/1024, with
+  uniform, empty-expert and nonempty skew patterns. Matched patterns preserve the
+  total token count and capacity; exact empty fractions require an integral
+  number of experts.
+- 56 supplemental boundary executions per version passed, with equal valid-output
+  hashes. They include odd/small N, K tails, non-tile-aligned capacities, and
+  aligned/two-byte-offset outputs.
+- 12 Nsight Systems captures confirmed two kernels for materialized GEMM plus
+  activation and one for fused SwiGLU. Direct-call profiler gaps are not used as
+  CUDA Graph speedup measurements.
+- Nsight Compute reports and raw CSV were retained. Resource information and SASS
+  were exported for all 416 indexed CUBINs, including ordinary and helper kernels.
+  Missing profiler/disassembler tools in the first run were installed and the
+  missing evidence was recovered separately; the initial failed statuses remain
+  in the original logs.
+
+## CUDA Graph measurements
+
+K=896, logical output N=4864, reused weights. For uniform cases below, values are
+medians of six measurements per path, alternating ordinary/fused timing order.
+The ordinary control is from the paired-store process. Scalar and paired runs
+are separate processes; sub-percent gains are not a claim of stable improvement.
+
+| Uniform case | Ordinary GEMM + activation, us | Scalar fused, us | Paired fused, us | Ordinary / paired |
+|---|---:|---:|---:|---:|
+| E4, 16 tokens/expert | 26.971 | 25.679 | 25.701 | 1.0494x |
+| E4, 128 tokens/expert | 48.880 | 53.993 | 48.491 | 1.0080x |
+| E16, 128 tokens/expert | 230.854 | 232.303 | 218.271 | 1.0576x |
+| E48, 128 tokens/expert | 762.293 | 630.439 | 603.623 | 1.2629x |
+
+Across 35 uniform cases, measured speedups over the ordinary path ranged from 1.0076x
+to 1.2629x. Fusion also has regressions: an E16, mean-64 nonempty heavy-skew case
+reproduced at 249.104 us fused versus 244.454 us ordinary (0.9813x, 12 samples).
+This case has twelve 16-token experts and four 208-token experts, permuted, and
+capacity 256. It has the same 1024 total tokens as the uniform E16/64 control.
+No universal speedup, cold-cache or cross-GPU claim is made.
+
+The E4/128 NCU comparison provides a mechanism for the paired-store improvement:
+warp-level global-store instructions fell from 77,824 to 38,912 and store-sector
+requests from 622,592 to 311,296. Launch registers remained 168/thread, and tensor
+activity rose from 65.43% to 73.53%. Sector requests count accesses per instruction;
+they are not unique cache lines or measured off-chip bytes.
+
+## Known numerical question
+
+The original random-input FP64 test remains unchanged and fails for both ordinary
+materialized and fused paths. With E48/M128/K896/N4864, supplemental all-expert
+diagnostics found 35 strict-threshold failures for seed 0 and 34 for seed 1 among
+29,884,416 outputs per seed. Ordinary and fused outputs were bitwise identical,
+and scalar and paired-store versions also matched.
+
+Each of these 69 outputs involves one gate/up projection whose native BF16 value
+and independently rounded exact-dot value are adjacent BF16 numbers. Exact
+rational dot products agree with FP64 at the failing coordinates. The exact dots
+lie within 3.208e-6 of a BF16 rounding midpoint. This supports a shared projection
+rounding explanation, but the native pre-rounding FP32 accumulator was not
+observed, so a specific Tensor Core reduction order is not claimed as measured.
+
+FP32 accumulation followed by BF16 rounding need not equal BF16 rounding of an
+exact real dot near a quantization boundary. The remaining decision is to specify
+and independently validate the intended FP32 accumulation error contract, or to
+change the implementation if exact-dot rounding is required. Matching the ordinary
+path alone does not replace independent mathematical validation. Increasing a
+fixed tolerance or silently removing this failure is not a numerical fix.
+
+## Known BK32 spills and rejected experiment
+
+At expected M >= 2048, the heuristic can select BM128/BN128/BK32 with four shared
+pipeline stages. Both scalar and paired fused specializations show static spill
+loads/stores in compiler logs and LDL/STL instructions in SASS. Actual NCU
+captures confirm local traffic; the ordinary GEMM has zero local sectors in the
+same two cases.
+
+| Half-empty case, active experts have 2048 tokens | Paired fused local load sectors | Paired fused local store sectors |
+|---|---:|---:|
+| E4 (2 active), capacity 3328 | 183,616 | 183,616 |
+| E48 (24 active), capacity 3328 | 2,203,392 | 2,203,392 |
+
+Source array size estimates depend on the actual warp layout. These launches use
+kNWarps=1, kMWarps=8, kMTilesPerWarp=1 and kNTilesPerWarp=16. Dual accumulator
+arrays occupy 128 float slots; two operand fragment buffers occupy 136 u32 slots.
+These 264 source slots are not the compiled physical register count.
+
+An isolated experiment reduced register fragments to one buffer only in fused
+BK32, keeping the shared TMA pipeline and per-output MMA order. It passed six
+exact-dot/Graph/boundary cases, ordinary regressions, sanitizer checks and 48
+controlled output-hash comparisons. However, LDL/STL instruction counts did not
+decrease, and local sectors increased by about 0.66%. Four affected Graph timing
+cases improved by only 0.11%-0.41%; two unchanged-path controls varied by
++0.57%/+0.11%. The experiment does not establish a useful spill reduction and is
+excluded from this patch. The validated paired-store schedule is retained.
+
+## Reproduction and review status
+
+```bash
+python -m pytest -q -ra tests/test_sm120_grouped_swiglu.py
+python -m pytest -q -ra tests/test_sm120_bf16_gemm.py tests/test_sm120_bf16_odd_n.py tests/test_sm120_native_rejections.py -k 'not k_grouped_small_stride and not test_filter'
+compute-sanitizer --tool memcheck --error-exitcode 99 python -m pytest -q -ra tests/test_sm120_grouped_swiglu.py -k 'exact_dot_product or graph_replay or runtime_alignment or capacity_tail or output_pair'
+compute-sanitizer --tool synccheck --error-exitcode 99 python -m pytest -q -ra tests/test_sm120_grouped_swiglu.py -k 'exact_dot_product or graph_replay or runtime_alignment or capacity_tail or output_pair'
+python experiments/sm120_grouped_swiglu_native.py --rows 128 128 128 128 --max-m 128 --repeats 12 --output timing.json
+```
+
+The first command is expected to retain the documented seed-0 failure on the
+tested environment. This contribution remains Draft while the numerical question
+is unresolved. Performance and profiler evidence do not waive that failure.
+
+Tested file identities (SHA256):
+
+- `deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh`: `bcc75a436bb6af663a24c02668693759b988b2b7395706c607d26d0931c93ac9`
+- `tests/test_sm120_grouped_swiglu.py`: `442ec81f9a830041235838556032f73b6741bc1591059fb47e2cbd2a8d7a54ff`

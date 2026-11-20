@@ -1,0 +1,962 @@
+{
+  "schema": "sm120-small-moe-accuracy-20261115",
+  "accuracy_base": "1c31df4b4969ca668bee71c548bc4b023c29ca52",
+  "scope": "Pre-routed X to Y: dispatch, gate/up, BF16 projection rounding, SwiGLU, BF16 H, down, BF16 partial rounding, ordered weighted combine, BF16 Y",
+  "independent_oracle": "FP64 dot -> FP32 -> BF16 at projection boundaries; FP32 activation and fixed-order FP32 multiply/add",
+  "rtol": 0.01,
+  "atol": 0.002,
+  "universal_correct_rounding_asserted": false,
+  "performance_is_diagnostic": true,
+  "route_plan_precomputed": true,
+  "allocations_and_compile_excluded": true,
+  "clocks_locked": false,
+  "ncu_reports_collected": 0,
+  "results_archive": "small-chain2-results.tar.gz",
+  "results_archive_sha256": "31c1536ea6370ba16b5f48e3aff3763d038f3f1b02be3a36b2e3ddb738b9cf0c",
+  "archived_manifest_files": 87,
+  "collection": {
+    "complete": true,
+    "current_source_hashes": {
+      "csrc/python_api.cpp": "428833fb0e5e3765189bf611bce987ced41d2cfcbc3dfeac9cd8cbb0e74e430e",
+      "csrc/apis/sm120_moe_small.hpp": "57ddec6b63b0f88d5ecfc6b6dbf3f6668f64db92ae728466d57cd65ebcd374c9",
+      "deep_gemm/include/deep_gemm/impls/sm120_bf16_moe_small.cuh": "1f31ac298774e7227dda30b4899b050c394f12c1c6c2c222f6c7042ec8cb2cd2",
+      "deep_gemm/small_moe.py": "5bc7309f002f3e34cc797835219c3569c8e696d2c89456431a377a2dbbfed62a",
+      "deep_gemm/small_moe_policy.py": "bba7bd57db879f592c24e26eca6ad121486ea51f989c45cbb607512b4a46be40",
+      "tests/test_sm120_small_moe_gpu.py": "e61ed4d2308665d8d385b6087db9a849e2aabda01d4fe31420c582c995644511",
+      "tests/test_sm120_small_moe_policy.py": "d54fddce690ff6aa737ae572fe063cc393f5833c0e4ba1766a974982e204cae1",
+      "tests/bench_sm120_small_moe.py": "9cea5717394d6ae7263905f3fbdbd1d481d69e4a07950a6e69887f89a5622af8",
+      "tests/run_sm120_small_moe_validation.py": "b8c085b261e1e2bcb162dd4e77f1bf0bfebe23d52e07ffdebfbea13a24fdc999",
+      "csrc/apis/gemm.hpp": "bd4f800c76888977fa84ca6664d19638d078ac4d56640b790c4d2f1a6047773d",
+      "csrc/jit_kernels/heuristics/sm120.hpp": "8768c8b8a5138f05941888b09a667e77c5d06169794ebd7c914408ffbbbf89f8",
+      "csrc/jit_kernels/heuristics/sm120_config.hpp": "35ac5e4d70d5f1c567d83196e82ae44c8e6f60f1dfab1710f7344386f786682a",
+      "deep_gemm/include/deep_gemm/mma/sm120.cuh": "e1d207c47b38b964ae97d08a62d7392dd742e21256d7dd616082675b478f2cdf",
+      "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "d072b59efbd15853c74c250f312487b8c8bce0b52aae88d412a9c963ff1b1ff6",
+      "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "bf144bac3247980312d92e1b72f7701353539203eef381f1ce10ca6ee3c26655"
+    },
+    "extension_sha256": "c4108c0f53288401d21b4e8c7675d2023669dafb3fa0d0de65957a6107f78958",
+    "prior_calibration_source_changes": [
+      "deep_gemm/small_moe.py",
+      "tests/test_sm120_small_moe_gpu.py"
+    ],
+    "timed_forward_and_triton_ast_unchanged": true,
+    "final_four_sanitizers_passed": true,
+    "final_fresh_seed": 283,
+    "source_accuracy_base": "1c31df4b4969ca668bee71c548bc4b023c29ca52",
+    "universal_correct_rounding_asserted": false
+  },
+  "environment": {
+    "python": "3.12.11 | packaged by Anaconda, Inc. | (main, Jun  5 2025, 13:09:17) [GCC 11.2.0]",
+    "commands": {
+      "gpu": "GPU-a7236a53-2726-62c6-41b5-0e53713a0063, NVIDIA GeForce RTX 5090, 610.57.04\n",
+      "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Mon_Mar_02_09:52:23_PM_PST_2026\nCuda compilation tools, release 13.2, V13.2.51\nBuild cuda_13.2.r13.2/compiler.37434383_0\n",
+      "sanitizer": "NVIDIA (R) Compute Sanitizer\nCopyright (c) 2020-2026 NVIDIA Corporation\nVersion 2026.1.0.0 (build 37182542) (public-release)\n"
+    },
+    "safe_environment": {
+      "CXX": "/root/sm120-toolchain/bin/x86_64-conda-linux-gnu-c++",
+      "CUDA_HOME": "/usr/local/cuda",
+      "DG_JIT_CACHE_DIR": "/root/sm120-work/small-chain2/jit-cache",
+      "DG_USE_LOCAL_VERSION": null,
+      "PYTHONPATH": "/root/sm120-work/small-chain2/source:/root/sm120-work/small-chain2/source/tests",
+      "OMP_NUM_THREADS": null
+    }
+  },
+  "inherited_regression": {
+    "complete": true,
+    "steps": [
+      {
+        "name": "original",
+        "command": [
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-m",
+          "pytest",
+          "tests/test_sm120_grouped_swiglu.py",
+          "-vv"
+        ],
+        "exit_code": 0,
+        "passed": true,
+        "elapsed_seconds": 5.175534698180854,
+        "log": "inherited-original.log",
+        "sha256": "05020aa24473447c763ef9406112821f2d228d9e7fbf7d6510197e3c893c22a8"
+      },
+      {
+        "name": "native",
+        "command": [
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-m",
+          "pytest",
+          "tests/test_sm120_bf16_gemm.py",
+          "tests/test_sm120_bf16_odd_n.py",
+          "tests/test_sm120_native_rejections.py",
+          "-k",
+          "not k_grouped_small_stride and not test_filter",
+          "-vv"
+        ],
+        "exit_code": 0,
+        "passed": true,
+        "elapsed_seconds": 10.473261335864663,
+        "log": "inherited-native.log",
+        "sha256": "14e6e7c6c208f4206358ea60469b0c94dc56546f3781100f8f188ca81e3abfe2"
+      },
+      {
+        "name": "expanded",
+        "command": [
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-m",
+          "unittest",
+          "tests.test_sm120_bf16_accumulation",
+          "tests.test_sm120_bf16_all_experts",
+          "-v"
+        ],
+        "exit_code": 0,
+        "passed": true,
+        "elapsed_seconds": 4.7317012920975685,
+        "log": "inherited-expanded.log",
+        "sha256": "be79262cf9c40ce703baced5cc080f2179eaeeb5571e9c74e1bf4cd1c6dbeff7"
+      }
+    ],
+    "accuracy_base": "1c31df4b4969ca668bee71c548bc4b023c29ca52",
+    "elapsed_seconds": 20.382231326773763
+  },
+  "final_validation": {
+    "complete": true,
+    "all_steps_passed": true,
+    "steps": [
+      {
+        "name": "correctness",
+        "command": [
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_policy",
+          "tests.test_sm120_small_moe_gpu",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "correctness.log",
+        "log_sha256": "bae3b65cee762c9761ffda13267e3f9b2660f48f87a30dd938e1f933dda77ff0",
+        "elapsed_seconds": 5.216190171428025,
+        "passed": true,
+        "sanitizer_clean": null
+      },
+      {
+        "name": "memcheck",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "99",
+          "--print-limit",
+          "32",
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "memcheck.log",
+        "log_sha256": "4698825df9fba6fd12576fb79982b5280294b20f745ab3ebf03ff80af8a24a4f",
+        "elapsed_seconds": 8.674563953652978,
+        "passed": true,
+        "sanitizer_clean": true
+      },
+      {
+        "name": "synccheck",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "synccheck",
+          "--error-exitcode",
+          "99",
+          "--print-limit",
+          "32",
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "synccheck.log",
+        "log_sha256": "da3eaa26e9cef3a3e518971a4a06906ea17d8882bafdcb5ee00f2cd7964045ea",
+        "elapsed_seconds": 6.379658859223127,
+        "passed": true,
+        "sanitizer_clean": true
+      },
+      {
+        "name": "racecheck",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "racecheck",
+          "--error-exitcode",
+          "99",
+          "--print-limit",
+          "32",
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "racecheck.log",
+        "log_sha256": "e22bc4afd9e71fa0254082b0382addd22f4d37fcd92afca2d63caf59c10374bc",
+        "elapsed_seconds": 267.11766892205924,
+        "passed": true,
+        "sanitizer_clean": true
+      },
+      {
+        "name": "initcheck",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "initcheck",
+          "--error-exitcode",
+          "99",
+          "--print-limit",
+          "32",
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "initcheck.log",
+        "log_sha256": "2e0b3379e2e089938c5d7f4c66fce5749f79eb46c161ff112b2e6c7ddf592c57",
+        "elapsed_seconds": 6.323797999881208,
+        "passed": true,
+        "sanitizer_clean": true
+      }
+    ],
+    "source_hashes": {
+      "csrc/python_api.cpp": "428833fb0e5e3765189bf611bce987ced41d2cfcbc3dfeac9cd8cbb0e74e430e",
+      "csrc/apis/sm120_moe_small.hpp": "57ddec6b63b0f88d5ecfc6b6dbf3f6668f64db92ae728466d57cd65ebcd374c9",
+      "deep_gemm/include/deep_gemm/impls/sm120_bf16_moe_small.cuh": "1f31ac298774e7227dda30b4899b050c394f12c1c6c2c222f6c7042ec8cb2cd2",
+      "deep_gemm/small_moe.py": "5bc7309f002f3e34cc797835219c3569c8e696d2c89456431a377a2dbbfed62a",
+      "deep_gemm/small_moe_policy.py": "bba7bd57db879f592c24e26eca6ad121486ea51f989c45cbb607512b4a46be40",
+      "tests/test_sm120_small_moe_gpu.py": "e61ed4d2308665d8d385b6087db9a849e2aabda01d4fe31420c582c995644511",
+      "tests/test_sm120_small_moe_policy.py": "d54fddce690ff6aa737ae572fe063cc393f5833c0e4ba1766a974982e204cae1",
+      "tests/bench_sm120_small_moe.py": "9cea5717394d6ae7263905f3fbdbd1d481d69e4a07950a6e69887f89a5622af8",
+      "tests/run_sm120_small_moe_validation.py": "b8c085b261e1e2bcb162dd4e77f1bf0bfebe23d52e07ffdebfbea13a24fdc999",
+      "csrc/apis/gemm.hpp": "bd4f800c76888977fa84ca6664d19638d078ac4d56640b790c4d2f1a6047773d",
+      "csrc/jit_kernels/heuristics/sm120.hpp": "8768c8b8a5138f05941888b09a667e77c5d06169794ebd7c914408ffbbbf89f8",
+      "csrc/jit_kernels/heuristics/sm120_config.hpp": "35ac5e4d70d5f1c567d83196e82ae44c8e6f60f1dfab1710f7344386f786682a",
+      "deep_gemm/include/deep_gemm/mma/sm120.cuh": "e1d207c47b38b964ae97d08a62d7392dd742e21256d7dd616082675b478f2cdf",
+      "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "d072b59efbd15853c74c250f312487b8c8bce0b52aae88d412a9c963ff1b1ff6",
+      "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "bf144bac3247980312d92e1b72f7701353539203eef381f1ce10ca6ee3c26655"
+    },
+    "extension_path": "/root/sm120-work/small-chain2/source/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so",
+    "extension_sha256": "c4108c0f53288401d21b4e8c7675d2023669dafb3fa0d0de65957a6107f78958",
+    "torch": "2.13.0+cu132",
+    "cuda": "13.2",
+    "gpu": "GPU-a7236a53-2726-62c6-41b5-0e53713a0063, NVIDIA GeForce RTX 5090, 610.57.04",
+    "inherited_accuracy_revision": "1c31df4b4969ca668bee71c548bc4b023c29ca52",
+    "universal_correct_rounding_asserted": false,
+    "pr_acceptance_asserted": false,
+    "total_tasks": 5,
+    "source_unchanged": true,
+    "elapsed_seconds": 293.7173509383574
+  },
+  "initial_validation": {
+    "complete": true,
+    "all_steps_passed": true,
+    "steps": [
+      {
+        "name": "correctness",
+        "command": [
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_policy",
+          "tests.test_sm120_small_moe_gpu",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "correctness.log",
+        "log_sha256": "4b3b83974473878f7a7b53a99c339f90b69ec8929d672be66ca60f62925bdccf",
+        "elapsed_seconds": 37.49168000277132,
+        "passed": true,
+        "sanitizer_clean": null
+      },
+      {
+        "name": "memcheck",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--error-exitcode",
+          "99",
+          "--print-limit",
+          "32",
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "memcheck.log",
+        "log_sha256": "03e64a938463a3f848acea662ca5da4e87013f35d0be9110a433c95a1bb64172",
+        "elapsed_seconds": 9.293740648776293,
+        "passed": true,
+        "sanitizer_clean": true
+      },
+      {
+        "name": "synccheck",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "synccheck",
+          "--error-exitcode",
+          "99",
+          "--print-limit",
+          "32",
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "synccheck.log",
+        "log_sha256": "0e245e66da5f3222e7c4e9d8f9b44814d8db6b8bc3194848aece4a330f5fd0e2",
+        "elapsed_seconds": 6.986019680276513,
+        "passed": true,
+        "sanitizer_clean": true
+      },
+      {
+        "name": "racecheck",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "racecheck",
+          "--error-exitcode",
+          "99",
+          "--print-limit",
+          "32",
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "racecheck.log",
+        "log_sha256": "cf352625696274ea6871b0ea72f44a2653237e769b24c816f273ff234b727d66",
+        "elapsed_seconds": 283.5206114947796,
+        "passed": true,
+        "sanitizer_clean": true
+      },
+      {
+        "name": "initcheck",
+        "command": [
+          "compute-sanitizer",
+          "--tool",
+          "initcheck",
+          "--error-exitcode",
+          "99",
+          "--print-limit",
+          "32",
+          "/usr/local/miniconda3/envs/py312/bin/python",
+          "-u",
+          "-m",
+          "unittest",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_kernel_template_matrix",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_controlled_dyadic_oracle",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_saved_midpoints_in_both_fused_layers",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_sparse_high_expert_slots",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_odd_topk_and_token_fallback",
+          "tests.test_sm120_small_moe_gpu.SmallMoEGpuTest.test_other_shape_and_custom_capacity_on_nondefault_stream",
+          "-v"
+        ],
+        "exit_code": 0,
+        "log": "initcheck.log",
+        "log_sha256": "55aea7f6b958d4a136a0b72646ca405b98eaf22c123e5a22cdb476942cea7d6e",
+        "elapsed_seconds": 7.130928070284426,
+        "passed": true,
+        "sanitizer_clean": true
+      }
+    ],
+    "source_hashes": {
+      "csrc/python_api.cpp": "428833fb0e5e3765189bf611bce987ced41d2cfcbc3dfeac9cd8cbb0e74e430e",
+      "csrc/apis/sm120_moe_small.hpp": "57ddec6b63b0f88d5ecfc6b6dbf3f6668f64db92ae728466d57cd65ebcd374c9",
+      "deep_gemm/include/deep_gemm/impls/sm120_bf16_moe_small.cuh": "1f31ac298774e7227dda30b4899b050c394f12c1c6c2c222f6c7042ec8cb2cd2",
+      "deep_gemm/small_moe.py": "7d2f1aa7ac4f760949c140428e427f010be4152134103b94998daf63c2fe9460",
+      "deep_gemm/small_moe_policy.py": "bba7bd57db879f592c24e26eca6ad121486ea51f989c45cbb607512b4a46be40",
+      "tests/test_sm120_small_moe_gpu.py": "b3fa31470e1cf9cfc2d8627c47bb3407cc712bfb92adf87006ed8906972a8d0a",
+      "tests/test_sm120_small_moe_policy.py": "d54fddce690ff6aa737ae572fe063cc393f5833c0e4ba1766a974982e204cae1",
+      "tests/bench_sm120_small_moe.py": "9cea5717394d6ae7263905f3fbdbd1d481d69e4a07950a6e69887f89a5622af8",
+      "tests/run_sm120_small_moe_validation.py": "b8c085b261e1e2bcb162dd4e77f1bf0bfebe23d52e07ffdebfbea13a24fdc999",
+      "csrc/apis/gemm.hpp": "bd4f800c76888977fa84ca6664d19638d078ac4d56640b790c4d2f1a6047773d",
+      "csrc/jit_kernels/heuristics/sm120.hpp": "8768c8b8a5138f05941888b09a667e77c5d06169794ebd7c914408ffbbbf89f8",
+      "csrc/jit_kernels/heuristics/sm120_config.hpp": "35ac5e4d70d5f1c567d83196e82ae44c8e6f60f1dfab1710f7344386f786682a",
+      "deep_gemm/include/deep_gemm/mma/sm120.cuh": "e1d207c47b38b964ae97d08a62d7392dd742e21256d7dd616082675b478f2cdf",
+      "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "d072b59efbd15853c74c250f312487b8c8bce0b52aae88d412a9c963ff1b1ff6",
+      "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "bf144bac3247980312d92e1b72f7701353539203eef381f1ce10ca6ee3c26655"
+    },
+    "extension_path": "/root/sm120-work/small-chain2/source/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so",
+    "extension_sha256": "c4108c0f53288401d21b4e8c7675d2023669dafb3fa0d0de65957a6107f78958",
+    "torch": "2.13.0+cu132",
+    "cuda": "13.2",
+    "gpu": "GPU-a7236a53-2726-62c6-41b5-0e53713a0063, NVIDIA GeForce RTX 5090, 610.57.04",
+    "inherited_accuracy_revision": "1c31df4b4969ca668bee71c548bc4b023c29ca52",
+    "universal_correct_rounding_asserted": false,
+    "pr_acceptance_asserted": false,
+    "total_tasks": 5,
+    "source_unchanged": true,
+    "elapsed_seconds": 344.4281469816342
+  },
+  "metadata_guard_note": "After holdouts, only SmallMoE constructor rejects zero-size weights, plus rejection tests. Timed forward/Triton AST and all GPU sources unchanged. Prior source retained; final source reruns correctness, four sanitizers and seed-283 boundaries.",
+  "summary": {
+    "complete": true,
+    "calibration_scenes": 144,
+    "holdout_scenes": 204,
+    "fused_holdout": {
+      "n": 180,
+      "min": 1.0490765224021783,
+      "geomean": 1.9368767335032515,
+      "max": 3.3283580987380015
+    },
+    "fallback_same_path": {
+      "n": 24,
+      "min": 0.9979079338685475,
+      "geomean": 1.0001777252204835,
+      "max": 1.002915474159107
+    },
+    "fallback_fastest_observed": {
+      "n": 24,
+      "min": 0.9661992025655074,
+      "geomean": 0.9975978886944769,
+      "max": 1.002915474159107
+    },
+    "rows": [
+      {
+        "shape": [
+          2048,
+          768,
+          1,
+          1
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 2.2627738203176184,
+          "geomean": 2.638600808442027,
+          "max": 3.3283580987380015
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 5.182481872774194,
+          "geomean": 5.648740298025508,
+          "max": 6.071428464702154
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.562043845240695,
+          "geomean": 1.771320398271028,
+          "max": 2.097014794084972
+        }
+      },
+      {
+        "shape": [
+          2048,
+          768,
+          1,
+          2
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 2.0,
+          "geomean": 2.4897023752898537,
+          "max": 3.1527776219847095
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 4.875862326435793,
+          "geomean": 5.223101117487306,
+          "max": 5.722221935899826
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.4827585895440574,
+          "geomean": 1.7270117652506876,
+          "max": 2.0486110753208115
+        }
+      },
+      {
+        "shape": [
+          2048,
+          768,
+          1,
+          4
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.9824560074771311,
+          "geomean": 2.498545230967246,
+          "max": 3.006493650687309
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 4.32163713975395,
+          "geomean": 4.980920529533836,
+          "max": 5.432432265016322
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.4736841388640707,
+          "geomean": 1.7128040342099409,
+          "max": 1.9610390408057452
+        }
+      },
+      {
+        "shape": [
+          2048,
+          768,
+          1,
+          8
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.8847736245999944,
+          "geomean": 2.2331344351434117,
+          "max": 2.5911112243645373
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 3.234567828781808,
+          "geomean": 3.5510991816496005,
+          "max": 4.009216660320601
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.3744856302233814,
+          "geomean": 1.540194944241073,
+          "max": 1.7188940061262894
+        }
+      },
+      {
+        "shape": [
+          2048,
+          768,
+          2,
+          1
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.8799998680626415,
+          "geomean": 2.3723986485944644,
+          "max": 3.0748300073957386
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 4.668831374384036,
+          "geomean": 5.050016655727328,
+          "max": 5.510204109916259
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.3793103275244762,
+          "geomean": 1.620511555822568,
+          "max": 1.9523809853784928
+        }
+      },
+      {
+        "shape": [
+          2048,
+          768,
+          2,
+          2
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.9640717581928369,
+          "geomean": 2.281686644650377,
+          "max": 2.759036147746824
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 4.365269441771995,
+          "geomean": 4.666051627137148,
+          "max": 5.090361345975032
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.4345238301472722,
+          "geomean": 1.6066525476501696,
+          "max": 1.8313252420592783
+        }
+      },
+      {
+        "shape": [
+          2048,
+          768,
+          2,
+          4
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.5791855984234942,
+          "geomean": 2.1347822518011714,
+          "max": 2.7488038012665177
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 3.393665268014679,
+          "geomean": 3.7851897351718846,
+          "max": 4.200956791883457
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.2824074688513223,
+          "geomean": 1.5490727781000249,
+          "max": 1.8086123802260783
+        }
+      },
+      {
+        "shape": [
+          2048,
+          768,
+          4,
+          1
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.949044569457032,
+          "geomean": 2.4016139934610017,
+          "max": 2.9225805258386153
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 4.496894205590177,
+          "geomean": 4.9487398669525025,
+          "max": 5.402597554767883
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.407643258969031,
+          "geomean": 1.6530021030231083,
+          "max": 1.9025974130284435
+        }
+      },
+      {
+        "shape": [
+          2048,
+          768,
+          4,
+          2
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.6274509901829497,
+          "geomean": 2.1710717138343774,
+          "max": 2.854999983629095
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 3.632352988382079,
+          "geomean": 4.042614727390859,
+          "max": 4.390862963285518
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.3217821860636738,
+          "geomean": 1.584944792661912,
+          "max": 1.8150000418367573
+        }
+      },
+      {
+        "shape": [
+          4096,
+          1536,
+          1,
+          1
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.4074074836239503,
+          "geomean": 1.8099645616721036,
+          "max": 2.207031235345056
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 4.217171809225464,
+          "geomean": 4.781290191414018,
+          "max": 5.138671908084646
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.1279461259664776,
+          "geomean": 1.3523116678287785,
+          "max": 1.5601503989741445
+        }
+      },
+      {
+        "shape": [
+          4096,
+          1536,
+          1,
+          2
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.3619631693713439,
+          "geomean": 1.7033085763203686,
+          "max": 2.023026492145795
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 3.8696316267567754,
+          "geomean": 4.299175980815996,
+          "max": 4.613945506343794
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.12269933556671,
+          "geomean": 1.323690368889183,
+          "max": 1.4934210979803473
+        }
+      },
+      {
+        "shape": [
+          4096,
+          1536,
+          1,
+          4
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.1462431254491061,
+          "geomean": 1.2167473924047956,
+          "max": 1.3415245969688814
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 1.5040120081759285,
+          "geomean": 1.5802378940011006,
+          "max": 1.6522177881910032
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.0280842323799226,
+          "geomean": 1.083178418299217,
+          "max": 1.1537298378224232
+        }
+      },
+      {
+        "shape": [
+          4096,
+          1536,
+          1,
+          8
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.0490765224021783,
+          "geomean": 1.1024691555692643,
+          "max": 1.2135770050867112
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 1.0934036682560173,
+          "geomean": 1.1287305331082542,
+          "max": 1.1665793500927084
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.0094986916637907,
+          "geomean": 1.0441585262741708,
+          "max": 1.0882506546462023
+        }
+      },
+      {
+        "shape": [
+          4096,
+          1536,
+          2,
+          1
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.4318182741635743,
+          "geomean": 1.7647253175141744,
+          "max": 2.0947369549733086
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 4.1964285629917,
+          "geomean": 4.576765301351331,
+          "max": 4.819298393417428
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.1461039749502944,
+          "geomean": 1.341926077352569,
+          "max": 1.5263158378457038
+        }
+      },
+      {
+        "shape": [
+          4096,
+          1536,
+          2,
+          2
+        ],
+        "vs_separate": {
+          "n": 12,
+          "min": 1.1476378536191874,
+          "geomean": 1.256679427729856,
+          "max": 1.5710723890652336
+        },
+        "vs_public": {
+          "n": 12,
+          "min": 1.522784174045855,
+          "geomean": 2.1005714604517856,
+          "max": 3.5232843844464847
+        },
+        "l2_increment": {
+          "n": 12,
+          "min": 1.0738288879752698,
+          "geomean": 1.1352514903502744,
+          "max": 1.316176529857499
+        }
+      }
+    ],
+    "scope": "X to Y, including dispatch, both layers, activation and combine",
+    "rtol": 0.01,
+    "atol": 0.002
+  },
+  "timing": {
+    "calibration": {
+      "complete": true,
+      "source_unchanged": true,
+      "source_hashes": {
+        "csrc/apis/gemm.hpp": "bd4f800c76888977fa84ca6664d19638d078ac4d56640b790c4d2f1a6047773d",
+        "csrc/apis/sm120_moe_small.hpp": "57ddec6b63b0f88d5ecfc6b6dbf3f6668f64db92ae728466d57cd65ebcd374c9",
+        "csrc/python_api.cpp": "428833fb0e5e3765189bf611bce987ced41d2cfcbc3dfeac9cd8cbb0e74e430e",
+        "csrc/jit_kernels/heuristics/sm120.hpp": "8768c8b8a5138f05941888b09a667e77c5d06169794ebd7c914408ffbbbf89f8",
+        "csrc/jit_kernels/heuristics/sm120_config.hpp": "35ac5e4d70d5f1c567d83196e82ae44c8e6f60f1dfab1710f7344386f786682a",
+        "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "bf144bac3247980312d92e1b72f7701353539203eef381f1ce10ca6ee3c26655",
+        "deep_gemm/include/deep_gemm/mma/sm120.cuh": "e1d207c47b38b964ae97d08a62d7392dd742e21256d7dd616082675b478f2cdf",
+        "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "d072b59efbd15853c74c250f312487b8c8bce0b52aae88d412a9c963ff1b1ff6",
+        "deep_gemm/include/deep_gemm/impls/sm120_bf16_moe_small.cuh": "1f31ac298774e7227dda30b4899b050c394f12c1c6c2c222f6c7042ec8cb2cd2",
+        "deep_gemm/small_moe.py": "7d2f1aa7ac4f760949c140428e427f010be4152134103b94998daf63c2fe9460",
+        "deep_gemm/small_moe_policy.py": "bba7bd57db879f592c24e26eca6ad121486ea51f989c45cbb607512b4a46be40",
+        "tests/test_sm120_small_moe_gpu.py": "b3fa31470e1cf9cfc2d8627c47bb3407cc712bfb92adf87006ed8906972a8d0a",
+        "tests/bench_sm120_small_moe.py": "9cea5717394d6ae7263905f3fbdbd1d481d69e4a07950a6e69887f89a5622af8"
+      },
+      "extension_sha256": "c4108c0f53288401d21b4e8c7675d2023669dafb3fa0d0de65957a6107f78958",
+      "seeds": [
+        269
+      ],
+      "batches": 7,
+      "repeats": 20,
+      "scene_count": 144
+    },
+    "holdout": {
+      "complete": true,
+      "source_unchanged": true,
+      "source_hashes": {
+        "csrc/apis/gemm.hpp": "bd4f800c76888977fa84ca6664d19638d078ac4d56640b790c4d2f1a6047773d",
+        "csrc/apis/sm120_moe_small.hpp": "57ddec6b63b0f88d5ecfc6b6dbf3f6668f64db92ae728466d57cd65ebcd374c9",
+        "csrc/python_api.cpp": "428833fb0e5e3765189bf611bce987ced41d2cfcbc3dfeac9cd8cbb0e74e430e",
+        "csrc/jit_kernels/heuristics/sm120.hpp": "8768c8b8a5138f05941888b09a667e77c5d06169794ebd7c914408ffbbbf89f8",
+        "csrc/jit_kernels/heuristics/sm120_config.hpp": "35ac5e4d70d5f1c567d83196e82ae44c8e6f60f1dfab1710f7344386f786682a",
+        "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "bf144bac3247980312d92e1b72f7701353539203eef381f1ce10ca6ee3c26655",
+        "deep_gemm/include/deep_gemm/mma/sm120.cuh": "e1d207c47b38b964ae97d08a62d7392dd742e21256d7dd616082675b478f2cdf",
+        "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "d072b59efbd15853c74c250f312487b8c8bce0b52aae88d412a9c963ff1b1ff6",
+        "deep_gemm/include/deep_gemm/impls/sm120_bf16_moe_small.cuh": "1f31ac298774e7227dda30b4899b050c394f12c1c6c2c222f6c7042ec8cb2cd2",
+        "deep_gemm/small_moe.py": "7d2f1aa7ac4f760949c140428e427f010be4152134103b94998daf63c2fe9460",
+        "deep_gemm/small_moe_policy.py": "bba7bd57db879f592c24e26eca6ad121486ea51f989c45cbb607512b4a46be40",
+        "tests/test_sm120_small_moe_gpu.py": "b3fa31470e1cf9cfc2d8627c47bb3407cc712bfb92adf87006ed8906972a8d0a",
+        "tests/bench_sm120_small_moe.py": "9cea5717394d6ae7263905f3fbdbd1d481d69e4a07950a6e69887f89a5622af8"
+      },
+      "extension_sha256": "c4108c0f53288401d21b4e8c7675d2023669dafb3fa0d0de65957a6107f78958",
+      "seeds": [
+        277,
+        281
+      ],
+      "batches": 7,
+      "repeats": 20,
+      "scene_count": 204
+    },
+    "final-boundary": {
+      "complete": true,
+      "source_unchanged": true,
+      "source_hashes": {
+        "csrc/apis/gemm.hpp": "bd4f800c76888977fa84ca6664d19638d078ac4d56640b790c4d2f1a6047773d",
+        "csrc/apis/sm120_moe_small.hpp": "57ddec6b63b0f88d5ecfc6b6dbf3f6668f64db92ae728466d57cd65ebcd374c9",
+        "csrc/python_api.cpp": "428833fb0e5e3765189bf611bce987ced41d2cfcbc3dfeac9cd8cbb0e74e430e",
+        "csrc/jit_kernels/heuristics/sm120.hpp": "8768c8b8a5138f05941888b09a667e77c5d06169794ebd7c914408ffbbbf89f8",
+        "csrc/jit_kernels/heuristics/sm120_config.hpp": "35ac5e4d70d5f1c567d83196e82ae44c8e6f60f1dfab1710f7344386f786682a",
+        "csrc/jit_kernels/impls/sm120_bf16_gemm.hpp": "bf144bac3247980312d92e1b72f7701353539203eef381f1ce10ca6ee3c26655",
+        "deep_gemm/include/deep_gemm/mma/sm120.cuh": "e1d207c47b38b964ae97d08a62d7392dd742e21256d7dd616082675b478f2cdf",
+        "deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh": "d072b59efbd15853c74c250f312487b8c8bce0b52aae88d412a9c963ff1b1ff6",
+        "deep_gemm/include/deep_gemm/impls/sm120_bf16_moe_small.cuh": "1f31ac298774e7227dda30b4899b050c394f12c1c6c2c222f6c7042ec8cb2cd2",
+        "deep_gemm/small_moe.py": "5bc7309f002f3e34cc797835219c3569c8e696d2c89456431a377a2dbbfed62a",
+        "deep_gemm/small_moe_policy.py": "bba7bd57db879f592c24e26eca6ad121486ea51f989c45cbb607512b4a46be40",
+        "tests/test_sm120_small_moe_gpu.py": "e61ed4d2308665d8d385b6087db9a849e2aabda01d4fe31420c582c995644511",
+        "tests/bench_sm120_small_moe.py": "9cea5717394d6ae7263905f3fbdbd1d481d69e4a07950a6e69887f89a5622af8"
+      },
+      "extension_sha256": "c4108c0f53288401d21b4e8c7675d2023669dafb3fa0d0de65957a6107f78958",
+      "seeds": [
+        283
+      ],
+      "batches": 7,
+      "repeats": 20,
+      "scene_count": 19
+    }
+  },
+  "timing_data": {
+    "file": "sm120-small-moe-timings-20261115.jsonl",
+    "sha256_lf": "3e5d818061d10b940993c8698fd3b9ffe81044879f617939830e753edc7f6bae",
+    "records": 367,
+    "format": "one JSON scene per line; raw samples listed in batch order per comparison label"
+  }
+}

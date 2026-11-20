@@ -1,0 +1,21 @@
+[
+  {"d": 4096, "i": 1536, "t": 1, "k": 8, "e": 64, "distribution": "uniform"},
+  {"d": 4096, "i": 1536, "t": 1, "k": 8, "e": 64, "distribution": "concentrated"},
+  {"d": 4096, "i": 1536, "t": 1, "k": 8, "e": 64, "distribution": "skew75"},
+  {"d": 4096, "i": 1536, "t": 1, "k": 8, "e": 128, "distribution": "uniform"},
+  {"d": 4096, "i": 1536, "t": 1, "k": 8, "e": 128, "distribution": "concentrated"},
+  {"d": 4096, "i": 1536, "t": 1, "k": 8, "e": 128, "distribution": "skew75"},
+  {"d": 4096, "i": 1536, "t": 2, "k": 2, "e": 64, "distribution": "uniform"},
+  {"d": 4096, "i": 1536, "t": 2, "k": 2, "e": 64, "distribution": "concentrated"},
+  {"d": 4096, "i": 1536, "t": 2, "k": 2, "e": 64, "distribution": "skew75"},
+  {"d": 4096, "i": 1536, "t": 2, "k": 2, "e": 128, "distribution": "uniform"},
+  {"d": 4096, "i": 1536, "t": 2, "k": 2, "e": 128, "distribution": "concentrated"},
+  {"d": 4096, "i": 1536, "t": 2, "k": 2, "e": 128, "distribution": "skew75"},
+  {"d": 2048, "i": 768, "t": 4, "k": 2, "e": 64, "distribution": "uniform"},
+  {"d": 2048, "i": 768, "t": 4, "k": 2, "e": 64, "distribution": "concentrated"},
+  {"d": 2048, "i": 768, "t": 4, "k": 2, "e": 64, "distribution": "skew75"},
+  {"d": 2048, "i": 768, "t": 4, "k": 2, "e": 128, "distribution": "uniform"},
+  {"d": 2048, "i": 768, "t": 4, "k": 2, "e": 128, "distribution": "concentrated"},
+  {"d": 2048, "i": 768, "t": 4, "k": 2, "e": 128, "distribution": "skew75"},
+  {"d": 4096, "i": 1536, "t": 4, "k": 4, "e": 128, "distribution": "concentrated"}
+]

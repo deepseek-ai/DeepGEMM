@@ -1,0 +1,53 @@
+{
+  "schema": "sm120-pr501-host-review-v1",
+  "date": "2026-11-21",
+  "checked_at": "2026-11-20T16:12:29.228172+00:00",
+  "reviewed_head": "f5a77a3f09d1efc1b4b676bf09046fcb9d418124",
+  "gpu_execution_head": "643f4f3ce4991889b702e814210fe754b7f36ec6",
+  "scope": "host metadata eligibility and documentation",
+  "fixes": [
+    "Direct expert IDs must be 16-byte aligned before fused dispatch; slot inputs retain offset support.",
+    "Down weights must be CUDA and share the gate/up device before workspace eligibility."
+  ],
+  "tests": {
+    "per_platform": 13,
+    "new_adapter_methods": 4,
+    "platforms": {
+      "windows": {
+        "exit_code": 0,
+        "log_sha256": "fda54b51a21e4c32eec889a7789968f94dece298ab2c4731c9c3461407920813"
+      },
+      "linux": {
+        "exit_code": 0,
+        "log_sha256": "0c1c72499a389243b36ad0c83d947f624666d5927fb66f7e6b84aa1835581b02"
+      }
+    },
+    "baseline_reproduction": {
+      "log_sha256": "5176fbf026df89d3457872ad36d12eae8ab1f1d8d5a661124124c010f179e149",
+      "outcome": "2 failures and 2 errors in four adapter test methods before the guard fixes"
+    },
+    "method": "Actual adapter registration/dispatch with metadata and module doubles; not GPU or vLLM ABI proof"
+  },
+  "source_sha256": {
+    "examples/vllm_sm120/sm120_vllm.py": "14167aa83dc5cbe498b3e354b6bd20898b492021eb7c4445beaff5510113d6ee",
+    "tests/test_sm120_vllm_adapter.py": "0b73ad98c7fb68d014c20eb282fe21b4e1e2570f409e61a5aa471426c860ad23",
+    "examples/vllm_sm120/README.md": "2992d6b18ccbf303266febbc732a8afe9253b2471d768f6d485f3385b7975256",
+    "docs/sm120-final-review-scope.md": "e0821f449776a0c89e1f1ee3a8d618ba2e4a4fffea2045886ace9766525dd94c",
+    "docs/sm120-grouped-bf16-swiglu-validation.md": "827f7c5924c278eee4a4f908235dec8cd1bc842280be11cf366ae8215bb1dc5c"
+  },
+  "csrc_deep_gemm_scripts_tp_policy_unchanged_since_gpu_execution": true,
+  "accepted_input_gpu_launch_order_unchanged": true,
+  "host_checks_increased": true,
+  "previous_gpu_timings_apply_to_recorded_execution_head_only": true,
+  "gpu_run_this_review": false,
+  "serving_run_this_review": false,
+  "original_checkout_and_index_unchanged": true,
+  "limitations": [
+    "Finite review and regression coverage are not exhaustive proof.",
+    "TP2 short-generation regression remains unresolved.",
+    "Historical full NLL corpus was not rerun on the merged extension.",
+    "Adapter remains disabled by default."
+  ],
+  "local_review_bundle": "deliverables/sm120-pr501-review-20261120",
+  "gpu_receipt": "sm120-pr501-postmerge-20261120.json"
+}

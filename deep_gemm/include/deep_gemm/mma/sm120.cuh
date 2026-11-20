@@ -13,6 +13,7 @@
 #endif
 
 #include <cuda/std/cstdint>
+#include <cuda_bf16.h>
 
 namespace deep_gemm::mma::sm120 {
 
@@ -141,14 +142,81 @@ static constexpr int BF16_MMA_ACCUM = 4;
 __device__ __forceinline__ void bf16_mma(
     float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]
 ) {
+    // Accumulate the local tensor-core dot into zero, then explicitly round
+    // the cross-instruction accumulation in FP32. Keeping a long reduction
+    // inside MMA can move a projection across a BF16 rounding midpoint.
+    float partial[4];
+    const float zero = 0.f;
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-        "{%0,%1,%2,%3};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        "{%10,%10,%10,%10};\n"
+        : "=f"(partial[0]), "=f"(partial[1]), "=f"(partial[2]), "=f"(partial[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-          "r"(b[0]), "r"(b[1])
+          "r"(b[0]), "r"(b[1]), "f"(zero)
     );
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+        d[i] = __fadd_rn(d[i], partial[i]);
+}
+
+// Rare BF16 midpoint refinement. FP32 accumulation can select the opposite
+// BF16 neighbor from the FP64 reference. Keep this
+// slow path outside the MMA loop; ordinary values retain the tensor-core path.
+__device__ __noinline__ float bf16_refine_pending(
+    float value, const __nv_bfloat16* a, const __nv_bfloat16* b, uint32_t k, uint32_t pending
+) {
+    constexpr uint32_t mask = 0xffffffffu;
+    const uint32_t lane = threadIdx.x % 32;
+    // All lanes in a full math warp must call this helper, even for invalid
+    // output positions. Cooperate on each rare dot to keep K loads coalesced
+    // and avoid a long scalar tail on the decode critical path.
+    while (pending) {
+        const uint32_t owner = __ffs(pending) - 1;
+        const auto* row_a = reinterpret_cast<const __nv_bfloat16*>(
+            __shfl_sync(mask, reinterpret_cast<unsigned long long>(a), owner));
+        const auto* row_b = reinterpret_cast<const __nv_bfloat16*>(
+            __shfl_sync(mask, reinterpret_cast<unsigned long long>(b), owner));
+        // Retain the low part of each FP32 addition with TwoSum. BF16
+        // products are exactly representable within the normal FP32 range.
+        float sum = 0.f, residual = 0.f;
+        auto add = [&](float term) {
+            const float next = __fadd_rn(sum, term);
+            const float split = __fsub_rn(next, sum);
+            const float error = __fadd_rn(__fsub_rn(sum, __fsub_rn(next, split)),
+                                         __fsub_rn(term, split));
+            residual = __fadd_rn(residual, error);
+            sum = next;
+        };
+        for (uint32_t index = lane; index < k; index += 32)
+            add(__fmul_rn(__bfloat162float(row_a[index]), __bfloat162float(row_b[index])));
+        #pragma unroll
+        for (uint32_t offset = 16; offset; offset >>= 1) {
+            const float other_sum = __shfl_down_sync(mask, sum, offset);
+            const float other_residual = __shfl_down_sync(mask, residual, offset);
+            add(other_sum);
+            residual = __fadd_rn(residual, other_residual);
+        }
+        const float refined = __shfl_sync(mask, __fadd_rn(sum, residual), 0);
+        if (lane == owner) value = refined;
+        pending &= pending - 1;
+    }
+    return value;
+}
+
+__device__ __forceinline__ float bf16_refine_midpoint(
+    float value, const __nv_bfloat16* a, const __nv_bfloat16* b, uint32_t k, bool valid = true
+) {
+    const uint32_t bits = __float_as_uint(value);
+    const int distance = static_cast<int>(bits & 0xffffu) - 0x8000;
+    // This guard is a practical refinement window, not a proof of correctly
+    // rounded arbitrary GEMMs. Infinities and NaNs keep their normal behavior.
+    constexpr uint32_t mask = 0xffffffffu;
+    const uint32_t lane = threadIdx.x % 32;
+    uint32_t pending = __ballot_sync(mask, valid and (bits & 0x7f800000u) != 0x7f800000u
+                                    and distance >= -32 and distance <= 32);
+    if (pending) return bf16_refine_pending(value, a, b, k, pending);
+    return value;
 }
 
 // TF32 MMA: m16n8k8

@@ -22,3 +22,7 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+
+# Local experiment packages and source seals
+/artifacts/
+/source-manifest.json
