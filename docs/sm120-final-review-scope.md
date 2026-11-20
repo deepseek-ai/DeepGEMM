@@ -42,7 +42,7 @@ T>1、未知键、其他设备在该策略下回退。压力测试退化的 3584
 - 每层拥有工作区；模型 forward 串行，不允许多个独立 stream 并发共享。计数器只计 dispatch/capture，不计 Graph replay。
 - 输入专家 ID 要求合法专家不重复；padding 会映射到保留行并在 combine 中排除。该约定并非 host 上逐值校验。
 
-## 结果、质量与未完成范围
+## 历史快照的结果、质量与未完成范围
 
 完整原始 BF16 Qwen3-Coder-30B-A3B-Instruct、双 5090、batch=1、串行请求、mode0、decode Graph：历史等输出整模型场景请求延迟 PP2 降低 2.27–7.22%，TP2 降低 4.82–8.30%。HTTP 的 72 行中有 56 行等输出，分别降低 1.00–3.00% 和 2.23–5.84%；16 行不同输出单列，不计入等输出收益。各实现两个独立进程位于同一会话，未证明跨会话稳定性或吞吐优势。
 
@@ -62,7 +62,8 @@ T>1、未知键、其他设备在该策略下回退。压力测试退化的 3584
 | 历史整模型/HTTP 原始证据 | `log/2026-11-20/batch1-final1-live/final-download2/b1f1/verified/b1f1/` |
 | 最终质量原始 logits/日志 | `log/2026-11-20/final-quality-live/final-download/extracted/final-quality-2/` |
 | 质量结果、独立复算、定位 | `deliverables/sm120-final-acceptance-completed-20261120/` 中的 REPORT、analysis、secondary-metrics、localization-summary、local-remote-reanalysis-audit |
-| 中文论文 | 同上 `paper/main.pdf` 与 `paper/main.tex`（25 页、16 图） |
+| 历史中文论文 | 同上 `paper/main.pdf` 与 `paper/main.tex`（25 页、16 图） |
+| 代码审查整理版论文 | `deliverables/sm120-pr501-review-20261120/paper/`（26 页、19 图、13 表；当前复测置于第4.2节） |
 | 当前候选与 CPU 回执 | `deliverables/sm120-pr501-review-ready-20261120/` |
 | 上游合并、发布身份与当前 CPU 回执 | `deliverables/sm120-pr501-publish-20261120/` |
 
@@ -77,7 +78,7 @@ T>1、未知键、其他设备在该策略下回退。压力测试退化的 3584
 
 ## 上游合并后的 GPU 验证（2026-11-20）
 
-GPU 执行 head 为 `643f4f3ce4991889b702e814210fe754b7f36ec6`，tree 为 `1c557cbf5fb0e848a8d35d0428340a66241f58d8`。本次新增提交只更新本文与验证 JSON，内核、API、测试、适配器与配置相对 GPU 执行 head 的字节不变。
+GPU 执行 head 为 `643f4f3ce4991889b702e814210fe754b7f36ec6`，tree 为 `1c557cbf5fb0e848a8d35d0428340a66241f58d8`。随后的 `f5a77a3` 只更新本文与验证 JSON；该提交的内核、API、测试、适配器与配置相对 GPU 执行 head 的字节不变。之后的主机端审查修订单列于下节。
 
 新扩展 SHA256：`a89993de11376f4ad9d15d04246df925a60476d09e575998ddcacad9a6555aa9`。证据归档 SHA256：`0dd5bb1a33b287beecdd1c50607d05ea26479e6e8dad9400faa235608b0f2056`。本地完整交付位于 `deliverables/sm120-pr501-gpu-20261120/`；机器可读摘要为 [合并后验证](validation/sm120-pr501-postmerge-20261120.json)。
 
@@ -90,3 +91,11 @@ GPU 执行 head 为 `643f4f3ce4991889b702e814210fe754b7f36ec6`，tree 为 `1c557
 TP2 短请求回退保留。上下文512/生成32时，原生/融合首 token 中位延迟99.18/123.44ms，首末token间隔179.67/177.49ms；decode间隔的节省未抵消首token增加。不能由此断言CPU/prefill/通信/包装器中的具体根因。核心正确性通过不等于完整服务性能验收，TP适配器继续默认关闭。
 
 相对历史对应进程/提示的48项核对，token相同48项，已记录top-5 logprob完全相同48项。历史 `PASS_SCOPED_NLL` 仍属于旧扩展；本轮没有重跑其三领域完整语料，不能写成当前提交的自动质量通过。
+
+## 主机端代码审查修订（2026-11-21）
+
+审查 `f5a77a3` 时发现，direct-ID 输入地址不满足私有接口要求的16字节对齐时，适配器仍进入融合后触发断言；同时权重预检遗漏 down 权重的 CUDA 设备一致性。已补齐这两个元数据检查。direct-ID 不对齐时在任何融合/共享专家调用前回到原生路径；slot 准备仍接受连续的偏移 ID，因为其内部输出拥有对齐的地址。两段权重必须位于同一 CUDA 设备才可进入融合候选。
+
+新增 `tests/test_sm120_vllm_adapter.py` 在 CPU 上执行实际注册与分派代码，以元数据替身检查 int32/int64 偏移 ID、slot/direct 正常分派顺序、配置、共享专家调用顺序、权重设备拒绝和默认关闭。它不替代真实 vLLM ABI 或 GPU 算术测试。修订前能复现 direct-ID 断言及错误的权重资格判定；修订后新增4项与原stub/策略9项合计13项在 Windows 与 Linux 各自通过。机器可读记录见 [主机端审查](validation/sm120-pr501-host-review-20261121.json)。
+
+该修订只增加主机端资格与回退检查，未修改 C++、CUDA、算术、配置、框架通信及合法输入的 GPU 发射顺序；主机检查有所增加，旧计时不自动成为修订后的新计时。2026-11-20的GPU/模型结果仍按原执行 head 报告，不将这次CPU检查写作新GPU或新服务验收。适配器仍默认关闭，TP2短请求回退仍待定位。

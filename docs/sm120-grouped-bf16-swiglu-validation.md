@@ -63,8 +63,9 @@ No outlined fused regression exceeded 1% versus the published fused control
 in this sweep.
 This sweep does not establish a universal speedup or an automatic fallback
 boundary. Callers retain explicit fused/separate API selection. Earlier
-speedups from before the accuracy repair remain historical. This PR remains
-Draft while the accuracy/performance tradeoff is reviewed. No NCU counters
+speedups from before the accuracy repair remain historical. The PR was Draft
+at the time of this sweep; its current scope and subsequent validation are
+recorded in [the final review guide](sm120-final-review-scope.md). No NCU counters
 were collected on this rental GPU; instruction-cache or occupancy causes
 are not established by these timings.
 

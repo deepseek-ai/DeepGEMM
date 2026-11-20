@@ -124,7 +124,8 @@ def register():
                     or layer.apply_router_weight_on_input or layer.expert_map is not None):
                 return "unsupported activation, scaling, bias or expert map"
             gu, down = layer.w13_weight, layer.w2_weight
-            if not gu.is_cuda or gu.ndim != 3 or down.ndim != 3:
+            if (not gu.is_cuda or not down.is_cuda or down.device != gu.device
+                    or gu.ndim != 3 or down.ndim != 3):
                 return "non-CUDA or unexpected weights"
             if gu.dtype != torch.bfloat16 or down.dtype != torch.bfloat16:
                 return "BF16 required"
@@ -157,7 +158,8 @@ def register():
                     or topk_ids.dtype not in (torch.int32, torch.int64)
                     or not topk_ids.is_contiguous() or not topk_weights.is_contiguous()
                     or topk_weights.device != x.device or topk_ids.device != x.device
-                    or topk_weights.data_ptr() % 16):
+                    or topk_weights.data_ptr() % 16
+                    or (ws["direct_ids"] and topk_ids.data_ptr() % 16)):
                 self.sm120_dispatches["native"] += 1
                 return super().forward_native(
                     layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input,
