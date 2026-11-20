@@ -9,7 +9,8 @@ namespace deep_gemm::sm120_moe_small {
 
 static void launch(const torch::Tensor& input, const torch::Tensor& b,
                    const torch::Tensor& slots, const torch::Tensor& weights,
-                   const torch::Tensor& output, bool l1, int bn, int stages, int bundle) {
+                   const torch::Tensor& output, bool l1, int bn, int stages, int bundle,
+                   bool gate_up_swapped) {
     DG_HOST_ASSERT(input.is_cuda());
     const c10::cuda::CUDAGuard guard(input.device());
     const auto* device = at::cuda::getDeviceProperties(input.get_device());
@@ -42,6 +43,7 @@ static void launch(const torch::Tensor& input, const torch::Tensor& b,
     DG_HOST_ASSERT(bn == 8 or bn == 16 or bn == 32);
     DG_HOST_ASSERT(stages >= 2 and stages <= 4 and bundle >= 1 and bundle <= topk and topk % bundle == 0);
     DG_HOST_ASSERT(l1 or bundle == topk);
+    DG_HOST_ASSERT(l1 or not gate_up_swapped);
     // Values of slots are a device-side caller contract: each route has a
     // unique slot in a valid expert row. No host readback or allocation here.
     const auto map_a = make_tma_2d_desc(input, k, l1 ? t : e * capacity, 64, 1, k, 0);
@@ -50,9 +52,10 @@ static void launch(const torch::Tensor& input, const torch::Tensor& b,
 #include <deep_gemm/impls/sm120_bf16_moe_small.cuh>
 using namespace deep_gemm;
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm120_bf16_moe_small<{}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&sm120_bf16_moe_small<{}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)", d, k, topk, bn, stages, bundle, l1 ? "true" : "false");
+)", d, k, topk, bn, stages, bundle, l1 ? "true" : "false",
+    gate_up_swapped ? "true" : "false");
     const int a_bytes = stages * (l1 ? 1 : bundle) * 128;
     const int b_offset = (a_bytes + 1023) & ~1023;
     const int smem = b_offset + stages * bundle * (l1 ? 2 : 1) * bn * 128 +
@@ -68,7 +71,8 @@ static void register_apis(pybind11::module_& m) {
     using namespace pybind11::literals;
     // Private building block; the opt-in Python workspace owns fallback policy.
     m.def("_sm120_moe_small", &launch, "input"_a, "weight"_a, "slots"_a,
-          "route_weights"_a, "output"_a, "l1"_a, "block_n"_a, "stages"_a, "bundle"_a);
+          "route_weights"_a, "output"_a, "l1"_a, "block_n"_a, "stages"_a, "bundle"_a,
+          pybind11::kw_only(), "gate_up_swapped"_a = false);
 }
 
 } // namespace deep_gemm::sm120_moe_small

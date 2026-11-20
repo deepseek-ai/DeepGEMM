@@ -8,7 +8,7 @@ namespace deep_gemm {
 // experts; L2 retains the rounded expert contributions until CTA-local combine.
 // The ring barriers transfer data ownership, not scheduler commands.
 template <uint32_t D, uint32_t I, uint32_t TOPK, uint32_t BN,
-          uint32_t STAGES, uint32_t BUNDLE, bool L1>
+          uint32_t STAGES, uint32_t BUNDLE, bool L1, bool GATE_UP_SWAPPED = false>
 CUTLASS_GLOBAL __launch_bounds__((BUNDLE + 4) * 32, 2)
 void sm120_bf16_moe_small(
     const int64_t* slots, const float* weights, cutlass::bfloat16_t* output,
@@ -18,6 +18,7 @@ void sm120_bf16_moe_small(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
     static_assert(TOPK >= 1 && TOPK <= 8 && TOPK % BUNDLE == 0);
     static_assert(L1 || BUNDLE == TOPK);
+    static_assert(L1 || !GATE_UP_SWAPPED);
     static_assert(BN == 8 || BN == 16 || BN == 32);
     static_assert(D % BN == 0 && I % 64 == 0 && STAGES >= 2 && STAGES <= 4);
     constexpr uint32_t GROUPS = TOPK / BUNDLE;
@@ -67,12 +68,13 @@ void sm120_bf16_moe_small(
                     }
                     tma::copy<128, BN, 128, char>(&map_b, &full[s],
                         buffer + B_OFFSET + s * B_BYTES + r * (L1 ? 2 : 1) * BN * 128,
-                        kb * 64, expert * (L1 ? 2 : 1) * D + nb * BN, 1);
+                        kb * 64, expert * (L1 ? 2 : 1) * D +
+                            (GATE_UP_SWAPPED ? D : 0) + nb * BN, 1);
                     bytes += BN * 128;
                     if constexpr (L1) {
                         tma::copy<128, BN, 128, char>(&map_b, &full[s],
                             buffer + B_OFFSET + s * B_BYTES + (r * 2 + 1) * BN * 128,
-                            kb * 64, expert * 2 * D + D + nb * BN, 1);
+                            kb * 64, expert * 2 * D + (GATE_UP_SWAPPED ? 0 : D) + nb * BN, 1);
                         bytes += BN * 128;
                     }
                 }
@@ -125,11 +127,14 @@ void sm120_bf16_moe_small(
             #pragma unroll
             for (uint32_t j = 0; j < 2; ++j) {
                 const uint32_t col = nb * BN + nt * 8 + (lane < 4 ? lane * 2 + j : 0);
-                const auto* row_b = original_b + (expert * (L1 ? 2 : 1) * D + col) * I;
+                const auto* row_b = original_b +
+                    (expert * (L1 ? 2 : 1) * D + (GATE_UP_SWAPPED ? D : 0) + col) * I;
                 accum[nt][j] = mma::sm120::bf16_refine_midpoint(accum[nt][j], row_a, row_b, I, lane < 4);
                 if constexpr (L1)
                     accum_up[nt][j] = mma::sm120::bf16_refine_midpoint(
-                        accum_up[nt][j], row_a, row_b + uint64_t(D) * I, I, lane < 4);
+                        accum_up[nt][j], row_a,
+                        GATE_UP_SWAPPED ? row_b - uint64_t(D) * I : row_b + uint64_t(D) * I,
+                        I, lane < 4);
             }
         }
         if (lane < 4) {

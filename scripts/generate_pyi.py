@@ -301,7 +301,12 @@ def parse_m_def_statement(m_def_str):
             result['cpp_function_name'] = cpp_func_name
 
     # Parse py::arg arguments
-    py_args = args_list[2:]
+    py_args = []
+    for expr in args_list[2:]:
+        if expr.strip() in ('py::kw_only()', 'pybind11::kw_only()'):
+            result['kw_only_start'] = len(py_args)
+        else:
+            py_args.append(expr)
     result['num_args'] = len(py_args)
 
     for idx, arg_expr in enumerate(py_args):
@@ -798,6 +803,8 @@ def generate_pyi_function(item_entry):
     # Build parameter list
     param_lines = []
     for i in range(num_params):
+        if i == parsed.get('kw_only_start'):
+            param_lines.append('    *')
         param_info = params[i] if i < len(params) else {'type': 'Any', 'name': f'arg{i}'}
         param_type = cpp_type_to_python_type(param_info['type'])
         param_name = param_info['name'] or f'arg{i}'

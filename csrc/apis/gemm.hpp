@@ -828,7 +828,10 @@ static void m_grouped_bf16_swiglu_nt_masked(const torch::Tensor& a,
                                              const torch::Tensor& b,
                                              const torch::Tensor& d,
                                              const torch::Tensor& masked_m,
-                                             const int expected_m) {
+                                             const int expected_m,
+                                             const int sm120_m_tile = 0) {
+    DG_HOST_ASSERT(sm120_m_tile == 0 or sm120_m_tile == 32 or
+                   sm120_m_tile == 64 or sm120_m_tile == 128);
     DG_HOST_ASSERT(a.is_cuda());
     c10::cuda::OptionalCUDAGuard device_guard;
     device_guard.set_device(a.device());
@@ -854,7 +857,7 @@ static void m_grouped_bf16_swiglu_nt_masked(const torch::Tensor& a,
     DG_HOST_ASSERT(get_major_type_ab(a) == cute::UMMA::Major::K and
                    get_major_type_ab(b) == cute::UMMA::Major::K);
 
-    sm120_m_grouped_bf16_swiglu_masked(a, b, d, masked_m, expected_m);
+    sm120_m_grouped_bf16_swiglu_masked(a, b, d, masked_m, expected_m, sm120_m_tile);
 }
 
 static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
@@ -1149,7 +1152,7 @@ static void register_apis(pybind11::module_& m) {
           py::arg("sm120_m_tile") = 0);
     m.def("m_grouped_bf16_swiglu_nt_masked", &m_grouped_bf16_swiglu_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
-          py::arg("expected_m"));
+          py::arg("expected_m"), py::kw_only(), py::arg("sm120_m_tile") = 0);
     m.def("k_grouped_bf16_gemm_tn_contiguous", &k_grouped_bf16_gemm_tn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("ks_cpu"), py::arg("grouped_layout"),

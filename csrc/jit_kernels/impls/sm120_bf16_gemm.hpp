@@ -311,7 +311,8 @@ static void sm120_m_grouped_bf16_swiglu_masked(const torch::Tensor& a,
                                                 const torch::Tensor& b,
                                                 const torch::Tensor& d,
                                                 const torch::Tensor& masked_m,
-                                                const int expected_m) {
+                                                const int expected_m,
+                                                const int block_m_override = 0) {
     const auto [groups, m, k] = get_shape<3>(a);
     const auto [weight_groups, twice_n, weight_k] = get_shape<3>(b);
     DG_HOST_ASSERT(groups == weight_groups and k == weight_k);
@@ -328,7 +329,8 @@ static void sm120_m_grouped_bf16_swiglu_masked(const torch::Tensor& a,
         .tc_util = deep_gemm::runtime->get_tc_util(),
         .compiled_dims = "nk",
         .expected_m = expected_m, .expected_n = n, .expected_k = k,
-        .expected_num_groups = groups
+        .expected_num_groups = groups,
+        .block_m_override = block_m_override
     };
     auto config = get_best_sm120_config<SM120ArchSpec>(desc);
     config.storage_config.swizzle_cd_mode = 0;
