@@ -8,10 +8,11 @@ namespace deep_gemm {
 // experts; L2 retains the rounded expert contributions until CTA-local combine.
 // The ring barriers transfer data ownership, not scheduler commands.
 template <uint32_t D, uint32_t I, uint32_t TOPK, uint32_t BN,
-          uint32_t STAGES, uint32_t BUNDLE, bool L1, bool GATE_UP_SWAPPED = false>
+          uint32_t STAGES, uint32_t BUNDLE, bool L1, bool GATE_UP_SWAPPED = false,
+          uint32_t EXPERTS = 0, typename IndexT = int64_t>
 CUTLASS_GLOBAL __launch_bounds__((BUNDLE + 4) * 32, 2)
 void sm120_bf16_moe_small(
-    const int64_t* slots, const float* weights, cutlass::bfloat16_t* output,
+    const IndexT* slots, const float* weights, cutlass::bfloat16_t* output,
     uint32_t capacity, const __nv_bfloat16* original_a, const __nv_bfloat16* original_b,
     const __grid_constant__ cute::TmaDescriptor map_a,
     const __grid_constant__ cute::TmaDescriptor map_b) {
@@ -53,8 +54,17 @@ void sm120_bf16_moe_small(
                 empty[s].wait(phase ^ 1);
                 uint32_t bytes = 0;
                 for (uint32_t r = warp - BUNDLE; r < BUNDLE; r += 4) {
-                    const uint64_t slot = slots[token * TOPK + route_base + r];
-                    const uint32_t expert = slot / capacity;
+                    uint64_t slot;
+                    uint32_t expert;
+                    if constexpr (EXPERTS > 0) {
+                        const int64_t id = slots[route_base + r];
+                        const bool valid = id >= 0 && id < int64_t(EXPERTS);
+                        expert = valid ? uint32_t(id) : 0;
+                        slot = valid ? uint64_t(expert) * capacity : route_base + r + 1;
+                    } else {
+                        slot = slots[token * TOPK + route_base + r];
+                        expert = slot / capacity;
+                    }
                     if constexpr (L1) {
                         if (r == 0) {
                             tma::copy<128, 1, 0, char>(&map_a, &full[s],
@@ -117,8 +127,16 @@ void sm120_bf16_moe_small(
             __syncwarp();
             if (lane == 0) empty[s].arrive();
         }
-        const uint64_t slot = slots[token * TOPK + route_base + warp];
-        const uint64_t expert = slot / capacity;
+        uint64_t slot, expert;
+        if constexpr (EXPERTS > 0) {
+            const int64_t id = slots[route_base + warp];
+            const bool valid = id >= 0 && id < int64_t(EXPERTS);
+            expert = valid ? uint64_t(id) : 0;
+            slot = valid ? expert * capacity : route_base + warp + 1;
+        } else {
+            slot = slots[token * TOPK + route_base + warp];
+            expert = slot / capacity;
+        }
         const auto* row_a = original_a + (L1 ? token : slot) * I;
         // Every math lane participates in the midpoint ballot and cooperative
         // refinement. Only lanes 0..3 own the logical row that is stored.
@@ -172,6 +190,12 @@ void sm120_bf16_moe_small(
             float x = 0.f, y = 0.f;
             #pragma unroll
             for (uint32_t r = 0; r < TOPK; ++r) {
+                if constexpr (EXPERTS > 0) {
+                    const int64_t id = slots[r];
+                    // Do not consume padding weights or contributions. This
+                    // also masks NaN sentinels without relying on 0 * NaN.
+                    if (id < 0 || id >= int64_t(EXPERTS)) continue;
+                }
                 const float2 v = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(partial + r * BN + col));
                 const float weight = weights[token * TOPK + r];
                 x = __fadd_rn(x, __fmul_rn(v.x, weight));

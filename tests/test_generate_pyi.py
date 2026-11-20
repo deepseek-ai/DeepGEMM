@@ -40,8 +40,10 @@ class KeywordOnlyStubTest(unittest.TestCase):
                     continue
                 function = ast.parse(generate_pyi_function(statement)).body[0]
                 self.assertEqual(len(function.args.args), 9)
-                self.assertEqual([p.arg for p in function.args.kwonlyargs], ['gate_up_swapped'])
-                self.assertIs(ast.literal_eval(function.args.kw_defaults[0]), False)
+                self.assertEqual([p.arg for p in function.args.kwonlyargs],
+                                 ['gate_up_swapped', 'expert_ids'])
+                self.assertEqual([ast.literal_eval(v) for v in function.args.kw_defaults],
+                                 [False, False])
                 return
         self.fail('Private MoE binding missing')
 
