@@ -43,7 +43,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -58,7 +58,8 @@ static void __instantiate_kernel() {{
         args.gemm_config.launch_config.num_tma_threads, args.gemm_config.launch_config.num_math_threads,
         args.gemm_config.layout.get_cluster_size(), args.gemm_config.layout.cluster_n > 1,
         args.gemm_config.launch_config.num_sms, to_string(args.gemm_desc.gemm_type),
-        to_string(args.gemm_desc.cd_dtype)));
+        to_string(args.gemm_desc.cd_dtype),
+        args.gemm_desc.with_accumulation));
 
         // Launch
         jit->launch(
