@@ -32,7 +32,7 @@ static bool early_return(const int& m, const int &n, const int& k,
     // NOTES: an FP8 D must come with SFD, and vice versa; kernels without SFD support must not receive FP8 D
     DG_HOST_ASSERT((d.scalar_type() == torch::kFloat8_e4m3fn) == sfd.has_value());
     if (c.has_value()) {
-        check_major_type_cd(c.value());
+        check_major_type_cd<false>(c.value());  // C is only read by copy_, batch need not be contiguous
         DG_HOST_ASSERT(d.scalar_type() == c.value().scalar_type());
     }
 
