@@ -272,6 +272,33 @@ def test_fp8_bhd_bhr_hdr(use_ue8m0: bool = True):
     print()
 
 
+def test_fp8_einsum_accumulation():
+    print('Testing FP8 "bhr, hdr -> bhd" accumulation:')
+    for b in (1, 4):
+        h, r, d = 8, 4096, 1024
+        x = torch.randn((b, h, r), device='cuda', dtype=torch.bfloat16)
+        y = torch.randn((h, d, r), device='cuda', dtype=torch.bfloat16)
+        x_fp8 = per_token_cast_to_fp8(x.view(-1, r), use_ue8m0=True)
+        x_fp8 = (x_fp8[0].view(b, h, r), x_fp8[1].view(b, h, ceil_div(r, 128)))
+        y_fp8 = (torch.empty_like(y, dtype=torch.float8_e4m3fn),
+                 torch.empty((h, ceil_div(d, 128), ceil_div(r, 128)), device='cuda', dtype=torch.float))
+        for i in range(h):
+            y_fp8[0][i], y_fp8[1][i] = per_block_cast_to_fp8(y[i], use_ue8m0=True)
+
+        c = torch.randn((b, h, d), device='cuda', dtype=torch.bfloat16)
+        d_no_c = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
+        deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, d_no_c)
+
+        d_with_c = torch.empty_like(d_no_c)
+        deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, d_with_c, c=c)
+        assert calc_diff(d_with_c, c + d_no_c) < 1e-3, f'{b=}: separate C not accumulated'
+
+        d_inplace = c.clone()
+        deep_gemm.fp8_einsum('bhr,hdr->bhd', x_fp8, y_fp8, d_inplace, c=d_inplace)
+        assert calc_diff(d_inplace, c + d_no_c) < 1e-3, f'{b=}: in-place C not accumulated'
+    print()
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -287,3 +314,4 @@ if __name__ == '__main__':
     test_fp8_bhr_hdr_bhd()
     test_fp8_bhd_hdr_bhr()
     test_fp8_bhd_bhr_hdr()
+    test_fp8_einsum_accumulation()
