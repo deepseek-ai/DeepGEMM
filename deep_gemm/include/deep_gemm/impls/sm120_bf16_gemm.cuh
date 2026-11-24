@@ -40,7 +40,8 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBKMajor = true,
           uint32_t kNWarps_ = 1,
           bool kKGroupedConstantStride = false,
-          uint32_t kKAlignment = 128>
+          uint32_t kKAlignment = 128,
+          bool kFuseSwiGLU = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                      cutlass::bfloat16_t* gmem_a_ptr, cutlass::bfloat16_t* gmem_b_ptr,
@@ -87,6 +88,15 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     DG_STATIC_ASSERT(kBKMajor or kNTilesPerWarp > 0, "Need at least one N tile per warp");
     DG_STATIC_ASSERT(not kBKMajor or kNTilesPerWarp == 1 or kNTilesPerWarp % 2 == 0,
                      "K-major B requires one N-tile or an even number of N-tiles per warp");
+
+    if constexpr (kFuseSwiGLU) {
+        DG_STATIC_ASSERT(kGemmType == GemmType::MGroupedMasked and kBKMajor and not kWithAccumulation,
+                         "SwiGLU requires masked K-major GEMM without accumulation");
+        DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> and
+                         cute::is_same_v<epilogue_operator_t, epilogue::operators::Identity>,
+                         "SwiGLU requires BF16 output and no additional epilogue");
+        DG_STATIC_ASSERT(kNTilesPerWarp % 2 == 0, "Each warp must own complete gate/up N8 pairs");
+    }
 
     static constexpr uint32_t kTMARegisters = 40;
     static constexpr uint32_t kMMARegisters = 232;
@@ -361,6 +371,51 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                     empty_barriers[stage]->arrive();
             }
 
+            if constexpr (kFuseSwiGLU) {
+                // Interleave8: [gate 0:8, up 0:8, gate 8:16, up 8:16, ...].
+                // Adjacent N8 MMA fragments belong to the same lane. No new barrier,
+                // shuffle or intermediate global-memory projection buffer is needed.
+                const uint32_t m_base = scheduler.template get_global_idx<true>(shape_m, BLOCK_M, m_block_idx);
+                const uint32_t n_base = n_block_idx * BLOCK_N;
+                const uint32_t group_m_base = shape_m * scheduler.current_group_idx;
+                const uint32_t valid_m = static_cast<uint32_t>(grouped_layout[scheduler.current_group_idx]);
+                const uint32_t h_n = shape_n / 2;
+                const int64_t h_stride = stride_d_m != 0 ? stride_d_m : h_n;
+
+                auto swiglu = [](float gate_accum, float up_accum) -> cd_dtype_t {
+                    // Preserve the materialized original L1 BF16 rounding boundary.
+                    const float gate = static_cast<float>(cutlass::bfloat16_t(gate_accum));
+                    const float up = static_cast<float>(cutlass::bfloat16_t(up_accum));
+                    // Match the non-fast-math formula in the official SM100 BF16
+                    // MegaMoE epilogue. Route weighting remains in the common combine.
+                    const float silu = gate / (1.0f + expf(-gate));
+                    return cd_dtype_t(silu * up);
+                };
+
+                #pragma unroll
+                for (uint32_t mt = 0; mt < kMTilesPerWarp; ++mt) {
+                    #pragma unroll
+                    for (uint32_t nt = 0; nt < kNTilesPerWarp; nt += 2) {
+                        const uint32_t gi = (mt * kNTilesPerWarp + nt) * MMA_ACCUM;
+                        const uint32_t ui = gi + MMA_ACCUM;
+                        const uint32_t col = (n_base + (n_tile_base + nt) * MMA_N) / 2 + thread_id * 2;
+                        const uint32_t row0 = m_base + (m_tile_base + mt) * MMA_M + group_id;
+                        const uint32_t row1 = row0 + 8;
+                        if (row0 - group_m_base < valid_m and row0 - group_m_base < shape_m and col + 1 < h_n) {
+                            const int64_t idx = static_cast<int64_t>(row0) * h_stride + col;
+                            gmem_d[idx] = swiglu(accum[gi + 0], accum[ui + 0]);
+                            gmem_d[idx + 1] = swiglu(accum[gi + 1], accum[ui + 1]);
+                        }
+                        if (row1 - group_m_base < valid_m and row1 - group_m_base < shape_m and col + 1 < h_n) {
+                            const int64_t idx = static_cast<int64_t>(row1) * h_stride + col;
+                            gmem_d[idx] = swiglu(accum[gi + 2], accum[ui + 2]);
+                            gmem_d[idx + 1] = swiglu(accum[gi + 3], accum[ui + 3]);
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Epilogue
             epilogue.apply_values(*reinterpret_cast<uint32_t(*)[kAccumPerWarp]>(accum));
             constexpr bool kEpilogueGroupOffset = not is_m_grouped_contiguous(kGemmType);
@@ -504,7 +559,7 @@ sm120_bf16_gemm_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
             }
         } // persistent loop
 
-        if constexpr (kUseTMAStoreEpilogue) {
+        if constexpr (kUseTMAStoreEpilogue and not kFuseSwiGLU) {
             if (math_warp_idx == 0 and lane_idx == 0)
                 cute::tma_store_wait<0>();
         }

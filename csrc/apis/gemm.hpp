@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ATen/MemoryOverlap.h>
+
 #include "../utils/compatibility.hpp"
 
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
@@ -860,6 +862,39 @@ static void m_grouped_bf16_gemm_nt_masked(const torch::Tensor& a, const torch::T
     }
 }
 
+// SM120-only fused gate/up projection + SwiGLU. B uses the same N8
+// interleaving as transform_weights_for_mega_moe; H has half its N dimension.
+static void m_grouped_bf16_gemm_swiglu_nt_masked(
+        const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& h,
+        const torch::Tensor& masked_m, const int& expected_m, const std::string& compiled_dims) {
+    DG_HOST_ASSERT(a.is_cuda());
+    c10::cuda::OptionalCUDAGuard guard;
+    guard.set_device(a.device());
+    DG_HOST_ASSERT(at::cuda::getDeviceProperties(a.get_device())->major == 12 and
+                   jit->device.get_arch_major() == 12 and "Fused BF16 SwiGLU is SM120-only");
+    for (const auto& t: {b, h, masked_m})
+        DG_HOST_ASSERT(t.is_cuda() and t.device() == a.device());
+    DG_HOST_ASSERT(a.dim() == 3 and b.dim() == 3 and h.dim() == 3 and masked_m.dim() == 1);
+    DG_HOST_ASSERT(a.is_contiguous() and b.is_contiguous() and h.is_contiguous() and masked_m.is_contiguous());
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and b.scalar_type() == torch::kBFloat16 and h.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(masked_m.scalar_type() == torch::kInt);
+    const auto [groups, m, k] = get_shape<3>(a);
+    const auto [groups_b, n, k_b] = get_shape<3>(b);
+    const auto [groups_h, m_h, i] = get_shape<3>(h);
+    DG_HOST_ASSERT(groups > 0 and m > 0 and k >= 64 and expected_m > 0);
+    DG_HOST_ASSERT(groups == groups_b and groups == groups_h and masked_m.numel() == groups);
+    DG_HOST_ASSERT(m == m_h and k == k_b and n == 2 * i and i >= 32 and i % 8 == 0 and k % 8 == 0);
+    at::assert_no_overlap(a, h);
+    at::assert_no_overlap(b, h);
+    at::assert_no_overlap(masked_m, h);
+    const auto major_a = get_major_type_ab(a), major_b = get_major_type_ab(b);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+    // As for the original masked GEMM, device counts must be in [0, M].
+    // No device-to-host count readback is introduced on the launch path.
+    sm120_m_grouped_bf16_gemm_masked(a, b, h, masked_m, groups, m, n, k,
+                                   expected_m, major_a, major_b, compiled_dims, true);
+}
+
 static void k_grouped_bf16_gemm_tn_contiguous(const torch::Tensor& a,
                                               const torch::Tensor& b,
                                               const torch::Tensor& d,
@@ -1166,6 +1201,9 @@ static void register_apis(pybind11::module_& m) {
           py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true,
           py::arg("epilogue") = nullptr);
+    m.def("m_grouped_bf16_gemm_swiglu_nt_masked", &m_grouped_bf16_gemm_swiglu_nt_masked,
+          py::arg("a"), py::arg("b"), py::arg("h"), py::arg("masked_m"),
+          py::arg("expected_m"), py::arg("compiled_dims") = "nk");
     m.def("m_grouped_bf16_gemm_nt_masked", &m_grouped_bf16_gemm_nt_masked,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("masked_m"),
           py::arg("expected_m"), py::arg("compiled_dims") = "nk",

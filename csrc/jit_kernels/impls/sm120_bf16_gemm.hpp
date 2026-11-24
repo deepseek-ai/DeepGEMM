@@ -21,6 +21,7 @@ public:
         EpilogueOperatorArgs epilogue_args{};
         bool k_grouped_constant_stride = false;
         int k_alignment = 128;
+        bool fuse_swiglu = false;
         int stride_d_m = 0;
         int stride_c_m = 0;
         int stride_d_batch = 0;
@@ -60,7 +61,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}, {}, {}
+        {}, {}, {}{}
     >);
 }};
 )",
@@ -78,7 +79,8 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.cd_dtype),
         get_sm120_epilogue_type(args.epilogue_type),
         args.gemm_desc.major_b == cute::UMMA::Major::K ? "true" : "false",
-        k_n_warps, args.k_grouped_constant_stride, args.k_alignment);
+        k_n_warps, args.k_grouped_constant_stride, args.k_alignment,
+        args.fuse_swiglu ? ", true" : "");
     }
 
     template <typename Kernel>
@@ -240,7 +242,8 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                              const int& num_groups, const int& m, const int& n, const int& k,
                                              const int& expected_m,
                                              const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
-                                             const std::string& compiled_dims) {
+                                             const std::string& compiled_dims,
+                                             const bool fuse_swiglu = false) {
     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
 
     const auto desc = SM120GemmDesc {
@@ -270,10 +273,10 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                               config.layout.block_k,
                                               static_cast<int>(b.stride(get_non_contiguous_dim(major_b))), num_groups,
                                               config.storage_config.swizzle_b_mode);
-    const auto tensor_map_cd = make_tma_cd_desc(d, m, n,
-                                                config.layout.block_m, config.layout.block_n,
+    const auto tensor_map_cd = make_tma_cd_desc(d, m, fuse_swiglu ? n / 2 : n,
+                                                config.layout.block_m, fuse_swiglu ? config.layout.block_n / 2 : config.layout.block_n,
                                                 static_cast<int>(d.stride(-2)), num_groups,
-                                                config.storage_config.swizzle_cd_mode);
+                                                fuse_swiglu ? 0 : config.storage_config.swizzle_cd_mode);
 
     const SM120BF16GemmRuntime::Args args = {
         .gemm_desc = desc,
@@ -282,6 +285,7 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
                                   config.pipeline_config.smem_size,
                                   1),
         .epilogue_type = std::nullopt,
+        .fuse_swiglu = fuse_swiglu,
         .stride_d_m = static_cast<int>(d.stride(-2)),
         .gmem_d = d.data_ptr(),
         .gmem_c = nullptr,
@@ -294,7 +298,7 @@ static void sm120_m_grouped_bf16_gemm_masked(const torch::Tensor& a,
         .tensor_map_cd = tensor_map_cd,
     };
     const auto code = SM120BF16GemmRuntime::generate(args);
-    const auto runtime = jit->compile("sm120_m_grouped_bf16_gemm_masked", code);
+    const auto runtime = jit->compile(fuse_swiglu ? "sm120_m_grouped_bf16_gemm_swiglu_masked" : "sm120_m_grouped_bf16_gemm_masked", code);
     SM120BF16GemmRuntime::launch(runtime, args);
 }
 

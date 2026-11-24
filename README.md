@@ -224,6 +224,39 @@ Each `DG_JIT_*` variable falls back to the corresponding global `DJ_JIT_*` varia
 
 For additional examples and details, please refer to [the test code](tests) or review the corresponding Python documentation.
 
+### SM120 masked BF16 GEMM + SwiGLU
+
+`m_grouped_bf16_gemm_swiglu_nt_masked(a, b, h, masked_m, expected_m, compiled_dims="nk")`
+is an opt-in SM120 API. It shares the original BF16 masked GEMM mainloop,
+configuration heuristic, producer/consumer warps and synchronization. The
+epilogue rounds gate/up projections to BF16, evaluates FP32
+`(gate / (1 + exp(-gate))) * up`, and writes BF16 activations directly.
+
+All tensors must be contiguous CUDA tensors on the same device:
+
+- `a`: BF16 `[E, M, D]`; `b`: BF16 `[E, 2*I, D]`; `h`: BF16 `[E, M, I]`.
+- `masked_m`: INT32 `[E]`, with device counts in `[0, M]`, as for the original API.
+- Positive `E`, `M`, `expected_m`; `D >= 64`, `I >= 32`, both multiples of 8.
+- `h` must not overlap any input. Only valid rows are written; padding is untouched.
+
+`b` interleaves eight gate rows with eight up rows along its second dimension:
+`[g0:8, u0:8, g8:16, u8:16, ...]`. Reuse the existing weight converter once when
+loading weights; this transformation is not part of each forward pass:
+
+```python
+# w_gate_up is [E, 2*I, D], gate half followed by up half.
+b, _ = deep_gemm.transform_weights_for_mega_moe(w_gate_up, w_down)
+deep_gemm.m_grouped_bf16_gemm_swiglu_nt_masked(a, b, h, masked_m, expected_m)
+```
+
+The API does not perform dispatch, routing-weight multiplication, L2 GEMM or
+combine, and does not automatically replace existing GEMM APIs. It preserves
+the BF16 projection rounding boundary. Different activation implementations or
+GEMM accumulation orders need not produce bitwise-identical results.
+See `tests/test_sm120_bf16_swiglu.py` for correctness checks and
+`tests/bench_sm120_bf16_swiglu.py` for repeated CUDA Graph timing against the
+original GEMM followed by a compiled standalone activation.
+
 ## Acknowledgement
 
 DeepGEMM is inspired by the [CUTLASS](https://github.com/nvidia/cutlass) project. Thanks and respect to the developers!
