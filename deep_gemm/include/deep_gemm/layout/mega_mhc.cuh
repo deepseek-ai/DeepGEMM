@@ -35,6 +35,7 @@ static constexpr uint32_t kNumGemmPartialElementsPerTask = BLOCK_M * kNumHCOutpu
 static constexpr uint32_t kNumSqrSumPartialElementsPerTask = BLOCK_M;
 static constexpr uint32_t kDefaultNumSplits = 16;
 static constexpr uint32_t kNumMaxSplits = 64;
+static constexpr uint32_t kNumMaxSM90Splits = 128;
 static constexpr uint32_t kNumSplitBarriers = 2;
 static constexpr uint64_t kSplitBarrierLineBytes = 128;
 static constexpr uint32_t kNumMaxTokens = 1u << 20;
@@ -89,7 +90,7 @@ struct Workspace {
     uint32_t num_m_blocks;
 
     DG_STATIC_ASSERT(kNumSplits > 0, "The number of splits must be positive");
-    DG_STATIC_ASSERT(kNumSplits <= kNumMaxSplits, "The number of splits exceeds the supported maximum");
+    DG_STATIC_ASSERT(kNumSplits <= kNumMaxSM90Splits, "The number of splits exceeds the supported maximum");
 
     CUTLASS_HOST_DEVICE
     Workspace(void* gmem_scratch, const uint32_t num_m_blocks):

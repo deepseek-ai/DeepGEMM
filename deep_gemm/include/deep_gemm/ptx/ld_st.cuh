@@ -351,6 +351,10 @@ CUTLASS_DEVICE void red_async_inc_rel(const uint64_t* ptr) {
     asm volatile("red.async.release.gpu.global.add.u64 [%0], 1;" :: "l"(ptr) : "memory");
 }
 
+CUTLASS_DEVICE void red_add_rel(const uint64_t* ptr, const uint64_t& value) {
+    asm volatile("red.release.gpu.global.add.u64 [%0], %1;" :: "l"(ptr), "l"(value) : "memory");
+}
+
 CUTLASS_DEVICE void red_add_rel_sys(const int* ptr, const int& value) {
     asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
