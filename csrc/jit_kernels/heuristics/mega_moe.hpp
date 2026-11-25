@@ -43,7 +43,7 @@ struct MegaMoEConfig {
     int num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads;
 
     // Dispatch pull config
-    int num_bytes_per_pull;
+    int num_warps_per_pull_token;
 
     friend std::ostream& operator << (std::ostream& os, const MegaMoEConfig& config) {
         os << "MegaMoEConfig("
@@ -58,7 +58,7 @@ struct MegaMoEConfig {
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
-           << ", num_bytes_per_pull=" << config.num_bytes_per_pull << ")";
+           << ", num_warps_per_pull_token=" << config.num_warps_per_pull_token << ")";
         return os;
     }
 };
@@ -97,22 +97,28 @@ static std::tuple<int, int, int, int, int, int> get_block_config_for_mega_moe(
     // Every M block costs roughly 128 extra rows (its tasks reload the weight tiles), so use the fewest blocks
     // per expert and the smallest tile covering them: one block up to 192 rows, then blocks of up to 240 rows.
     // A single 240-row block per expert only pays off with many local experts (about 14 or more blocks per rank).
+    // Tiles of 96 and 160 rows leave shared memory for more stages. Being closer to the expected count, they need a
+    // wider margin, as an overflow costs another pass over the expert's weights (most for a single BF16 block).
     int block_m = num_expected_tokens <= 10 ? 16 : 32;
     if (num_expected_tokens > 24) {
         int num_blocks = static_cast<int>(std::ceil(num_covered_tokens / 240));
         if (num_blocks == 1 and num_covered_tokens > 192 and num_experts / num_ranks < 14)
             num_blocks = 2;
-        for (const int& candidate: {64, 128, 192, 240}) {
+        const float num_margin_sigmas = (mma_kind == MmaKind::BF16 and num_blocks == 1) ? 2.5f : 2.0f;
+        const float num_covered_tokens_wide = num_expected_tokens + num_margin_sigmas * std::sqrt(num_expected_tokens);
+        for (const int& candidate: {64, 96, 128, 160, 192, 240}) {
+            const bool is_wide_margin_tile = candidate == 96 or candidate == 160;
             block_m = candidate;
-            if (num_blocks * candidate >= num_covered_tokens)
+            if (num_blocks * candidate >= (is_wide_margin_tile ? num_covered_tokens_wide : num_covered_tokens))
                 break;
         }
     }
 
     // Use smaller, asymmetric store blocks at FP8xFP4 prefill to save shared memory for sufficient TMA pipeline depth
-    const int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 :
-                                 mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;
-    const int store_block_m_l2 = (block_m == 240 and mma_kind == MmaKind::MXFP8FP4) ? 8 : store_block_m_l1;
+    // NOTES: a store block divides the rows of an epilogue warpgroup (`block_m / 2`)
+    const int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m == 96 ? 24 : block_m == 160 ? 16 :
+                                 block_m <= 192 ? 32 : mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;
+    const int store_block_m_l2 = ((block_m == 160 or block_m == 240) and mma_kind == MmaKind::MXFP8FP4) ? 8 : store_block_m_l1;
 
     const int block_k = 128 / get_num_mma_elem_bytes(mma_kind);
 
@@ -130,9 +136,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
     const int& num_experts, const int& hidden,
     const int& block_m, const int& block_n, const int& block_k, 
-    const int& num_bytes_per_pull, const int& store_block_m_l1, const int& store_block_m_l2,
+    const int& store_block_m_l1, const int& store_block_m_l2,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
-    const int& num_dispatch_warps, const int& num_epilogue_warps,
+    const int& num_epilogue_warps,
     const MmaKind& mma_kind) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
@@ -143,12 +149,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int load_block_m = block_m / 2;
 
     // Dispatch region
-    const int smem_expert_count_size = align(
+    const int smem_dispatch_size = align(
         num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
-    const int smem_send_buffers_size = align(
-        static_cast<int>(layout::Buffer(layout::Data(num_bytes_per_pull), num_dispatch_warps, 1).get_num_bytes()),
-        kSmemAlignment);
-    const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
@@ -160,9 +162,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     constexpr int kNumScheduleStages = 2;
     const int smem_task_info = kNumScheduleStages * static_cast<int>(sizeof(sched::TaskInfo<true>));
 
-    // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
+    // Barriers (stage-independent): tensor memory full/empty + combine (2 per epilogue warp)
     // + schedule task publish full/empty barriers.
-    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
+    const int smem_barriers = (kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
     const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
@@ -220,21 +222,20 @@ static MegaMoEConfig get_mega_moe_config(
     const int num_dispatch_threads = 128;
     const int num_non_epilogue_threads = 128;
 
-    // Pull: divide token bytes by 2 until <= num_max_pull_bytes
-    const int num_max_pull_bytes = is_mma_with_sf(mma_kind) ? 8192 : 4096;
-    int num_bytes_per_pull = hidden * get_num_mma_elem_bytes(mma_kind);
-    while (num_bytes_per_pull > num_max_pull_bytes) {
-        DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
-        num_bytes_per_pull /= 2;
-    }
+    // Warps per pulled token: larger groups land a token sooner, smaller ones keep more tokens in flight
+    // NOTES: for FP8xFP4, the pull load weighs a block's tokens against the expert's GEMM work; BF16 GEMMs take longer
+    // per token, so only the block size matters there
+    const float pull_load = block_m * 1e6f / (3.0f * intermediate_hidden * hidden);
+    const int num_warps_per_pull_token = mma_kind == MmaKind::BF16 ?
+        (block_m <= 128 ? 4 : 2) : (pull_load <= 1.5f ? 4 : (pull_load <= 4.5f ? 2 : 1));
 
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
         SM100ArchSpec::smem_capacity,
         num_experts, hidden,
-        block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
+        block_m, block_n, block_k, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        num_epilogue_threads / 32,
         mma_kind);
 
     const auto config = MegaMoEConfig {
@@ -245,7 +246,7 @@ static MegaMoEConfig get_mega_moe_config(
         swizzle_acts_mode, swizzle_weights_mode,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
-        num_bytes_per_pull
+        num_warps_per_pull_token
     };
 
     // Print configs for the first time
