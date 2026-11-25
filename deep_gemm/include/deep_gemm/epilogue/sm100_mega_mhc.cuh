@@ -4,6 +4,7 @@
 #include <cutlass/arch/reg_reconfig.h>
 
 #include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/fp32x2.cuh>
 #include <deep_gemm/layout/mega_mhc.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/scheduler/mega_mhc.cuh>
@@ -12,34 +13,12 @@ namespace deep_gemm::epilogue::mega_mhc {
 
 using namespace layout::mega_mhc;
 
-// Reduce one token's split partials and produce its Mix coefficients.
-template <uint32_t kHidden, bool kIsShifted, uint32_t kNumSplits>
-CUTLASS_DEVICE float run_mix_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
-                                  const MixArgs& mix_args,
-                                  const uint32_t& token_idx, const uint32_t& lane_idx) {
-    const uint32_t m_block_idx = token_idx / BLOCK_M;
-    const uint32_t row_idx = token_idx % BLOCK_M;
-    sched::mega_mhc::Mix::wait<kNumSplits>(gmem_split_barriers, m_block_idx);
-
-    // Reduce HC norm statistics and GEMM outputs across the split tasks.
+// Both serial and SM90 cooperative reduction use the same numerical epilogue.
+template <uint32_t kHidden, bool kIsShifted>
+CUTLASS_DEVICE float finish_mix(const float hc_output, const float hc_norm_sqr_sum,
+                               const MixArgs& mix_args, const uint32_t token_idx,
+                               const uint32_t lane_idx) {
     const bool is_hc_output_lane = lane_idx < kNumHCOutputs;
-    const uint32_t first_task_idx = m_block_idx * kNumSplits;
-    const auto hc_norm_sqr_sum_partials = workspace.get_hc_norm_sqr_sum_partial_ptr(first_task_idx);
-    float hc_norm_sqr_sum = 0.0f;
-    #pragma unroll
-    for (uint32_t k_split_idx = lane_idx; k_split_idx < kNumSplits; k_split_idx += 32)
-        hc_norm_sqr_sum += hc_norm_sqr_sum_partials[
-            k_split_idx * kNumSqrSumPartialElementsPerTask + row_idx];
-    hc_norm_sqr_sum = math::warp_reduce_sum(hc_norm_sqr_sum);
-
-    const uint32_t safe_hc_output_idx = cute::min(lane_idx, kNumHCOutputs - 1);
-    const auto gemm_partials = workspace.get_gemm_partial_ptr(first_task_idx);
-    float hc_output = 0.0f;
-    #pragma unroll
-    for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
-        hc_output += gemm_partials[k_split_idx * kNumGemmPartialElementsPerTask +
-                                   row_idx * kNumHCOutputs + safe_hc_output_idx];
-    hc_output = is_hc_output_lane ? hc_output : 0.0f;
     const float hc_rms_scale = rsqrtf(hc_norm_sqr_sum * (1.0f / static_cast<float>(kNumRoutes * kHidden)) + mix_args.hc_norm_eps);
 
     // Warp lanes map to [Pre routes | Post routes | Comb routes x routes | inactive].
@@ -100,6 +79,37 @@ CUTLASS_DEVICE float run_mix_task(const Workspace<kNumSplits>& workspace, uint64
     return mix_value;
 }
 
+// Reduce one token's split partials and produce its Mix coefficients.
+template <uint32_t kHidden, bool kIsShifted, uint32_t kNumSplits>
+CUTLASS_DEVICE float run_mix_task(const Workspace<kNumSplits>& workspace, uint64_t* gmem_split_barriers,
+                                  const MixArgs& mix_args,
+                                  const uint32_t& token_idx, const uint32_t& lane_idx) {
+    const uint32_t m_block_idx = token_idx / BLOCK_M;
+    const uint32_t row_idx = token_idx % BLOCK_M;
+    sched::mega_mhc::Mix::wait<kNumSplits>(gmem_split_barriers, m_block_idx);
+
+    // Reduce HC norm statistics and GEMM outputs across the split tasks.
+    const bool is_hc_output_lane = lane_idx < kNumHCOutputs;
+    const uint32_t first_task_idx = m_block_idx * kNumSplits;
+    const auto hc_norm_sqr_sum_partials = workspace.get_hc_norm_sqr_sum_partial_ptr(first_task_idx);
+    float hc_norm_sqr_sum = 0.0f;
+    #pragma unroll
+    for (uint32_t k_split_idx = lane_idx; k_split_idx < kNumSplits; k_split_idx += 32)
+        hc_norm_sqr_sum += hc_norm_sqr_sum_partials[
+            k_split_idx * kNumSqrSumPartialElementsPerTask + row_idx];
+    hc_norm_sqr_sum = math::warp_reduce_sum(hc_norm_sqr_sum);
+
+    const uint32_t safe_hc_output_idx = cute::min(lane_idx, kNumHCOutputs - 1);
+    const auto gemm_partials = workspace.get_gemm_partial_ptr(first_task_idx);
+    float hc_output = 0.0f;
+    #pragma unroll
+    for (uint32_t k_split_idx = 0; k_split_idx < kNumSplits; ++ k_split_idx)
+        hc_output += gemm_partials[k_split_idx * kNumGemmPartialElementsPerTask +
+                                   row_idx * kNumHCOutputs + safe_hc_output_idx];
+    hc_output = is_hc_output_lane ? hc_output : 0.0f;
+    return finish_mix<kHidden, kIsShifted>(hc_output, hc_norm_sqr_sum, mix_args, token_idx, lane_idx);
+}
+
 // Every warp-wide pack spans 256 hidden elements.
 constexpr uint32_t kHiddenPerNormPack = 256;
 constexpr uint32_t kHiddenPerNormLane = kHiddenPerNormPack / 32;
@@ -110,7 +120,7 @@ constexpr uint32_t kNumLanesPerSFWord = kHiddenPerSFWord / kHiddenPerNormLane;
 
 // Shared normalization and FP8 output helpers.
 CUTLASS_DEVICE nv_bfloat162 normalize_bf16_pair(const nv_bfloat162& input, const nv_bfloat162& weight, const float& scale) {
-    return __float22bfloat162_rn(__fmul2_rn(__fmul2_rn(__bfloat1622float2(input), {scale, scale}), __bfloat1622float2(weight)));
+    return __float22bfloat162_rn(math::mul_fp32x2_rn(math::mul_fp32x2_rn(__bfloat1622float2(input), {scale, scale}), __bfloat1622float2(weight)));
 }
 
 template <uint32_t SF_BLOCK_M>
@@ -137,8 +147,8 @@ CUTLASS_DEVICE uint32_t store_fp8_and_pack_sf(const NormArgs& norm_args, const u
 
 // A Normal task fuses Mix, Pre, and RMSNorm for one token.
 template <uint32_t kHidden, uint32_t kNumSMs, bool kStoreBF16, bool kStoreFP8,
-          uint32_t SF_BLOCK_M, uint32_t kNumSplits>
-CUTLASS_DEVICE void run_normal_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
+          uint32_t SF_BLOCK_M, uint32_t kNumSplits, typename Storage>
+CUTLASS_DEVICE void run_normal_worker(Storage& smem, const Workspace<kNumSplits>& workspace,
                                       const uint32_t& wg_idx_in_cta,
                                       const uint32_t& warp_idx_in_wg, const uint32_t& lane_idx,
                                       uint64_t* gmem_split_barriers,
@@ -200,13 +210,13 @@ CUTLASS_DEVICE void run_normal_worker(SharedStorage& smem, const Workspace<kNumS
                 const auto pairs = reinterpret_cast<const nv_bfloat162*>(&input);
                 #pragma unroll
                 for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx)
-                    values[pair_idx] = __ffma2_rn(__bfloat1622float2(pairs[pair_idx]), {coeff, coeff}, values[pair_idx]);
+                    values[pair_idx] = math::fma_fp32x2_rn(__bfloat1622float2(pairs[pair_idx]), {coeff, coeff}, values[pair_idx]);
             }
             #pragma unroll
             for (uint32_t pair_idx = 0; pair_idx < kNumBF16PairsPerLane; ++ pair_idx) {
                 output[pair_idx] = __float22bfloat162_rn(values[pair_idx]);
                 values[pair_idx] = __bfloat1622float2(output[pair_idx]);
-                sqr_sum = __ffma2_rn(values[pair_idx], values[pair_idx], sqr_sum);
+                sqr_sum = math::fma_fp32x2_rn(values[pair_idx], values[pair_idx], sqr_sum);
             }
         }
 
@@ -390,8 +400,8 @@ CUTLASS_DEVICE void run_shifted_norm_task(const Workspace<kNumSplits>& workspace
 }
 
 template <uint32_t kHidden, uint32_t kNumSMs, uint32_t kNumRegisters, bool kStoreBF16, bool kStoreFP8,
-          uint32_t SF_BLOCK_M, uint32_t kNumSplits>
-CUTLASS_DEVICE void run_shifted_norm_worker(SharedStorage& smem, const Workspace<kNumSplits>& workspace,
+          uint32_t SF_BLOCK_M, uint32_t kNumSplits, typename Storage>
+CUTLASS_DEVICE void run_shifted_norm_worker(Storage& smem, const Workspace<kNumSplits>& workspace,
                                             uint64_t* gmem_split_barriers,
                                             const NormArgs& norm_args,
                                             const uint32_t& lane_idx) {

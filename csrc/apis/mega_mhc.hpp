@@ -6,20 +6,26 @@
 #include "../utils/compatibility.hpp"
 
 #include "../jit_kernels/impls/sm100_mega_mhc.hpp"
+#include "../jit_kernels/impls/sm90_mega_mhc.hpp"
 #include "../utils/layout.hpp"
 
 namespace deep_gemm::mega_mhc {
 
 namespace mhc_layout = layout::mega_mhc;
 
-static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms) {
+static uint32_t get_num_splits(const uint32_t num_m_blocks, const uint32_t hidden, const uint32_t num_sms,
+                               const int arch_major, const bool use_decode_mix) {
     if (heuristics_runtime->get_deterministic_algorithms())
         return mhc_layout::kDefaultNumSplits;
 
+    // Hopper amortizes persistent task and partial-reduction costs with fewer splits.
+    const uint32_t min_num_splits = arch_major == 9 ? 4u : mhc_layout::kDefaultNumSplits;
     // Fewest splits that still reach the shortest possible longest task
     const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
+    const uint32_t split_cap = arch_major == 9 and use_decode_mix
+        ? mhc_layout::kNumMaxSM90Splits : mhc_layout::kNumMaxSplits;
     const uint32_t max_num_splits = cute::min(
-        mhc_layout::kNumMaxSplits, cute::max(mhc_layout::kDefaultNumSplits, num_sms / num_m_blocks));
+        split_cap, cute::max(min_num_splits, num_sms / num_m_blocks));
     return math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
 }
 
@@ -220,17 +226,32 @@ static void mega_mhc(const torch::Tensor& x,
         DG_HOST_ASSERT(num_required_bytes <= y_shared_sf->storage().nbytes());
     }
 
-    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    const auto arch_major = jit->device.get_arch_major();
+    DG_HOST_ASSERT(arch_major == 9 or arch_major == 10);
     const auto num_sms = runtime->get_num_sms();
     const auto num_m_blocks = mhc_layout::Workspace<>::get_num_m_blocks(static_cast<uint32_t>(num_tokens));
-    const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms));
+    const bool use_decode_mix = is_shifted and num_tokens >= 16 and num_tokens <= mhc_layout::BLOCK_M;
+    const auto num_splits = get_num_splits(num_m_blocks, static_cast<uint32_t>(hidden), static_cast<uint32_t>(num_sms),
+                                         arch_major, use_decode_mix);
     const auto num_mhc_scratch_bytes = mhc_layout::Workspace<>::get_num_scratch_bytes(num_m_blocks, num_splits);
 
     const bool needs_bf16_scratch = not y_bf16.has_value() and is_shifted;
     const auto num_bf16_scratch_bytes = needs_bf16_scratch ? static_cast<int64_t>(num_tokens) * hidden * x.element_size() : 0;
+    // SM90 owns barriers per invocation, including graph nodes. Concurrent graphs
+    // captured on one stream must not share mutable synchronization state (#503).
+    const auto split_barriers = arch_major == 9
+        ? torch::empty({mhc_layout::kNumSplitBarriers, mhc_layout::kNumMaxMBlocks,
+                        mhc_layout::kSplitBarrierLineBytes}, x.options().dtype(torch::kByte))
+        : get_split_barriers(x.options());
     const auto scratch = torch::empty({static_cast<int64_t>(num_mhc_scratch_bytes) + num_bf16_scratch_bytes},
                                       x.options().dtype(torch::kByte));
-    const auto& split_barriers = get_split_barriers(x.options());
+    // CUDA graph replays reuse grid IDs. Clear this launch's active barrier lines
+    // before independent consumers can observe a previous terminal tag.
+    if (arch_major == 9)
+        DG_CUDA_RUNTIME_CHECK(cudaMemset2DAsync(
+            split_barriers.data_ptr(), mhc_layout::kNumMaxMBlocks * mhc_layout::kSplitBarrierLineBytes,
+            0, num_m_blocks * mhc_layout::kSplitBarrierLineBytes, mhc_layout::kNumSplitBarriers,
+            at::cuda::getCurrentCUDAStream()));
 
     // Shifted FP8 is derived from rounded BF16, so FP8-only calls borrow the scratch tail for that numerical boundary.
     const auto y_bf16_storage = needs_bf16_scratch ? scratch.narrow(0, num_mhc_scratch_bytes, num_bf16_scratch_bytes).
@@ -240,7 +261,8 @@ static void mega_mhc(const torch::Tensor& x,
     // GEMM and routed SF differ only in strides and share one primary writer.
     const auto& y_primary_sf = y_routed_sf.has_value() ? y_routed_sf : y_gemm_sf;
 
-    sm100_mega_mhc(
+    const auto launch = arch_major == 9 ? sm90_mega_mhc : sm100_mega_mhc;
+    launch(
         x, residual, post_mix, comb_res_mix, shifted_prev_mix,
         fn, mix_scales, mix_bases,
         hc_norm_eps, hc_pre_eps, hc_post_scale, sinkhorn_eps, num_sinkhorn_iters,
