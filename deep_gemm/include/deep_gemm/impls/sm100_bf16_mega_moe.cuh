@@ -27,7 +27,7 @@ template <
     uint32_t STORE_BLOCK_M,
     uint32_t kNumRingTokens,
     uint32_t kNumStages,
-    uint32_t kNumBytesPerPull,
+    uint32_t kNumWarpsPerPullToken,
     uint32_t kNumDispatchThreads, uint32_t kNumNonEpilogueThreads,
     uint32_t kNumEpilogueThreads,
     uint32_t kNumSMs, uint32_t kNumRanks,
@@ -76,6 +76,7 @@ sm100_bf16_mega_moe_impl(void* y,
 
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
+    DG_STATIC_ASSERT(kNumDispatchWarps % kNumWarpsPerPullToken == 0, "Invalid number of warps per pulled token");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
@@ -162,7 +163,6 @@ sm100_bf16_mega_moe_impl(void* y,
     // Assign shared memory
     struct SharedStorage {
         alignas(kSharedMemoryAlignment) uint32_t expert_token_count[kNumExperts];
-        alignas(kSharedMemoryAlignment) uint8_t dispatch_send_buffer[kNumDispatchWarps][kNumBytesPerPull];
         union {
             alignas(kSharedMemoryAlignment) d_dtype_t l1[kNumEpilogueWarpgroups][kNumTMAStoreStages][STORE_BLOCK_M * L1_OUT_BLOCK_N];
             alignas(kSharedMemoryAlignment) d_dtype_t l2[kNumEpilogueWarpgroups][STORE_BLOCK_M * BLOCK_N];
@@ -170,7 +170,6 @@ sm100_bf16_mega_moe_impl(void* y,
         alignas(kSharedMemoryAlignment) a_dtype_t smem_a[kNumStages][LOAD_BLOCK_M * BLOCK_K];
         alignas(kSharedMemoryAlignment) b_dtype_t smem_b[kNumStages][LOAD_BLOCK_N * BLOCK_K];
         task_info_t task_infos[kNumScheduleStages];
-        Barrier dispatch_barriers[kNumDispatchWarps];
         Barrier full_barriers[kNumStages];
         Barrier empty_barriers[kNumStages];
         Barrier tmem_full_barriers[kNumEpilogueStages];
@@ -180,14 +179,8 @@ sm100_bf16_mega_moe_impl(void* y,
         Barrier task_info_empty_barriers[kNumScheduleStages];
         uint32_t tmem_ptr_in_smem;
     };
-    constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
+    constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, full_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
-
-    // Send buffers
-    constexpr auto pull_layout = layout::Data(kNumBytesPerPull);
-    const auto smem_send_buffers = layout::Buffer(
-        pull_layout, kNumDispatchWarps, 1,
-        static_cast<void*>(shared_storage.dispatch_send_buffer));
 
     // A cluster sync is essential for 2CTA tensor memory allocation
     comm::cluster_sync_with_relaxed_arrive();
@@ -203,20 +196,17 @@ sm100_bf16_mega_moe_impl(void* y,
             );
         }
     } else if (warp_idx == 1) {
-        // Init m-barriers for dispatch
+        // Init GEMM pipeline barriers
         #pragma unroll
-        for (uint32_t i = lane_idx; i < kNumDispatchWarps; i += 32)
-            shared_storage.dispatch_barriers[i].init(1);
+        for (uint32_t i = lane_idx; i < kNumStages; i += 32) {
+            // Arrive at 2 CTAs, A + B
+            shared_storage.full_barriers[i].init(2 * 2);
+            shared_storage.empty_barriers[i].init(1);
+        }
         cutlass::arch::fence_barrier_init();
     } else if (warp_idx == 2) {
-        // Init GEMM barriers
+        // Init tensor memory, combine and scheduler barriers
         if (cute::elect_one_sync()) {
-            #pragma unroll
-            for (uint32_t i = 0; i < kNumStages; ++ i) {
-                // Arrive at 2 CTAs, A + B
-                shared_storage.full_barriers[i].init(2 * 2);
-                shared_storage.empty_barriers[i].init(1);
-            }
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
                 // Arrive at all CTAs
@@ -273,6 +263,7 @@ sm100_bf16_mega_moe_impl(void* y,
     constexpr uint32_t kDispatchWithEpilogueBarrierIdx = 1;
     constexpr uint32_t kEpilogueFullBarrierIdx = 2;
     constexpr uint32_t kEpilogueWGBarrierStartIdx = 3;
+    constexpr uint32_t kDispatchPullBarrierStartIdx = kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups;
 
     // NVLink barrier tags
     constexpr uint32_t kBeforeDispatchPullBarrierTag = 1;
@@ -280,10 +271,11 @@ sm100_bf16_mega_moe_impl(void* y,
 
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
+    // NOTES: the dispatch warps always take 96 registers, as a pull batch (up to 8 KB) needs 64 per lane
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
-    constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
+    constexpr uint32_t kNumDispatchRegisters = 96;
     constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 88;
-    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 160;
+    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 184 : 160;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
                      kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
@@ -385,10 +377,14 @@ sm100_bf16_mega_moe_impl(void* y,
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // Pull token data and SF from remote ranks into local L1 buffer
-        uint32_t pull_mbarrier_phase = 0;
-        const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
-        const auto pull_mbarrier = &shared_storage.dispatch_barriers[warp_idx];
+        // Pull token data from remote ranks into local L1 buffer
+        // NOTES: each token is pulled by a group of `kNumWarpsPerPullToken` warps; consecutive tokens go to
+        // different SMs
+        constexpr uint32_t kNumTokenGroups = kNumDispatchWarps / kNumWarpsPerPullToken;
+        DG_STATIC_ASSERT(kDispatchPullBarrierStartIdx + kNumTokenGroups <= 16, "Too many named barriers");
+        const uint32_t token_group_idx = warp_idx / kNumWarpsPerPullToken;
+        const uint32_t warp_idx_in_group = warp_idx % kNumWarpsPerPullToken;
+        const bool is_token_leader_warp = warp_idx_in_group == 0;
 
         // Per-rank counts for current expert (re-loaded when expert changes)
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
@@ -400,8 +396,8 @@ sm100_bf16_mega_moe_impl(void* y,
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
 
-        constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+        constexpr uint32_t kNumGlobalTokenGroups = kNumSMs * kNumTokenGroups;
+        for (uint32_t token_idx = token_group_idx * kNumSMs + sm_idx; ; token_idx += kNumGlobalTokenGroups) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -488,12 +484,8 @@ sm100_bf16_mega_moe_impl(void* y,
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx = src_token_topk_idx % kNumTopk;
 
-            // Hidden bytes are divided into chunks
+            // Copy token from remote rank into local
             constexpr uint32_t kHiddenBytes = kHidden * sizeof(nv_bfloat16);
-            constexpr uint32_t kNumChunks = kHiddenBytes / kNumBytesPerPull;
-            DG_STATIC_ASSERT(kHiddenBytes % kNumBytesPerPull == 0, "Invalid hidden");
-
-            // TMA load token from remote rank and store into local
             const auto pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             const uint32_t pool_block_idx = pool_token_idx / BLOCK_M;
 
@@ -508,43 +500,56 @@ sm100_bf16_mega_moe_impl(void* y,
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
-            const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
-                ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
-                ptx::tma_store_1d(
-                    math::advance_ptr(dst_base_ptr, i * kNumBytesPerPull),
-                    pull_buffer.get_base_ptr(), kNumBytesPerPull
-                );
-                cute::tma_store_arrive();
-                ptx::tma_store_wait<0>();
-            };
-            // Load the weight first, so that its remote latency overlaps with the token pull below
-            const auto weight = *sym_buffer.map(
-                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                current_rank_in_expert_idx);
-            if (cute::elect_one_sync()) {
+
+            // Load the weight first to overlap its remote latency with the loads below
+            float weight = 0;
+            if (is_token_leader_warp) {
+                weight = *sym_buffer.map(
+                    buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                    current_rank_in_expert_idx);
+            }
+
+            // Copy this warp's part of the token through registers, in batches of up to 8 KB
+            // NOTES: a batch issues all its loads before its stores, so that the loads are in flight together
+            DG_STATIC_ASSERT(kHiddenBytes % (sizeof(uint4) * kNumWarpsPerPullToken) == 0, "Invalid hidden size");
+            constexpr uint32_t kNumTokenUint4 = kHiddenBytes / sizeof(uint4) / kNumWarpsPerPullToken;
+            constexpr uint32_t kNumCopySteps = math::constexpr_ceil_div(kNumTokenUint4, 32u);
+            constexpr uint32_t kNumMaxCopyStepsPerBatch = 8192 / (32 * sizeof(uint4));
+            // NOTES: the lane offset is folded into the pointers, so that each step adds a constant offset
+            const auto src_ptr = static_cast<const uint4*>(src_base_ptr) + warp_idx_in_group * kNumTokenUint4 + lane_idx;
+            const auto dst_ptr = static_cast<uint4*>(dst_base_ptr) + warp_idx_in_group * kNumTokenUint4 + lane_idx;
+            #pragma unroll 1
+            for (uint32_t k = 0; k < kNumCopySteps; k += kNumMaxCopyStepsPerBatch) {
+                uint4 values[kNumMaxCopyStepsPerBatch];
                 #pragma unroll
-                for (uint32_t i = 0; i < kNumChunks; ++ i) {
-                    ptx::tma_load_1d(
-                        pull_buffer.get_base_ptr(),
-                        math::advance_ptr(src_base_ptr, i * kNumBytesPerPull),
-                        pull_mbarrier, kNumBytesPerPull
-                    );
-                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kNumBytesPerPull);
-                    i != (kNumChunks - 1) ? issue_and_wait_pull_store(i) : void();
+                for (uint32_t i = 0; i < kNumMaxCopyStepsPerBatch; ++ i) {
+                    if (k + i < kNumCopySteps and (k + i) * 32 + lane_idx < kNumTokenUint4)
+                        values[i] = src_ptr[(k + i) * 32];
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumMaxCopyStepsPerBatch; ++ i) {
+                    if (k + i < kNumCopySteps and (k + i) * 32 + lane_idx < kNumTokenUint4)
+                        dst_ptr[(k + i) * 32] = values[i];
                 }
             }
-            __syncwarp();
+
+            // NOTES: the L1 GEMMs read the token by TMA after acquiring the count released below, which orders the
+            // group's stores (after its barrier) at GPU scope; there is no proxy fence
+            if constexpr (kNumWarpsPerPullToken > 1) {
+                ptx::sync_aligned(kNumWarpsPerPullToken * 32, kDispatchPullBarrierStartIdx + token_group_idx);
+            } else {
+                __syncwarp();
+            }
 
             // Store weights and metadata
-            if (cute::elect_one_sync()) {
+            if (is_token_leader_warp and cute::elect_one_sync()) {
                 *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
-                // Wait for token TMA store to complete
-                issue_and_wait_pull_store(kNumChunks - 1);
+                // Release the token to its block
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
                 ptx::red_add_rel(
                     workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
@@ -1174,7 +1179,7 @@ sm100_bf16_mega_moe_impl(void* y,
 
         // Verify combined shared memory budget at runtime
         DG_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <=
-            static_cast<uint32_t>(offsetof(SharedStorage, dispatch_barriers)));
+            static_cast<uint32_t>(offsetof(SharedStorage, full_barriers)));
 
         // Per-warp buffer: 2 stage load buffers + 1 store buffer
         const auto combine_load_buffer = utils::PatternVisitor([&](const uint32_t& i) {

@@ -123,7 +123,7 @@ static void __instantiate_kernel() {{
         config.store_block_m_l1,
         config.num_ring_tokens,
         config.num_stages,
-        config.num_bytes_per_pull,
+        config.num_warps_per_pull_token,
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
         to_string(activation_clamp),
