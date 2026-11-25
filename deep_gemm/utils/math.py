@@ -104,7 +104,7 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     padded_n = align(n, gran_k)
     x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
     x_padded[:, :n] = x
-    x_view = x_padded.view(m, -1, gran_k)
+    x_view = x_padded.view(m, padded_n // gran_k, gran_k)
     x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
     sf = x_amax / 6.0
     sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
