@@ -18,9 +18,9 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 def pack_ue8m0_to_int(x: torch.Tensor):
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
-    x_int = x.view(torch.int)
+    x_int = x.contiguous().view(torch.int)
     assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
-    return (x_int >> 23).to(torch.uint8).view(torch.int)
+    return (x_int >> 23).to(torch.uint8).contiguous().view(torch.int)
 
 
 def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
@@ -78,7 +78,8 @@ def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims: Tuple, use_ue8m0: bool) -
     sf = x_amax / 448.0
     sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
     x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled, sf.squeeze()
+    sf = sf.squeeze(dim=excluded_dims) if excluded_dims else sf
+    return x_scaled, sf
 
 
 def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
@@ -149,7 +150,7 @@ def _dequantize_from_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_ue8m0_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
-    return (packed_sf.view(torch.uint8).to(torch.int) << 23).view(torch.float)
+    return (packed_sf.contiguous().view(torch.uint8).to(torch.int) << 23).view(torch.float)
 
 
 def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128,
@@ -163,8 +164,9 @@ def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128
     unpacked[:, 1::2] = (packed >> 4) & 0x0F
     x_dequantized = _dequantize_from_fp4_e2m1(unpacked)
     group_idx = torch.arange(n, device=packed.device) // gran_k
-    x_restored = x_dequantized * sf[:, group_idx]
-    return x_restored
+    if sf.dim() == 1:
+        return x_dequantized * sf[group_idx].unsqueeze(0)
+    return x_dequantized * sf[:, group_idx]
 
 
 def cast_back_from_fp8(x_fp8: torch.Tensor, sf: torch.Tensor, gran_k: int = 128,
@@ -173,4 +175,6 @@ def cast_back_from_fp8(x_fp8: torch.Tensor, sf: torch.Tensor, gran_k: int = 128,
     if use_packed_ue8m0:
         sf = unpack_ue8m0_from_int(sf)
     group_idx = torch.arange(n, device=x_fp8.device) // gran_k
+    if sf.dim() == 1:
+        return x_fp8.float() * sf[group_idx].unsqueeze(0)
     return x_fp8.float() * sf[:, group_idx]
