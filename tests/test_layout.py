@@ -1,6 +1,6 @@
 import torch
 import random
-from deep_gemm.testing import bench_kineto, count_bytes, get_arch_major
+from deep_gemm.testing import assert_check, bench_kineto, count_bytes, get_arch_major
 from deep_gemm.utils import (
     align, ceil_div, ceil_to_ue8m0,
     per_token_cast_to_fp8, per_channel_cast_to_fp8,
@@ -55,7 +55,7 @@ def test_sf_layout_kernels() -> None:
             impl, name = get_mn_major_tma_aligned_packed_ue8m0_tensor, 'pack_fp32_into_ue8m0'
             packed_sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(fp32_sf)
             ref_packed_sf = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(fp32_sf)
-            assert torch.equal(packed_sf, ref_packed_sf), f'{mn=}, {k=}, {with_transpose=}, {num_groups=}'
+            assert_check(torch.equal(packed_sf, ref_packed_sf), f'{mn=}, {k=}, {with_transpose=}, {num_groups=}')
             assert packed_sf.shape == ref_packed_sf.shape
             assert all([packed_sf.stride(i) == ref_packed_sf.stride(i) for i in range(packed_sf.dim())])
         else:
@@ -67,7 +67,7 @@ def test_sf_layout_kernels() -> None:
                 assert transposed_sf.stride(0) == tma_aligned_mn * sf_k
             assert transposed_sf.shape[-2:] == (mn, sf_k)
             assert transposed_sf.stride()[-2:] == (1, tma_aligned_mn)
-            assert torch.equal(fp32_sf, transposed_sf)
+            assert_check(torch.equal(fp32_sf, transposed_sf))
 
         # Performance
         try:
@@ -101,10 +101,10 @@ def test_k_grouped_sf_layout_kernels() -> None:
         split_fp32_sf = fp32_sf.split(sf_ks)
         for group_idx in range(num_groups):
             ref_packed_sf = get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(split_fp32_sf[group_idx].T).T
-            assert torch.equal(split_packed_sf[group_idx], ref_packed_sf), f'{group_idx=}'
+            assert_check(torch.equal(split_packed_sf[group_idx], ref_packed_sf), f'{group_idx=}')
             if sf_ks[group_idx] % 4:
                 packed_bytes = split_packed_sf[group_idx][-1].view(torch.uint8).view(mn, 4)
-                assert torch.count_nonzero(packed_bytes[:, sf_ks[group_idx] % 4:]) == 0
+                assert_check(torch.count_nonzero(packed_bytes[:, sf_ks[group_idx] % 4:]) == 0)
 
         # Performance
         t = bench_kineto(lambda: get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(fp32_sf, grouped_layout, ks_cpu, gran_k, k_alignment), 'pack_fp32_into_ue8m0')
@@ -136,15 +136,15 @@ def test_k_grouped_psum_sf_layout_kernels() -> None:
         # Psum layout provides raw K; SF covers each group's aligned K span and
         # packing independently pads every group to a packed row boundary.
         packed_sf = get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(fp32_sf, grouped_layout, aligned_ks_cpu, gran_k, k_alignment, use_psum_layout=True)
-        assert torch.equal(packed_sf, ref_packed_sf)
+        assert_check(torch.equal(packed_sf, ref_packed_sf))
 
         # Without synchronized aligned K sizes, allocation uses a safe upper bound.
         unsynced_packed_sf = get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
             fp32_sf, grouped_layout, None, gran_k, k_alignment, use_psum_layout=True)
-        assert torch.equal(unsynced_packed_sf[:sum(packed_sf_ks)], ref_packed_sf)
+        assert_check(torch.equal(unsynced_packed_sf[:sum(packed_sf_ks)], ref_packed_sf))
         empty_ks_packed_sf = get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
             fp32_sf, grouped_layout, [], gran_k, k_alignment, use_psum_layout=True)
-        assert torch.equal(empty_ks_packed_sf[:sum(packed_sf_ks)], ref_packed_sf)
+        assert_check(torch.equal(empty_ks_packed_sf[:sum(packed_sf_ks)], ref_packed_sf))
 
         # Performance
         t = bench_kineto(lambda: get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(fp32_sf, grouped_layout, aligned_ks_cpu, gran_k, k_alignment, use_psum_layout=True), 'pack_fp32_into_ue8m0')

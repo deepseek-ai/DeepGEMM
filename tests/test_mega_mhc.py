@@ -3,6 +3,7 @@ import torch
 import deep_gemm
 from deep_gemm.testing import (
     assert_bitwise_equal,
+    assert_check,
     bench_kineto,
     calc_diff,
     count_bytes,
@@ -15,11 +16,11 @@ from deep_gemm.utils import align, per_token_cast_to_fp8
 def enumerate_cases():
     for sf_layout in ('col', 'extra'):
         for hidden in (4096, 7168):
-            for num_tokens in (1, 64, 65, 200, 1025, 4096, 32768):
+            for num_tokens in (1, 64, 65, 200, 256, 1025, 4096, 32768):
                 yield sf_layout, num_tokens, hidden
 
 
-def make_inputs(num_tokens: int, hidden: int, seed: int, is_shifted: bool):
+def make_inputs(num_tokens: int, hidden: int, seed: int):
     hc_mult = 4
     num_hc_outputs = hc_mult * (hc_mult + 2)
     generator = torch.Generator(device='cuda').manual_seed(seed)
@@ -32,7 +33,7 @@ def make_inputs(num_tokens: int, hidden: int, seed: int, is_shifted: bool):
         residual=randn((num_tokens, hc_mult, hidden), torch.bfloat16),
         post_mix=randn((num_tokens, hc_mult, 1), torch.float).sigmoid(),
         comb_res_mix=torch.rand((num_tokens, hc_mult, hc_mult), device='cuda', generator=generator),
-        shifted_prev_mix=randn((num_tokens, hc_mult, 1), torch.float).sigmoid() if is_shifted else None,
+        shifted_prev_mix=randn((num_tokens, hc_mult, 1), torch.float).sigmoid(),
         fn=randn((num_hc_outputs, hc_mult * hidden), torch.float).mul_(1e-2),
         mix_scales=randn((3,), torch.float).mul_(0.1),
         mix_bases=randn((num_hc_outputs,), torch.float).mul_(0.1),
@@ -51,17 +52,15 @@ def make_inputs(num_tokens: int, hidden: int, seed: int, is_shifted: bool):
         inputs['comb_res_mix'] /= inputs['comb_res_mix'].sum(-2, keepdim=True)
     duplicates = tuple(i for i in (63, 64, 511, 512, num_tokens - 1) if 0 < i < num_tokens)
     for name in ('x', 'residual', 'post_mix', 'comb_res_mix', 'shifted_prev_mix'):
-        if inputs[name] is not None:
-            inputs[name][list(set(duplicates))] = inputs[name][0].clone()
+        inputs[name][list(set(duplicates))] = inputs[name][0].clone()
     return inputs, duplicates
 
 
 def make_outputs(inputs, sf_layout: str, shared_sf_block_m: int = 224):
     num_tokens, hidden = inputs['x'].shape
-    is_shifted = inputs['shifted_prev_mix'] is not None
     outputs = dict(
         new_residual=torch.empty_like(inputs['residual']),
-        new_prev_mix=torch.empty_like(inputs['shifted_prev_mix']) if is_shifted else None,
+        new_prev_mix=torch.empty_like(inputs['shifted_prev_mix']),
         new_post_mix=torch.empty_like(inputs['post_mix']),
         new_comb_res_mix=torch.empty_like(inputs['comb_res_mix']),
         y_bf16=torch.empty_like(inputs['x']),
@@ -138,16 +137,15 @@ def mhc_reference(
     num_sinkhorn_iters: int,
     rmsnorm_eps: float,
     rmsnorm_scale: float,
+    shifted_prev_mix: torch.Tensor,
     sf_layout: str = 'bf16',
     shared_sf_block_m: int = 0,
-    shifted_prev_mix: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     new_residual = x.float().unsqueeze(1) * post_mix
     new_residual += torch.einsum(
         'tij,tih->tjh', comb_res_mix, residual.float())
     new_residual = new_residual.bfloat16()
-    norm_input = None if shifted_prev_mix is None else (
-        new_residual.float() * shifted_prev_mix).sum(dim=1).bfloat16()
+    norm_input = (new_residual.float() * shifted_prev_mix).sum(dim=1).bfloat16()
 
     old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -173,9 +171,6 @@ def mhc_reference(
         num_sinkhorn_iters,
         sinkhorn_eps,
     )
-    if norm_input is None:
-        norm_input = (new_residual.float() * new_prev_mix).sum(dim=1).bfloat16()
-
     norm_input_float = norm_input.float()
     y_bf16 = (
         norm_input_float
@@ -184,12 +179,11 @@ def mhc_reference(
     ).bfloat16()
     result = {
         'new_residual': new_residual,
+        'new_prev_mix': new_prev_mix,
         'new_post_mix': new_post_mix,
         'new_comb_res_mix': new_comb_res_mix,
         'y_bf16': y_bf16,
     }
-    if shifted_prev_mix is not None:
-        result['new_prev_mix'] = new_prev_mix
     if sf_layout == 'bf16':
         return result
 
@@ -211,8 +205,7 @@ def mhc_reference(
 
 
 def logical_outputs(result, shared_sf_block_m=None):
-    names = ('new_residual', 'new_post_mix', 'new_comb_res_mix', 'y_bf16')
-    names += ('new_prev_mix',) if result.get('new_prev_mix') is not None else ()
+    names = ('new_residual', 'new_prev_mix', 'new_post_mix', 'new_comb_res_mix', 'y_bf16')
     names += tuple(name for name in ('y_fp8', 'y_gemm_sf', 'y_routed_sf') if name in result)
     values = {name: result[name] for name in names}
     if 'y_shared_sf_storage' in result:
@@ -233,7 +226,7 @@ def check_correctness(actual, reference, case):
         reference_tensor = comparable(reference[name])
         diff = float(calc_diff(actual_tensor, reference_tensor))
         limit = 2e-4 if name == 'y_fp8' else 5e-5
-        assert diff < limit, f'{case}, {name=}, {diff=}'
+        assert_check(diff < limit, f'{case}, {name=}, {diff=}')
         max_diffs.append(diff)
     return max_diffs
 
@@ -241,8 +234,12 @@ def check_correctness(actual, reference, case):
 @test_filter(lambda: get_arch_major() == 10)
 @torch.no_grad()
 def test_mega_mhc_api_contract() -> None:
+    def check_outputs(outputs, expected, label):
+        for name, tensor in logical_outputs(outputs).items():
+            assert_bitwise_equal(tensor, expected[name], f'{label}: {name}')
+
     num_tokens, hidden = 64, 4096
-    inputs, _ = make_inputs(num_tokens, hidden, 2026, False)
+    inputs, _ = make_inputs(num_tokens, hidden, 2026)
 
     # Deterministic mode selects fixed Split-K independently for every invocation
     outputs = make_outputs(inputs, 'bf16')
@@ -251,113 +248,142 @@ def test_mega_mhc_api_contract() -> None:
         run_mega_mhc(inputs, outputs)
         expected = {name: tensor.clone() for name, tensor in logical_outputs(outputs).items()}
         run_mega_mhc(inputs, outputs)
-        for name, tensor in logical_outputs(outputs).items():
-            assert_bitwise_equal(tensor, expected[name], f'Deterministic invocation: {name}')
+        check_outputs(outputs, expected, 'Deterministic invocation')
     finally:
         deep_gemm.use_deterministic_algorithms(False)
 
+    # FP8-only calls remain bitwise stable after a different-sized invocation
+    small_inputs, _ = make_inputs(1, hidden, 2027)
+    outputs = make_outputs(inputs, 'extra')
+    run_mega_mhc(inputs, outputs)
+    names = ('y_fp8', 'y_routed_sf', 'y_shared_sf_storage')
+    expected = {name: outputs[name].clone() for name in names}
+    run_mega_mhc(small_inputs, make_outputs(small_inputs, 'extra'))
+    run_mega_mhc(inputs, outputs, y_bf16=None)
+    for name in names:
+        assert_bitwise_equal(outputs[name], expected[name], f'FP8-only: {name}')
+
     # A stream must initialize its split barriers before CUDA Graph capture
-    expected_outputs = make_outputs(inputs, 'bf16')
-    run_mega_mhc(inputs, expected_outputs)
-    torch.cuda.synchronize()
-    capture_stream = torch.cuda.Stream()
-    graph_outputs = make_outputs(inputs, 'bf16')
+    outputs = make_outputs(inputs, 'bf16')
     try:
-        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=capture_stream):
-            graph_outputs['y_bf16'].zero_()
-            run_mega_mhc(inputs, graph_outputs)
+        with torch.cuda.graph(torch.cuda.CUDAGraph(), stream=torch.cuda.Stream()):
+            run_mega_mhc(inputs, outputs)
     except RuntimeError as error:
         assert 'CaptureStatus::None' in str(error)
     else:
         raise AssertionError('Mega mHC must be warmed up before CUDA Graph capture')
 
-    with torch.cuda.stream(capture_stream):
-        run_mega_mhc(inputs, graph_outputs)
-    capture_stream.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        run_mega_mhc(inputs, graph_outputs)
-    graph.replay()
-    capture_stream.synchronize()
-    for name, tensor in logical_outputs(graph_outputs).items():
-        assert_bitwise_equal(tensor, expected_outputs[name], f'CUDA Graph: {name}')
-
-    # FP8-only calls remain bitwise stable after a different-sized invocation
-    for is_shifted in (False, True):
-        inputs, _ = make_inputs(num_tokens, hidden, 2026, is_shifted)
-        small_inputs, _ = make_inputs(1, hidden, 2027, is_shifted)
-        outputs = make_outputs(inputs, 'extra')
-        run_mega_mhc(inputs, outputs)
-        names = ('y_fp8', 'y_routed_sf', 'y_shared_sf_storage')
-        expected = {name: outputs[name].clone() for name in names}
-        run_mega_mhc(small_inputs, make_outputs(small_inputs, 'extra'))
-        run_mega_mhc(inputs, outputs, y_bf16=None)
-        for name in names:
-            assert_bitwise_equal(outputs[name], expected[name], f'FP8-only: {name}')
-
     # Concurrent kernels on different streams use independent split barriers
-    inputs, _ = make_inputs(num_tokens, hidden, 2028, False)
-    expected_outputs = make_outputs(inputs, 'bf16')
-    run_mega_mhc(inputs, expected_outputs)
-    torch.cuda.synchronize()
+    eager_inputs = inputs
+    eager_outputs = make_outputs(eager_inputs, 'bf16')
+    run_mega_mhc(eager_inputs, eager_outputs)
+    eager_expected = {name: tensor.clone() for name, tensor in logical_outputs(eager_outputs).items()}
 
     streams = (torch.cuda.Stream(), torch.cuda.Stream())
-    stream_outputs = []
-    for stream in streams:
+    stream_outputs = [make_outputs(inputs, 'bf16') for _ in streams]
+    for stream, outputs in zip(streams, stream_outputs):
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            outputs = make_outputs(inputs, 'bf16')
             run_mega_mhc(inputs, outputs)
-            stream_outputs.append(outputs)
-    for stream in streams:
-        stream.synchronize()
+    torch.cuda.synchronize()
+
+    # Fork both cooperative grids from one graph so repeated launches can contend for SMs.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        capture_stream = torch.cuda.current_stream()
+        for stream, outputs in zip(streams, stream_outputs):
+            stream.wait_stream(capture_stream)
+            with torch.cuda.stream(stream):
+                run_mega_mhc(inputs, outputs)
+        for stream in streams:
+            capture_stream.wait_stream(stream)
+    for _ in range(20):
+        graph.replay()
+    torch.cuda.current_stream().synchronize()
+
     for stream_idx, outputs in enumerate(stream_outputs):
-        for name, tensor in logical_outputs(outputs).items():
-            assert_bitwise_equal(tensor, expected_outputs[name], f'Multi-stream {stream_idx}: {name}')
+        check_outputs(outputs, eager_expected, f'Multi-stream {stream_idx}')
+
+    # Share a stream while changing token count, split count and output layout
+    stream = streams[0]
+    cases = []
+    for tokens, hidden, sf_layout in ((1, 4096, 'bf16'), (65, 4096, 'col'), (200, 7168, 'extra')):
+        inputs, _ = make_inputs(tokens, hidden, 2026)
+        outputs = make_outputs(inputs, sf_layout)
+        x_versions = (inputs['x'].clone(), -inputs['x'])
+        expected = []
+        for x in x_versions:
+            inputs['x'].copy_(x)
+            run_mega_mhc(inputs, outputs)
+            expected.append({name: tensor.clone() for name, tensor in logical_outputs(outputs).items()})
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run_mega_mhc(inputs, outputs)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run_mega_mhc(inputs, outputs)
+        cases.append((graph, inputs, outputs, x_versions, expected))
+
+    # Alternate inputs and interleave graphs and eager calls on the same split barriers.
+    for replay_idx in range(20):
+        for graph, inputs, outputs, x_versions, expected in reversed(cases):
+            version = replay_idx % 2
+            with torch.cuda.stream(stream):
+                inputs['x'].copy_(x_versions[version])
+                if version == 1:
+                    run_mega_mhc(eager_inputs, eager_outputs)
+                graph.replay()
+            stream.synchronize()
+            check_outputs(outputs, expected[version], f'Graph replay {replay_idx}: {inputs["x"].shape}')
+            if version == 1:
+                check_outputs(eager_outputs, eager_expected, f'Eager between replays: {replay_idx}')
 
 
 @test_filter(lambda: get_arch_major() == 10)
 @torch.no_grad()
 def test_mega_mhc() -> None:
-    for is_shifted in (True, False):
-        mode = 'shifted' if is_shifted else 'normal'
-        print(f'Testing Mega {mode} mHC:')
-        for case_idx, (sf_layout, num_tokens, hidden) in enumerate(enumerate_cases()):
-            inputs, duplicates = make_inputs(
-                num_tokens, hidden, 2026 + case_idx + (0 if is_shifted else 1000), is_shifted)
-            outputs = make_outputs(inputs, sf_layout)
-            ref_kwargs = dict(
-                **inputs, sf_layout=sf_layout,
-                shared_sf_block_m=outputs.get('shared_sf_block_m', 0))
-            reference = mhc_reference(**ref_kwargs)
+    print('Testing Mega shifted mHC:')
+    for case_idx, (sf_layout, num_tokens, hidden) in enumerate(enumerate_cases()):
+        inputs, duplicates = make_inputs(
+            num_tokens, hidden, 2026 + case_idx)
+        outputs = make_outputs(inputs, sf_layout)
+        ref_kwargs = dict(
+            **inputs, sf_layout=sf_layout,
+            shared_sf_block_m=outputs.get('shared_sf_block_m', 0))
+        reference = mhc_reference(**ref_kwargs)
+        run_mega_mhc(inputs, outputs)
+        actual = logical_outputs(outputs)
+        ref = logical_outputs(reference, outputs.get('shared_sf_block_m'))
+        diffs = check_correctness(actual, ref, (sf_layout, num_tokens, hidden))
+
+        expected = {name: tensor.clone() for name, tensor in actual.items()}
+        for _ in range(30):
             run_mega_mhc(inputs, outputs)
             actual = logical_outputs(outputs)
-            ref = logical_outputs(reference, outputs.get('shared_sf_block_m'))
-            diffs = check_correctness(actual, ref, (mode, sf_layout, num_tokens, hidden))
+            for name in actual:
+                assert_bitwise_equal(actual[name], expected[name], name)
+        for token_idx in duplicates:
+            for name, tensor in actual.items():
+                assert_bitwise_equal(tensor[token_idx], tensor[0], f'{name}, token={token_idx}')
 
-            expected = {name: tensor.clone() for name, tensor in actual.items()}
-            for _ in range(30):
-                run_mega_mhc(inputs, outputs)
-                actual = logical_outputs(outputs)
-                for name in actual:
-                    assert_bitwise_equal(actual[name], expected[name], name)
-            for token_idx in duplicates:
-                for name, tensor in actual.items():
-                    assert_bitwise_equal(tensor[token_idx], tensor[0], f'{name}, token={token_idx}')
-
-            kernel_t = bench_kineto(lambda: run_mega_mhc(inputs, outputs),
-                                    'sm100_mega_mhc', suppress_kineto_output=True)
-            logical_inputs = [tensor for tensor in inputs.values() if isinstance(tensor, torch.Tensor)]
-            logical_bytes = count_bytes(*logical_inputs, *actual.values())
-            intermediate_io_bytes = 2 * count_bytes(outputs['y_bf16'])
-            if not is_shifted:
-                intermediate_io_bytes += count_bytes(outputs['new_residual'])
-            print(f' > {sf_layout:5} T={num_tokens:5}, H={hidden:4}: {kernel_t * 1e6:6.1f} us, '
-                  f'{logical_bytes / kernel_t / 1e9:4.0f} GB/s '
-                  f'({(logical_bytes + intermediate_io_bytes) / kernel_t / 1e9:4.0f} incl. Scratch I/O) | '
-                  f'diff {max(diffs):.1e}')
+        kernel_t = bench_kineto(lambda: run_mega_mhc(inputs, outputs),
+                                'sm100_mega_mhc', suppress_kineto_output=True)
+        logical_inputs = [tensor for tensor in inputs.values() if isinstance(tensor, torch.Tensor)]
+        logical_bytes = count_bytes(*logical_inputs, *actual.values())
+        intermediate_io_bytes = 2 * count_bytes(outputs['y_bf16'])
+        print(f' > {sf_layout:5} T={num_tokens:5}, H={hidden:4}: {kernel_t * 1e6:6.1f} us, '
+              f'{logical_bytes / kernel_t / 1e9:4.0f} GB/s '
+              f'({(logical_bytes + intermediate_io_bytes) / kernel_t / 1e9:4.0f} incl. Scratch I/O) | '
+              f'diff {max(diffs):.1e}')
     print()
 
 
 if __name__ == '__main__':
+    torch.manual_seed(0)
+
+    print('Library path:')
+    print(f' > {deep_gemm.__path__}\n')
+
     test_mega_mhc_api_contract()
     test_mega_mhc()

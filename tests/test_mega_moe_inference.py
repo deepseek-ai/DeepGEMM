@@ -33,7 +33,7 @@ def import_baseline():
     return deep_ep, tilelang_ops, do_bench, is_legacy_loaded
 
 
-def _to_shared_mega_moe_sf_layout(sf: torch.Tensor, block_m: int, num_max_sf_tokens: int) -> torch.Tensor:
+def _to_shared_mega_moe_inference_sf_layout(sf: torch.Tensor, block_m: int, num_max_sf_tokens: int) -> torch.Tensor:
     num_tokens, packed_sf_k = sf.shape
     aligned_block_m = align(block_m, 128)
     num_m_blocks = (num_tokens + block_m - 1) // block_m
@@ -50,7 +50,7 @@ def _to_shared_mega_moe_sf_layout(sf: torch.Tensor, block_m: int, num_max_sf_tok
     return result
 
 
-def _cast_fp8_for_mega_moe(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _cast_fp8_for_mega_moe_inference(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     x_fp8, x_sf = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
     mn, packed_sf_k = x_sf.shape
     x_sf_tma = torch.empty_strided(
@@ -68,6 +68,57 @@ def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
     dst[:num_tokens].copy_(src)
     if num_tokens < dst.shape[0]:
         dst[num_tokens:].copy_(src[-1:].expand(dst.shape[0] - num_tokens, -1))
+
+
+def _rms_norm_reference(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    num_tokens, hidden = x.shape
+    # Match the combine layout selected by the FP8/FP4 heuristic with eight epilogue warps.
+    num_chunks = 1 if hidden <= 4096 else 2
+    x = x.float()
+    values = x.reshape(num_tokens, num_chunks, hidden // (num_chunks * 256), 32, 4, 2)
+    sum_sq = torch.zeros_like(values[:, :, 0])
+    for value in values.unbind(2):
+        sum_sq = torch.addcmul(sum_sq, value, value)
+    sum_sq = (sum_sq[..., 0, :] + sum_sq[..., 1, :]) + (sum_sq[..., 2, :] + sum_sq[..., 3, :])
+    sum_sq = sum_sq[..., 0] + sum_sq[..., 1]
+    # Reproduce lane 0 of the XOR warp reduction, then combine the chunks.
+    for offset in (16, 8, 4, 2, 1):
+        sum_sq = sum_sq[..., :offset] + sum_sq[..., offset:]
+    sum_sq = sum_sq[:, :, 0]
+    sum_sq = sum_sq[:, 0] if num_chunks == 1 else sum_sq[:, 0] + sum_sq[:, 1]
+    # Match the FP32 reciprocal and fused multiply-add used before CUDA rsqrtf.
+    inv_rms = torch.rsqrt(torch.addcmul(torch.full_like(sum_sq, eps), sum_sq, torch.full_like(sum_sq, 1.0 / hidden)))
+    return (x * inv_rms[:, None] * weight.float()).to(weight.dtype)
+
+
+def _fp32_combine_reference(x: torch.Tensor, handle, shared: Optional[torch.Tensor],
+                            group: dist.ProcessGroup) -> torch.Tensor:
+    """Reverse expanded dispatch without rounding the sum to BF16 (correctness only)."""
+    assert handle.do_expand
+    num_tokens, num_topk = handle.topk_idx.shape
+    capacity, hidden = handle.num_max_tokens_per_rank, x.size(1)
+    # Metadata holds the global source token and one expanded L2 row per top-k slot.
+    # The remaining allocated rows and expert padding must never be read.
+    counts = getattr(handle, 'psum_num_recv_tokens_per_scaleup_rank', None)
+    if counts is None:
+        counts = handle.psum_num_recv_tokens_per_rank
+    metadata = handle.recv_src_metadata[:int(counts[-1].item())]
+    assert metadata.size(1) == num_topk + 2
+    combined = torch.zeros((num_tokens, hidden), dtype=torch.float32, device=x.device)
+    if shared is not None:
+        combined.copy_(shared.float())
+
+    send = torch.empty((group.size() * capacity, hidden), dtype=x.dtype, device=x.device)
+    received = torch.empty((capacity, hidden), dtype=x.dtype, device=x.device)
+    for topk_slot_idx in range(num_topk):
+        rows = metadata[:, 2 + topk_slot_idx].long()
+        valid = rows >= 0
+        send.zero_()
+        send.index_copy_(0, metadata[valid, 0].long(), x[rows[valid]])
+        # A token/slot has exactly one owner, so this transports BF16 values exactly.
+        dist.reduce_scatter_tensor(received, send, group=group)
+        combined.add_(received[:num_tokens].float())
+    return combined
 
 
 # TODO: skip the test for SM90
@@ -89,9 +140,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
     shared_intermediate_hidden = intermediate_hidden * num_shared_experts
     assert num_tokens <= num_max_tokens_per_rank
+    assert not (args.rms_norm and is_bf16xbf16), 'RMSNorm requires FP8/FP4 Mega MoE'
+    assert not args.rms_norm or (args.rms_eps is not None and args.rms_eps > 0)
+    output_dtype = torch.float32 if args.output_dtype == 'fp32' else torch.bfloat16
+    fp32_output = output_dtype == torch.float32
+    assert not (fp32_output and is_bf16xbf16), 'FP32 output requires FP8/FP4 Mega MoE'
 
     # Allocate symmetric memory
-    buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+    buffer = deep_gemm.get_symm_buffer_for_mega_moe_inference(
         group, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
@@ -122,7 +178,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # noinspection PyGlobalUndefined
     def create_inputs():
         global x, shared_x, shared_l1_x_sf, topk_idx, topk_weights, l1_weights, l2_weights
-        global transformed_l1_weights, transformed_l2_weights
+        global transformed_l1_weights, transformed_l2_weights, rms_weights
         global shared_l1_weights, shared_l2_weights, transformed_shared_l1_weights, transformed_shared_l2_weights
         global cumulative_local_expert_recv_stats_fused, cumulative_local_expert_recv_stats_baseline
         global initial_cumulative_local_expert_recv_stats_fused, initial_cumulative_local_expert_recv_stats_baseline
@@ -154,25 +210,25 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if not is_bf16xbf16:
             # FP8 path: cast inputs and weights with per-32 UE8M0 SF
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
-            block_m = deep_gemm.get_block_m_for_mega_moe(
+            block_m = deep_gemm.get_block_m_for_mega_moe_inference(
                 num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
-            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
+            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe_inference(x)
             x = (x_fp8, x_sf)
             shared_x = (x_fp8, x_sf_tma)
             if num_shared_experts > 0:
-                shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
+                shared_l1_x_sf = _to_shared_mega_moe_inference_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
             cast_weights = _cast_weights_to_fp8 if args.mma_type == 'fp8xfp8' else _cast_weights_to_fp4
             l1_weights = cast_weights(l1_weights)
             l2_weights = cast_weights(l2_weights)
             if num_shared_experts > 0:
-                shared_l1_weights = _cast_fp8_for_mega_moe(shared_l1_weights)[0::2]
-                shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
+                shared_l1_weights = _cast_fp8_for_mega_moe_inference(shared_l1_weights)[0::2]
+                shared_l2_weights = _cast_fp8_for_mega_moe_inference(shared_l2_weights)[0::2]
 
         transformed_l1_weights, transformed_l2_weights = (
-            deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights))
+            deep_gemm.transform_weights_for_mega_moe_inference(l1_weights, l2_weights))
         if num_shared_experts > 0:
             transformed_shared_l1_weights, transformed_shared_l2_weights = (
-                deep_gemm.transform_weights_for_mega_moe(shared_l1_weights, shared_l2_weights))
+                deep_gemm.transform_weights_for_mega_moe_inference(shared_l1_weights, shared_l2_weights))
         else:
             transformed_shared_l1_weights = transformed_shared_l2_weights = None
 
@@ -184,6 +240,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             transformed_l1_weights, transformed_l2_weights = localize(transformed_l1_weights), localize(transformed_l2_weights)
             if num_shared_experts > 0:
                 transformed_shared_l1_weights, transformed_shared_l2_weights = localize(transformed_shared_l1_weights), localize(transformed_shared_l2_weights)
+
+        # Generate in both modes to keep the same inputs across ON/OFF runs.
+        rms_weights = torch.randn((hidden, ), dtype=output_dtype, device='cuda')
 
     # Run fused mega MoE
     # NOTES: copy x into buffer before each call because debug mode zeros the entire buffer
@@ -202,23 +261,26 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         cumulative_local_expert_recv_stats_fused.copy_(initial_cumulative_local_expert_recv_stats_fused)
         copy_inputs_to_buffer()
 
-        y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+        y = torch.empty((num_tokens, hidden), dtype=output_dtype, device='cuda')
         kernel_kwargs = dict(
             y=y, l1_weights=transformed_l1_weights, l2_weights=transformed_l2_weights,
             sym_buffer=buffer,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats_fused,
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math))
+        if not is_bf16xbf16:
+            kernel_kwargs.update(rms_weights=rms_weights if args.rms_norm else None, rms_eps=args.rms_eps)
         if num_shared_experts > 0:
             kernel_kwargs.update(
                 shared_l1_weights=transformed_shared_l1_weights,
                 shared_l2_weights=transformed_shared_l2_weights
             )
-        (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
+        (deep_gemm.bf16_mega_moe_inference if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe_inference)(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+    dist_print(f' > Output: {args.output_dtype}, RMSNorm: {bool(args.rms_norm)}, eps: {args.rms_eps}', once_in_node=True)
     dist_print(f' > Localized weights: {args.use_localization}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
@@ -301,7 +363,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 deep_gemm.fp8_gemm_nt(l2_in, shared_l2_weights, y, recipe=(1, 1, 32), disable_ue8m0_cast=True)
             return y
 
-        def run_baseline():
+        def run_baseline(with_rms_norm: bool = True):
             cumulative_local_expert_recv_stats_baseline.copy_(initial_cumulative_local_expert_recv_stats_baseline)
             # Dispatch
             recv_x, _, recv_topk_weights, handle, _ = ep_buffer.dispatch(
@@ -329,10 +391,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             gemm_fn(l1_y, l2_weights, l2_y, handle.psum_num_recv_tokens_per_expert, **gemm_kwargs)
 
             # Combine
-            return (
-                ep_buffer.combine(l2_y, handle=handle, bias=get_baseline_shared_bias())[0],
-                cumulative_local_expert_recv_stats_baseline
-            )
+            shared_bias = get_baseline_shared_bias()
+            y = _fp32_combine_reference(l2_y, handle, shared_bias, group) if fp32_output else \
+                ep_buffer.combine(l2_y, handle=handle, bias=shared_bias)[0]
+            if args.rms_norm and with_rms_norm:
+                y = torch.nn.functional.rms_norm(
+                    y.float(), (hidden, ), weight=rms_weights.float(), eps=args.rms_eps).to(output_dtype)
+            return y, cumulative_local_expert_recv_stats_baseline
 
     # Check correctness
     # noinspection PyBroadException
@@ -341,9 +406,14 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         for i in range(num_correctness_tests):
             create_inputs()
             fused_y, fused_stats = run_fused()
-            baseline_y, baseline_stats = run_baseline()
+            baseline_y, baseline_stats = run_baseline(with_rms_norm=False)
             assert torch.equal(fused_stats, baseline_stats)
-            assert torch.equal(fused_y, baseline_y), f'calc_diff={calc_diff(fused_y, baseline_y)}'
+            if args.rms_norm:
+                baseline_y = _rms_norm_reference(baseline_y, rms_weights, args.rms_eps)
+            if fp32_output and args.rms_norm:
+                torch.testing.assert_close(fused_y, baseline_y, rtol=1e-5, atol=1e-6)
+            else:
+                assert torch.equal(fused_y, baseline_y), f'calc_diff={calc_diff(fused_y, baseline_y)}'
             if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
                 dist_print(f' > Correctness test #{i + 1}/{num_correctness_tests} passed', once_in_node=True)
         dist_print(once_in_node=True)
@@ -359,11 +429,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Benchmark
     barrier_kwargs = {'wait_comm_stream': False} if hasattr(deep_ep, 'EPBuffer') else {'use_comm_stream': False}
     barrier_fn = lambda: ep_buffer.barrier(**barrier_kwargs) if ep_buffer else dist.all_reduce(torch.empty(1, device='cuda'))
-    trace_path = None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json'
-    t_fused = bench_kineto(run_fused, 'mega_moe', barrier=barrier_fn, trace_path=trace_path)
+    trace_path = None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_inference_rank{rank_idx}.json'
+    t_fused = bench_kineto(run_fused, 'mega_moe_inference', barrier=barrier_fn, trace_path=trace_path)
+    # The FP32 reference reverses routing with PyTorch collectives and CPU metadata
+    # reads; it is for correctness, not a comparable CUDA-graph performance baseline.
     t_baseline = tilelang_bench(
         run_baseline, _n_warmup=5, _n_repeat=1,
-        backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
+        backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded and not fp32_output else 0
 
     # TFLOPS: routed + shared L1/L2, each 2 * M * N * K
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
@@ -406,6 +478,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         hbm_gbs = safe_div(num_hbm_bytes / 1e9, elapsed)
         nvlink_gbs = safe_div(num_nvlink_bytes / 1e9, elapsed)
         approx_factor = safe_div(elapsed, elapsed - t_reduction)
+        comparison = f'{safe_div(ref_time, elapsed):.2f}x {ref_label}' if ref_time else 'no comparable baseline'
         dist_print(f' > EP {rank_idx:2}/{num_ranks} | '
                    f'{tflops:4.0f} TFLOPS | '
                    f'overlap: '
@@ -414,7 +487,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                    f'NVL {nvlink_gbs * approx_factor:3.0f} GB/s | '
                    f'{elapsed * 1e6:4.0f} us, '
                    f'reduction: {t_reduction * 1e6:4.1f} us | '
-                   f'{safe_div(ref_time, elapsed):.2f}x {ref_label}')
+                   f'{comparison}')
 
     dist_print(f'Performance (w/{"" if num_shared_experts else "o"} shared):', once_in_node=True)
     print_perf(t_fused, t_baseline, f'legacy{"+shared" if num_shared_experts else ""}')
@@ -446,6 +519,9 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
+    parser.add_argument('--rms-norm', type=int, default=0, choices=(0, 1), help='Enable RMSNorm after combine (0 or 1, default: 0)')
+    parser.add_argument('--rms-eps', type=float, default=None, help='RMSNorm epsilon (required when --rms-norm=1)')
+    parser.add_argument('--output-dtype', choices=('bf16', 'fp32'), default='bf16', help='Output y (and RMSNorm weight) dtype')
     parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
     parser.add_argument('--use-localization', action='store_true', help='Localize the weights into the locality domains (requires MLOPart)')
 

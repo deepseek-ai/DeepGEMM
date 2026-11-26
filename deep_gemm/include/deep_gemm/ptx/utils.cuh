@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 
 #include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/ptx/math.cuh>
 
 #if defined(DG_IN_CUDA_COMPILATION)
 namespace deep_gemm::ptx {
@@ -30,6 +31,10 @@ CUTLASS_DEVICE void sync_aligned(const uint32_t& num_threads, const uint32_t& ba
     asm volatile("bar.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads));
 }
 
+CUTLASS_DEVICE void arrive_unaligned(const uint32_t& num_threads, const uint32_t& barrier_idx) {
+    asm volatile("barrier.arrive %0, %1;" : : "r"(barrier_idx), "r"(num_threads));
+}
+
 CUTLASS_DEVICE void sync_unaligned(const uint32_t& num_threads, const uint32_t& barrier_idx) {
     asm volatile("barrier.sync %0, %1;" : : "r"(barrier_idx), "r"(num_threads));
 }
@@ -44,45 +49,6 @@ CUTLASS_DEVICE dtype_t exchange(dtype_t ptr, const uint32_t& src_lane_idx) {
     for (uint32_t i = 0; i < sizeof(dtype_t) / sizeof(uint32_t); ++ i)
         recv_int_values[i] = __shfl_sync(0xffffffff, send_int_values[i], static_cast<int>(src_lane_idx));
     return recv_dtype;
-}
-
-CUTLASS_DEVICE float reduce_max_sync(const float& value) {
-    float ret;
-    asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(ret) : "f"(value));
-    return ret;
-}
-
-CUTLASS_DEVICE nv_bfloat162 cvt_relu_bf16x2_f32(const float2& v) {
-#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
-    uint32_t packed;
-    asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;\n" : "=r"(packed) : "f"(v.y), "f"(v.x));
-    return *reinterpret_cast<const nv_bfloat162*>(&packed);
-#else
-    return __floats2bfloat162_rn(fmaxf(v.x, 0.0f), fmaxf(v.y, 0.0f));
-#endif
-}
-
-CUTLASS_DEVICE void accumulate(float2& a, nv_bfloat162 b) {
-#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
-    // Use `add.rn.f32.bf16` instruction to perform fused (cast + add) operation on SM100
-    asm("add.rn.f32.bf16 %0, %1, %0;\n" : "+f"(a.x) : "h"(*reinterpret_cast<uint16_t*>(&b.x)));
-    asm("add.rn.f32.bf16 %0, %1, %0;\n" : "+f"(a.y) : "h"(*reinterpret_cast<uint16_t*>(&b.y)));
-#else
-    const auto [x, y] = __bfloat1622float2(b);
-    a.x += x, a.y += y;
-#endif
-}
-
-CUTLASS_DEVICE void accumulate_square(float2& a, nv_bfloat162 b) {
-#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
-    // Accumulate BF16 squares directly into FP32 without separate conversion instructions.
-    asm("fma.rn.f32.bf16 %0, %1, %1, %0;\n" : "+f"(a.x) : "h"(*reinterpret_cast<uint16_t*>(&b.x)));
-    asm("fma.rn.f32.bf16 %0, %1, %1, %0;\n" : "+f"(a.y) : "h"(*reinterpret_cast<uint16_t*>(&b.y)));
-#else
-    const float2 b_f32 = __bfloat1622float2(b);
-    a.x += b_f32.x * b_f32.x;
-    a.y += b_f32.y * b_f32.y;
-#endif
 }
 
 } // namespace deep_gemm::ptx

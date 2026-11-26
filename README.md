@@ -8,6 +8,8 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## News
 
+- 2026.11.26: Mega MoE fused RMSNorm & low-latency optimizations, GEMM FP8 stochastic rounding & bias support, experimental fused kernels and more.
+    - Please see [#525](https://github.com/deepseek-ai/DeepGEMM/pull/525) for more details.
 - 2026.09.30
   - DeepGEMM Ascend is available! Check [DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend/) for more details
   - Add more optimizations, including locality domain features, check [#462](https://github.com/deepseek-ai/DeepGEMM/pull/462) for more details
@@ -73,6 +75,8 @@ Please note that operations like input transposition or FP8 casting must be hand
 
 To perform a basic non-grouped FP8 GEMM, call the `fp8_gemm_{nt, nn, tn, tt}` function. For more details, please refer to the function documentation.
 
+On SM100, dense BF16 and FP8/FP4 GEMMs accept a contiguous `[1, N]` bias through `c`: `D = A @ B.T + bias`, including when `M = 1`. Bias must match the BF16/FP32 output's dtype and device, and its memory must not overlap D. Bias cannot be combined with `alpha` (including 1), an explicit `epilogue` (including `Identity`), or FP8 output quantization. Other full `[M, N]` C inputs retain normal accumulation, including in-place `C = D` when `M = 1`.
+
 #### Grouped GEMMs (contiguous layout)
 
 Unlike traditional grouped GEMMs in CUTLASS, DeepGEMM groups only the M-axis, while N and K must remain fixed. This design is tailored for scenarios where experts in an MoE model share the same shape. For training forward passes or inference prefilling, where each expert may process a varying number of tokens, we concatenate these tokens into a single tensor, referred to as the "contiguous" layout. Note that each expert segment must be aligned to the GEMM M block size (`get_mk_alignment_for_contiguous_layout()`).  For more information, please refer to the `m_grouped_fp8_gemm_{nt, nn}_contiguous` function documentation.
@@ -109,39 +113,23 @@ out_ij = out_ij.sum()  # Scalar
 
 For more details and the paged version `fp8_fp4_paged_mqa_logits`, please refer to `tests/test_attention.py`.
 
-#### Mega MoE
+#### Mega MoE inference
 
-Mega MoE fuses and overlaps EP dispatch, linear 1 and linear 2 (FP8xFP4 or FP8xFP8), SwiGLU, and EP combine into a single mega-kernel, overlapping NVLink communication and tensor core computation. It requires multi-process launch with symmetric memory. Usage:
+FP8 inputs with FP8/FP4 weights. `x` and each weight are `(data, sf)` tuples; the caller allocates BF16 `y`.
 
 ```python
-# Allocate symmetric memory buffer
-# NOTES: requires PyTorch >= 2.9
-buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+buffer = deep_gemm.get_symm_buffer_for_mega_moe_inference(
     group, num_experts, num_max_tokens_per_rank, num_topk, hidden, intermediate_hidden,
-    mma_type='fp8xfp4',  # Use 'fp8xfp8' for FP8 routed-expert weights
+    mma_type='fp8xfp4',  # Or 'fp8xfp8'
 )
+l1, l2 = deep_gemm.transform_weights_for_mega_moe_inference(l1_weights, l2_weights)
 
-# Transform weights (FP4 or FP8 with UE8M0 SF) into the required layout
-transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe(l1_weights, l2_weights)
-
-# (Optional) Localize weights into locality domains
-transformed_l1 = (deep_gemm.localize(transformed_l1[0]), transformed_l1[1])
-transformed_l2 = (deep_gemm.localize(transformed_l2[0]), transformed_l2[1])
-deep_gemm.destroy_localizer()
-
-# Copy inputs into the buffer before each call
-# You may fuse these into previous kernels
-buffer.x[:num_tokens].copy_(x_fp8)
-buffer.x_sf[:num_tokens].copy_(x_sf)
+buffer.x[:num_tokens].copy_(x[0])
+buffer.x_sf[:num_tokens].copy_(x[1])
 buffer.topk_idx[:num_tokens].copy_(topk_idx)
 buffer.topk_weights[:num_tokens].copy_(topk_weights)
-
-# Run the fused mega MoE kernel
-y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
+deep_gemm.fp8_fp4_mega_moe_inference(y, l1, l2, buffer)
 ```
-
-For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 
 #### Utilities
 

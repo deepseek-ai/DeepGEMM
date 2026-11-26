@@ -6,12 +6,13 @@ from deep_gemm.utils import align, pack_ue8m0_to_int
 from deep_gemm.testing import (
     assert_bitwise_equal,
     bench_kineto,
-    calc_diff, count_bytes,
+    assert_check, calc_diff, count_bytes,
     get_arch_major
 )
 from utils import (
     add_sf_k_padding, assert_direct_output_matches_fp32_accumulation,
     assert_stochastic_bf16_matches_fp32_accumulation,
+    assert_stochastic_fp8_matches_fp32_accumulation,
     assert_psum_zero_padding, convert_to_fp8, make_cublas_gemm,
 )
 
@@ -26,7 +27,8 @@ from generators import (
 def test_gemm() -> None:
     print('Testing GEMM:')
     use_alpha_options = (False, True) if get_arch_major() == 10 else (False,)
-    test_sf_k_padding = get_arch_major() == 10
+    use_bias_options = (False, True) if get_arch_major() == 10 else (False,)
+    test_sf_k_padding = set(use_bias_options) if get_arch_major() == 10 else set()
     for kernel_type, quant_config, m, n, k, major_a, major_b, accumulate, out_dtype, scores in \
             enumerate_normal(torch.float8_e4m3fn, collect_cublas_scores=True):
         major_opt  = 'N' if major_a.is_k_major() else 'T'
@@ -39,76 +41,107 @@ def test_gemm() -> None:
         recipe, recipe_a, recipe_b = quant_config.get_recipes(is_wgrad=(kernel_type.is_1d1d() and accumulate))
 
         for test_alias in (False, True):
+            func_name = f'fp8_fp4_gemm_{major_opt.lower() if test_alias else "nt"}'
             for use_alpha in use_alpha_options:
                 alpha = random.uniform(-1.0, 1.0) if use_alpha else None
-                a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype,
-                                                     kernel_type, use_ue8m0=use_ue8m0,
-                                                     quant_config=quant_config, alpha=alpha)
-                func_name = f'fp8_fp4_gemm_{major_opt.lower() if test_alias else "nt"}'
-                if test_alias:
-                    a = a if major_a.is_k_major() else (a[0].T, a[1].T)
-                    b = b if major_b.is_k_major() else (b[0].T, b[1].T)
-                    assert a[0].is_contiguous() and b[0].is_contiguous()
-                getattr(deep_gemm, func_name)(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast,
-                                              recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b, alpha=alpha)
-                diff = calc_diff(d, ref_d)
-                assert diff < quant_config.max_diff(), (f'{m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}, '
-                                                        f'{accumulate=}, {out_dtype=}, {use_alpha=}, {alpha=}, '
-                                                        f'{diff:.5f}, alias={test_alias}')
+                for with_bias in use_bias_options:
+                    if with_bias and accumulate:
+                        continue
+                    a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype,
+                                                         kernel_type, use_ue8m0=use_ue8m0,
+                                                         quant_config=quant_config, alpha=alpha, with_bias=with_bias)
+                    if test_alias:
+                        a = a if major_a.is_k_major() else (a[0].T, a[1].T)
+                        b = b if major_b.is_k_major() else (b[0].T, b[1].T)
+                        assert a[0].is_contiguous() and b[0].is_contiguous()
+                    epilogue_options = [dict(alpha=alpha)]
+                    if with_bias:
+                        epilogue_options.append(dict(epilogue=deep_gemm.epilogue.Alpha(alpha) if use_alpha else deep_gemm.epilogue.Identity()))
+                        if use_alpha:
+                            epilogue_options.extend((dict(alpha=1.0), dict(epilogue=deep_gemm.epilogue.Alpha(1.0))))
+                    saved_c = c.clone() if with_bias else None
+                    for epilogue_args in epilogue_options:
+                        expect_error = with_bias and (epilogue_args.get('alpha') is not None or 'epilogue' in epilogue_args)
+                        try:
+                            getattr(deep_gemm, func_name)(a, b, d, c=c, disable_ue8m0_cast=disable_ue8m0_cast,
+                                                          recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b, **epilogue_args)
+                        except RuntimeError as error:
+                            if not expect_error:
+                                raise
+                            assert 'The epilogue class, `alpha`, the FP8 output pair and bias are exclusive' in str(error), str(error)
+                            continue
+                        assert not expect_error, 'Bias with alpha or an explicit epilogue must be rejected'
+                        diff = calc_diff(d, ref_d)
+                        assert_check(diff < quant_config.max_diff(), (f'{m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}, '
+                                                                f'{accumulate=}, {out_dtype=}, {use_alpha=}, {alpha=}, {with_bias=}, '
+                                                                f'{diff:.5f}, alias={test_alias}'))
+                        if with_bias:
+                            assert_check(torch.equal(c, saved_c))
+                    if with_bias and not use_alpha:
+                        fp32_output = torch.empty_like(d, dtype=torch.float32)
+                        getattr(deep_gemm, func_name)(a, b, fp32_output, disable_ue8m0_cast=disable_ue8m0_cast,
+                                                      recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b, alpha=alpha)
+                        assert_check(calc_diff(d, (fp32_output + c.float()).to(out_dtype)) < 1e-5)
 
-        a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_ue8m0=use_ue8m0, quant_config=quant_config)
-        if get_arch_major() == 10 and not accumulate and out_dtype == torch.bfloat16:
-            d_sr = torch.empty_like(d)
-            deep_gemm.fp8_fp4_gemm_nt(a, b, d_sr, disable_ue8m0_cast=disable_ue8m0_cast,
-                                      recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
-                                      epilogue=deep_gemm.epilogue.BF16StochasticRounding())
-            assert_stochastic_bf16_matches_fp32_accumulation(
-                d_sr,
-                lambda output, accumulator: deep_gemm.fp8_fp4_gemm_nt(
-                    a, b, output, c=accumulator, disable_ue8m0_cast=disable_ue8m0_cast,
-                    recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
-                f'FP8/FP4 GEMM stochastic rounding, {m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}')
-        initial_d = d.clone()
-        def test_func(a_=a, b_=b, d_=d):
-            deep_gemm.fp8_fp4_gemm_nt(a_, b_, d_, c=d_ if accumulate else None,
-                                       disable_ue8m0_cast=disable_ue8m0_cast,
-                                       recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
-        equivalent_d = d.clone()
-        test_func(d_=equivalent_d)
-        # Bitwise deterministic test
-        for _ in range(20):
-            d.copy_(initial_d)
-            test_func()
-            assert torch.equal(d, equivalent_d), f'{m=}, {n=}, {k=}, {accumulate=}'
-        if test_sf_k_padding and use_ue8m0 and not accumulate:
-            packed_a = deep_gemm.transform_sf_into_required_layout(a[1], m, k, (1, quant_config.gran_k_a))
-            gran_mn_b = 1 if quant_config.is_fp4_b else quant_config.gran_k_b
-            packed_b = deep_gemm.transform_sf_into_required_layout(b[1], n, k, (gran_mn_b, quant_config.gran_k_b))
-            strided_a = a[0], add_sf_k_padding(packed_a, padding=4)
-            strided_b = b[0], add_sf_k_padding(packed_b, padding=4)
-            strided_d = initial_d.clone()
-            deep_gemm.fp8_fp4_gemm_nt(
-                strided_a, strided_b, strided_d,
-                recipe_a=(1, quant_config.gran_k_a), recipe_b=(1, quant_config.gran_k_b))
-            assert_bitwise_equal(strided_d, equivalent_d, 'packed SF K-stride')
-            test_sf_k_padding = False
-        if quant_config.is_fp4_a or quant_config.is_fp4_b:
-            equivalent_fp8_d = initial_d.clone()
-            test_func(convert_to_fp8(a), convert_to_fp8(b), equivalent_fp8_d)
-            # FP4 and converted FP8 have different UMMA_K, but BF16 outputs are usually bitwise identical.
-            assert calc_diff(equivalent_d, equivalent_fp8_d) < 1e-14, (f'FP4/FP8 mismatch: {m=}, {n=}, {k=}, '
-                                                                      f'{accumulate=}')
-        t = bench_kineto(test_func, 'gemm_', suppress_kineto_output=True)
-        cublas_func = make_cublas_gemm(a, b, d, c)
-        cublas_times = bench_kineto(cublas_func, ('nvjet', 'bstensorop', 'reduce'),
-                                    suppress_kineto_output=True, with_multiple_kernels=True)
-        cublas_t = sum(cublas_times)
-        if cublas_t > 0:
-            scores.append(cublas_t / t)
-        print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}): '
-              f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
-              f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
-              f'{cublas_t / t:.2f}x cuBLAS speedup')
+        for with_bias in use_bias_options:
+            if with_bias and accumulate:
+                continue
+            a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type,
+                                                 use_ue8m0=use_ue8m0, quant_config=quant_config, with_bias=with_bias)
+            if get_arch_major() == 10 and not accumulate and not with_bias and out_dtype == torch.bfloat16:
+                d_sr = torch.empty_like(d)
+                deep_gemm.fp8_fp4_gemm_nt(a, b, d_sr, disable_ue8m0_cast=disable_ue8m0_cast,
+                                          recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b,
+                                          epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                assert_stochastic_bf16_matches_fp32_accumulation(
+                    d_sr,
+                    lambda output, accumulator: deep_gemm.fp8_fp4_gemm_nt(
+                        a, b, output, c=accumulator, disable_ue8m0_cast=disable_ue8m0_cast,
+                        recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
+                    f'FP8/FP4 GEMM stochastic rounding, {m=}, {n=}, {k=}, {kernel_opt}, {major_opt=}')
+            initial_d = d.clone()
+            def test_func(a_=a, b_=b, d_=d):
+                deep_gemm.fp8_fp4_gemm_nt(a_, b_, d_, c=c if with_bias else d_ if accumulate else None,
+                                           disable_ue8m0_cast=disable_ue8m0_cast,
+                                           recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+            equivalent_d = d.clone()
+            test_func(d_=equivalent_d)
+            # Bitwise deterministic test
+            for _ in range(20):
+                d.copy_(initial_d)
+                test_func()
+                assert_check(torch.equal(d, equivalent_d), f'{m=}, {n=}, {k=}, {accumulate=}')
+            if with_bias in test_sf_k_padding and use_ue8m0 and not accumulate:
+                packed_a = deep_gemm.transform_sf_into_required_layout(a[1], m, k, (1, quant_config.gran_k_a))
+                gran_mn_b = 1 if quant_config.is_fp4_b else quant_config.gran_k_b
+                packed_b = deep_gemm.transform_sf_into_required_layout(b[1], n, k, (gran_mn_b, quant_config.gran_k_b))
+                strided_a = a[0], add_sf_k_padding(packed_a, padding=4)
+                strided_b = b[0], add_sf_k_padding(packed_b, padding=4)
+                strided_d = initial_d.clone()
+                deep_gemm.fp8_fp4_gemm_nt(
+                    strided_a, strided_b, strided_d, c=c if with_bias else None,
+                    recipe_a=(1, quant_config.gran_k_a), recipe_b=(1, quant_config.gran_k_b))
+                assert_bitwise_equal(strided_d, equivalent_d, 'packed SF K-stride')
+                test_sf_k_padding.remove(with_bias)
+            if quant_config.is_fp4_a or quant_config.is_fp4_b:
+                equivalent_fp8_d = initial_d.clone()
+                test_func(convert_to_fp8(a), convert_to_fp8(b), equivalent_fp8_d)
+                # FP4 and converted FP8 have different UMMA_K, but BF16 outputs are usually bitwise identical.
+                assert_check(calc_diff(equivalent_d, equivalent_fp8_d) < 1e-14, (f'FP4/FP8 mismatch: {m=}, {n=}, {k=}, '
+                                                                          f'{accumulate=}'))
+            t = bench_kineto(test_func, 'gemm_', suppress_kineto_output=True)
+            cublas_t = 0
+            if not with_bias:
+                cublas_func = make_cublas_gemm(a, b, d, c)
+                cublas_times = bench_kineto(cublas_func, ('nvjet', 'bstensorop', 'splitKreduce'),
+                                            suppress_kineto_output=True, with_multiple_kernels=True)
+                cublas_t = sum(cublas_times)
+            if cublas_t > 0:
+                scores.append(cublas_t / t)
+            print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, {kernel_opt}, layout={major_opt}, {out_opt}, {acc_opt}, bias={int(with_bias)}): '
+                  f'{t * 1e6:6.1f} us | {2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+                  f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate or with_bias)) / 1e9 / t:4.0f} GB/s'
+                  + (f' | {cublas_t / t:.2f}x cuBLAS speedup' if not with_bias else ''))
 
 
 def test_m_grouped_gemm_contiguous() -> None:
@@ -144,16 +177,16 @@ def test_m_grouped_gemm_contiguous() -> None:
             # Bitwise deterministic test
             for _ in range(20):
                 test_func()
-                assert torch.equal(d[valid_mask], equivalent_d[valid_mask]), f'{m=}, {n=}, {k=}, alias={test_alias}'
+                assert_check(torch.equal(d[valid_mask], equivalent_d[valid_mask]), f'{m=}, {n=}, {k=}, alias={test_alias}')
             if quant_config.is_fp4_a or quant_config.is_fp4_b:
                 equivalent_fp8_d = d.clone()
                 test_func(convert_to_fp8(a), convert_to_fp8(b), equivalent_fp8_d)
                 # FP4 and converted FP8 have different UMMA_K, but BF16 outputs are usually bitwise identical.
-                assert calc_diff(equivalent_d[valid_mask], equivalent_fp8_d[valid_mask]) < 1e-14, (
-                    f'FP4/FP8 mismatch: {m=}, {n=}, {k=}, alias={test_alias}')
+                assert_check(calc_diff(equivalent_d[valid_mask], equivalent_fp8_d[valid_mask]) < 1e-14, (
+                    f'FP4/FP8 mismatch: {m=}, {n=}, {k=}, alias={test_alias}'))
             diff = calc_diff(d[valid_mask], ref_d[valid_mask])
-            assert diff < quant_config.max_diff(), (f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, '
-                                                    f'{diff:.5f}, alias={test_alias}, {ensure_zero_padding=}')
+            assert_check(diff < quant_config.max_diff(), (f'{m=}, {n=}, {k=}, {major_opt}, {kernel_opt}, '
+                                                    f'{diff:.5f}, alias={test_alias}, {ensure_zero_padding=}'))
             if use_psum_layout and ensure_zero_padding:
                 assert_psum_zero_padding(a, d, grouped_layout, 'FP8/FP4')
         m, a, b, grouped_layout, d, ref_d, valid_mask = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b,
@@ -211,15 +244,15 @@ def test_m_grouped_gemm_masked() -> None:
             # Bitwise deterministic test
             for _ in range(20):
                 test_func()
-                assert torch.equal(d[valid_mask], equivalent_d[valid_mask]), f'{max_m=}, {n=}, {k=}'
+                assert_check(torch.equal(d[valid_mask], equivalent_d[valid_mask]), f'{max_m=}, {n=}, {k=}')
             if quant_config.is_fp4_a or quant_config.is_fp4_b:
                 equivalent_fp8_d = d.clone()
                 test_func(convert_to_fp8(a), convert_to_fp8(b), equivalent_fp8_d)
                 # FP4 and converted FP8 have different UMMA_K, but BF16 outputs are usually bitwise identical.
-                assert calc_diff(equivalent_d[valid_mask], equivalent_fp8_d[valid_mask]) < 1e-14, (
-                    f'FP4/FP8 mismatch: {max_m=}, {n=}, {k=}, {num_groups=}')
+                assert_check(calc_diff(equivalent_d[valid_mask], equivalent_fp8_d[valid_mask]) < 1e-14, (
+                    f'FP4/FP8 mismatch: {max_m=}, {n=}, {k=}, {num_groups=}'))
             diff = calc_diff(d[valid_mask], ref_d[valid_mask])
-            assert diff < quant_config.max_diff(), f'{max_m=}, {n=}, {k=}, {kernel_opt}, {num_groups=}, {diff:.5f}'
+            assert_check(diff < quant_config.max_diff(), f'{max_m=}, {n=}, {k=}, {kernel_opt}, {num_groups=}, {diff:.5f}')
 
             # Test performance with fixed shapes
             valid_m = int(valid_mask.sum().item())
@@ -282,7 +315,7 @@ def test_k_grouped_gemm_contiguous() -> None:
                         recipe=recipe, use_psum_layout=use_psum_layout)
                     mismatch_message = (f'FP4/FP8 mismatch: {m=}, {n=}, {total_k=}, '
                                         f'{test_real_ks_cpu=}, {use_psum_layout=}')
-                    assert calc_diff(equivalent_d, equivalent_fp8_d) < 1e-14, mismatch_message
+                    assert_check(calc_diff(equivalent_d, equivalent_fp8_d) < 1e-14, mismatch_message)
 
                 # Bitwise deterministic test
                 host_ks_options = (host_ks_cpu, None, []) if use_psum_layout else (host_ks_cpu, )
@@ -309,12 +342,23 @@ def test_k_grouped_gemm_contiguous() -> None:
                                  recipe=recipe, use_psum_layout=use_psum_layout,
                                  epilogue=deep_gemm.epilogue.BF16StochasticRounding())
                             assert_stochastic_bf16_matches_fp32_accumulation(d, launch, f'stochastic rounding, {case_label}')
+                        elif n % 128 == 0:
+                            # Test FP8 stochastic rounding on the FP32 direct-output iteration
+                            fp8_output = torch.empty_like(d, dtype=torch.float8_e4m3fn)
+                            sfd = torch.empty_strided((m, num_groups * n // 128), (1, align(m, 4)),
+                                                      dtype=torch.int32, device='cuda')
+                            gemm(a, b, fp8_output, test_host_ks_cpu, grouped_layout, None,
+                                 recipe=recipe, use_psum_layout=use_psum_layout,
+                                 epilogue=deep_gemm.epilogue.FP8StochasticRounding(sfd))
+                            assert_stochastic_fp8_matches_fp32_accumulation(
+                                fp8_output, sfd, lambda output: launch(output, output),
+                                f'FP8 stochastic rounding, {case_label}')
 
                 if accumulate:
                     diff = calc_diff(d, ref_d)
-                    assert diff < quant_config.max_diff(), (
+                    assert_check(diff < quant_config.max_diff(), (
                         f'{dtype_opt}, {m=}, {n=}, {total_k=}, {test_real_ks_cpu=}, '
-                        f'{host_ks_cpu=}, {use_psum_layout=}, {accumulate=}, {out_dtype=}, {diff:.5f}')
+                        f'{host_ks_cpu=}, {use_psum_layout=}, {accumulate=}, {out_dtype=}, {diff:.5f}'))
 
                 # gran_k=128 requires FP32 SF input; only gran_k=32 accepts
                 # the per-group packed INT32 UE8M0 layout.
@@ -336,8 +380,8 @@ def test_k_grouped_gemm_contiguous() -> None:
                     packed_b = (
                         b[0], deep_gemm.get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor(
                             b[1], grouped_layout, host_ks_cpu, gran_k, k_alignment, use_psum_layout))
-                    assert torch.equal(packed_a[1], ref_packed_a)
-                    assert torch.equal(packed_b[1], ref_packed_b)
+                    assert_check(torch.equal(packed_a[1], ref_packed_a))
+                    assert_check(torch.equal(packed_b[1], ref_packed_b))
 
                     packed_d = initial_d.clone()
                     gemm(packed_a, packed_b, packed_d, host_ks_cpu, grouped_layout, packed_d if accumulate else None,
@@ -352,10 +396,10 @@ def test_k_grouped_gemm_contiguous() -> None:
                         test_sf_k_padding = False
                     if accumulate:
                         packed_diff = calc_diff(packed_d, ref_d)
-                        assert packed_diff < quant_config.max_diff(), (
+                        assert_check(packed_diff < quant_config.max_diff(), (
                             f'pre-packed INT32 SF: {dtype_opt}, {m=}, {n=}, {total_k=}, {test_real_ks_cpu=}, '
                             f'{host_ks_cpu=}, {use_psum_layout=}, {accumulate=}, {out_dtype=}, '
-                            f'{packed_diff:.5f}')
+                            f'{packed_diff:.5f}'))
                     else:
                         case_label = (f'pre-packed INT32 SF direct output: {dtype_opt}, {m=}, {n=}, '
                                       f'{total_k=}, {test_real_ks_cpu=}, {host_ks_cpu=}, '

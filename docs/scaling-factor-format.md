@@ -5,7 +5,7 @@ This document specifies the scaling factor (SF) tensor contract for DeepGEMM's F
 - `csrc/apis/layout.hpp` — SF transform dispatch (`transform_sf_into_required_layout`, `transform_k_grouped_sf_into_required_layout`)
 - `csrc/utils/layout.hpp` — SF layout validation (`check_sf_layout`)
 - `csrc/apis/gemm.hpp` — GEMM argument checks
-- `csrc/apis/attention.hpp`, `csrc/apis/mega_moe.hpp`, `deep_gemm/mega/__init__.py` — attention / mega MoE SF requirements (Section 6)
+- `csrc/apis/attention.hpp`, `csrc/apis/mega_moe_inference.hpp`, `deep_gemm/mega_moe/inference.py` — attention / mega MoE SF requirements (Section 6)
 - `csrc/jit_kernels/impls/smxx_layout.hpp` — host-side transform launchers
 - `deep_gemm/include/deep_gemm/impls/smxx_layout.cuh` — transform kernels
 - `tests/test_layout.py`, `tests/test_fp8_fp4.py`, `tests/generators.py` — working usage examples
@@ -388,16 +388,16 @@ deep_gemm.fp8_einsum('bhr,hdr->bhd', (x_fp8, sfx_int32), (w_fp8, sfw), out, reci
 
 Untransformed `float32` SFs need no special care — the internal transform handles the permuted layout.
 
-### 6.3 Mega MoE: `fp8_fp4_mega_moe`
+### 6.3 Mega MoE: `fp8_fp4_mega_moe_inference`
 
-Sources: `csrc/apis/mega_moe.hpp` (host checks), `deep_gemm/mega/__init__.py` (Python wrapper + weight transform), `tests/test_mega_moe.py` (SF construction).
+Sources: `csrc/apis/mega_moe_inference.hpp` (host checks), `deep_gemm/mega_moe/inference.py` (Python wrapper + weight transform), `tests/test_mega_moe_inference.py` (SF construction).
 
-- **Recipe is pinned to `(1, 1, 32)`** (mega.hpp:179); `kGranK = 32` is also hardcoded in the JIT impl (sm100_fp8_fp4_mega_moe.hpp:165).
-- **Weight SFs must already be packed `int32`** — unlike the GEMM APIs, there is NO float32 fallback and no auto-transform: `check_sf_layout(..., type_check=torch::kInt)` rejects `float32` outright (mega.hpp:206-209, 229-232). The required layout is exactly the Section 3 contract with `gran_k = 32`:
+- **Recipe is pinned to `(1, 1, 32)`** in `csrc/apis/mega_moe_inference.hpp`; `kGranK = 32` is also hardcoded in `csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe_inference.hpp`.
+- **Weight SFs must already be packed `int32`** — unlike the GEMM APIs, there is NO float32 fallback and no auto-transform: `check_sf_layout(..., type_check=torch::kInt)` in `csrc/apis/mega_moe_inference.hpp` rejects `float32` outright. The required layout is exactly the Section 3 contract with `gran_k = 32`:
   - Routed L1 SF: `[num_experts_per_rank, 2*intermediate_hidden, ceil_div(hidden, 128)]`, `int32`, MN-major, TMA-aligned (`stride(-2)==1`, `stride(-1)==align(mn,4)`); routed L2 SF: `[num_experts_per_rank, hidden, ceil_div(intermediate_hidden, 128)]`. (The `/128` is `gran_k * 4 = 32 * 4`.)
   - Shared expert SFs (optional; weights are FP8 instead of FP4): same contract, 2-D without the group dimension.
-- **An extra mega-MoE-only layout step is mandatory**: pass weights + SFs through `deep_gemm.transform_weights_for_mega_moe` before the call. It (a) interleaves gate/up rows of L1 (weights AND SF, 8-row granularity) and (b) applies a UTCCP intra-128-row transpose to both L1 and L2 SFs (`reshape(-1, 4, 32, packed_sf_k).transpose(2, 3)`; requires `mn % 128 == 0`) — `deep_gemm/mega/__init__.py:97-149`. The SFs in Section 3 layout alone are NOT directly consumable by the kernel.
-- **Activation SFs are internal**: they live in slices of the symmetric buffer (`x_sf` is K-major `[num_max_tokens_per_rank, hidden // 128]` `int32`; the intermediate `l1/l2_acts_sf` are MN-major), produced by the kernel pipeline — not user-supplied arguments (mega.hpp:96-153).
+- **An extra mega-MoE-only layout step is mandatory**: pass weights + SFs through `deep_gemm.transform_weights_for_mega_moe_inference` before the call. It (a) interleaves gate/up rows of L1 (weights AND SF, 8-row granularity) and (b) applies a UTCCP intra-128-row transpose to both L1 and L2 SFs (`reshape(-1, 4, 32, packed_sf_k).transpose(2, 3)`; requires `mn % 128 == 0`) — `deep_gemm/mega_moe/inference.py`. The SFs in Section 3 layout alone are NOT directly consumable by the kernel.
+- **Activation SFs are internal**: they live in slices of the symmetric buffer (`x_sf` is K-major `[num_max_tokens_per_rank, hidden // 128]` `int32`; the intermediate `l1/l2_acts_sf` are MN-major), produced by the kernel pipeline — not user-supplied arguments (see `get_symm_buffer_size_for_mega_moe_inference`).
 
 ```python
 from deep_gemm.utils import per_token_cast_to_fp4
@@ -412,7 +412,8 @@ for i in range(g):
 w_sf = deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), num_groups=g)
 
 # Step 2: mega-MoE weight/SF shuffle (gate-up interleave + UTCCP SF transpose; mandatory)
-(l1_w, l1_sf), (l2_w, l2_sf) = deep_gemm.transform_weights_for_mega_moe((l1_w, l1_sf), (l2_w, l2_sf))
+(l1_w, l1_sf), (l2_w, l2_sf) = deep_gemm.transform_weights_for_mega_moe_inference(
+    (l1_w, l1_sf), (l2_w, l2_sf))
 ```
 
 ## 7. Internals

@@ -3,6 +3,8 @@ import os
 import torch
 from typing import Callable
 
+JIT_DRY_RUN = os.getenv('DG_JIT_DRY_RUN', '0') == '1'
+
 def get_arch_major() -> int:
     major, minor = torch.cuda.get_device_capability()
     return major

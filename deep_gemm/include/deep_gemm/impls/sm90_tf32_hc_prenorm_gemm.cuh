@@ -5,6 +5,7 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
+#include <deep_gemm/ptx/math.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
@@ -194,8 +195,8 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
                 auto a_bf16x2_ptr = reinterpret_cast<nv_bfloat162*>(a_bf16);
                 auto a_float2_ptr = reinterpret_cast<float2*>(a);
-                float2 a_float2_0 = __bfloat1622float2(a_bf16x2_ptr[0]);
-                float2 a_float2_1 = __bfloat1622float2(a_bf16x2_ptr[1]);
+                float2 a_float2_0 = ptx::cvt_bf16x2_to_fp32x2(a_bf16x2_ptr[0]);
+                float2 a_float2_1 = ptx::cvt_bf16x2_to_fp32x2(a_bf16x2_ptr[1]);
                 a_float2_ptr[i * 2 + 0] = a_float2_0;
                 a_float2_ptr[i * 2 + 1] = a_float2_1;
                 sqr_sum_acc_0 += a_float2_0.x * a_float2_0.x + a_float2_1.x * a_float2_1.x;

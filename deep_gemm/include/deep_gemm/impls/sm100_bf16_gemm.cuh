@@ -32,7 +32,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t, typename epilogue_operator_t,
-          uint64_t kTensorCoreUtilControl>
+          uint64_t kTensorCoreUtilControl, uint32_t kNumTMAStoreStages>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_gemm_impl(int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -75,7 +75,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     // Epilogue configs
     // Always enable pipeline for better performance
     constexpr uint32_t kNumEpilogueStages = 2;
-    constexpr uint32_t kNumTMAStoreStages = 2;
+    DG_STATIC_ASSERT(kNumTMAStoreStages == 1 or kNumTMAStoreStages == 2, "Invalid number of TMA store stages");
     // NOTES: To maximize epilogue threads utilization, process an entire BLOCK_N
     //        per store stage for swap-AB cases, and an entire BLOCK_M for non-swap cases
     constexpr uint32_t STORE_BLOCK_M =        kSwapAB ? 16      : cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
@@ -154,7 +154,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     // NOTES: BF16 has no SF, so `kSFKSpan` is unused here; pass `kKAlignment` explicitly to avoid relying on the default.
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kKAlignment>(
         shape_m, shape_n, shape_k, grouped_layout);
-    epilogue_operator_t epilogue_operator(epilogue_args);
+    typename epilogue::operators::OperatorForBlock<epilogue_operator_t, BLOCK_N>::type epilogue_operator(epilogue_args);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0, tensor_core_phase = 0;
@@ -350,7 +350,8 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         }
     } else if (epilogue_warp_idx < kNumUMMAStoreThreads / 32) {
         // Epilogue warp groups
-        epilogue_operator.init(scheduler.num_blocks * kNumGroups, epilogue_warp_idx * 32 + lane_idx);
+        epilogue_operator.template init<kSwapAB, false>(scheduler, scheduler.num_blocks * kNumGroups,
+                                                       epilogue_warp_idx * 32 + lane_idx);
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
@@ -366,6 +367,7 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
 
             // Wait UMMA arrival
+            epilogue_operator.template prefetch<kSwapAB, false>(scheduler);
             smem.tmem_full_barriers[accum_stage_idx].wait(accum_phase_idx);
             ptx::tcgen05_after_thread_sync();
 

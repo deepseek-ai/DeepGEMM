@@ -82,17 +82,19 @@ from ._C import (
     # Layout kernels
     transform_sf_into_required_layout,
     # MegaMoE
-    get_block_m_for_mega_moe,
+    get_block_m_for_mega_moe_inference,
 )
 
 # Mega kernels
-from .mega import (
-    SymmBuffer,
-    get_symm_buffer_for_mega_moe,
-    transform_weights_for_mega_moe,
-    fp8_fp4_mega_moe,
-    bf16_mega_moe,
+from .mega_moe import (
+    SymmetricBuffer,
+    MegaMoEInferenceSymmetricBuffer,
+    get_symm_buffer_for_mega_moe_inference,
+    transform_weights_for_mega_moe_inference,
+    fp8_fp4_mega_moe_inference,
+    bf16_mega_moe_inference,
 )
+from .mega_moe.compat import *
 
 # Epilogue classes
 from ._C import epilogue
@@ -112,6 +114,9 @@ from . import testing
 from . import utils
 from .utils import *
 
+# Experimental kernels
+from ._C import experimental
+
 # Legacy Triton kernels for A100
 try:
     from . import legacy
@@ -124,4 +129,4 @@ _C.init(os.path.dirname(os.path.abspath(__file__)))
 # Release handles and workspaces while Python, PyTorch and CUDA are still available.
 atexit.register(shutdown)
 
-__version__ = '2.8.2'
+__version__ = '2.9.4'

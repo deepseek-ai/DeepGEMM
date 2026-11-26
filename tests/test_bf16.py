@@ -5,7 +5,7 @@ import torch
 import deep_gemm
 from deep_gemm.testing import (
     bench_kineto,
-    calc_diff, count_bytes
+    assert_check, calc_diff, count_bytes
 )
 from utils import (
     assert_direct_output_matches_fp32_accumulation,
@@ -24,6 +24,7 @@ def test_gemm() -> None:
     print('Testing GEMM:')
     scores = []
     use_alpha_options = (False, True) if get_arch_major() == 10 else (False,)
+    use_bias_options = (False, True) if get_arch_major() == 10 else (False,)
     for kernel_type, _, m, n, k, major_a, major_b, accumulate, out_dtype in enumerate_normal(torch.bfloat16):
         deep_gemm.use_deterministic_algorithms(True)
         major_opt  = 'N' if major_a.is_k_major() else 'T'
@@ -32,38 +33,71 @@ def test_gemm() -> None:
         acc_opt    = f'acc={int(accumulate)}'
 
         for test_alias in (False, True):
+            func_name = f'bf16_gemm_{major_opt.lower() if test_alias else "nt"}'
             for use_alpha in use_alpha_options:
                 alpha = random.uniform(-1.0, 1.0) if use_alpha else None
-                a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype,
-                                                     kernel_type, use_bf16=True, alpha=alpha)
-                func_name = f'bf16_gemm_{major_opt.lower() if test_alias else "nt"}'
-                if test_alias:
-                    a = a if major_a.is_k_major() else a.T
-                    b = b if major_b.is_k_major() else b.T
-                    assert a.is_contiguous() and b.is_contiguous()
-                getattr(deep_gemm, func_name)(a, b, d, c=c, alpha=alpha)
-                diff = calc_diff(d, ref_d)
-                assert diff < 1e-5, (f'{m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=}, '
-                                       f'{use_alpha=}, {alpha=}, {diff:.5f}, alias={test_alias}')
-        a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype, kernel_type, use_bf16=True)
-        if get_arch_major() == 10 and not accumulate and out_dtype == torch.bfloat16:
-            deep_gemm.bf16_gemm_nt(a, b, d, epilogue=deep_gemm.epilogue.BF16StochasticRounding())
-            assert_stochastic_bf16_matches_fp32_accumulation(
-                d,
-                lambda output, accumulator: deep_gemm.bf16_gemm_nt(a, b, output, c=accumulator),
-                f'BF16 GEMM stochastic rounding, {m=}, {n=}, {k=}, {major_opt=}')
+                for with_bias in use_bias_options:
+                    if with_bias and accumulate:
+                        continue
+                    a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype,
+                                                         kernel_type, use_bf16=True, alpha=alpha, with_bias=with_bias)
+                    if test_alias:
+                        a = a if major_a.is_k_major() else a.T
+                        b = b if major_b.is_k_major() else b.T
+                        assert a.is_contiguous() and b.is_contiguous()
+                    epilogue_options = [dict(alpha=alpha)]
+                    if with_bias:
+                        epilogue_options.append(dict(epilogue=deep_gemm.epilogue.Alpha(alpha) if use_alpha else deep_gemm.epilogue.Identity()))
+                        if use_alpha:
+                            epilogue_options.extend((dict(alpha=1.0), dict(epilogue=deep_gemm.epilogue.Alpha(1.0))))
+                    saved_c = c.clone() if with_bias else None
+                    for epilogue_args in epilogue_options:
+                        expect_error = with_bias and (epilogue_args.get('alpha') is not None or 'epilogue' in epilogue_args)
+                        try:
+                            getattr(deep_gemm, func_name)(a, b, d, c=c, **epilogue_args)
+                        except RuntimeError as error:
+                            if not expect_error:
+                                raise
+                            assert 'The epilogue class, `alpha`, the FP8 output pair and bias are exclusive' in str(error), str(error)
+                            continue
+                        assert not expect_error, 'Bias with alpha or an explicit epilogue must be rejected'
+                        diff = calc_diff(d, ref_d)
+                        assert_check(diff < 1e-5, (f'{m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=}, '
+                                               f'{use_alpha=}, {alpha=}, {with_bias=}, {diff:.5f}, alias={test_alias}'))
+                        if with_bias:
+                            assert_check(torch.equal(c, saved_c))
+                    if with_bias and not use_alpha:
+                        fp32_output = torch.empty_like(d, dtype=torch.float32)
+                        getattr(deep_gemm, func_name)(a, b, fp32_output, alpha=alpha)
+                        assert_check(calc_diff(d, (fp32_output + c.float()).to(out_dtype)) < 1e-5)
 
-        t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), 'bf16_gemm', suppress_kineto_output=True)
-        deep_gemm.use_deterministic_algorithms(False)
-        cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), ('nvjet', 'reduce'), suppress_kineto_output=True)
-        print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}): '
-              f'{t * 1e6:7.1f} us | '
-              f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
-              f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate)) / 1e9 / t:4.0f} GB/s | '
-              f'{(cublas_t + split_k_t) / t:.2f}x cuBLAS')
-        if cublas_t > 0:
-            scores.append((cublas_t + split_k_t) / t)
-    print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
+        for with_bias in use_bias_options:
+            if with_bias and accumulate:
+                continue
+            deep_gemm.use_deterministic_algorithms(True)
+            a, b, c, d, ref_d = generate_normal(m, n, k, major_a, major_b, accumulate, out_dtype,
+                                                 kernel_type, use_bf16=True, with_bias=with_bias)
+            if get_arch_major() == 10 and not accumulate and not with_bias and out_dtype == torch.bfloat16:
+                deep_gemm.bf16_gemm_nt(a, b, d, epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                assert_stochastic_bf16_matches_fp32_accumulation(
+                    d,
+                    lambda output, accumulator: deep_gemm.bf16_gemm_nt(a, b, output, c=accumulator),
+                    f'BF16 GEMM stochastic rounding, {m=}, {n=}, {k=}, {major_opt=}')
+
+            t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), 'bf16_gemm', suppress_kineto_output=True)
+            cublas_t = split_k_t = 0
+            if not with_bias:
+                deep_gemm.use_deterministic_algorithms(False)
+                cublas_t, split_k_t = bench_kineto(lambda: deep_gemm.bf16_gemm_nt(a, b, d, c=c), ('nvjet', 'splitKreduce'), suppress_kineto_output=True)
+            print(f' > Perf (m={m:6}, n={n:6}, k={k:6}, layout={major_opt}, {out_opt}, {acc_opt}, bias={int(with_bias)}): '
+                  f'{t * 1e6:7.1f} us | '
+                  f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
+                  f'{(count_bytes(a, b, d) + count_bytes(c) * int(accumulate or with_bias)) / 1e9 / t:4.0f} GB/s'
+                  + (f' | {(cublas_t + split_k_t) / t:.2f}x cuBLAS' if not with_bias else ''))
+            if cublas_t > 0:
+                scores.append((cublas_t + split_k_t) / t)
+    if scores:
+        print(f"Average speedup over cuBLASLt: {float(np.prod(scores)) ** (1.0 / len(scores)):.3f}x\n")
 
 
 def test_m_grouped_gemm_contiguous() -> None:
@@ -88,7 +122,7 @@ def test_m_grouped_gemm_contiguous() -> None:
             getattr(deep_gemm, func_name)(a, b, d, grouped_layout, use_psum_layout=use_psum_layout,
                                           ensure_zero_padding=ensure_zero_padding)
             diff = calc_diff(d[valid_mask], ref_d[valid_mask])
-            assert diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}, {ensure_zero_padding=}'
+            assert_check(diff < 1e-5, f'{m=}, {n=}, {k=}, {major_opt}, {diff:.5f}, alias={test_alias}, {ensure_zero_padding=}')
             if use_psum_layout and ensure_zero_padding:
                 assert_psum_zero_padding(a, d, grouped_layout, 'BF16')
         m, a, b, grouped_layout, d, ref_d, valid_mask = generate_m_grouped_contiguous(num_groups, expected_m_per_group, n, k, major_a, major_b,
@@ -135,7 +169,7 @@ def test_m_grouped_gemm_masked() -> None:
 
             test_func()
             diff = calc_diff(d[valid_mask], ref_d[valid_mask])
-            assert diff < 1e-5, f'{max_m=}, {n=}, {k=}, {num_groups=}, {diff:.5f}'
+            assert_check(diff < 1e-5, f'{max_m=}, {n=}, {k=}, {num_groups=}, {diff:.5f}')
 
 
             # Test performance with fixed shapes
@@ -175,9 +209,9 @@ def test_k_grouped_gemm_contiguous() -> None:
                     a, b, d, test_host_ks_cpu, grouped_layout, c, use_psum_layout=use_psum_layout)
                 if accumulate:
                     diff = calc_diff(d, ref_d)
-                    assert diff < 1e-5, (f'{m=}, {n=}, {total_k=}, {test_real_ks_cpu=}, '
+                    assert_check(diff < 1e-5, (f'{m=}, {n=}, {total_k=}, {test_real_ks_cpu=}, '
                                         f'{test_host_ks_cpu=}, {use_psum_layout=}, {accumulate=}, '
-                                        f'{out_dtype=}, {diff:.7f}')
+                                        f'{out_dtype=}, {diff:.7f}'))
                 else:
                     case_label = (f'BF16 K-grouped direct output, {m=}, {n=}, {total_k=}, '
                                   f'{test_real_ks_cpu=}, {test_host_ks_cpu=}, {use_psum_layout=}, '
@@ -232,8 +266,8 @@ def test_cublaslt_gemm() -> None:
             deep_gemm.use_deterministic_algorithms(False)
             deep_gemm.bf16_gemm_nt(a, b, d, c=c, alpha=alpha)
             diff = calc_diff(d, ref_d)
-            assert diff < threshold, (f'{diff=}, {use_alpha=}, {alpha=}, '
-                                      f'({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})')
+            assert_check(diff < threshold, (f'{diff=}, {use_alpha=}, {alpha=}, '
+                                      f'({m=}, {n=}, {k=}, {major_opt=}, {accumulate=}, {out_dtype=})'))
 
         t_nvjet, t_gemv, t_gemm = bench_kineto(lambda: deep_gemm.cublaslt_gemm_nt(a, b, d, c=c), ('nvjet', 'gemv', 'gemm'), suppress_kineto_output=True)
         t = t_nvjet + t_gemv + t_gemm
@@ -264,9 +298,9 @@ def test_cublaslt_batched_syrk() -> None:
                 deep_gemm.batched_syrk(a, d)
                 ref_d = (a.float() @ a.float().mT).to(out_dtype)
                 diff = calc_diff(d, ref_d)
-                assert diff < threshold, (
+                assert_check(diff < threshold, (
                     f'{diff=}, ({batch_shape=}, {padding=}, {rows=}, {cols=}, {major_opt=}, {out_dtype=})'
-                )
+                ))
 
             t_nvjet, t_gemv, t_gemm = bench_kineto(
                 lambda: deep_gemm.batched_syrk(a, d),
@@ -307,9 +341,9 @@ def test_cublaslt_batched_symm() -> None:
                 deep_gemm.batched_symm(a, b, d)
                 ref_d = (a.float() @ b.float()).to(out_dtype)
                 diff = calc_diff(d, ref_d)
-                assert diff < threshold, (
+                assert_check(diff < threshold, (
                     f'{diff=}, ({batch_shape=}, {padding=}, {rows=}, {cols=}, {major_opt=}, {out_dtype=})'
-                )
+                ))
 
             t_nvjet, t_gemv, t_gemm = bench_kineto(
                 lambda: deep_gemm.batched_symm(a, b, d),
