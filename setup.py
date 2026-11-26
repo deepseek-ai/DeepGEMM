@@ -149,7 +149,7 @@ class CustomBuildPy(build_py):
         code = '# Pre-installed environment variables\n'
         code += 'persistent_envs = dict()\n'
         for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_CPP_STANDARD'):
-            code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
+            code += f"persistent_envs[{name!r}] = {os.environ[name]!r}\n" if name in os.environ else ''
 
         with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
             f.write(code)
