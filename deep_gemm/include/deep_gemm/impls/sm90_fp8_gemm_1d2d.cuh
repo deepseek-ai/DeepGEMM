@@ -43,7 +43,7 @@ template <cute::UMMA::Major kMajorSFB,
           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
           uint32_t kNumSMs, GemmType kGemmType,
-          typename cd_dtype_t>
+          typename cd_dtype_t, bool kWithAccumulation>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
 sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -431,10 +431,16 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 auto n_idx = n_block_idx * BLOCK_N + in_block_n_offset;
                 auto m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
                 if constexpr (kGemmType == GemmType::Batched) {
-                    cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,
-                                                  n_idx, m_idx, scheduler.current_group_idx);
+                    using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                                                           cute::SM90_TMA_REDUCE_ADD_3D,
+                                                           cute::SM90_TMA_STORE_3D>;
+                    cute_tma_t::copy(&tensor_map_d, smem_ptr,
+                                     n_idx, m_idx, scheduler.current_group_idx);
                 } else {
-                    cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr, n_idx, m_idx);
+                    using cute_tma_t = cute::conditional_t<kWithAccumulation,
+                                                           cute::SM90_TMA_REDUCE_ADD_2D,
+                                                           cute::SM90_TMA_STORE_2D>;
+                    cute_tma_t::copy(&tensor_map_d, smem_ptr, n_idx, m_idx);
                 }
                 cute::tma_store_arrive();
             }
