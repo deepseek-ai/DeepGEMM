@@ -3,13 +3,20 @@ import sys
 import torch
 from typing import Callable, Optional
 
+from .utils import JIT_DRY_RUN
+
 
 def bench(fn, num_warmups: int = 5, num_tests: int = 10,
           high_precision: bool = False):
+    if JIT_DRY_RUN:
+        # Trigger compilation.
+        fn()
+        return 1
+
     # Flush L2 cache with 256 MB data
     torch.cuda.synchronize()
     cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
-    cache.zero_()
+    cache.sum()
 
     # Warmup
     for _ in range(num_warmups):
@@ -84,6 +91,10 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
 
+    if JIT_DRY_RUN:
+        fn()
+        return (1, ) * len(kernel_names) if is_tuple else 1
+
     # Skip profiling
     # Conflict with Nsight Systems, Nsight Compute and Compute Sanitizer
     if int(os.environ.get('DG_USE_NVIDIA_TOOLS', 0)):
@@ -105,7 +116,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
             for i in range(2):
                 for _ in range(num_tests):
                     if flush_l2:
-                        torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
+                        torch.empty(flush_l2_size, dtype=torch.int, device='cuda').sum()
                     if barrier is not None:
                         # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
                         # noinspection PyProtectedMember

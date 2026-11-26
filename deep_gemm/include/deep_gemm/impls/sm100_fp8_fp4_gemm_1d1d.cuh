@@ -54,11 +54,12 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              cute::is_same_v<b_dtype_t, cutlass::float_e2m1_t>;
 
     // C/D type: BF16 and FP32 are supported, with or without accumulation; FP8 C/D requires the
-    // dynamically-scaled epilogue with per-32 UE8M0 SFD output, batched only, without accumulation
-    constexpr bool kIsFP8CastWithClamp = epilogue_operator_t::kIsFP8CastWithClamp;
-    DG_STATIC_ASSERT(kIsFP8CastWithClamp ? (cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t> and
-                                            kGemmType == GemmType::Batched and not kWithAccumulation) :
-                                           (cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
+    // dynamically-scaled epilogue with per-32 UE8M0 SFD output, without accumulation
+    constexpr bool kIsFP8Output = epilogue_operator_t::kIsFP8Output;
+    DG_STATIC_ASSERT(kIsFP8Output ? (cute::is_same_v<cd_dtype_t, cutlass::float_e4m3_t> and
+                                     (kGemmType == GemmType::Batched or is_k_grouped_contiguous(kGemmType)) and
+                                     not kWithAccumulation) :
+                                    (cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>),
                      "Invalid C/D data dtype");
 
     // MMA Configs
@@ -195,7 +196,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4>(
         shape_m, shape_n, shape_k, grouped_layout);
-    epilogue_operator_t epilogue_operator(epilogue_args);
+    typename epilogue::operators::OperatorForBlock<epilogue_operator_t, BLOCK_N>::type epilogue_operator(epilogue_args);
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -494,7 +495,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
         }
     } else if (epilogue_warp_idx < kNumUMMAStoreThreads / 32) {
         // Epilogue warp groups
-        epilogue_operator.init(scheduler.num_blocks * kNumGroups, epilogue_warp_idx * 32 + lane_idx);
+        epilogue_operator.template init<kSwapAB, (kNumOverlappedTmemCols > 0)>(
+            scheduler, scheduler.num_blocks * kNumGroups, epilogue_warp_idx * 32 + lane_idx);
 
         // NOTES: tensor memory addresses are simplified, as the hardware will ignore the warp index bits,
         // i.e., no need for `tmem_ptr |= (epilogue_warp_idx * 32) << 16`.
@@ -510,6 +512,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             auto accum_phase_idx = (scheduler.current_iter / kNumEpilogueStages) & 1;
 
             // Wait UMMA arrival
+            epilogue_operator.template prefetch<kSwapAB, (kNumOverlappedTmemCols > 0)>(scheduler);
             smem.tmem_full_barriers[accum_stage_idx].wait(accum_phase_idx);
             ptx::tcgen05_after_thread_sync();
 

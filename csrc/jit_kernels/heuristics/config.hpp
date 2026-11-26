@@ -53,9 +53,10 @@ struct GemmDesc {
             DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
             DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);
         }
-        // FP8 D implies casting with dynamic per-32 UE8M0 SFD output, only exposed for batched GEMMs
+        // FP8 D implies casting with dynamic per-32 UE8M0 SFD output
         DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat or
-                       (cd_dtype == torch::kFloat8_e4m3fn and gemm_type == GemmType::Batched and
+                       (cd_dtype == torch::kFloat8_e4m3fn and
+                        (gemm_type == GemmType::Batched or is_k_grouped_contiguous(gemm_type)) and
                         not with_accumulation));
         DG_HOST_ASSERT(num_sms % 2 == 0);
     }

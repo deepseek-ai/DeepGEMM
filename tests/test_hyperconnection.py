@@ -1,8 +1,10 @@
 import torch
 import random
+from itertools import product
 
 import deep_gemm
 from deep_gemm.testing import (
+    assert_check,
     test_filter,
     bench_kineto,
     calc_diff, count_bytes
@@ -18,10 +20,11 @@ def test_hc_prenorm_gemm() -> None:
     torch.backends.cudnn.allow_tf32 = True
 
     print('Testing hyperconnection prenorm GEMM:')
-    for m in (13, 137, 4096, 8192):
+    a_dtypes = (torch.bfloat16, torch.float) if get_arch_major() == 10 else (torch.bfloat16,)
+    for a_dtype, m in product(a_dtypes, (13, 137, 4096, 8192)):
         for n, k in [(24, 28672), (24, 7680), (24, 7168)]:
             for num_splits in [None, 16]:
-                a = torch.randn((m, k), dtype=torch.bfloat16, device='cuda')
+                a = torch.randn((m, k), dtype=a_dtype, device='cuda')
                 b = torch.randn((n, k), dtype=torch.float, device='cuda')
                 d = torch.empty((m, n), dtype=torch.float, device='cuda') if num_splits is None else \
                         torch.empty((num_splits, m, n), dtype=torch.float, device='cuda')
@@ -35,10 +38,10 @@ def test_hc_prenorm_gemm() -> None:
                 ref_s = a.float().square().sum(-1)
 
                 diff = max(calc_diff(final_d, ref_d), calc_diff(final_s, ref_s))
-                assert diff < 1e-8, f'{m=}, {n=}, {k=}, {diff:.10f}'
+                assert_check(diff < 1e-8, f'{m=}, {n=}, {k=}, {a_dtype=}, {diff:.10f}')
 
                 t = bench_kineto(lambda: deep_gemm.tf32_hc_prenorm_gemm(a, b, d, s, num_splits=num_splits), 'tf32_hc_prenorm_gemm', suppress_kineto_output=True)
-                print(f' > Perf (m={m:5}, n={n:5}, k={k:5}, num_splits={(num_splits or 0):2}): '
+                print(f' > Perf (a_dtype={a_dtype}, m={m:5}, n={n:5}, k={k:5}, num_splits={(num_splits or 0):2}): '
                       f'{t * 1e6:4.0f} us | '
                       f'{2 * m * n * k / t / 1e12:4.0f} TFLOPS | '
                       f'{count_bytes(a, b, d, s) / 1e9 / t:4.0f} GB/s')

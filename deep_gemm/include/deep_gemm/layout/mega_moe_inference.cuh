@@ -1,20 +1,29 @@
 #pragma once
 
 #include <cstddef>
+#include <cuda.h>
 #include <cute/numeric/math.hpp>
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/common/types.cuh>
+#include <deep_gemm/layout/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 
-namespace deep_gemm::layout {
+namespace deep_gemm::layout::inference {
 
-static constexpr int kNumCandidateBlockMs = 8;
-static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192, 240};
+static constexpr int kNumCandidateBlockMs = 6;
+static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {16, 32, 64, 128, 192, 240};
 static constexpr int kMaxCandidateBlockM = 240;
-static constexpr int kMinCandidateBlockM = 8;
+static constexpr int kMinCandidateBlockM = 16;
 static constexpr int kLCMCandidateBlockM = 1920;
+
+// Full activation maps keep their original kernel arguments; only partial rows use this table.
+struct MegaMoEPartialActMaps {
+    static constexpr uint32_t kRowStep = 8;
+    static constexpr uint32_t kNumMaps = (kMaxCandidateBlockM / 2 - 1) / kRowStep;
+    CUtensorMap maps[4][kNumMaps];
+};
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -52,16 +61,15 @@ struct TokenSrcMetadata {
 };
 
 struct alignas(128) MegaMoESignals {
-    static constexpr uint32_t kNumMaxGridSyncCounters = 4;
+    static constexpr uint32_t kNumMaxGridSyncCounters = BarrierSignals::kNumMaxGridSyncCounters;
     static constexpr uint32_t kNumMaxExperts = 2048;
     static constexpr uint32_t kNumMaxExpertsPerRank = 512;
     static constexpr uint32_t kNumMaxRingBlocks = 1u << 20;  // 20 MiB for the ring signals
     static constexpr uint32_t kNumMaxSharedL2Blocks = 1u << 15;  // 128 KiB
+    static constexpr uint32_t kNumMaxSourceSlots = 512u * 65536;  // 128 MiB
 
     // Grid and NVLink synchronization
-    uint32_t grid_sync_count[kNumMaxGridSyncCounters];
-    uint32_t nvl_barrier_counter;
-    int nvl_barrier_signals[2];
+    BarrierSignals barrier;
 
     // Task scheduling
     uint32_t l1_task_count[kNumDeviceLocalityDomains];
@@ -69,12 +77,11 @@ struct alignas(128) MegaMoESignals {
     uint32_t shared_l1_task_count[kNumDeviceLocalityDomains];
     uint32_t shared_l2_task_count[kNumDeviceLocalityDomains];
 
-    // Combine readiness: `combine_ready_grid_idx[peer] == own grid index` means the peer's L2 writes into this
-    // rank are done; grid indices are unique per launch, so no reset is needed. Peers push theirs during dispatch.
-    alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
-    alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
+    // Each invocation subtracts one locally and adds one remotely after L2 writes; ready at zero.
+    alignas(128) uint64_t combine_ready_count[kNumMaxRanks];
 
-    // Expert token counts
+    // Expert counts: low 32 bits hold token totals. FP8 send counts also track CTA arrivals;
+    // FP8 recv counts mark one completed rank. recv_count_sum counts completed ranks in its high word.
     alignas(128) uint64_t expert_send_count[kNumMaxExperts];
     uint64_t expert_recv_count[kNumMaxExperts];
     uint64_t expert_recv_count_sum[kNumMaxExpertsPerRank];
@@ -87,8 +94,13 @@ struct alignas(128) MegaMoESignals {
 
     // Shared-expert signals
     uint32_t shared_l2_full_count[kNumMaxSharedL2Blocks];
+
+    // Fixed reservation: different inference layouts sharing a base cannot overwrite source slots with payload.
+    alignas(128) uint32_t source_token_topk_idx[kNumMaxSourceSlots];
 };
-DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_grid_idx) == 128, "Invalid control signal layout");
+DG_STATIC_ASSERT(offsetof(MegaMoESignals, combine_ready_count) == 128, "Invalid control signal layout");
+DG_STATIC_ASSERT(offsetof(MegaMoESignals, barrier) == 0, "Invalid barrier signal offset");
+DG_STATIC_ASSERT(offsetof(MegaMoESignals, l1_task_count) == sizeof(BarrierSignals), "Invalid task counter offset");
 
 struct Workspace {
     MegaMoESignals* signals;
@@ -121,6 +133,7 @@ struct Workspace {
         DG_UNIFIED_ASSERT(num_experts % num_ranks == 0);
         DG_UNIFIED_ASSERT(num_experts <= MegaMoESignals::kNumMaxExperts);
         DG_UNIFIED_ASSERT(num_experts_per_rank <= MegaMoESignals::kNumMaxExpertsPerRank);
+        DG_UNIFIED_ASSERT(static_cast<uint64_t>(num_experts) * num_max_tokens_per_rank <= MegaMoESignals::kNumMaxSourceSlots);
         DG_UNIFIED_ASSERT(num_ring_tokens <= MegaMoESignals::kNumMaxRingBlocks * kMinCandidateBlockM);
         DG_UNIFIED_ASSERT(num_shared_l2_pool_blocks <= MegaMoESignals::kNumMaxSharedL2Blocks);
     }
@@ -131,9 +144,6 @@ struct Workspace {
 
         // Fixed-position global and expert signals
         num_bytes += sizeof(MegaMoESignals);
-
-        // Source token-topk: [local expert][source rank][token], with distinct experts per token
-        num_bytes += num_experts * num_max_tokens_per_rank * sizeof(uint32_t);
 
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
@@ -151,29 +161,22 @@ struct Workspace {
     template <uint32_t kIndex = 0>
     CUTLASS_DEVICE
     uint32_t* get_grid_sync_count_ptr() const {
-        DG_STATIC_ASSERT(kIndex < MegaMoESignals::kNumMaxGridSyncCounters, "Grid sync index out of bounds");
-        return signals->grid_sync_count + kIndex;
+        return signals->barrier.get_grid_sync_count_ptr<kIndex>();
     }
 
     CUTLASS_DEVICE
     uint32_t* get_nvl_barrier_counter_ptr() const {
-        return &signals->nvl_barrier_counter;
+        return signals->barrier.get_nvl_barrier_counter_ptr();
     }
 
     CUTLASS_DEVICE
     int* get_nvl_barrier_signal_ptr(const uint32_t& phase) const {
-        // NOTES: the signal is signed, as we may minus
-        return signals->nvl_barrier_signals + phase;
+        return signals->barrier.get_nvl_barrier_signal_ptr(phase);
     }
 
     CUTLASS_DEVICE
-    uint64_t* get_combine_ready_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
-        return signals->combine_ready_grid_idx + peer_rank_idx;
-    }
-
-    CUTLASS_DEVICE
-    uint64_t* get_peer_grid_idx_ptr(const uint32_t& peer_rank_idx = 0) const {
-        return signals->peer_grid_idx + peer_rank_idx;
+    uint64_t* get_combine_ready_count_ptr(const uint32_t& peer_rank_idx = 0) const {
+        return signals->combine_ready_count + peer_rank_idx;
     }
 
     CUTLASS_DEVICE
@@ -204,7 +207,7 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_expert_recv_count_ptr(
         const uint32_t& rank_idx = 0, const uint32_t& expert_idx = 0) const {
-        return signals->expert_recv_count + rank_idx * num_experts_per_rank + expert_idx;
+        return signals->expert_recv_count + expert_idx * num_ranks + rank_idx;
     }
 
     CUTLASS_DEVICE
@@ -237,18 +240,18 @@ struct Workspace {
         return signals->shared_l2_full_count + block_idx;
     }
 
-    // For dispatch pulling
+    // Single-consumer source slots: zero means empty, otherwise token_topk_idx + 1
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
         const auto offset = (expert_idx * num_ranks + rank_idx) * num_max_tokens_per_rank + token_idx;
-        return math::advance_ptr<uint32_t>(signals, sizeof(MegaMoESignals)) + offset;
+        return signals->source_token_topk_idx + offset;
     }
 
     // For combine usages (full)
     CUTLASS_DEVICE
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
-        const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
+        const auto base = math::advance_ptr<TokenSrcMetadata>(signals, sizeof(MegaMoESignals));
         return base + pool_token_idx;
     }
 };
@@ -324,11 +327,11 @@ struct Buffer {
 
     CUTLASS_HOST_DEVICE
     Buffer get_rank_buffer(const uint32_t& rank_idx) const {
-        return {
+        return Buffer(
             data_layout,
             1, num_max_tokens_per_rank,
             math::advance_ptr(base, get_num_bytes_per_rank() * rank_idx)
-        };
+        );
     }
 
     CUTLASS_HOST_DEVICE
@@ -386,16 +389,16 @@ struct MegaMoEBuffer {
 
         // Layouts
         const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
-        const auto input_token_layout = layout::Data(hidden * num_mma_elem_bytes);
-        const auto bf16_token_layout = layout::Data(hidden * 2);
-        const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
-        const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
-        const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0, false);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0, false);
-        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / 32 : 0, false);
-        const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
-        const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
-        const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
+        const auto input_token_layout = layout::inference::Data(hidden * num_mma_elem_bytes);
+        const auto bf16_token_layout = layout::inference::Data(hidden * 2);
+        const auto intermediate_token_layout = layout::inference::Data(intermediate_hidden * num_mma_elem_bytes);
+        const auto shared_intermediate_token_layout = layout::inference::Data(shared_intermediate_hidden * num_mma_elem_bytes);
+        const auto input_sf_layout = layout::inference::Data(with_sf ? hidden / 32 : 0, false);
+        const auto intermediate_sf_layout = layout::inference::Data(with_sf ? intermediate_hidden / 32 : 0, false);
+        const auto shared_intermediate_sf_layout = layout::inference::Data(with_sf ? shared_intermediate_hidden / 32 : 0, false);
+        const auto input_topk_idx_layout = layout::inference::Data(num_topk * sizeof(int64_t), false);
+        const auto input_topk_weights_layout = layout::inference::Data(num_topk * sizeof(float), false);
+        const auto l1_topk_weights_layout = layout::inference::Data(sizeof(float), false);
 
         // Input buffers
         input_token_buffer = Buffer(
@@ -456,4 +459,4 @@ struct MegaMoEBuffer {
     }
 };
 
-} // namespace deep_gemm::layout
+} // namespace deep_gemm::layout::inference

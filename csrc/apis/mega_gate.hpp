@@ -77,7 +77,7 @@ bf16_mega_gate(const torch::Tensor& x,
                const std::optional<torch::Tensor>& unmapped_topk_idx,
                const std::optional<torch::Tensor>& force_random,
                const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& out) {
-    constexpr int kHiddenAlignment = 256, kNumMaxRoutedExperts = 512, kNumMaxTopk = 32;
+    constexpr int kHiddenAlignment = static_cast<int>(mega_gate_layout::BLOCK_K), kNumMaxRoutedExperts = 512, kNumMaxTopk = 32;
     const auto [num_tokens, hidden] = get_shape<2>(x);
     const auto num_routed_experts = static_cast<int>(weight.size(0));
     DG_HOST_ASSERT(hidden > 0 and hidden % kHiddenAlignment == 0);

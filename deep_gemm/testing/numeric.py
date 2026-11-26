@@ -1,6 +1,8 @@
 import torch
 from typing import Iterable
 
+from .utils import JIT_DRY_RUN
+
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
     x, y = x.double(), y.double()
@@ -21,7 +23,16 @@ def count_bytes(*tensors):
     return total
 
 
+def assert_check(condition, message: str = '') -> None:
+    """Check a numerical result outside the compile-only phase."""
+    if JIT_DRY_RUN:
+        return
+    assert condition, message
+
+
 def assert_bitwise_equal(x: torch.Tensor, y: torch.Tensor, label: str = ''):
+    if JIT_DRY_RUN:
+        return
     assert x.shape == y.shape
     assert x.dtype == y.dtype
     x_bytes = x.contiguous().view(torch.uint8)

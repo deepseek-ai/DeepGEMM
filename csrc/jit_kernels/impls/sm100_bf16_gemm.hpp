@@ -47,7 +47,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {}, {},
         {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -67,7 +67,7 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
         args.epilogue_class->get_epilogue_operator_type(),
-        args.gemm_desc.tc_util), args.epilogue_class->compiler_options());
+        args.gemm_desc.tc_util, args.gemm_config.pipeline_config.num_tma_store_stages), args.epilogue_class->compiler_options());
 
         // Launch
         jit->launch(
