@@ -124,7 +124,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(not schedule_meta.has_value());
         DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
-        DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
+        DG_HOST_ASSERT(128 % num_heads == 0);
         sm90_fp8_mqa_logits(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits,
                             seq_len, seq_len_kv, stride_logits, num_heads, head_dim, block_q, block_kv);
     } else {
@@ -271,7 +271,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
                                aligned_max_context_len, block_table_stride);
     } else if (arch_major == 9) {
         DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
-        DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
+        DG_HOST_ASSERT(128 % num_heads == 0);
         sm90_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                   batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                   is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv);
