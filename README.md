@@ -8,6 +8,8 @@ Despite its lightweight design, DeepGEMM's performance matches or exceeds expert
 
 ## News
 
+- 2026.11.26: Mega MoE fused RMSNorm & low-latency optimizations, GEMM FP8 stochastic rounding & bias support, experimental fused kernels and more.
+    - Please see [#525](https://github.com/deepseek-ai/DeepGEMM/pull/525) for more details.
 - 2026.09.30
   - DeepGEMM Ascend is available! Check [DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend/) for more details
   - Add more optimizations, including locality domain features, check [#462](https://github.com/deepseek-ai/DeepGEMM/pull/462) for more details
