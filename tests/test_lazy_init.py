@@ -183,6 +183,64 @@ class TestNativeRuntimeShutdown(unittest.TestCase):
                         self.skipTest('requires an available CUDA device')
                     self.assertIn('DG_CUDA_CLEAN', result.stdout, details)
 
+    def test_cublaslt_workspace_cache_is_bounded(self):
+        child = textwrap.dedent('''\
+            import os
+            import torch
+            if not torch.cuda.is_available():
+                print('DG_NO_CUDA')
+                raise SystemExit(0)
+            import deep_gemm
+            max_cached = deep_gemm._C.max_cached_cublaslt_workspaces()
+            a = torch.ones((32, 64), device='cuda', dtype=torch.bfloat16)
+            b = torch.ones((48, 64), device='cuda', dtype=torch.bfloat16)
+
+            def gemm_on(stream):
+                output = torch.empty((32, 48), device='cuda', dtype=torch.bfloat16)
+                with torch.cuda.stream(stream):
+                    deep_gemm.cublaslt_gemm_nt(a, b, output)
+                return output
+
+            if os.environ['DG_USE_TEMP_CUBLASLT_WORKSPACE'] == '1':
+                for _ in range(4):
+                    gemm_on(torch.cuda.Stream())
+                torch.cuda.synchronize()
+                cached = deep_gemm._C.num_cached_cublaslt_workspaces()
+                assert cached == 0, cached
+                print('DG_CACHE_EMPTY', flush=True)
+            else:
+                reused = torch.cuda.Stream()
+                for _ in range(4):
+                    gemm_on(reused)
+                torch.cuda.synchronize()
+                cached = deep_gemm._C.num_cached_cublaslt_workspaces()
+                assert cached == 1, cached
+                outputs = []
+                for _ in range(max_cached + 8):
+                    stream = torch.cuda.Stream()
+                    outputs.append(gemm_on(stream))
+                    del stream
+                torch.cuda.synchronize()
+                cached = deep_gemm._C.num_cached_cublaslt_workspaces()
+                assert cached <= max_cached, (cached, max_cached)
+                print('DG_CACHE_BOUNDED', cached, max_cached, flush=True)
+        ''')
+        for temporary in ('0', '1'):
+            with self.subTest(temporary=temporary):
+                env = os.environ.copy()
+                env['PYTHONPATH'] = str(self.repo) + os.pathsep + env.get('PYTHONPATH', '')
+                env['DG_USE_TEMP_CUBLASLT_WORKSPACE'] = temporary
+                result = subprocess.run([sys.executable, '-c', child], cwd=self.repo, env=env,
+                                        capture_output=True, text=True, timeout=90)
+                details = f'exit {result.returncode}\n{result.stdout}\n{result.stderr}'
+                self.assertEqual(result.returncode, 0, details)
+                if 'DG_NO_CUDA' in result.stdout:
+                    self.skipTest('requires an available CUDA device')
+                if temporary == '1':
+                    self.assertIn('DG_CACHE_EMPTY', result.stdout, details)
+                else:
+                    self.assertIn('DG_CACHE_BOUNDED', result.stdout, details)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test lazy initialization')

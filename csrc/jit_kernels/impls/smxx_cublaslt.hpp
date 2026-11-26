@@ -103,6 +103,7 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
                                      &heuristic.algo,                       // Algorithm
                                      workspace.data_ptr(), workspace_bytes, // Workspace
                                      stream));                              // Stream
+    runtime->record_cublaslt_workspace_use(stream);
 
     // Free memory
     DG_CUBLASLT_CHECK(cublasLtMatmulPreferenceDestroy(pref));
