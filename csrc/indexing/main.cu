@@ -9,6 +9,7 @@
 #include <deep_gemm/impls/sm90_fp8_mqa_logits.cuh>
 #include <deep_gemm/impls/sm90_fp8_paged_mqa_logits.cuh>
 #include <deep_gemm/impls/sm100_mqa_logits.cuh>
+#include <deep_gemm/impls/sm100_sparse_mqa_logits.cuh>
 
 // Einsum kernels
 #include <deep_gemm/impls/sm90_bmk_bnk_mn.cuh>
@@ -25,9 +26,10 @@
 #include <deep_gemm/impls/sm100_locality_domain.cuh>
 
 // Mega kernels
-#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
-#include <deep_gemm/impls/sm100_bf16_mega_moe.cuh>
+#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe_inference.cuh>
+#include <deep_gemm/impls/sm100_bf16_mega_moe_inference.cuh>
 #include <deep_gemm/impls/sm100_bf16_mega_gate.cuh>
+#include <deep_gemm/impls/sm100_mega_mhc_inference.cuh>
 
 using namespace deep_gemm;
 

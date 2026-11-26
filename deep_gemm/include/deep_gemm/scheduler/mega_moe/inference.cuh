@@ -1,16 +1,18 @@
 #pragma once
 
+#include <algorithm>
+#include <limits>
+
 #include <cutlass/arch/barrier.h>
 #include <deep_gemm/common/cute_tie.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/common/exception.cuh>
-#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/layout/mega_moe_inference.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
-// TODO: add MegaMoE namespace
-namespace deep_gemm::sched {
+namespace deep_gemm::mega_moe::inference {
 
 // Get minimal L1 warmup waves to ensure no L1 -> L2 deadlock
 // constexpr func, no runtime overhead in kernel
@@ -53,11 +55,17 @@ CUTLASS_HOST_DEVICE constexpr int get_num_max_live_pool_blocks(
     constexpr int kMegaMoEBlockN = 128;
     constexpr int kNumCTAsPerCluster = 2;
 
+    DG_UNIFIED_ASSERT(intermediate_hidden > 0 and intermediate_hidden <= std::numeric_limits<int>::max() / 2);
     DG_UNIFIED_ASSERT((intermediate_hidden * 2) % (kNumCTAsPerCluster * kMegaMoEBlockN) == 0);
+    DG_UNIFIED_ASSERT(hidden > 0);
     DG_UNIFIED_ASSERT(hidden % (kNumCTAsPerCluster * kMegaMoEBlockN) == 0);
     const int num_clusters = num_sms / kNumCTAsPerCluster;
     const int num_l1_n_clusters = intermediate_hidden * 2 / (kNumCTAsPerCluster * kMegaMoEBlockN);
     const int num_l2_n_clusters = hidden / (kNumCTAsPerCluster * kMegaMoEBlockN);
+    // Leave room for ceil-div rounding in the task and warmup-wave arithmetic.
+    DG_UNIFIED_ASSERT(num_total_m_blocks > 0 and num_clusters > 0);
+    DG_UNIFIED_ASSERT(std::max(num_total_m_blocks, num_clusters) <=
+                      (std::numeric_limits<int>::max() - num_clusters) / std::max(num_l1_n_clusters, num_l2_n_clusters));
     const int num_l1_clusters = num_total_m_blocks * num_l1_n_clusters;
     const int num_l1_waves = math::constexpr_ceil_div(num_l1_clusters, num_clusters);
     const int num_min_l1_warmup_waves = get_num_l1_warmup_waves(
@@ -133,7 +141,7 @@ struct alignas(16) TaskInfo {
     }
 };
 
-DG_STATIC_ASSERT(sizeof(sched::TaskInfo<true>) == sizeof(sched::TaskInfo<false>), "Invalid layout");
+DG_STATIC_ASSERT(sizeof(mega_moe::inference::TaskInfo<true>) == sizeof(mega_moe::inference::TaskInfo<false>), "Invalid layout");
 
 #if defined(__CUDACC__) or defined(__CLION_IDE__)
 
@@ -160,8 +168,12 @@ struct L2KBlockDependency {
     // Re-read the mask only when the K block is not fed yet
     CUTLASS_DEVICE void wait(const uint32_t& k_block_idx) {
         const auto k_block_mask = ((1ull << kNumL1BlockNsPerL2KBlock) - 1) << (k_block_idx * kNumL1BlockNsPerL2KBlock);
-        while (pending_mask & k_block_mask)
-            pending_mask = ptx::ld_acq_gpu(mask_ptr) ^ expected_mask;
+        if (pending_mask & k_block_mask) {
+            do {
+                pending_mask = ptx::ld_acq_gpu(mask_ptr) ^ expected_mask;
+            } while (pending_mask & k_block_mask);
+            ptx::fence_async_global();
+        }
     }
 };
 
@@ -200,7 +212,7 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumRingBlocks > 0, "Invalid ring buffer config");
 
     // Workspace
-    const layout::Workspace& workspace;
+    const layout::inference::Workspace& workspace;
 
     // Scheduler configs
     static constexpr uint32_t kNumScheduleStages = 2;
@@ -211,9 +223,10 @@ struct MegaMoEScheduler {
     Barrier* task_info_empty_barriers = nullptr;
     task_info_t* task_infos = nullptr;
 
-    // Pre-cached per-expert token counts.
+    // Pre-cached per-expert token counts and balanced block strides.
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count.
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
+    uint32_t stored_block_m[kNumExpertsPerLane] = {};
     uint32_t num_total_m_blocks = 0;
 
     // Per-scheduler warmup waves; all CTA-pair schedulers together form one global wave.
@@ -227,10 +240,10 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumL1Clusters % kNumLocalityDomains == 0 and kNumL2Clusters % kNumLocalityDomains == 0, "Each domain must take whole clusters");
     uint32_t sm_locality_domain_idx = 0;
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace):
+    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::inference::Workspace& workspace):
         workspace(workspace) {}
 
-    CUTLASS_DEVICE MegaMoEScheduler(const layout::Workspace& workspace,
+    CUTLASS_DEVICE MegaMoEScheduler(const layout::inference::Workspace& workspace,
                                     Barrier* task_info_full_barriers,
                                     Barrier* task_info_empty_barriers,
                                     task_info_t* task_infos):
@@ -268,6 +281,14 @@ struct MegaMoEScheduler {
         return ptx::exchange(valid_value, expert_idx % 32);
     }
 
+    CUTLASS_DEVICE uint32_t get_expert_block_m(const uint32_t& expert_idx) const {
+        uint32_t value = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i)
+            value = expert_idx == i * 32 + ptx::get_lane_idx() ? stored_block_m[i] : value;
+        return ptx::exchange(value, expert_idx % 32);
+    }
+
     // Get pool block offset for a given expert index from a per-lane token count array.
     CUTLASS_DEVICE uint32_t get_pool_block_offset(const uint32_t& expert_idx) const {
         uint32_t num_blocks = 0;
@@ -279,11 +300,8 @@ struct MegaMoEScheduler {
         return __reduce_add_sync(0xffffffff, num_blocks);
     }
 
-    CUTLASS_DEVICE uint32_t get_num_total_pool_blocks() const {
-        return get_pool_block_offset(kNumExpertsPerRank);
-    }
-
     CUTLASS_DEVICE void fetch_expert_recv_count() {
+        num_total_m_blocks = 0;
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
@@ -291,19 +309,28 @@ struct MegaMoEScheduler {
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
                 do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                    value = ptx::ld_acq_sys(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } while (static_cast<uint32_t>(value >> 32) != kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+
+            const uint32_t num_m_blocks = math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+            // Balance an expert's tokens across its blocks with one 16-row-aligned stride
+            stored_block_m[i] = cute::max(math::align(math::ceil_div(
+                stored_num_tokens_per_expert[i], cute::max(num_m_blocks, 1u)), 16u), 16u);
+            num_total_m_blocks += __reduce_add_sync(0xffffffff, num_m_blocks);
         }
         __syncwarp();
 
-        num_total_m_blocks = get_num_total_pool_blocks();
         const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1Clusters;
         const uint32_t num_total_l1_waves = math::ceil_div(num_total_l1_tasks, kNumSMs / 2);
         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
             num_total_m_blocks, kNumSMs / 2, kNumL1Clusters, kNumL2Clusters);
         num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
+        // Advance a short resident L1 tail while leaving a wave for L1/L2 overlap
+        if (num_total_l1_waves > 1 and num_total_l1_waves <= min_l1_warmup_waves + kNumScheduleStages and
+                num_total_m_blocks <= kNumRingBlocks)
+            num_sched_l1_waves = cute::max(num_sched_l1_waves, cute::min(kNumScheduleStages + 1, num_total_l1_waves - 1));
     }
 
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
@@ -331,7 +358,7 @@ struct MegaMoEScheduler {
             if (owner_mask) {
                 const uint32_t owner_lane_idx = static_cast<uint32_t>(__ffs(owner_mask) - 1);
                 const uint32_t owner_m_block_idx = m_block_idx - lane_pool_block_offset;
-                const uint32_t owner_valid_m = cute::min(num_tokens - owner_m_block_idx * BLOCK_M, BLOCK_M);
+                const uint32_t owner_valid_m = cute::min(num_tokens - owner_m_block_idx * stored_block_m[i], stored_block_m[i]);
                 result.local_expert_idx = ptx::exchange(expert_idx, owner_lane_idx);
                 result.m_block_idx = ptx::exchange(owner_m_block_idx, owner_lane_idx);
                 result.valid_m = ptx::exchange(owner_valid_m, owner_lane_idx);
@@ -343,9 +370,10 @@ struct MegaMoEScheduler {
 
     static CUTLASS_DEVICE uint32_t get_next_local_task_idx(const uint32_t* task_count_ptr, const uint32_t& locality_domain_idx) {
         uint32_t result = 0;
-        if (cute::elect_one_sync())
+        const auto [is_leader, leader_lane_idx] = cute::elect_one_leader_sync();
+        if (is_leader)
             result = ptx::atomic_add(task_count_ptr + locality_domain_idx, 1u);
-        return ptx::exchange(result, 0);
+        return ptx::exchange(result, leader_lane_idx);
     }
 
     template <uint32_t kNumClusters>
@@ -471,11 +499,11 @@ struct MegaMoEScheduler {
         }
 
         // Sentinel.
-        task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
         publish_task(task_info_t(BlockPhase::None, 0, 0, 0, 0, 0, 0, 0), lane_idx);
+        task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
     }
 };
 
 #endif
 
-} // namespace deep_gemm::sched
+} // namespace deep_gemm::mega_moe::inference
