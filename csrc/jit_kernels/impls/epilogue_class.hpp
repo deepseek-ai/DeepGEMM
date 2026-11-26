@@ -1,5 +1,6 @@
 #pragma once
 
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -12,6 +13,7 @@
 
 #include "../../runtime/jit.hpp"
 #include "../../utils/exception.hpp"
+#include "../../utils/layout.hpp"
 
 namespace deep_gemm {
 
@@ -109,9 +111,36 @@ public:
     void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
         DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kFloat8_e4m3fn and
                        "FP8 quantization requires a direct E4M3 output");
+        const auto [num_groups, m, n] = get_shape<3>(d);
+        DG_HOST_ASSERT(n % 128 == 0 and sfd.device() == d.device());
+        check_sf_layout(sfd, m, num_groups * n, 1, 32, std::nullopt, true, false, torch::kInt);
     }
 
     std::optional<torch::Tensor> output_sfd() const override { return sfd; }
+};
+
+class BiasEpilogue final: public EpilogueClass {
+    torch::Tensor bias;
+
+public:
+    explicit BiasEpilogue(const torch::Tensor& bias): bias(bias) {}
+
+    std::string get_epilogue_operator_type() const override {
+        return std::format("epilogue::operators::AddBias<{}>",
+                           bias.scalar_type() == torch::kFloat ? "float" : "cutlass::bfloat16_t");
+    }
+
+    EpilogueOperatorArgs make_epilogue_operator_args(const int&, const int& n) const override {
+        return {.shape_n = static_cast<uint32_t>(n), .bias = bias.data_ptr()};
+    }
+
+    void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
+        EpilogueClass::check(c, d);
+        DG_HOST_ASSERT(jit->device.get_arch_major() == 10 and "Bias GEMM requires SM100");
+        DG_HOST_ASSERT(d.dim() == 2 and bias.dim() == 2 and bias.size(0) == 1 and bias.size(1) == d.size(1));
+        DG_HOST_ASSERT(bias.device() == d.device() and bias.scalar_type() == d.scalar_type());
+        DG_HOST_ASSERT(bias.is_contiguous() and "Bias must be contiguous");
+    }
 };
 
 class BF16StochasticRoundingEpilogue final: public EpilogueClass {
@@ -131,22 +160,58 @@ public:
     }
 };
 
+class FP8StochasticRoundingEpilogue final: public EpilogueClass {
+    torch::Tensor sfd;
+
+public:
+    explicit FP8StochasticRoundingEpilogue(const torch::Tensor& sfd): sfd(sfd) {}
+
+    std::string get_epilogue_operator_type() const override {
+        return "epilogue::operators::StochasticRoundToFP8";
+    }
+
+    EpilogueOperatorArgs make_epilogue_operator_args(const int& m, const int& n) const override {
+        return {.sfd = static_cast<uint32_t*>(sfd.data_ptr()),
+                .sfd_stride = static_cast<uint32_t>(sfd.stride(-1)),
+                .shape_m = static_cast<uint32_t>(m), .shape_n = static_cast<uint32_t>(n)};
+    }
+
+    deep_jit::cuda::CompilerOptions compiler_options() const override {
+        return {.arch = jit->device.get_arch(false)};
+    }
+
+    void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
+        DG_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kFloat8_e4m3fn and
+                       "FP8 stochastic rounding requires a direct E4M3 output");
+        const auto [num_groups, m, n] = get_shape<3>(d);
+        DG_HOST_ASSERT(n % 128 == 0 and sfd.device() == d.device());
+        check_sf_layout(sfd, m, num_groups * n, 1, 32, std::nullopt, true, false, torch::kInt);
+    }
+
+    std::optional<torch::Tensor> output_sfd() const override { return sfd; }
+};
+
 // Resolve the epilogue-related API inputs into the single epilogue class of an SM100 GEMM,
 // validated against the GEMM output: the user class, the standalone `alpha` (an API argument
-// for cuBLASLt signature parity), or the FP8 `(d, sfd)` output pair; all exclusive
+// for cuBLASLt signature parity), bias, or the FP8 `(d, sfd)` output pair; all exclusive
 static std::shared_ptr<EpilogueClass> resolve_epilogue_class(const std::shared_ptr<EpilogueClass>& epilogue_class,
                                                              const std::optional<torch::Tensor>& c,
                                                              const torch::Tensor& d,
                                                              const std::optional<float>& alpha = std::nullopt,
                                                              const std::optional<torch::Tensor>& sfd = std::nullopt) {
-    DG_HOST_ASSERT((epilogue_class != nullptr) + alpha.has_value() + sfd.has_value() <= 1 and
-                   "The epilogue class, `alpha` and the FP8 output pair are exclusive");
+    const bool with_bias = c.has_value() and d.dim() == 2 and c->dim() == 2 and
+                           c->size(0) == 1 and c->data_ptr() != d.data_ptr();
+    DG_HOST_ASSERT((epilogue_class != nullptr) + alpha.has_value() + sfd.has_value() + with_bias <= 1 and
+                   "The epilogue class, `alpha`, the FP8 output pair and bias are exclusive");
+
     std::shared_ptr<EpilogueClass> resolved = epilogue_class;
-    if (alpha.has_value())
+    if (with_bias)
+        resolved = std::make_shared<BiasEpilogue>(c.value());
+    else if (alpha.has_value())
         resolved = std::make_shared<AlphaEpilogue>(alpha.value());
-    if (sfd.has_value())
+    else if (sfd.has_value())
         resolved = std::make_shared<FP8CastWithClampEpilogue>(sfd.value());
-    if (resolved == nullptr)
+    else if (resolved == nullptr)
         resolved = std::make_shared<IdentityEpilogue>();
     resolved->check(c, d);
     return resolved;

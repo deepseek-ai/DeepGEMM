@@ -52,6 +52,7 @@ struct EpilogueOperatorArgs {
     float clamp_value = 0.0f;  // Zero disables clamping
     uint32_t* clamped_count = nullptr;
     uint32_t* clamp_count_ready = nullptr;  // Per-stream GPU launch tag for in-kernel initialization
+    const void* bias = nullptr;
 };
 
 static constexpr uint32_t kNumDeviceLocalityDomains = 2;

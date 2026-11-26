@@ -190,29 +190,34 @@ struct SM100ArchSpec {
         };
     }
 
-    static int get_num_tma_store_stages(const GemmDesc& desc, const Layout& layout) {
-        // With single-stage TMA stores, each SM keeps at most one bulk store in
-        // flight. This paces the store traffic and improves the achieved DRAM
-        // throughput when C/D flushes dominate DRAM traffic; it also frees up
-        // shared memory for the A/B mainloop and halves the C/D smem read/write
-        // footprint. Only enabled for k-grouped GEMMs.
-        if (desc.get_mma_kind() == MmaKind::BF16 or layout.swap_ab or
-            not is_k_grouped_contiguous(desc.gemm_type))
+    static int get_num_tma_store_stages(const GemmDesc& desc, const Layout& layout, const int smem_cd_per_stage,
+                                         const int num_stages_double_store, const int num_stages_single_store) {
+        // Single-buffered stores pace output traffic and free SMEM for input staging.
+        if (layout.swap_ab)
             return 2;
 
-        const int num_k_blocks_per_group = desc.k / std::max(desc.num_groups, 1) / layout.block_k;
-        const int min_k_blocks = desc.cd_dtype != torch::kFloat ? 16 :
-                                 desc.with_accumulation ? 24 : 32;
-        return num_k_blocks_per_group >= min_k_blocks ? 1 : 2;
+        if (is_k_grouped_contiguous(desc.gemm_type)) {
+            const int num_k_blocks_per_group = desc.k / std::max(desc.num_groups, 1) / layout.block_k;
+            const int min_k_blocks = desc.cd_dtype != torch::kFloat ? 16 :
+                                     desc.with_accumulation ? 24 : 32;
+            return desc.get_mma_kind() != MmaKind::BF16 and num_k_blocks_per_group >= min_k_blocks ? 1 : 2;
+        }
+
+        const int num_k_blocks = ceil_div(desc.get_expected_k(), layout.block_k);
+        const int num_store_blocks = layout.block_m * layout.block_n * c10::elementSize(desc.cd_dtype) / smem_cd_per_stage;
+        const int min_k_blocks = num_store_blocks <= 4 ? 8 : 24;
+        return std::min(num_stages_single_store, num_k_blocks) > num_stages_double_store and
+               get_layout_info(desc, layout).num_waves > 1 and
+               num_k_blocks >= min_k_blocks and
+               num_k_blocks <= 6 * min_k_blocks ? 1 : 2;
     }
 
     static PipelineConfig get_pipeline_config(const GemmDesc& desc, const Layout& layout, const StorageConfig& storage_config) {
         constexpr int kNumMaxStages = 32;
 
-        // C/D for TMA stores
-        const int num_tma_store_stages = get_num_tma_store_stages(desc, layout);
-        const int smem_cd = (layout.swap_ab ? storage_config.store_block_m * storage_config.store_block_n * c10::elementSize(desc.cd_dtype)
-                                            : storage_config.store_block_m * storage_config.swizzle_cd_mode) * num_tma_store_stages;
+        // C/D per store stage
+        const int smem_cd_per_stage = layout.swap_ab ? storage_config.store_block_m * storage_config.store_block_n * c10::elementSize(desc.cd_dtype)
+                                                    : storage_config.store_block_m * storage_config.swizzle_cd_mode;
 
         // TODO: remove SF barriers for BF16 GEMMs
         // A/B-and-SF-transpose full, SF-TMA full, empty, and tensor memory full/empty/overlap barriers
@@ -238,12 +243,17 @@ struct SM100ArchSpec {
             smem_sfb_per_stage = sf_block_n * layout.block_k / 32;
         }
 
-        // Calculate stages
-        int smem_extra = smem_cd + smem_barriers + smem_tmem_ptr;
-        int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
-        int num_stages = std::min(
-            (smem_capacity - smem_extra) / smem_per_stage,
-            kNumMaxStages);
+        // Input depths for the output-stage selector
+        const int smem_per_stage = smem_a_per_stage + smem_b_per_stage + smem_sfa_per_stage + smem_sfb_per_stage;
+        const int smem_fixed = smem_barriers + smem_tmem_ptr;
+        const int num_stages_double_store = std::min((smem_capacity - smem_fixed - smem_cd_per_stage * 2) / smem_per_stage, kNumMaxStages);
+        const int num_stages_single_store = std::min((smem_capacity - smem_fixed - smem_cd_per_stage) / smem_per_stage, kNumMaxStages);
+
+        // C/D for TMA stores
+        const int num_tma_store_stages = get_num_tma_store_stages(desc, layout, smem_cd_per_stage, num_stages_double_store, num_stages_single_store);
+        const int smem_cd = smem_cd_per_stage * num_tma_store_stages;
+        const int num_stages = num_tma_store_stages == 1 ? num_stages_single_store : num_stages_double_store;
+        const int smem_extra = smem_cd + smem_fixed;
         return {
             smem_extra + num_stages * smem_per_stage,
             num_stages,

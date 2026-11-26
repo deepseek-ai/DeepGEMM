@@ -28,6 +28,9 @@ static void register_apis(pybind11::module_& m) {
     pybind11::class_<BF16StochasticRoundingEpilogue, EpilogueClass,
                      std::shared_ptr<BF16StochasticRoundingEpilogue>>(submodule, "BF16StochasticRounding")
         .def(pybind11::init<>());
+    pybind11::class_<FP8StochasticRoundingEpilogue, EpilogueClass,
+                     std::shared_ptr<FP8StochasticRoundingEpilogue>>(submodule, "FP8StochasticRounding")
+        .def(pybind11::init<const torch::Tensor&>(), pybind11::arg("sfd"));
 }
 
 } // namespace deep_gemm::epilogue_class
