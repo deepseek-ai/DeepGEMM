@@ -211,8 +211,11 @@ def enumerate_m_grouped_contiguous(dtype: torch.dtype) -> Generator:
 
 def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
     quant_config_list = QuantConfig.get_list_from_dtype(dtype)
-    max_m = 4096
-    m_group_list = [(32, 192), (6, 1024), (32, 20), (6, 20)]
+    # (num_groups, max_m, expected_m_per_group)
+    m_group_list = [(32, 4096, 192), (6, 4096, 1024), (32, 4096, 20), (6, 4096, 20)]
+    if get_arch_major() == 9:
+        # `max_m` not a multiple of the block M (64 or 128), with groups using up to all their rows
+        m_group_list.append((4, 200, 200))
     n_k_list = [(6144, 7168), (7168, 3072), (4096, 4096), (4096, 2048)]
     for kernel_type in get_kernel_types(dtype):
         for quant_config in quant_config_list:
@@ -220,7 +223,7 @@ def enumerate_m_grouped_masked(dtype: torch.dtype) -> Generator:
                 quant_config.print()
             for use_psum_layout in get_psum_layout_usage():
                 reset_seed()
-                for num_groups, m in m_group_list:
+                for num_groups, max_m, m in m_group_list:
                     for n, k in n_k_list:
                         yield kernel_type, quant_config, num_groups, max_m, m, n, k, use_psum_layout
 
@@ -455,7 +458,7 @@ def generate_m_grouped_masked(num_groups: int, max_m: int, expected_m_per_group:
     masked_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
     psum_m = torch.empty((num_groups, ), device='cuda', dtype=torch.int)
     for j in range(num_groups):
-        masked_m[j] = int(expected_m_per_group * random.uniform(0.7, 1.3))
+        masked_m[j] = min(int(expected_m_per_group * random.uniform(0.7, 1.3)), max_m)
         psum_m[j] = (0 if j == 0 else align(psum_m[j - 1], get_mk_alignment_for_contiguous_layout())) + masked_m[j]
     assert masked_m.amax().item() <= max_m
     valid_mask = torch.arange(max_m, device='cuda')[None, :] < masked_m[:, None]

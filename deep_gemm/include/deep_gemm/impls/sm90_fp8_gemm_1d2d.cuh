@@ -430,9 +430,10 @@ sm90_fp8_gemm_1d2d_impl(float* sfb, int* grouped_layout,
                 auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
                 auto n_idx = n_block_idx * BLOCK_N + in_block_n_offset;
                 auto m_idx = scheduler.get_global_idx<kWithGroupOffsetD>(shape_m, BLOCK_M, m_block_idx);
-                if constexpr (kGemmType == GemmType::Batched) {
-                    cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr,
-                                                  n_idx, m_idx, scheduler.current_group_idx);
+                if constexpr (kGemmType == GemmType::Batched or kGemmType == GemmType::MGroupedMasked) {
+                    cute::SM90_TMA_STORE_3D::copy(&tensor_map_d, smem_ptr, n_idx,
+                                                  kGemmType == GemmType::MGroupedMasked ? m_block_idx * BLOCK_M : m_idx,
+                                                  scheduler.current_group_idx);
                 } else {
                     cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_ptr, n_idx, m_idx);
                 }
