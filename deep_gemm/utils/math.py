@@ -29,8 +29,11 @@ def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     assert not use_packed_ue8m0 or use_ue8m0
     m, n = x.shape
     padded_n = align(n, gran_k)
-    x_padded = torch.empty((m, padded_n), dtype=x.dtype, device=x.device).fill_(0)
-    x_padded[:, :n] = x
+    if padded_n == n and x.is_contiguous() and not (torch.is_grad_enabled() and x.requires_grad):
+        x_padded = x
+    else:
+        x_padded = torch.empty((m, padded_n), dtype=x.dtype, device=x.device).fill_(0)
+        x_padded[:, :n] = x
     x_view = x_padded.view(m, padded_n // gran_k, gran_k)
     x_amax = x_view.abs().float().amax(dim=2).view(m, padded_n // gran_k).clamp(1e-4)
     sf = x_amax / 448.0
