@@ -19,7 +19,11 @@ def ceil_to_ue8m0(x: torch.Tensor):
 def pack_ue8m0_to_int(x: torch.Tensor):
     assert x.dtype == torch.float and x.size(-1) % 4 == 0
     x_int = x.view(torch.int)
-    assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
+    # Evaluating CUDA tensors as Python bools forces a device-to-host sync, which
+    # is illegal while the current stream is capturing a CUDA graph. The packing
+    # itself is capture safe, so the value checks only run on the eager path.
+    if not x.is_cuda or not torch.cuda.is_current_stream_capturing():
+        assert (x_int >= 0).all() and (x_int & 0x7fffff == 0).all()
     return (x_int >> 23).to(torch.uint8).view(torch.int)
 
 
