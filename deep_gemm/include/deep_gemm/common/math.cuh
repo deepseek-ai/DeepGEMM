@@ -73,8 +73,12 @@ CUTLASS_HOST_DEVICE float fast_rcp(const float& x) {
 }
 
 // Approximate exp with FTZ; subnormal outputs disappear in the sigmoid's FP32 `1 + exp`.
-CUTLASS_HOST_DEVICE float2 fast_exp_ftz(const float2& x) {
+CUTLASS_DEVICE float2 fast_exp_ftz(const float2& x) {
+#if defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)
     const auto scaled = __fmul2_rn(x, make_float2(1.4426950408889634f, 1.4426950408889634f));
+#else
+    const auto scaled = make_float2(x.x * 1.4426950408889634f, x.y * 1.4426950408889634f);
+#endif
     float2 ret;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ret.x) : "f"(scaled.x));
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ret.y) : "f"(scaled.y));
