@@ -71,7 +71,8 @@ static int get_num_token_cols(const int& block_tokens, const int& num_experts_pe
     return num_experts_per_group == static_cast<int>(mega_gate_layout::kExpertAlignment) ? block_tokens / num_mma_ctas : block_tokens;
 }
 
-static bool is_task_doubling_free(const int& num_tokens, const int& num_sms, const bool& deterministic, const MegaGateConfig& candidate) {
+static bool is_task_doubling_free(const int& num_tokens, const int& hidden, const int& num_sms, const bool& deterministic,
+                                  const MegaGateConfig& candidate) {
     const auto num_doubled_logical_ctas = candidate.num_logical_ctas * 2;
     if (num_doubled_logical_ctas > num_sms or num_doubled_logical_ctas >= static_cast<int>(mega_gate_layout::kNumMaxLogicalCtas))
         return false;
@@ -82,7 +83,8 @@ static bool is_task_doubling_free(const int& num_tokens, const int& num_sms, con
         return get_num_waves(num_tokens, num_doubled_worker_groups) <= candidate.num_waves + kNumMaxExtraWavesForDoubling;
     // A single-wave CTA pair can only be doubled by splitting K, which deterministic mode forbids
     if (candidate.num_mma_ctas == 2 and candidate.num_split_k == 1 and candidate.num_waves == 1 and not deterministic)
-        return select_wave_block_tokens(num_tokens, num_doubled_worker_groups) == candidate.block_tokens;
+        return hidden % (2 * static_cast<int>(mega_gate_layout::BLOCK_K)) == 0 and
+               select_wave_block_tokens(num_tokens, num_doubled_worker_groups) == candidate.block_tokens;
     return false;
 }
 
@@ -148,7 +150,7 @@ static MegaGateConfig get_mega_gate_config(const int& num_tokens, const int& hid
                     .num_token_cols = std::min(get_num_token_cols(block_tokens, num_experts_per_group, num_mma_ctas),
                                                kNumMaxGateWarpgroups * kNumTransposeColsPerWarpgroup),
                 };
-                if (not is_task_doubling_free(num_tokens, num_sms, deterministic, candidate))
+                if (not is_task_doubling_free(num_tokens, hidden, num_sms, deterministic, candidate))
                     candidates.push_back(candidate);
             }
         }

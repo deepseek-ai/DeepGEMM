@@ -174,7 +174,6 @@ def enumerate_normal(dtype: torch.dtype, collect_cublas_scores: bool = False) ->
 
 
 def enumerate_batched_syrk_symm() -> Generator:
-    # Real Muon parameter shapes from 5120/7168 models. Batch merging is capped at 16 in hai-llm.
     b_m_k_list = [
         (16, 4608, 5120),
         (16, 1536, 5120),
@@ -353,14 +352,15 @@ def generate_normal(m: int, n: int, k: int,
                     kernel_type: KernelType,
                     use_ue8m0: bool = False, use_bf16: bool = False,
                     quant_config: Optional[QuantConfig] = None,
-                    alpha: Optional[float] = None):
+                    alpha: Optional[float] = None, with_bias: bool = False):
+    assert not with_bias or not accumulate
     a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
     b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
     d = torch.randn((m, n), device='cuda', dtype=out_dtype) * 32 if accumulate else \
         torch.empty((m, n), device='cuda', dtype=out_dtype)
-    c = d if accumulate else None
+    c = d if accumulate else torch.randn((1, n), device='cuda', dtype=out_dtype) if with_bias else None
     alpha_value = alpha if alpha is not None else 1.0
-    ref_d = (alpha_value * (a.float() @ b.float().t()) + (c if accumulate else 0)).to(out_dtype)
+    ref_d = (alpha_value * (a.float() @ b.float().t()) + (c if c is not None else 0)).to(out_dtype)
 
     if use_bf16:
         a = a if major_a.is_k_major() else a.T.contiguous().T

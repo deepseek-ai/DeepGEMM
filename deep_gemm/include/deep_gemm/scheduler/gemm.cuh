@@ -25,6 +25,8 @@ static constexpr uint32_t get_num_1d_blocks_per_group() {
     return num_best_blocks;
 }
 
+#if defined(DG_IN_CUDA_COMPILATION)
+
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
 template <GemmType kGemmType,
@@ -250,6 +252,15 @@ struct Scheduler {
 
             current_group_idx = next_block_idx / num_blocks;
             const auto block_idx = next_block_idx - current_group_idx * num_blocks;
+#if __CUDA_ARCH__ >= 1000
+            const auto num_primary_tiles = kIsMulticastOnA ? num_n_blocks : num_m_blocks;
+            const auto num_secondary_tiles = kIsMulticastOnA ? num_m_blocks : num_n_blocks;
+            // Use grouped traversal only when it changes the tile order.
+            if (num_primary_tiles > kNum1DBlocksPerGroup and num_secondary_tiles > 1) {
+                get_swizzled_block_idx(block_idx, m_block_idx, n_block_idx);
+                return true;
+            }
+#endif
             if constexpr (kIsMulticastOnA) {
                 m_block_idx = block_idx / num_n_blocks;
                 n_block_idx = block_idx % num_n_blocks;
@@ -310,5 +321,7 @@ struct Scheduler {
 };
 
 #pragma clang diagnostic pop
+
+#endif
 
 } // namespace deep_gemm::sched

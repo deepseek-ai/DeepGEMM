@@ -2,7 +2,7 @@ import torch
 from typing import Callable, Tuple
 
 import deep_gemm
-from deep_gemm.testing import assert_bitwise_equal
+from deep_gemm.testing import assert_bitwise_equal, assert_check
 from deep_gemm.utils import align, ceil_div, get_mk_alignment_for_contiguous_layout
 
 
@@ -13,8 +13,8 @@ def assert_psum_zero_padding(a: torch.Tensor | tuple, d: torch.Tensor, grouped_l
         if current_m < aligned_m:
             a_padding = a_data[current_m: aligned_m]
             d_padding = d[current_m: aligned_m]
-            assert torch.equal(a_padding, torch.zeros_like(a_padding)), f'{group_idx=}, nonzero {dtype_label} input padding'
-            assert torch.equal(d_padding, torch.zeros_like(d_padding)), f'{group_idx=}, nonzero {dtype_label} output padding'
+            assert_check(torch.equal(a_padding, torch.zeros_like(a_padding)), f'{group_idx=}, nonzero {dtype_label} input padding')
+            assert_check(torch.equal(d_padding, torch.zeros_like(d_padding)), f'{group_idx=}, nonzero {dtype_label} output padding')
 
 
 def assert_direct_output_matches_fp32_accumulation(
@@ -77,6 +77,65 @@ def assert_stochastic_bf16_matches_fp32_accumulation(
     rounded = (values >> 16) + (((values & 0xffff) + random_bits) >> 16)
     expected = rounded.to(torch.uint16).view(torch.bfloat16).view(shape)
     assert_bitwise_equal(direct_output, expected, label)
+
+
+def _reverse_16_bits(x: torch.Tensor) -> torch.Tensor:
+    x = ((x & 0x5555) << 1) | ((x >> 1) & 0x5555)
+    x = ((x & 0x3333) << 2) | ((x >> 2) & 0x3333)
+    x = ((x & 0x0f0f) << 4) | ((x >> 4) & 0x0f0f)
+    return ((x & 0x00ff) << 8) | ((x >> 8) & 0x00ff)
+
+
+def assert_stochastic_fp8_matches_fp32_accumulation(
+        direct_output: torch.Tensor,
+        sfd: torch.Tensor,
+        launch: Callable[[torch.Tensor], None],
+        label: str,
+        rows_are_batch_major: bool = True) -> None:
+    assert direct_output.dtype == torch.float8_e4m3fn
+    shape, n = direct_output.shape, direct_output.size(-1)
+    assert n % 128 == 0
+    num_batches = int(sfd.size(1)) * 128 // n
+    num_rows = direct_output.numel() // n
+    num_group_rows = num_rows // num_batches
+
+    fp32 = torch.zeros_like(direct_output, dtype=torch.float)
+    launch(fp32)
+
+    # Per-row groups of 32 columns: |amax| -> UE8M0 exponent -> scaled FP32
+    groups = fp32.reshape(num_rows, n // 32, 32)
+    amax_bits = groups.abs().amax(dim=-1).view(torch.int32).to(torch.int64) & 0xffffffff
+    sf_exp = ((amax_bits + 0x1fffff) >> 23).clamp(min=113) - 8
+    scaled = groups * ((254 - sf_exp) << 23).to(torch.int32).view(torch.float).unsqueeze(-1)
+
+    # Quartet hash and 16-bit thresholds (L, rev16(L), H, rev16(H))
+    scaled = scaled.reshape(num_rows, n // 4, 4)
+    quartet_n_idx = torch.arange(n // 4, device=fp32.device, dtype=torch.int64)
+    bits = scaled.view(torch.int32).to(torch.int64) & 0xffffffff
+    h = (bits[..., 0] * 0x5671d42b + bits[..., 1] * 0x9995e499 + bits[..., 2] * 0xace1b8a5 +
+         bits[..., 3] * 0xe153538d + quartet_n_idx) & 0xffffffff
+    h = ((h ^ (h >> 23)) * 0x7feb352d) & 0xffffffff
+    h = ((h ^ (h >> 16)) * 0x846ca68b) & 0xffffffff
+    h ^= h >> 11
+    lower, upper = h & 0xffff, (h >> 16) & 0xffff
+    random_bits = torch.stack((lower, _reverse_16_bits(lower),
+                               upper, _reverse_16_bits(upper)), dim=-1)
+
+    # Align normal/subnormal mantissas, add the 16-bit threshold and saturate at 0x7e
+    exp32 = (bits >> 23) & 0xff
+    mant = torch.where(exp32 > 120, ((exp32 - 120) << 23) | (bits & 0x7fffff),
+                       ((bits & 0x7fffff) | 0x800000) >> (121 - exp32).clamp(max=25))
+    codes = ((mant >> 20) + ((((mant >> 4) & 0xffff) + random_bits) >> 16)).clamp(max=0x7e)
+    expected = (((bits >> 31) << 7) | codes).to(torch.uint8).reshape(shape)
+    assert torch.equal(direct_output.view(torch.uint8), expected.view(torch.uint8)), label
+
+    if rows_are_batch_major:
+        expected_sf = sf_exp.view(num_batches, num_group_rows, n // 32).permute(1, 0, 2)
+    else:
+        expected_sf = sf_exp.view(num_group_rows, num_batches, n // 32)
+    expected_sf = expected_sf.reshape(num_group_rows, -1).to(torch.uint8)
+    actual_sf = sfd.T.contiguous().view(torch.uint8).view(sfd.size(1), sfd.size(0), 4)
+    assert torch.equal(actual_sf.permute(1, 0, 2).reshape(sfd.size(0), -1), expected_sf), f'{label} (SFs)'
 
 
 def convert_to_fp8(x: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:

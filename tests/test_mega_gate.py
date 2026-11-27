@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import deep_gemm
 from deep_gemm.testing import (
     assert_bitwise_equal,
+    assert_check,
     bench_kineto,
     calc_diff,
     count_bytes,
@@ -16,7 +17,7 @@ from deep_gemm.testing import (
 NUM_TOPK = 6
 NUM_SHARED_EXPERTS = 1
 ROUTED_SCALING_FACTOR = 1.5
-VLLM_NUM_EXTRA_EXPERTS = 32
+NUM_EXTRA_EXPERTS = 32
 
 GATE_CONFIGS = (
     (64, 2, 6), (72, 1, 6), (96, 2, 6), (108, 2, 6), (128, 2, 6), (144, 2, 6),
@@ -34,15 +35,16 @@ def enumerate_cases():
         (128, 7168, 512), (8192, 4096, 512), (32768, 7168, 512),
         # 4 waves with a K loop that is not a multiple of the pipeline depth: carries the stage position across blocks
         (32768, 4096, 512),
+        (4096, 1664, 384), (4096, 2176, 384),
     )
 
 
 def make_physical_map(num_logical_experts: int) -> tuple[torch.Tensor, torch.Tensor]:
     to_physical_map = torch.full(
-        (num_logical_experts, VLLM_NUM_EXTRA_EXPERTS + 1), -1, dtype=torch.int32, device='cuda')
+        (num_logical_experts, NUM_EXTRA_EXPERTS + 1), -1, dtype=torch.int32, device='cuda')
     logical_count = torch.ones((num_logical_experts,), dtype=torch.int32, device='cuda')
     to_physical_map[:, 0] = torch.arange(num_logical_experts, dtype=torch.int32, device='cuda')
-    num_duplicated_experts = min(num_logical_experts, VLLM_NUM_EXTRA_EXPERTS)
+    num_duplicated_experts = min(num_logical_experts, NUM_EXTRA_EXPERTS)
     to_physical_map[:num_duplicated_experts, 1] = (
         num_logical_experts + torch.arange(num_duplicated_experts, dtype=torch.int32, device='cuda'))
     logical_count[:num_duplicated_experts] = 2
@@ -76,9 +78,9 @@ def make_outputs(inputs: dict[str, Any], use_shared_as_routed: bool = False,
                  num_shared_experts: int = NUM_SHARED_EXPERTS) -> dict[str, torch.Tensor | None]:
     shape = (inputs['x'].shape[0], num_topk + (num_shared_experts if use_shared_as_routed else 0))
     return dict(
-        topk_idx=torch.empty(shape, dtype=torch.int64, device='cuda'),
-        topk_weights=torch.empty(shape, dtype=torch.float32, device='cuda'),
-        unmapped_topk_idx=(torch.empty((shape[0], num_topk), dtype=torch.int64, device='cuda')
+        topk_idx=torch.zeros(shape, dtype=torch.int64, device='cuda'),
+        topk_weights=torch.zeros(shape, dtype=torch.float32, device='cuda'),
+        unmapped_topk_idx=(torch.zeros((shape[0], num_topk), dtype=torch.int64, device='cuda')
                            if with_unmapped_topk_idx else None),
     )
 
@@ -111,7 +113,7 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
     num_tokens, num_routed_experts = logits.shape
     active = mask if mask is not None else torch.ones((num_tokens,), dtype=torch.bool, device='cuda')
     score_based = active if force_random is None else active & ~force_random
-    weight_diff = 0.0
+    diff = 0.0
 
     if score_based.any():
         scores = F.softplus(logits).sqrt()
@@ -125,7 +127,7 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
                     logical_topk_idx, logical_topk_idx - to_physical_map.shape[0])
 
         selected_idx = logical_topk_idx[score_based]
-        assert torch.all((selected_idx >= 0) & (selected_idx < num_routed_experts)).item()
+        assert_check(torch.all((selected_idx >= 0) & (selected_idx < num_routed_experts)).item())
 
         ranking_bias = (inputs['bias'] if inputs['bias'] is not None
                         else torch.zeros((num_routed_experts,), dtype=torch.float32, device='cuda'))
@@ -138,39 +140,32 @@ def check_topk_weights(inputs: dict[str, Any], outputs: dict[str, torch.Tensor |
             topk_scores = scores[row_mask].gather(1, topk_idx)
             return topk_scores / (topk_scores.sum(dim=1, keepdim=True) + 1e-20) * ROUTED_SCALING_FACTOR
 
-        weight_diff = float(calc_diff(fused_weights[score_based, :num_topk],
-                                      reference_weights(score_based, selected_idx)))
-        assert weight_diff < 1e-11, f'{weight_diff=}'
+        diff = float(calc_diff(fused_weights[score_based, :num_topk],
+                               reference_weights(score_based, selected_idx)))
+        assert_check(diff < 1e-11, f'{diff=}')
 
         ranked = score_based if fix_routing_mask is None else score_based & ~fix_routing_mask
         if ranked.any():
             ranked_idx = logical_topk_idx[ranked]
             sorted_idx = ranked_idx.sort(dim=1).values
-            assert torch.all(sorted_idx[:, 1:] != sorted_idx[:, :-1]).item()
+            assert_check(torch.all(sorted_idx[:, 1:] != sorted_idx[:, :-1]).item())
 
-            selected_ranking = ranking[ranked].gather(1, ranked_idx)
-            unselected_max = ranking[ranked].scatter(1, ranked_idx, float('-inf')).max(dim=1).values
-            crossing = unselected_max - selected_ranking.min(dim=1).values
-            tolerance = 1e-5 + 1e-5 * ranking[ranked].abs().amax(dim=1)
-            assert torch.all(crossing <= tolerance).item(), \
-                f'top-k selection beyond numerical ties: {crossing.max().item()=}'
-
-            ref_weights = reference_weights(ranked, ranking[ranked].topk(num_topk, dim=1).indices)
-            ranked_diff = float(calc_diff(fused_weights[ranked, :num_topk].sort(dim=1).values,
-                                          ref_weights.sort(dim=1).values))
-            assert ranked_diff < 1e-11, f'{ranked_diff=}'
-            weight_diff = max(weight_diff, ranked_diff)
+            selected_ranking = ranking[ranked].gather(1, ranked_idx).sort(dim=1, descending=True).values
+            reference_ranking = ranking[ranked].topk(num_topk, dim=1).values
+            ranking_diff = float(calc_diff(selected_ranking, reference_ranking))
+            assert_check(ranking_diff < 1e-11, f'{ranking_diff=}')
+            diff = max(diff, ranking_diff)
 
         if fused_weights.shape[1] > num_topk:
-            assert torch.all(fused_weights[score_based, num_topk:] == 1.0).item()
+            assert_check(torch.all(fused_weights[score_based, num_topk:] == 1.0).item())
 
     if (~active).any():
-        assert torch.all(fused_idx[~active] == -1).item()
-        assert torch.all(fused_weights[~active] == 0).item()
+        assert_check(torch.all(fused_idx[~active] == -1).item())
+        assert_check(torch.all(fused_weights[~active] == 0).item())
         if outputs['unmapped_topk_idx'] is not None:
-            assert torch.all(outputs['unmapped_topk_idx'][~active] == -1).item()
+            assert_check(torch.all(outputs['unmapped_topk_idx'][~active] == -1).item())
 
-    return weight_diff
+    return diff
 
 
 def check_correctness(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | None],
@@ -180,7 +175,7 @@ def check_correctness(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | 
                       num_repeats: int = 10) -> float:
     logits = run_reference_gemm(inputs)
     run_mega_gate(inputs, outputs, use_shared_as_routed, num_topk=num_topk, num_shared_experts=num_shared_experts)
-    weight_diff = check_topk_weights(inputs, outputs, logits, inputs['mask'], num_topk=num_topk)
+    diff = check_topk_weights(inputs, outputs, logits, inputs['mask'], num_topk=num_topk)
 
     # The split reduction is order-fixed, so every launch must be bitwise identical
     expected = {name: tensor.clone() for name, tensor in outputs.items() if tensor is not None}
@@ -188,7 +183,7 @@ def check_correctness(inputs: dict[str, Any], outputs: dict[str, torch.Tensor | 
         run_mega_gate(inputs, outputs, use_shared_as_routed, num_topk=num_topk, num_shared_experts=num_shared_experts)
         for name, tensor in expected.items():
             assert_bitwise_equal(outputs[name], tensor, name)
-    return weight_diff
+    return diff
 
 
 def check_case(num_tokens: int, hidden: int, num_routed_experts: int,
@@ -210,7 +205,7 @@ def test_mega_gate() -> None:
     for num_tokens, hidden, num_routed_experts in enumerate_cases():
         inputs = make_inputs(num_tokens, hidden, num_routed_experts)
         outputs = make_outputs(inputs)
-        weight_diff = check_correctness(inputs, outputs)
+        diff = check_correctness(inputs, outputs)
 
         fused_t = bench_kineto(
             lambda: run_mega_gate(inputs, outputs),
@@ -221,7 +216,7 @@ def test_mega_gate() -> None:
               f'{fused_t * 1e6:7.1f} us | '
               f'{num_flops / fused_t / 1e12:4.0f} TFLOPS | '
               f'{num_bytes / fused_t / 1e9:4.0f} GB/s | '
-              f'diff {weight_diff:.1e}')
+              f'diff {diff:.1e}')
     print()
 
 
@@ -244,13 +239,13 @@ def check_routing_controls() -> None:
 
     active_force_random = force_random & mask
     fixed = fix_routing_mask & mask & ~force_random
-    assert torch.equal(unmapped_topk_idx[fixed], fixed_topk_idx[fixed])
+    assert_check(torch.equal(unmapped_topk_idx[fixed], fixed_topk_idx[fixed]))
     random_idx, random_weights = fused_idx[active_force_random], fused_weights[active_force_random]
-    assert torch.all((random_idx >= 0) & (random_idx < inputs['logical_count'].sum())).item()
-    assert torch.all(random_weights > 0).item()
+    assert_check(torch.all((random_idx >= 0) & (random_idx < inputs['logical_count'].sum())).item())
+    assert_check(torch.all(random_weights > 0).item())
     sorted_random_idx = random_idx.sort(dim=1).values
-    assert torch.all(sorted_random_idx[:, 1:] != sorted_random_idx[:, :-1]).item()
-    assert torch.all(unmapped_topk_idx[active_force_random] == -1).item()
+    assert_check(torch.all(sorted_random_idx[:, 1:] != sorted_random_idx[:, :-1]).item())
+    assert_check(torch.all(unmapped_topk_idx[active_force_random] == -1).item())
 
 
 @test_filter(lambda: get_arch_major() == 10)
@@ -281,11 +276,11 @@ def test_mega_gate_api_contract() -> None:
     inputs['x'].zero_()
     inputs['weight'].zero_()
     topk_idx, _ = run_mega_gate(inputs, make_outputs(inputs, num_topk=num_topk), num_topk=num_topk)
-    assert torch.equal(topk_idx, torch.arange(num_topk, dtype=torch.int64, device='cuda').expand(8, -1))
+    assert_check(torch.equal(topk_idx, torch.arange(num_topk, dtype=torch.int64, device='cuda').expand(8, -1)))
 
     inputs = make_inputs(16, 4096, 128, with_physical_map=False)
     outputs = make_outputs(inputs, with_unmapped_topk_idx=True, num_topk=num_topk)
-    unmapped_storage = torch.empty((16, num_topk + 3), dtype=torch.int64, device='cuda')
+    unmapped_storage = torch.zeros((16, num_topk + 3), dtype=torch.int64, device='cuda')
     outputs['unmapped_topk_idx'] = unmapped_storage[:, :num_topk]
     assert outputs['unmapped_topk_idx'].stride() == (num_topk + 3, 1)
     check_correctness(inputs, outputs, num_topk=num_topk)
@@ -294,11 +289,11 @@ def test_mega_gate_api_contract() -> None:
     outputs = make_outputs(inputs, with_unmapped_topk_idx=True, num_topk=num_topk)
     force_random = torch.ones((32,), dtype=torch.bool, device='cuda')
     topk_idx, topk_weights = run_mega_gate(inputs, outputs, num_topk=num_topk, force_random=force_random)
-    assert torch.all((topk_idx >= 0) & (topk_idx < 128)).item()
-    assert torch.all(topk_weights > 0).item()
+    assert_check(torch.all((topk_idx >= 0) & (topk_idx < 128)).item())
+    assert_check(torch.all(topk_weights > 0).item())
     sorted_topk_idx = topk_idx.sort(dim=1).values
-    assert torch.all(sorted_topk_idx[:, 1:] != sorted_topk_idx[:, :-1]).item()
-    assert torch.all(outputs['unmapped_topk_idx'] == -1).item()
+    assert_check(torch.all(sorted_topk_idx[:, 1:] != sorted_topk_idx[:, :-1]).item())
+    assert_check(torch.all(outputs['unmapped_topk_idx'] == -1).item())
 
     inputs = make_inputs(0, 4096, 128, with_physical_map=False)
     topk_idx, topk_weights = run_mega_gate(inputs, make_outputs(inputs, num_topk=num_topk), num_topk=num_topk)

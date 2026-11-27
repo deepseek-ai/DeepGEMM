@@ -5,6 +5,7 @@
 #include <cutlass/numeric_types.h>
 #include <deep_gemm/common/compile.cuh>
 #include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/ptx/math.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
 namespace deep_gemm::math {
@@ -71,6 +72,15 @@ CUTLASS_HOST_DEVICE float fast_rcp(const float& x) {
     return ret;
 }
 
+// Approximate exp with FTZ; subnormal outputs disappear in the sigmoid's FP32 `1 + exp`.
+CUTLASS_HOST_DEVICE float2 fast_exp_ftz(const float2& x) {
+    const auto scaled = __fmul2_rn(x, make_float2(1.4426950408889634f, 1.4426950408889634f));
+    float2 ret;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ret.x) : "f"(scaled.x));
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ret.y) : "f"(scaled.y));
+    return ret;
+}
+
 /// Casting
 template <typename old_t>
 CUTLASS_DEVICE nv_bfloat162 cast_into_bf16x2(const old_t& x, const old_t& y) {
@@ -81,6 +91,19 @@ template <typename old_t>
 CUTLASS_DEVICE int cast_into_bf16_and_pack(const old_t& x, const old_t& y) {
     auto bf16x2 = cast_into_bf16x2(x, y);
     return *reinterpret_cast<int*>(&bf16x2);
+}
+
+CUTLASS_DEVICE uint32_t cast_into_fp8x4_and_pack(const float2& x, const float2& y) {
+#if __CUDACC_VER_MAJOR__ >= 13
+    const auto fp8x4 = make_ushort2(__nv_cvt_float2_to_fp8x2(x, __NV_SATFINITE, __NV_E4M3),
+                                    __nv_cvt_float2_to_fp8x2(y, __NV_SATFINITE, __NV_E4M3));
+    return *reinterpret_cast<const uint32_t*>(&fp8x4);
+#else
+    const uint32_t packed_lower = __nv_cvt_float2_to_fp8x2(x, __NV_SATFINITE, __NV_E4M3);
+    const uint32_t packed_upper = __nv_cvt_float2_to_fp8x2(y, __NV_SATFINITE, __NV_E4M3);
+    // Explicit packing also handles identical halves correctly with CUDA 12.9.
+    return packed_lower | (packed_upper << 16);
+#endif
 }
 
 /// Packed BF16 quantization
@@ -106,12 +129,8 @@ CUTLASS_DEVICE nv_bfloat16 get_packed_bf16_amax(const nv_bfloat162 (&values)[kNu
 CUTLASS_DEVICE uint32_t scale_bf16x2_into_fp8x4(const nv_bfloat162& lower, const nv_bfloat162& upper,
                                                 const nv_bfloat162& sf_inv_lower, const nv_bfloat162& sf_inv_upper) {
     // The BF16 FP8 constructor converts each element separately; float2 uses packed conversion.
-    const auto scaled_lower = __bfloat1622float2(__hmul2(lower, sf_inv_lower));
-    const auto scaled_upper = __bfloat1622float2(__hmul2(upper, sf_inv_upper));
-    const uint32_t packed_lower = __nv_cvt_float2_to_fp8x2(scaled_lower, __NV_SATFINITE, __NV_E4M3);
-    const uint32_t packed_upper = __nv_cvt_float2_to_fp8x2(scaled_upper, __NV_SATFINITE, __NV_E4M3);
-    // Explicit packing also handles identical halves correctly with CUDA 12.9.
-    return packed_lower | (packed_upper << 16);
+    return cast_into_fp8x4_and_pack(ptx::cvt_bf16x2_to_fp32x2(__hmul2(lower, sf_inv_lower)),
+                                    ptx::cvt_bf16x2_to_fp32x2(__hmul2(upper, sf_inv_upper)));
 }
 
 // Select a power-of-two UE8M0 SF mapping `amax` into the finite range of `quant_dtype_t`:
@@ -149,6 +168,30 @@ CUTLASS_DEVICE auto get_ue8m0_sf_inv(const uint32_t& sf_exp) {
     } else {
         DG_STATIC_ASSERT((cute::is_same_v<dtype_t, nv_bfloat16>), "The output type must be FP32 or BF16");
         return __ushort_as_bfloat16((254u - sf_exp) << 7);
+    }
+}
+
+/// Stochastic rounding hash
+// The quartet hash is the sum of the four members' partial terms plus `quartet_n_idx`;
+// each member then finalizes the sum and selects either its 16-bit half or the full 32-bit word
+CUTLASS_DEVICE uint32_t partial_hash(const uint32_t& value, const uint32_t& quartet_offset) {
+    return value * (quartet_offset == 0 ? 0x5671d42bu :
+                    quartet_offset == 1 ? 0x9995e499u :
+                    quartet_offset == 2 ? 0xace1b8a5u : 0xe153538du);
+}
+
+// Finalize the quartet hash sum and extract 16 random bits (for BF16) or the full 32-bit word (for FP8x4)
+template <bool kExtract16Bits = true>
+CUTLASS_DEVICE uint32_t select_random_bits(uint32_t h, const uint32_t& quartet_offset = 0) {
+    h ^= h >> 23;
+    h *= 0x7feb352du;
+    h ^= h >> 16;
+    h *= quartet_offset < 2 ? 0x846ca68bu : 0xd35a2d97u;
+    h ^= h >> 11;
+    if constexpr (kExtract16Bits) {
+        return (h >> (quartet_offset % 2 * 16)) & 0xffffu;
+    } else {
+        return h;
     }
 }
 

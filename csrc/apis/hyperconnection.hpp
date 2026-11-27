@@ -34,7 +34,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
         DG_HOST_ASSERT(m == m_ and m == m__ and n == n_ and k == k_);
     }
     DG_HOST_ASSERT(n > 0 and k > 0);
-    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 or a.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(b.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(sqr_sum.scalar_type() == torch::kFloat);
@@ -46,6 +46,7 @@ static void tf32_hc_prenorm_gemm(const torch::Tensor& a,
     // Dispatch into different implements
     const auto arch_major = jit->device.get_arch_major();
     if (arch_major == 9) {
+        DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
         sm90_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
     } else if (arch_major == 10) {
         sm100_tf32_hc_prenorm_gemm(a, b, d, sqr_sum, m, n, k, num_splits.has_value() ? num_splits.value() : 1);
