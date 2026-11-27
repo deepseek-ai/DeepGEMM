@@ -25,6 +25,21 @@ static auto get_cublaslt_layout(const cudaDataType& type, const int& rows, const
     return layout;
 }
 
+// Largest power-of-two byte alignment (capped at 256) of a matrix pointer that holds for every batch
+static uint32_t get_cublaslt_alignment(const void* ptr, const cublasLtMatrixLayout_t& layout, const int64_t& elem_size) {
+    int32_t batch_count = 1;
+    int64_t batch_offset = 0;
+    size_t num_written_bytes;
+    DG_CUBLASLT_CHECK(cublasLtMatrixLayoutGetAttribute(layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                       &batch_count, sizeof(batch_count), &num_written_bytes));
+    DG_CUBLASLT_CHECK(cublasLtMatrixLayoutGetAttribute(layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                                                       &batch_offset, sizeof(batch_offset), &num_written_bytes));
+    auto bits = reinterpret_cast<std::uintptr_t>(ptr) | 256u;
+    if (batch_count > 1)
+        bits |= static_cast<std::uintptr_t>(batch_offset * elem_size);
+    return static_cast<uint32_t>(bits & (~bits + 1));
+}
+
 static void call_cublaslt_api(const cublasOperation_t& trans_a,
                               const cublasOperation_t& trans_b,
                               const cublasLtMatrixLayout_t& layout_a,
@@ -38,7 +53,10 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
                               // NOTES: block-scaled UE4M3 scale pointers for the cuBLASLt A/B operands
                               // (i.e. the already-swapped column-major operands), `nullptr` means no block scaling
                               const void* a_block_sf = nullptr,
-                              const void* b_block_sf = nullptr) {
+                              const void* b_block_sf = nullptr,
+                              const std::optional<float>& beta_opt = std::nullopt,
+                              const void* c_ptr = nullptr,
+                              const cublasLtMatrixLayout_t layout_c = nullptr) {
     const bool with_block_sf = a_block_sf != nullptr;
     DG_HOST_ASSERT(with_block_sf == (b_block_sf != nullptr));
 
@@ -86,19 +104,38 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
                                                            &workspace_bytes, sizeof(workspace_bytes)));
     DG_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
                                                            &reduction_scheme_mask, sizeof(reduction_scheme_mask)));
-    DG_CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(handle, desc, layout_a, layout_b, layout_d, layout_d,
+    const auto effective_layout_c = layout_c != nullptr ? layout_c : layout_d;
+    const void* effective_c_ptr = c_ptr != nullptr ? c_ptr : d.data_ptr();
+
+    // NOTES: the heuristic assumes 256-byte aligned matrices unless told otherwise, and cuBLASLt's A/B are our `b`/`a`
+    const uint32_t alignments[4] = {
+        get_cublaslt_alignment(b.data_ptr(), layout_a, b.element_size()),
+        get_cublaslt_alignment(a.data_ptr(), layout_b, a.element_size()),
+        get_cublaslt_alignment(effective_c_ptr, effective_layout_c, d.element_size()),
+        get_cublaslt_alignment(d.data_ptr(), layout_d, d.element_size()),
+    };
+    const cublasLtMatmulPreferenceAttributes_t alignment_attrs[4] = {
+        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
+    };
+    for (int i = 0; i < 4; ++ i) {
+        // 256 bytes is already the default, so other GEMM paths keep their exact preference setup
+        if (alignments[i] < 256)
+            DG_CUBLASLT_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, alignment_attrs[i], &alignments[i], sizeof(alignments[i])));
+    }
+    DG_CUBLASLT_CHECK(cublasLtMatmulAlgoGetHeuristic(handle, desc, layout_a, layout_b, effective_layout_c, layout_d,
                                                      pref, 1, &heuristic, &num_heuristic_results));
     DG_HOST_ASSERT(num_heuristic_results == 1 and "Unable to find any algorithm for the GEMM");
 
     // Call: D = alpha * (A @ B) + beta * C
-    const float beta = accumulate ? 1.0f : 0.0f;
+    const float beta = beta_opt.has_value() ? beta_opt.value() : (accumulate ? 1.0f : 0.0f);
     DG_CUBLASLT_CHECK(cublasLtMatmul(handle,                                // Light handle
                                      desc,                                  // Operation description
                                      &alpha,                                // Alpha
                                      b.data_ptr(), layout_a,                // A
                                      a.data_ptr(), layout_b,                // B
                                      &beta,                                 // Beta
-                                     d.data_ptr(), layout_d,                // C
+                                     effective_c_ptr, effective_layout_c,   // C
                                      d.data_ptr(), layout_d,                // D
                                      &heuristic.algo,                       // Algorithm
                                      workspace.data_ptr(), workspace_bytes, // Workspace
@@ -108,6 +145,8 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     DG_CUBLASLT_CHECK(cublasLtMatmulPreferenceDestroy(pref));
     DG_CUBLASLT_CHECK(cublasLtMatrixLayoutDestroy(layout_a));
     DG_CUBLASLT_CHECK(cublasLtMatrixLayoutDestroy(layout_b));
+    if (layout_c != nullptr)
+        DG_CUBLASLT_CHECK(cublasLtMatrixLayoutDestroy(layout_c));
     DG_CUBLASLT_CHECK(cublasLtMatrixLayoutDestroy(layout_d));
     DG_CUBLASLT_CHECK(cublasLtMatmulDescDestroy(desc));
 }
@@ -138,28 +177,45 @@ static void cublaslt_batched_gemm(const torch::Tensor& lhs, const torch::Tensor&
                                   const torch::Tensor& out,
                                   const uint32_t& m, const uint32_t& n, const uint32_t& k,
                                   const uint32_t& num_batches,
-                                  const cute::UMMA::Major& a_major, const cute::UMMA::Major& b_major) {
+                                  const cute::UMMA::Major& a_major, const cute::UMMA::Major& b_major,
+                                  const std::optional<torch::Tensor>& c = std::nullopt,
+                                  const float& alpha = 1.0f,
+                                  const float& beta = 0.0f) {
     const auto trans_a = b_major == cute::UMMA::Major::K ? CUBLAS_OP_T : CUBLAS_OP_N;
     const auto trans_b = a_major == cute::UMMA::Major::K ? CUBLAS_OP_N : CUBLAS_OP_T;
     const auto lhs_batch_offset = lhs.stride(0);
     const auto rhs_batch_offset = rhs.stride(0);
-    const auto out_batch_offset = out.stride(0);
+
+    // NOTES: cuBLASLt requires C and D to share a type. A BF16 `C` is widened losslessly for an FP32 `D`,
+    // while an FP32 `C` with a BF16 `D` goes through an FP32 output, so that `D` is rounded only once.
+    // Temporaries are allocated before any raw cuBLASLt descriptor is created.
+    const bool has_c = c.has_value() and beta != 0.0f;
+    const bool use_fp32_out = has_c and c->scalar_type() == torch::kFloat and out.scalar_type() == torch::kBFloat16;
+    const auto cublaslt_out = use_fp32_out ? torch::empty({static_cast<int64_t>(num_batches), static_cast<int64_t>(m), static_cast<int64_t>(n)}, c->options()) : out;
+    const auto cublaslt_c = not has_c ? cublaslt_out :
+        (c->scalar_type() == cublaslt_out.scalar_type() ? *c : c->to(cublaslt_out.scalar_type()));
 
     // cuBLASLt uses column-major layouts. Swap the operands so that their column-major
     // interpretation computes the transpose of the requested row-major result.
     const auto cuda_type_a = at::cuda::ScalarTypeToCudaDataType(rhs.scalar_type());
     const auto cuda_type_b = at::cuda::ScalarTypeToCudaDataType(lhs.scalar_type());
-    const auto cuda_type_d = at::cuda::ScalarTypeToCudaDataType(out.scalar_type());
+    const auto cuda_type_d = at::cuda::ScalarTypeToCudaDataType(cublaslt_out.scalar_type());
     const auto layout_a = b_major == cute::UMMA::Major::K ?
         get_cublaslt_layout(cuda_type_a, k, n, rhs.stride(-2), num_batches, rhs_batch_offset) :
         get_cublaslt_layout(cuda_type_a, n, k, rhs.stride(-1), num_batches, rhs_batch_offset);
     const auto layout_b = a_major == cute::UMMA::Major::K ?
         get_cublaslt_layout(cuda_type_b, k, m, lhs.stride(-2), num_batches, lhs_batch_offset) :
         get_cublaslt_layout(cuda_type_b, m, k, lhs.stride(-1), num_batches, lhs_batch_offset);
-    const auto layout_d = get_cublaslt_layout(cuda_type_d, n, m, out.stride(-2),
-                                              num_batches, out_batch_offset);
+    const auto layout_d = get_cublaslt_layout(cuda_type_d, n, m, cublaslt_out.stride(-2), num_batches, cublaslt_out.stride(0));
 
-    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, out, false);
+    // NOTES: in-place `C == D` must pass the same layout for C and D
+    const bool is_in_place = not has_c or cublaslt_c.data_ptr() == cublaslt_out.data_ptr();
+    const auto layout_c = is_in_place ? nullptr : get_cublaslt_layout(cuda_type_d, n, m, cublaslt_c.stride(-2),
+                                                                      num_batches, cublaslt_c.stride(0));
+    call_cublaslt_api(trans_a, trans_b, layout_a, layout_b, layout_d, lhs, rhs, cublaslt_out, has_c,
+                      alpha, nullptr, nullptr, has_c ? beta : 0.0f, is_in_place ? nullptr : cublaslt_c.data_ptr(), layout_c);
+    if (use_fp32_out)
+        out.copy_(cublaslt_out);
 }
 
 static void cublaslt_nvfp4_gemm(const torch::Tensor& lhs, const torch::Tensor& lhs_sf,

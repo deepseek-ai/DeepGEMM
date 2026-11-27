@@ -1,11 +1,13 @@
+import contextlib
 import numpy as np
+import os
 import random
 import torch
 
 import deep_gemm
 from deep_gemm.testing import (
     bench_kineto,
-    assert_check, calc_diff, count_bytes
+    assert_bitwise_equal, assert_check, calc_diff, count_bytes
 )
 from utils import (
     assert_direct_output_matches_fp32_accumulation,
@@ -279,7 +281,7 @@ def test_cublaslt_gemm() -> None:
 
 
 def test_cublaslt_batched_syrk() -> None:
-    print('Testing cuBLASLt batched SYRK:')
+    print('Testing batched SYRK (default dispatch):')
     for num_batches, m, k, out_dtype in enumerate_batched_syrk_symm():
         out_opt = 'FP32' if out_dtype == torch.float else 'BF16'
         rows, cols = min(m, k), max(m, k)
@@ -312,6 +314,297 @@ def test_cublaslt_batched_syrk() -> None:
                   f'{2 * num_batches * rows * rows * cols / t / 1e12:4.0f} TFLOPS | '
                   f'{count_bytes(a, d) / 1e9 / t:4.0f} GB/s')
     print()
+
+
+def test_batched_syrk_epilogue() -> None:
+    print('Testing batched SYRK epilogue (default dispatch: values; forced native: bitwise symmetry and repeatability):')
+    routes = ('default', 'native') if get_arch_major() == 9 else ('default', )
+
+    # Default dispatch may pick cuBLASLt, which gives no symmetry guarantee, so only values are checked there
+    def run(route, a, d, **kwargs):
+        with batched_syrk_route(route):
+            deep_gemm.batched_syrk(a, d, **kwargs)
+            if route == 'native':
+                d_again = torch.empty_like(d)
+                deep_gemm.batched_syrk(a, d_again, **kwargs)
+                assert_bitwise_equal(d, d_again, 'native SYRK repeatability')
+
+    for b, n, k, k_major, out_dtype in (
+        (1, 64, 128, True, torch.bfloat16),
+        (1, 136, 72, False, torch.bfloat16),
+        (2, 320, 256, True, torch.bfloat16),
+        (3, 520, 1040, True, torch.bfloat16),
+        (3, 520, 1040, False, torch.bfloat16),
+        (4, 1536, 2048, True, torch.float32),
+        (4, 1536, 2048, False, torch.bfloat16),
+        (8, 2048, 2048, True, torch.bfloat16),
+    ):
+        shape = (n, k) if k_major else (k, n)
+        a = torch.randn(b, shape[0], shape[1], device='cuda', dtype=torch.bfloat16)
+        if not k_major:
+            a = a.mT
+        ref = (a.float() @ a.float().mT).to(out_dtype)
+        for route in routes:
+            d = torch.empty(b, n, n, device='cuda', dtype=out_dtype)
+            run(route, a, d)
+            diff = calc_diff(d, ref)
+            assert_check(diff < 1e-5, f'SYRK diff={diff}, case={(route, b, n, k, k_major, out_dtype)}')
+            if route == 'native':
+                assert_bitwise_equal(d, d.mT, f'native SYRK symmetry {(b, n, k, k_major, out_dtype)}')
+
+    # Edge cases: k=0, n=0, b=0
+    for out_dtype in (torch.bfloat16, torch.float32):
+        a0 = torch.empty(2, 128, 0, device='cuda', dtype=torch.bfloat16)
+        d0 = torch.full((2, 128, 128), 7.0, device='cuda', dtype=out_dtype)
+        deep_gemm.batched_syrk(a0, d0)
+        assert_check(torch.equal(d0, torch.zeros_like(d0)), 'k=0 did not zero D')
+
+        c0 = torch.randn(2, 128, 128, device='cuda', dtype=out_dtype)
+        deep_gemm.batched_syrk(a0, d0, c=c0, alpha=2.0, beta=-1.5)
+        assert_check(calc_diff(d0, (-1.5 * c0.float()).to(out_dtype)) < 1e-5, 'k=0 with C mismatch')
+
+        deep_gemm.batched_syrk(torch.empty(2, 0, 128, device='cuda', dtype=torch.bfloat16),
+                               torch.empty(2, 0, 0, device='cuda', dtype=out_dtype))
+        deep_gemm.batched_syrk(torch.empty(0, 128, 128, device='cuda', dtype=torch.bfloat16),
+                               torch.empty(0, 128, 128, device='cuda', dtype=out_dtype))
+
+    # Fused C / alpha / beta epilogue (symmetric C, non-symmetric C, in-place C==D, mixed dtypes, beta=0)
+    alpha, beta = 2.0315, -4.7750
+    for b, n, k, k_major, d_dtype, c_dtype in (
+        (4, 1536, 2048, True, torch.bfloat16, torch.bfloat16),
+        (4, 1536, 2048, False, torch.bfloat16, torch.bfloat16),
+        (2, 520, 640, True, torch.bfloat16, torch.bfloat16),
+        (2, 520, 640, True, torch.bfloat16, torch.float32),
+        (2, 520, 640, True, torch.float32, torch.bfloat16),
+        (2, 520, 640, True, torch.float32, torch.float32),
+        (4, 1536, 2048, True, torch.float32, torch.float32),
+    ):
+        shape = (n, k) if k_major else (k, n)
+        a = torch.randn(b, shape[0], shape[1], device='cuda', dtype=torch.bfloat16) * 0.1
+        if not k_major:
+            a = a.mT
+        # `(C + C.mT) * 0.5` is bitwise symmetric, which the native bitwise symmetry guarantee requires
+        c_sym = torch.randn(b, n, n, device='cuda', dtype=c_dtype) * 0.5
+        c_sym = ((c_sym.float() + c_sym.float().mT) * 0.5).to(c_dtype)
+        c_nonsym = torch.randn(b, n, n, device='cuda', dtype=c_dtype) * 0.5
+        c_nan = torch.full((b, n, n), float('nan'), device='cuda', dtype=c_dtype)
+        gram = a.float() @ a.float().mT
+        case = (b, n, k, k_major, d_dtype, c_dtype)
+        for route in routes:
+            d = torch.empty(b, n, n, device='cuda', dtype=d_dtype)
+            run(route, a, d, c=c_sym, alpha=alpha, beta=beta)
+            ref = (alpha * gram + beta * c_sym.float()).to(d_dtype)
+            assert_check(calc_diff(d, ref) < 1e-4, f'Fused symmetric C mismatch: {(route, ) + case}')
+            if route == 'native':
+                assert_bitwise_equal(d, d.mT, f'native fused symmetric C symmetry {case}')
+            d_sym = d.clone()
+
+            run(route, a, d, c=c_nonsym, alpha=alpha, beta=beta)
+            ref_ns = (alpha * gram + beta * c_nonsym.float()).to(d_dtype)
+            assert_check(calc_diff(d, ref_ns) < 1e-4, f'Fused non-symmetric C mismatch: {(route, ) + case}')
+
+            if d_dtype == c_dtype:
+                d_inplace = c_sym.clone()
+                with batched_syrk_route(route):
+                    deep_gemm.batched_syrk(a, d_inplace, c=d_inplace, alpha=alpha, beta=beta)
+                assert_check(calc_diff(d_inplace, ref) < 1e-4, f'In-place C==D mismatch: {(route, ) + case}')
+                if route == 'native':
+                    assert_bitwise_equal(d_inplace, d_sym, f'native in-place C==D {case}')
+
+            # beta=0 must ignore C even if C contains NaNs
+            run(route, a, d, c=c_nan, alpha=alpha, beta=0.0)
+            assert_check(not torch.isnan(d).any().item(), f'beta=0 produced NaN from C: {(route, ) + case}')
+            assert_check(calc_diff(d, (alpha * gram).to(d_dtype)) < 1e-4, f'beta=0 result mismatch: {(route, ) + case}')
+
+    # Muon Newton-Schulz Step 1 + fused Step 2 (B = b * A + c * (A @ A))
+    b_ns, c_ns = -4.7750, 2.0315
+    for batch, n, k in ((4, 576, 5120), (4, 1536, 5120)):
+        x = torch.randn(batch, n, k, device='cuda', dtype=torch.bfloat16) / (k ** 0.5)
+        for route in routes:
+            gram = torch.empty(batch, n, n, device='cuda', dtype=torch.bfloat16)
+            run(route, x, gram)
+            ref_gram = (x.float() @ x.float().mT).to(torch.bfloat16)
+            assert_check(calc_diff(gram, ref_gram) < 1e-5, f'Muon step 1 mismatch: {(route, batch, n, k)}')
+            if route == 'native':
+                assert_bitwise_equal(gram, gram.mT, f'native Muon step 1 symmetry {(batch, n, k)}')
+            poly = torch.empty_like(gram)
+            run(route, gram, poly, c=gram, alpha=c_ns, beta=b_ns)
+            ref_poly = (b_ns * gram.float() + c_ns * (gram.float() @ gram.float().mT)).to(torch.bfloat16)
+            assert_check(calc_diff(poly, ref_poly) < 1e-4, f'Muon step 2 mismatch: {(route, batch, n, k)}')
+            if route == 'native':
+                assert_bitwise_equal(poly, poly.mT, f'native Muon step 2 symmetry {(batch, n, k)}')
+    print(' > All batched SYRK epilogue tests passed!\n')
+
+
+@contextlib.contextmanager
+def batched_syrk_env(**kwargs):
+    old = {key: os.environ.get(key) for key in kwargs}
+    os.environ.update({key: str(value) for key, value in kwargs.items()})
+    try:
+        yield
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key)
+            else:
+                os.environ[key] = value
+
+
+def batched_syrk_route(route: str):
+    # `DG_SYRK_FORCE_*` are internal test controls; 'default' keeps the normal dispatch
+    if route == 'default':
+        return contextlib.nullcontext()
+    return batched_syrk_env(**{'DG_SYRK_FORCE_NATIVE' if route == 'native' else 'DG_SYRK_FORCE_FALLBACK': 1})
+
+
+def batched_syrk_rejects(message: str, *args, **kwargs) -> bool:
+    try:
+        deep_gemm.batched_syrk(*args, **kwargs)
+    except RuntimeError as e:
+        return message in str(e)
+    return False
+
+
+def test_batched_syrk_routes() -> None:
+    print('Testing batched SYRK routes (forced native and forced cuBLASLt fallback):')
+
+    # Small integer `A` and `C` values with a few fractional bits keep every FP32 intermediate exact, so
+    # results must match bitwise: a missing tile or rounding `C` before `beta` shows up as a mismatch
+    def make_a(b, n, k, k_major):
+        a = torch.randint(-2, 3, (b, n, k) if k_major else (b, k, n), device='cuda').to(torch.bfloat16)
+        return a if k_major else a.mT
+
+    def make_c(*shape, dtype):
+        c = torch.randint(-4, 4, shape, device='cuda') + torch.randint(0, 512, shape, device='cuda') * 2 ** -9 + 2 ** -10
+        return c.to(dtype)
+
+    def ref_syrk(a, c, alpha, beta, dtype):
+        ref = alpha * (a.float() @ a.float().mT)
+        return (ref if c is None or beta == 0 else ref + beta * c.float()).to(dtype)
+
+    alpha, beta = 2.0, 1.5
+    routes = ('native', 'fallback') if get_arch_major() == 9 else ('fallback', )
+    for route in routes:
+        # Odd tile-row counts, partial `n`/`k` tails, and an odd number of tiles (unpaired final CTA)
+        blocks = ((64, 64), (128, 128), (128, 256)) if route == 'native' else ((0, 0), )
+        for b, n, k, k_major, d_dtype, c_dtype in (
+            (3, 200, 136, True, torch.bfloat16, None),
+            (2, 264, 72, False, torch.bfloat16, torch.bfloat16),
+            (1, 392, 200, True, torch.bfloat16, torch.float),
+            (5, 136, 64, True, torch.float, torch.bfloat16),
+            (2, 520, 128, False, torch.float, torch.float),
+        ):
+            for block_m, block_n in blocks:
+                if block_n == 256 and d_dtype != torch.bfloat16:
+                    continue
+                a = make_a(b, n, k, k_major)
+                c = None if c_dtype is None else make_c(b, n, n, dtype=c_dtype)
+                d = torch.empty(b, n, n, device='cuda', dtype=d_dtype)
+                with batched_syrk_route(route), batched_syrk_env(DG_SYRK_BLOCK_M=block_m, DG_SYRK_BLOCK_N=block_n):
+                    deep_gemm.batched_syrk(a, d, c=c, alpha=alpha, beta=beta)
+                assert_bitwise_equal(d, ref_syrk(a, c, alpha, beta, d_dtype), f'{route=}, {(b, n, k, k_major, d_dtype, c_dtype, block_m, block_n)}')
+
+        with batched_syrk_route(route):
+            # Misaligned `C` views: a one-element offset with padded rows, and an odd batch stride
+            b, n, k = 3, 128, 64
+            a = make_a(b, n, k, True)
+            for c_dtype in (torch.bfloat16, torch.float):
+                c_offset = make_c(b, n, n + 3, dtype=c_dtype)[..., 1:n + 1]
+                c_odd_batch = make_c(b * (n * n + 1), dtype=c_dtype).as_strided((b, n, n), (n * n + 1, n, 1))
+                for c in (c_offset, c_odd_batch):
+                    for d_dtype in (torch.bfloat16, torch.float):
+                        d = torch.empty(b, n, n, device='cuda', dtype=d_dtype)
+                        deep_gemm.batched_syrk(a, d, c=c, alpha=alpha, beta=beta)
+                        assert_bitwise_equal(d, ref_syrk(a, c, alpha, beta, d_dtype), f'{route=}, misaligned C, {c_dtype=}, {d_dtype=}')
+
+            # Pointer-only offsets of `A`, `C`, or `D` with aligned pitches and batch strides
+            # (only `C` can be offset on the native route, as `A` and `D` must be TMA-encodable)
+            for offset_idx in (range(3) if route == 'fallback' else (1, )):
+                def make_view(buf, rows, cols, offset):
+                    return buf[offset:offset + b * rows * (cols + 64)].view(b, rows, cols + 64)[..., :cols]
+                a_buf = make_a(1, 1, b * n * (k + 64) + 8, True).flatten()
+                c_buf = make_c(b * n * (n + 64) + 8, dtype=torch.bfloat16)
+                d_buf = torch.empty(b * n * (n + 64) + 8, device='cuda', dtype=torch.bfloat16)
+                a_view = make_view(a_buf, n, k, int(offset_idx == 0))
+                c_view = make_view(c_buf, n, n, int(offset_idx == 1))
+                d_view = make_view(d_buf, n, n, int(offset_idx == 2))
+                ref = ref_syrk(a_view, c_view, alpha, beta, torch.bfloat16)
+                deep_gemm.batched_syrk(a_view, d_view, c=c_view, alpha=alpha, beta=beta)
+                assert_bitwise_equal(d_view, ref, f'{route=}, pointer offset on operand {"ACD"[offset_idx]}')
+
+            # FP32 `C` with a BF16 `D` (the fallback casts an FP32 temporary) on a non-default stream
+            stream = torch.cuda.Stream()
+            c = make_c(b, n, n, dtype=torch.float)
+            d = torch.empty(b, n, n, device='cuda', dtype=torch.bfloat16)
+            ref = ref_syrk(a, c, alpha, beta, torch.bfloat16)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                deep_gemm.batched_syrk(a, d, c=c, alpha=alpha, beta=beta)
+            torch.cuda.current_stream().wait_stream(stream)
+            assert_bitwise_equal(d, ref, f'{route=}, FP32 C -> BF16 D on a side stream')
+
+            # Batches interleaved across rows: distinct elements despite failing both fast overlap checks
+            d_interleaved = torch.empty(256, device='cuda', dtype=torch.bfloat16).as_strided((2, 8, 8), (32, 24, 1))
+            a_small = make_a(2, 8, 16, True)
+            deep_gemm.batched_syrk(a_small, d_interleaved, alpha=alpha)
+            assert_bitwise_equal(d_interleaved, ref_syrk(a_small, None, alpha, 0.0, torch.bfloat16), f'{route=}, interleaved D')
+
+            # Asymmetric in-place `C == D`
+            for dtype in (torch.bfloat16, torch.float):
+                c = make_c(b, n, n, dtype=dtype)
+                d = c.clone()
+                deep_gemm.batched_syrk(a, d, c=d, alpha=alpha, beta=beta)
+                assert_bitwise_equal(d, ref_syrk(a, c, alpha, beta, dtype), f'{route=}, in-place C, {dtype=}')
+
+            # `beta == 0` ignores NaN `C`, `alpha == 0` ignores NaN `A`
+            c_nan = torch.full((b, n, n), float('nan'), device='cuda', dtype=torch.float)
+            a_nan = torch.full((b, n, k), float('nan'), device='cuda', dtype=torch.bfloat16)
+            c = make_c(b, n, n, dtype=torch.float)
+            d = torch.empty(b, n, n, device='cuda', dtype=torch.bfloat16)
+            deep_gemm.batched_syrk(a, d, c=c_nan, alpha=alpha, beta=0.0)
+            assert_bitwise_equal(d, ref_syrk(a, None, alpha, 0.0, torch.bfloat16), f'{route=}, beta=0 with NaN C')
+            deep_gemm.batched_syrk(a_nan, d, c=c, alpha=0.0, beta=beta)
+            assert_bitwise_equal(d, (beta * c).to(torch.bfloat16), f'{route=}, alpha=0 with NaN A')
+
+    # Forcing the native route on an unsupported view must fail instead of silently falling back
+    if get_arch_major() == 9:
+        a = torch.randn(1, 128, 72, device='cuda', dtype=torch.bfloat16)[..., 1:65]
+        d = torch.empty(1, 128, 128, device='cuda', dtype=torch.bfloat16)
+        with batched_syrk_route('native'):
+            assert_check(batched_syrk_rejects('native SM90 batched SYRK is not applicable', a, d),
+                         'Forced native SYRK accepted a TMA-misaligned A')
+
+        # Cluster-2 multicast with an unpaired final tile: 3 * 45 64x64 tiles = 135 tiles on 132 SMs
+        a = make_a(3, 520, 136, True)
+        c = make_c(3, 520, 520, dtype=torch.bfloat16)
+        d = torch.empty(3, 520, 520, device='cuda', dtype=torch.bfloat16)
+        with batched_syrk_route('native'), batched_syrk_env(DG_SYRK_BLOCK_M=64, DG_SYRK_BLOCK_N=64, DG_SYRK_CLUSTER_SIZE=2):
+            deep_gemm.batched_syrk(a, d, c=c, alpha=alpha, beta=beta)
+        assert_bitwise_equal(d, ref_syrk(a, c, alpha, beta, torch.bfloat16), 'cluster-2 native with an unpaired final tile')
+
+    # Aliasing: partial `C`/`D` overlap, `A`/`D` overlap, and overlapping `D` batches are rejected,
+    # while disjoint column windows of one padded buffer are accepted
+    b, n, k = 2, 128, 64
+    a = make_a(b, n, k, True)
+    buf = make_c(b, n, n + 8, dtype=torch.bfloat16)
+    assert_check(batched_syrk_rejects('C must be exactly D or not overlap D', a, buf[..., 8:], c=buf[..., :n]),
+                 'Partial C/D overlap was accepted')
+    d = torch.empty(b, n, n, device='cuda', dtype=torch.bfloat16)
+    assert_check(batched_syrk_rejects('A must not overlap D', d[..., :k], d), 'A/D overlap was accepted')
+    for d_overlap in (torch.empty(n * n + n, device='cuda', dtype=torch.bfloat16).as_strided((b, n, n), (n, n, 1)),
+                      # Neighbour of the accepted interleaved layout `(32, 24, 1)` whose rows do overlap
+                      torch.empty(256, device='cuda', dtype=torch.bfloat16).as_strided((2, 8, 8), (28, 24, 1))):
+        a_overlap = make_a(d_overlap.size(0), d_overlap.size(1), 16, True)
+        assert_check(batched_syrk_rejects('D must not have overlapping elements', a_overlap, d_overlap),
+                     f'Overlapping D elements were accepted: {d_overlap.stride()}')
+        assert_check(batched_syrk_rejects('D must not have overlapping elements', a_overlap[..., :0], d_overlap),
+                     f'Overlapping D elements were accepted with k=0: {d_overlap.stride()}')
+    buf = make_c(b, n, 2 * n, dtype=torch.bfloat16)
+    c, d = buf[..., :n], buf[..., n:]
+    ref = ref_syrk(a, c, alpha, beta, torch.bfloat16)
+    deep_gemm.batched_syrk(a, d, c=c, alpha=alpha, beta=beta)
+    assert_bitwise_equal(d, ref, 'Disjoint padded C/D views')
+    print(' > All batched SYRK route tests passed!\n')
 
 
 def test_cublaslt_batched_symm() -> None:
@@ -372,4 +665,6 @@ if __name__ == '__main__':
 
     test_cublaslt_gemm()
     test_cublaslt_batched_syrk()
+    test_batched_syrk_epilogue()
+    test_batched_syrk_routes()
     test_cublaslt_batched_symm()

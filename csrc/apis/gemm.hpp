@@ -5,6 +5,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm90_bf16_batched_syrk.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 
@@ -798,8 +799,129 @@ static auto get_cublaslt_batched_view(const torch::Tensor& tensor) {
     return tensor.dim() == 2 ? tensor.unsqueeze(0) : tensor;
 }
 
-static void batched_syrk(const torch::Tensor& a, const torch::Tensor& d) {
-    // D = A @ A.mT. A and D may be either unbatched 2D tensors or batched 3D tensors.
+// Byte range `[begin, end)` spanned by a strided tensor
+static std::pair<std::uintptr_t, std::uintptr_t> get_byte_range(const torch::Tensor& t) {
+    int64_t last_offset = 0;
+    for (int i = 0; i < t.dim(); ++ i)
+        last_offset += (t.size(i) - 1) * t.stride(i);
+    const auto begin = reinterpret_cast<std::uintptr_t>(t.data_ptr());
+    return {begin, begin + static_cast<std::uintptr_t>((last_offset + 1) * t.element_size())};
+}
+
+// Contiguous byte runs (one per row along the unit-stride dimension) of a non-empty 3D view, or `std::nullopt`
+// when the view has no unit-stride dimension or too many runs, in which case callers assume overlap
+static std::optional<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>> get_byte_runs_3d(const torch::Tensor& t) {
+    constexpr int64_t kMaxNumRuns = 1 << 20;
+    const int inner_dim = t.stride(2) == 1 ? 2 : (t.stride(1) == 1 ? 1 : -1);
+    const int outer_dim = 3 - inner_dim;
+    if (inner_dim < 0 or t.size(0) * t.size(outer_dim) > kMaxNumRuns)
+        return std::nullopt;
+
+    const auto begin = reinterpret_cast<std::uintptr_t>(t.data_ptr());
+    const auto run_bytes = static_cast<std::uintptr_t>(t.size(inner_dim) * t.element_size());
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+    runs.reserve(t.size(0) * t.size(outer_dim));
+    for (int64_t i = 0; i < t.size(0); ++ i) {
+        for (int64_t j = 0; j < t.size(outer_dim); ++ j) {
+            const auto run_begin = begin + static_cast<std::uintptr_t>((i * t.stride(0) + j * t.stride(outer_dim)) * t.element_size());
+            runs.emplace_back(run_begin, run_begin + run_bytes);
+        }
+    }
+    return runs;
+}
+
+// Whether two non-empty 3D views share memory. Disjoint byte ranges, and row-major views with one row pitch
+// whose column windows do not intersect (e.g. two halves of a padded buffer), are accepted without enumerating
+// rows; other layouts sort and compare their row byte intervals exactly, and views with more than 2^20 rows on
+// that path are conservatively treated as overlapping (and thus rejected).
+static bool may_overlap_3d(const torch::Tensor& x, const torch::Tensor& y) {
+    const auto [x_begin, x_end] = get_byte_range(x);
+    const auto [y_begin, y_end] = get_byte_range(y);
+    if (x_end <= y_begin or y_end <= x_begin)
+        return false;
+
+    const int64_t pitch = x.stride(-2) * x.element_size();
+    const auto is_on_pitch = [&](const torch::Tensor& t) {
+        return t.stride(-1) == 1 and t.stride(-2) * t.element_size() == pitch and
+               (t.size(0) == 1 or (t.stride(0) * t.element_size()) % pitch == 0) and
+               t.size(-1) * t.element_size() <= pitch;
+    };
+    if (pitch > 0 and is_on_pitch(x) and is_on_pitch(y)) {
+        const auto offset = (static_cast<int64_t>(y_begin - x_begin) % pitch + pitch) % pitch;
+        if (x.size(-1) * x.element_size() <= offset and offset + y.size(-1) * y.element_size() <= pitch)
+            return false;
+    }
+
+    const auto x_runs = get_byte_runs_3d(x), y_runs = get_byte_runs_3d(y);
+    if (not x_runs.has_value() or not y_runs.has_value())
+        return true;
+    std::vector<std::tuple<std::uintptr_t, std::uintptr_t, int>> runs;
+    runs.reserve(x_runs->size() + y_runs->size());
+    for (const auto& [begin, end]: *x_runs)
+        runs.emplace_back(begin, end, 0);
+    for (const auto& [begin, end]: *y_runs)
+        runs.emplace_back(begin, end, 1);
+    std::sort(runs.begin(), runs.end());
+    std::uintptr_t max_end[2] = {0, 0};
+    for (const auto& [begin, end, idx]: runs) {
+        if (begin < max_end[1 - idx])
+            return true;
+        max_end[idx] = std::max(max_end[idx], end);
+    }
+    return false;
+}
+
+// Whether distinct elements of a non-empty row-major `[b, m, n]` view share memory
+static bool has_internal_overlap_3d(const torch::Tensor& t) {
+    const auto [b, m, n] = get_shape<3>(t);
+    const auto row_stride = t.stride(-2), batch_stride = t.stride(0);
+    if (m > 1 and row_stride < n)
+        return true;
+    if (b <= 1)
+        return false;
+
+    // Fast paths: batches are stacked, or batches are interleaved inside each row
+    if (batch_stride >= (m - 1) * row_stride + n)
+        return false;
+    if (batch_stride >= n and (m == 1 or row_stride >= (b - 1) * batch_stride + n))
+        return false;
+
+    // Otherwise (e.g. batches interleaved across rows), compare the sorted row byte runs exactly
+    auto runs = get_byte_runs_3d(t);
+    if (not runs.has_value())
+        return true;
+    std::sort(runs->begin(), runs->end());
+    for (size_t i = 1; i < runs->size(); ++ i) {
+        if ((*runs)[i].first < (*runs)[i - 1].second)
+            return true;
+    }
+    return false;
+}
+
+// D = alpha * (A @ A.mT) + beta * C, where A, D, and the optional C are unbatched 2D or batched 3D tensors.
+// - `C` is read only when `beta != 0` (a `C` containing NaN/Inf is ignored for `beta == 0`), and `A` is read
+//   only when `alpha != 0` (so `alpha == 0` yields `beta * C` or zeros even if `A` holds NaN/Inf), on every route.
+// - `C` may be exactly `D` (same storage offset, dtype, and strides) for an in-place update; any other overlap
+//   between `C` and `D`, any overlap between `A` and `D`, and overlapping elements inside `D` are rejected.
+//   Uncommon layouts are checked by sorting row byte intervals; above 2^20 rows they are conservatively rejected.
+// - Routes: on SM90, BF16 `A` with BF16/FP32 `C`/`D` uses the native lower-triangular kernel when `A` and `D`
+//   are TMA-encodable (`C` is read with plain loads and has no alignment requirement) and the dispatch cutoff
+//   expects it to be faster; otherwise cuBLASLt computes the full product.
+// - Symmetry: the native route computes each Gram block once and mirrors it, so `alpha * (A @ A.mT)` is bitwise
+//   symmetric. `C` is added elementwise, so `D == D.mT` is guaranteed bitwise when the active `C` is bitwise
+//   symmetric (or absent); an asymmetric `C` gives an asymmetric `D`. The cuBLASLt route gives no bitwise
+//   symmetry guarantee.
+// - Determinism: the native route has no split-K and a fixed accumulation order, so it is bitwise run-to-run
+//   reproducible. The cuBLASLt route is reproducible only as far as cuBLASLt guarantees it for the selected
+//   algorithm (same library version, GPU architecture, SM count, workspace, and operand alignments).
+// - Rounding: `alpha * acc + beta * C` is evaluated in FP32 and rounded to `D`'s dtype once on both routes.
+// - `DG_SYRK_FORCE_NATIVE=1` (asserts that native is applicable) and `DG_SYRK_FORCE_FALLBACK=1` are internal
+//   test/benchmark controls that bypass the dispatch cutoff; they are not part of the public API.
+static void batched_syrk(const torch::Tensor& a,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c = std::nullopt,
+                         const float& alpha = 1.0f,
+                         const float& beta = 1.0f) {
     const auto a_3d = get_cublaslt_batched_view(a);
     const auto d_3d = get_cublaslt_batched_view(d);
     const auto [num_batches, m, k] = get_shape<3>(a_3d);
@@ -807,11 +929,66 @@ static void batched_syrk(const torch::Tensor& a, const torch::Tensor& d) {
     const auto major_a = get_major_type_ab<false>(a_3d);
     check_major_type_cd<false>(d_3d);
     DG_HOST_ASSERT(num_batches == num_batches_ and m == m_ and m == n_);
-    DG_HOST_ASSERT(a_3d.scalar_type() == d_3d.scalar_type());
+    DG_HOST_ASSERT(a_3d.scalar_type() == torch::kBFloat16 or a_3d.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(d_3d.scalar_type() == a_3d.scalar_type() or
+                   (a_3d.scalar_type() == torch::kBFloat16 and d_3d.scalar_type() == torch::kFloat));
 
-    if (num_batches == 0 or early_return(m, m, k, d_3d, std::nullopt))
+    std::optional<torch::Tensor> c_3d = std::nullopt;
+    if (c.has_value()) {
+        c_3d = get_cublaslt_batched_view(*c);
+        const auto [num_batches_c, m_c, n_c] = get_shape<3>(*c_3d);
+        check_major_type_cd<false>(*c_3d);
+        DG_HOST_ASSERT(num_batches == num_batches_c and m == m_c and m == n_c);
+        DG_HOST_ASSERT(c_3d->scalar_type() == torch::kBFloat16 or c_3d->scalar_type() == torch::kFloat);
+    }
+
+    if (num_batches == 0 or m == 0)
         return;
-    cublaslt_batched_gemm(a_3d, a_3d, d_3d, m, m, k, num_batches, major_a, major_a);
+
+    // Only operands that are actually read take part in the device and aliasing checks
+    const bool has_c = c_3d.has_value() and beta != 0.0f;
+    const bool has_a = k > 0 and alpha != 0.0f;
+    const auto& device = d_3d.device();
+    DG_HOST_ASSERT(device.is_cuda() and device.index() == c10::cuda::current_device());
+    DG_HOST_ASSERT(not has_internal_overlap_3d(d_3d) and "D must not have overlapping elements");
+    if (has_a) {
+        DG_HOST_ASSERT(a_3d.device() == device);
+        DG_HOST_ASSERT(not may_overlap_3d(a_3d, d_3d) and "A must not overlap D");
+    }
+    if (has_c) {
+        DG_HOST_ASSERT(c_3d->device() == device);
+        const bool is_in_place = c_3d->data_ptr() == d_3d.data_ptr() and
+                                 c_3d->scalar_type() == d_3d.scalar_type() and
+                                 c_3d->strides() == d_3d.strides();
+        DG_HOST_ASSERT((is_in_place or not may_overlap_3d(*c_3d, d_3d)) and "C must be exactly D or not overlap D");
+    }
+
+    if (not has_a) {
+        if (not has_c) {
+            d_3d.zero_();
+        } else if (beta == 1.0f) {
+            if (c_3d->data_ptr() != d_3d.data_ptr())
+                d_3d.copy_(*c_3d);
+        } else {
+            d_3d.copy_(c_3d->to(torch::kFloat) * beta);
+        }
+        return;
+    }
+
+    // Internal test/benchmark route controls (see above)
+    const bool force_native = deep_jit::get_env<int>("DG_SYRK_FORCE_NATIVE", 0);
+    const bool force_fallback = deep_jit::get_env<int>("DG_SYRK_FORCE_FALLBACK", 0);
+    DG_HOST_ASSERT(not (force_native and force_fallback));
+    const auto active_c_3d = has_c ? c_3d : std::nullopt;
+    if (not force_fallback and
+        can_use_sm90_bf16_batched_syrk(a_3d, d_3d, active_c_3d, num_batches, m, k, major_a, force_native)) {
+        sm90_bf16_batched_syrk(a_3d, d_3d, active_c_3d, num_batches, m, k, major_a, alpha, beta);
+        return;
+    }
+    DG_HOST_ASSERT(not force_native and "The native SM90 batched SYRK is not applicable");
+
+    cublaslt_batched_gemm(a_3d, a_3d, d_3d, m, m, k, num_batches, major_a, major_a,
+                          active_c_3d, alpha, has_c ? beta : 0.0f);
 }
 
 static void batched_symm(const torch::Tensor& a, const torch::Tensor& b,
@@ -994,7 +1171,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("cublaslt_nvfp4_gemm_nt", &cublaslt_nvfp4_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("c") = std::nullopt);
     m.def("batched_syrk", &batched_syrk,
-          py::arg("a"), py::arg("d"));
+          py::arg("a"), py::arg("d"),
+          py::arg("c") = std::nullopt,
+          py::arg("alpha") = 1.0f,
+          py::arg("beta") = 1.0f);
     m.def("batched_symm", &batched_symm,
           py::arg("a"), py::arg("b"), py::arg("d"));
 }
