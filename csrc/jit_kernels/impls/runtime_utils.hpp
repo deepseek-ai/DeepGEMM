@@ -161,13 +161,13 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
 static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
                                     int gmem_dim_0, int gmem_dim_1, int gmem_dim_2,
                                     int smem_dim_0, int smem_dim_1, int smem_dim_2,
-                                    const int& gmem_stride_0, const int& gmem_stride_1,
+                                    const int64_t& gmem_stride_0, const int64_t& gmem_stride_1,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
                                     const bool& allow_tf32 = false,
                                     const bool& fp4_unpacked_smem = true) {
     const auto elem_size = static_cast<int>(t.element_size());
-    const auto num_gmem_stride_0_bytes = static_cast<uint32_t>(gmem_stride_0) * static_cast<uint32_t>(elem_size);
-    const auto num_gmem_stride_1_bytes = static_cast<uint32_t>(gmem_stride_1) * static_cast<uint32_t>(elem_size);
+    const auto num_gmem_stride_0_bytes = static_cast<cuuint64_t>(gmem_stride_0) * elem_size;
+    const auto num_gmem_stride_1_bytes = static_cast<cuuint64_t>(gmem_stride_1) * elem_size;
     DG_HOST_ASSERT(reinterpret_cast<std::uintptr_t>(t.data_ptr()) % 16u == 0u);
     DG_HOST_ASSERT(num_gmem_stride_0_bytes % 16u == 0u);
     DG_HOST_ASSERT(num_gmem_stride_1_bytes % 16u == 0u);
@@ -186,12 +186,12 @@ static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
     CUtensorMap tensor_map;
     const cuuint64_t gmem_dims[3] = {static_cast<cuuint64_t>(gmem_dim_0), static_cast<cuuint64_t>(gmem_dim_1), static_cast<cuuint64_t>(gmem_dim_2),};
     const cuuint32_t smem_dims[3] = {static_cast<cuuint32_t>(smem_dim_0), static_cast<cuuint32_t>(smem_dim_1), static_cast<cuuint32_t>(smem_dim_2)};
-    const cuuint64_t gmem_strides[2] = {static_cast<cuuint64_t>(gmem_stride_0 * elem_size), static_cast<cuuint64_t>(gmem_stride_1 * elem_size)};
+    const cuuint64_t gmem_strides[2] = {num_gmem_stride_0_bytes, num_gmem_stride_1_bytes};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
     if (deep_jit::get_env<int>("DG_PRINT_CONFIGS")) {
-        printf("Making 3D TMA desc: global memory: %d %d %d, shared memory: %d %d %d, outer stride: %d %d, swizzle: %d, elem size: %d\n",
+        printf("Making 3D TMA desc: global memory: %d %d %d, shared memory: %d %d %d, outer stride: %ld %ld, swizzle: %d, elem size: %d\n",
                gmem_dim_0, gmem_dim_1, gmem_dim_2, smem_dim_0, smem_dim_1, smem_dim_2,
-               gmem_stride_0, gmem_stride_1, swizzle_mode, elem_size);
+               static_cast<long>(gmem_stride_0), static_cast<long>(gmem_stride_1), swizzle_mode, elem_size);
     }
     DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
         &tensor_map, aten_dtype_to_tensor_map_dtype(t.scalar_type(), allow_tf32, fp4_unpacked_smem),
